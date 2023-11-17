@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -e
 
-CORGEA_URL="http://localhost:5000"
+CORGEA_URL="http://localhost:8000"
 CMD="$@"
 RUN_ID=$(cat /dev/urandom | LC_ALL=C tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1) || true
 FILES_FOR_UPLOAD=()
 CORGEA_REPORT_NAME="corgea_report_$RUN_ID.json"
+PROJECT_NAME=$(basename $(pwd))
 
 check_requirements() {
   if ! command -v semgrep &> /dev/null
@@ -87,11 +88,11 @@ run_scan() {
 upload_results() {
   echo "Uploading results to Corgea"
 
-  echo $REPORT | curl -s -X POST -H "Content-Type: application/json" -d @- "$CORGEA_URL/api/cli/scan-upload?token=$CORGEA_TOKEN&run_id=$RUN_ID" > /dev/null
+  echo $REPORT | curl -s -X POST -H "Content-Type: application/json" -d @- "$CORGEA_URL/api/cli/scan-upload?token=$CORGEA_TOKEN&run_id=$RUN_ID&engine=$cmd_binary&project=$PROJECT_NAME" > /dev/null
 
   for f in "${FILES_FOR_UPLOAD[@]}"
   do
-    curl -s -X POST -F "file=@$f" "$CORGEA_URL/api/cli/code-upload?token=$CORGEA_TOKEN&run_id=$RUN_ID" > /dev/null
+    curl -s -X POST -F "file=@$f" "$CORGEA_URL/api/cli/code-upload?token=$CORGEA_TOKEN&run_id=$RUN_ID&path=$f" > /dev/null
   done
 
   echo "View results at: https://corgea.app/$RUN_ID"
