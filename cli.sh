@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-CORGEA_URL="http://localhost:8000"
+: ${CORGEA_URL:="https://www.corgea.app"}
 CMD="$@"
 RUN_ID=$(cat /dev/urandom | LC_ALL=C tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1) || true
 FILES_FOR_UPLOAD=()
