@@ -3,21 +3,30 @@ set -e
 
 : ${CORGEA_URL:="https://www.corgea.app"}
 CMD="$@"
+CMD_BINARY=$(echo $CMD | awk '{print $1}')
+VALID_BINARIES=(snyk semgrep)
 RUN_ID=$(cat /dev/urandom | LC_ALL=C tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1) || true
 FILES_FOR_UPLOAD=()
 CORGEA_REPORT_NAME="corgea_report_$RUN_ID.json"
 PROJECT_NAME=$(basename $(pwd))
 
 check_requirements() {
-  if ! command -v semgrep &> /dev/null
-  then
-      echo "semgrep could not be found"
-      exit
+  found=0
+  for i in "${VALID_BINARIES[@]}"; do
+    if [ "$i" == "$CMD_BINARY" ]; then
+        found=1
+        break
+    fi
+  done
+
+  if [ $found -eq 0 ]; then
+    echo "Invalid command provided. Supported SAST tools are snyk and semgrep currently."
+    exit
   fi
 
-  if ! command -v snyk &> /dev/null
+  if ! command -v $CMD_BINARY &> /dev/null
   then
-      echo "snyk could not be found"
+      echo "$CMD_BINARY could not be found. Is it installed?"
       exit
   fi
 
@@ -76,9 +85,9 @@ run_scan() {
   $($CMD > $CORGEA_REPORT_NAME) || true
   REPORT=$(cat $CORGEA_REPORT_NAME)
 
-  if [[ $cmd_binary == "snyk" ]]; then
+  if [[ $CMD_BINARY == "snyk" ]]; then
     parse_snyk_report
-  elif [[ $cmd_binary == "semgrep" ]]; then
+  elif [[ $CMD_BINARY == "semgrep" ]]; then
     parse_semgrep_report
   fi
 
