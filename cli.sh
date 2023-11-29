@@ -97,7 +97,7 @@ run_scan() {
 upload_results() {
   echo "Uploading results to Corgea"
 
-  echo $REPORT | curl -s -X POST -H "Content-Type: application/json" -d @- "$CORGEA_URL/api/cli/scan-upload?token=$CORGEA_TOKEN&run_id=$RUN_ID&engine=$CMD_BINARY&project=$PROJECT_NAME" > /dev/null
+  cat $CORGEA_REPORT_NAME | curl -s -X POST -H "Content-Type: application/json" -d @- "$CORGEA_URL/api/cli/scan-upload?token=$CORGEA_TOKEN&run_id=$RUN_ID&engine=$CMD_BINARY&project=$PROJECT_NAME" > /dev/null
 
   for f in "${FILES_FOR_UPLOAD[@]}"
   do
