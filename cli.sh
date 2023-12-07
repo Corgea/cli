@@ -41,6 +41,13 @@ check_requirements() {
     echo "CORGEA_TOKEN is not set"
     exit
   fi
+
+  VERIFY_TOKEN=$(curl -s "$CORGEA_URL/api/cli/verify/$CORGEA_TOKEN")
+
+  if [[ $VERIFY_TOKEN == *"error"* ]]; then
+    echo "Invalid token provided"
+    exit
+  fi
 }
 
 parse_semgrep_report() {
