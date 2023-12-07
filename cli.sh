@@ -111,7 +111,7 @@ upload_results() {
     curl -s -X POST -F "file=@$f" "$CORGEA_URL/api/cli/code-upload?token=$CORGEA_TOKEN&run_id=$RUN_ID&path=$f" > /dev/null
   done
 
-  echo "View results at: https://corgea.app/$RUN_ID"
+  echo "View results at: $CORGEA_URL"
 }
 
 run_corgea() {
