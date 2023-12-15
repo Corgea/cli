@@ -51,6 +51,11 @@ check_requirements() {
 }
 
 parse_semgrep_report() {
+  if [[ $REPORT_ERROR == *"semgrep login"* ]]; then
+    echo "Please log into semgrep first. Run 'semgrep login' to get started."
+    exit
+  fi
+
   FILES=$(cat $CORGEA_REPORT_NAME | tr "," "\n" | grep '"path": ' | uniq)
 
   for i in $FILES
@@ -89,8 +94,9 @@ run_scan() {
   cmd_binary=$(echo $CMD | awk '{print $1}')
 
   echo "Running scan with commmand '$CMD'"
-  $($CMD > $CORGEA_REPORT_NAME) || true
+  $($CMD > $CORGEA_REPORT_NAME 2> corgea_report_error.log) || true
   REPORT=$(cat $CORGEA_REPORT_NAME)
+  REPORT_ERROR=$(cat corgea_report_error.log)
 
   if [[ $CMD_BINARY == "snyk" ]]; then
     parse_snyk_report
