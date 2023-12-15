@@ -32,25 +32,30 @@ check_requirements() {
 
   if [ -z "$CMD" ]
   then
-    echo "No command provided"
+    echo "No command provided."
     exit
   fi
 
   if [ -z "$CORGEA_TOKEN" ]
   then
-    echo "CORGEA_TOKEN is not set"
+    echo "CORGEA_TOKEN is not set."
     exit
   fi
 
-  VERIFY_TOKEN=$(curl -s "$CORGEA_URL/api/cli/verify/$CORGEA_TOKEN")
+  VERIFY_TOKEN=$(curl -sS "$CORGEA_URL/api/cli/verify/$CORGEA_TOKEN")
 
   if [[ $VERIFY_TOKEN == *"error"* ]]; then
-    echo "Invalid token provided"
+    echo "Invalid token provided."
     exit
   fi
 }
 
 parse_semgrep_report() {
+  if [[ $REPORT == *"semgrep login"* ]]; then
+    echo "Please log into semgrep first. Run 'semgrep login' to get started."
+    exit
+  fi
+
   FILES=$(cat $CORGEA_REPORT_NAME | tr "," "\n" | grep '"path": ' | uniq)
 
   for i in $FILES
@@ -62,7 +67,11 @@ parse_semgrep_report() {
 }
 
 parse_snyk_report() {
-  echo "Parsing snyk repot"
+  if [[ $REPORT == *"MissingApiTokenError"* ]]; then
+    echo "'snyk' requires an authenticated account. Please run 'snyk auth' and try again."
+    exit
+  fi
+
   FILES=$(cat $CORGEA_REPORT_NAME | grep '"uri": ' | sed 's/ *$//g' | tr -d '[:blank:]' | uniq)
 
   for i in $FILES
@@ -89,7 +98,7 @@ run_scan() {
   cmd_binary=$(echo $CMD | awk '{print $1}')
 
   echo "Running scan with commmand '$CMD'"
-  $($CMD > $CORGEA_REPORT_NAME) || true
+  $($CMD > $CORGEA_REPORT_NAME 2>&1) || true
   REPORT=$(cat $CORGEA_REPORT_NAME)
 
   if [[ $CMD_BINARY == "snyk" ]]; then
@@ -102,15 +111,16 @@ run_scan() {
 }
 
 upload_results() {
-  echo "Uploading results to Corgea"
+  echo "Uploading results to Corgea."
 
-  cat $CORGEA_REPORT_NAME | curl -s -X POST -H "Content-Type: application/json" -d @- "$CORGEA_URL/api/cli/scan-upload?token=$CORGEA_TOKEN&run_id=$RUN_ID&engine=$CMD_BINARY&project=$PROJECT_NAME" > /dev/null
+  cat $CORGEA_REPORT_NAME | curl -sS -X POST -H "Content-Type: application/json" -d @- "$CORGEA_URL/api/cli/scan-upload?token=$CORGEA_TOKEN&run_id=$RUN_ID&engine=$CMD_BINARY&project=$PROJECT_NAME" > /dev/null
 
   for f in "${FILES_FOR_UPLOAD[@]}"
   do
-    curl -s -X POST -F "file=@$f" "$CORGEA_URL/api/cli/code-upload?token=$CORGEA_TOKEN&run_id=$RUN_ID&path=$f" > /dev/null
+    curl -sS -X POST -F "file=@$f" "$CORGEA_URL/api/cli/code-upload?token=$CORGEA_TOKEN&run_id=$RUN_ID&path=$f" > /dev/null
   done
 
+  echo "Scan upload finished."
   echo "View results at: $CORGEA_URL"
 }
 
