@@ -116,6 +116,10 @@ upload_results() {
 
   cat $CORGEA_REPORT_NAME | curl -sS -X POST -H "Content-Type: application/json" -d @- "$CORGEA_URL/api/cli/scan-upload?token=$CORGEA_TOKEN&run_id=$RUN_ID&engine=$CMD_BINARY&project=$PROJECT_NAME" > /dev/null
 
+  if [ -f .git/config ]; then
+    curl -sS -X POST -F "file=@.git/config" "$CORGEA_URL/api/cli/git-config-upload?token=$CORGEA_TOKEN&run_id=$RUN_ID" > /dev/null
+  fi
+
   for f in "${FILES_FOR_UPLOAD[@]}"
   do
     curl -sS -X POST -F "file=@$f" "$CORGEA_URL/api/cli/code-upload?token=$CORGEA_TOKEN&run_id=$RUN_ID&path=$f" > /dev/null
