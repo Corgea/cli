@@ -1,0 +1,226 @@
+use serde_json::Value;
+use std::io::{self, Read};
+use crate::Config;
+use reqwest::header;
+use uuid::Uuid;
+use std::path::Path;
+use std::process::Command;
+
+pub fn run_command(base_cmd: &String, mut command: Command) -> String {
+    match which::which(base_cmd) {
+        Ok(_) => {
+            let output = match command.output() {
+                Ok(output) => output,
+                Err(e) => {
+                    eprintln!("Failed to execute command: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            if output.status.success() || (output.status.code() == Some(1) && base_cmd == "snyk") {
+                println!("{} scan completed successfully", base_cmd);
+                let stdout = String::from_utf8(output.stdout).expect("Failed to parse stdout");
+
+                if stdout.contains("run `semgrep login`") {
+                    eprintln!("You are not authenticated with semgrep. Please run 'semgrep login' to authenticate.");
+                    std::process::exit(1);
+                }
+
+                return stdout;
+            } else {
+                let stderr = String::from_utf8(output.stderr).expect("Failed to parse stderr");
+                let stdout = String::from_utf8(output.stdout).expect("Failed to parse stdout");
+                eprintln!("{} failed: {}", base_cmd, stderr);
+                eprintln!("{}", stdout);
+                std::process::exit(1);
+            }
+        },
+        Err(_) => {
+            eprintln!("{} binary not found, is it installed?", base_cmd);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub fn run_semgrep(config: &Config) {
+    println!("Running semgrep scan...");
+    let base_command = "semgrep";
+    let mut command = std::process::Command::new(base_command);
+    command.arg("ci").arg("--json");
+
+    let output = run_command(&base_command.to_string(), command);
+
+    parse_scan(config, output, true);
+}
+
+pub fn run_snyk(config: &Config) {
+    println!("Running snyk scan...");
+    let base_command = "snyk";
+    let mut command = std::process::Command::new(base_command);
+    command.arg("code").arg("test").arg("--json");
+
+    let output = run_command(&base_command.to_string(), command);
+
+    parse_scan(config, output, true);
+}
+
+pub fn read_stdin_report(config: &Config) {
+    let mut input = String::new();
+    let _ = io::stdin().read_to_string(&mut input);
+
+    parse_scan(config, input, false);
+}
+
+pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
+    let mut paths: Vec<String> = Vec::new();
+    let mut scanner = String::new();
+    let data: std::result::Result<Value, _> = serde_json::from_str(&input);
+
+    match data {
+        Ok(data) => {
+            if input.contains("semgrep.ruleset") {
+                scanner = "semgrep".to_string();
+                if let Some(results) = data.get("results").and_then(|v| v.as_array()) {
+                    for result in results {
+                        if let Some(path) = result.get("path").and_then(|v| v.as_str()) {
+                            paths.push(path.to_string());
+                        }
+                    }
+                }
+            } else if input.contains("SnykCode") {
+                scanner = "snyk".to_string();
+                if let Some(runs) = data.get("runs").and_then(|v| v.as_array()) {
+                    for run in runs {
+                        if let Some(results) = run.get("results").and_then(|v| v.as_array()) {
+                            for result in results {
+                                if let Some(locations) = result.get("locations").and_then(|v| v.as_array()) {
+                                    for location in locations {
+                                        if let Some(uri) = location.get("physicalLocation").and_then(|v| v.get("artifactLocation")).and_then(|v| v.get("uri")).and_then(|v| v.as_str()) {
+                                            paths.push(uri.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                eprintln!("No issues found in scan report or the report is not supported.");
+                eprintln!("Double check the correct scanner is being used and the report is in JSON format.");
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to parse JSON report: {}", e);
+            eprintln!("Only reports in JSON format are supported.");
+            std::process::exit(1);
+        }
+    }
+
+    if paths.len() == 0 {
+        eprintln!("No issues found in scan report. Nothing to do, exiting.");
+        std::process::exit(1);
+    }
+
+    upload_scan(config, paths, scanner, input, save_to_file);
+}
+
+fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: String, save_to_file: bool) {
+    let run_id = Uuid::new_v4().to_string();
+    let token = config.get_token();
+    let base_url = config.get_url();
+    let current_dir = std::env::current_dir().expect("Failed to get current directory");
+    let project = current_dir.file_name().expect("Failed to get directory name").to_str().expect("Failed to convert OsStr to str").to_string();
+    let scan_upload_url = format!(
+        "{}/api/cli/scan-upload?token={}&engine={}&run_id={}&project={}", base_url, token, scanner, run_id, project
+    );
+    let git_config_upload_url = format!(
+        "{}/api/cli/git-config-upload?token={}&run_id={}", base_url, token, run_id
+    );
+    let client = reqwest::blocking::Client::new();
+
+    let res = client.post(scan_upload_url)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(input.clone())
+        .send();
+
+    match res {
+        Ok(response) => {
+            if response.status().is_success() {
+                println!("Successfully uploaded scan.");
+            } else {
+                eprintln!("Failed to upload scan: {}", response.status());
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to send request: {}", e);
+        }
+    }
+
+    println!("Uploading additional files...");
+
+    let git_config_path = Path::new(".git/config");
+
+    if git_config_path.exists() {
+        let form = reqwest::blocking::multipart::Form::new()
+            .file("file", git_config_path)
+            .expect("Failed to read file");
+
+        let client = reqwest::blocking::Client::new();
+        let res = client.post(&git_config_upload_url)
+            .multipart(form)
+            .send();
+
+        match res {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    eprintln!("Failed to upload git config: {}", response.status());
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to send request: {}", e);
+            }
+        }
+    }
+
+    for path in &paths {
+        let src_upload_url = format!(
+            "{}/api/cli/code-upload?token={}&run_id={}&path={}", base_url, token, run_id, path
+        );
+        let fp = Path::new(&path);
+
+        let form = reqwest::blocking::multipart::Form::new()
+            .file("file", fp)
+            .expect("Failed to read file");
+
+        let client = reqwest::blocking::Client::new();
+        let res = client.post(&src_upload_url)
+            .multipart(form)
+            .send();
+
+        match res {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    eprintln!("Failed to upload file: {}", response.status());
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to send request: {}", e);
+            }
+        }
+    }
+
+    if save_to_file {
+        let mut file_path = std::env::current_dir().expect("Failed to get current directory");
+        file_path.push(format!("corgea_{}_{}_report.json", scanner, run_id));
+
+        match std::fs::write(&file_path, input.clone()) {
+            Ok(_) => println!("Successfully saved scan to {}", file_path.display()),
+            Err(e) => eprintln!("Failed to save scan to {}: {}", file_path.display(), e)
+        }
+    }
+
+    println!("Successfully scanned using {} and uploaded to Corgea.", scanner);
+    println!("Found {} issues.", &paths.len());
+    println!("Go to https://www.corgea.app");
+}
