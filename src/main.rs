@@ -18,19 +18,22 @@ struct Cli {
 enum Commands {
     /// Authenticate to Corgea
     Login { token: String },
-    /// Upload a scan report to Corgea via STDIN
-    Upload,
+    /// Upload a scan report to Corgea via STDIN or a file
+    Upload {
+        /// Option path to JSON report to upload
+        report: Option<String>,
+    },
     /// Scan the current directory. Supports semgrep and snyk.
     Scan {
         /// What scanner to use. Valid options are sempgrep and snyk.
         scanner: Scanner
-    }
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
 enum Scanner {
     Snyk,
-    Semgrep
+    Semgrep,
 }
 
 impl FromStr for Scanner {
@@ -62,23 +65,32 @@ fn main() {
                 Ok(true) => {
                     corgea_config.set_token(token.clone()).expect("Failed to set token");
                     println!("Successfully authenticated to Corgea.")
-                },
+                }
                 Ok(false) => println!("Invalid token provided."),
                 Err(e) => eprintln!("Error occurred: {}", e),
             }
         }
-        Some(Commands::Upload) => {
+        Some(Commands::Upload { report }) => {
             check_token_set(&corgea_config);
 
             match login::verify_token(corgea_config.get_token().as_str(), corgea_config.get_url().as_str()) {
                 Ok(true) => {
-                    scan::read_stdin_report(&corgea_config);
+                    match report {
+                        Some(report) => {
+                            // Use the provided report
+                            scan::read_file_report(&corgea_config, report);
+                        }
+                        None => {
+                            // Read from stdin
+                            scan::read_stdin_report(&corgea_config);
+                        }
+                    }
                 }
                 Ok(false) => println!("Invalid token provided. Please run 'corgea login' to authenticate."),
                 Err(e) => eprintln!("Error occurred: {}", e)
             }
         }
-        Some(Commands::Scan { scanner}) => {
+        Some(Commands::Scan { scanner }) => {
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config),
                 Scanner::Semgrep => scan::run_semgrep(&corgea_config)
