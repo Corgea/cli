@@ -71,6 +71,18 @@ pub fn read_stdin_report(config: &Config) {
     parse_scan(config, input, false);
 }
 
+pub fn read_file_report(config: &Config, file_path: &str) {
+    let input = match std::fs::read_to_string(file_path) {
+        Ok(input) => input,
+        Err(e) => {
+            eprintln!("Failed to read file: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    parse_scan(config, input, false);
+}
+
 pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
     let mut paths: Vec<String> = Vec::new();
     let mut scanner = String::new();
