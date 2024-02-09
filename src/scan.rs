@@ -34,7 +34,7 @@ pub fn run_command(base_cmd: &String, mut command: Command) -> String {
                 eprintln!("{}", stdout);
                 std::process::exit(1);
             }
-        },
+        }
         Err(_) => {
             eprintln!("{} binary not found, is it installed?", base_cmd);
             std::process::exit(1);
@@ -90,6 +90,8 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
 
     match data {
         Ok(data) => {
+            let schema = data.get("$schema").and_then(|v| v.as_str()).unwrap_or("unknown");
+
             if input.contains("semgrep.ruleset") {
                 scanner = "semgrep".to_string();
                 if let Some(results) = data.get("results").and_then(|v| v.as_array()) {
@@ -99,8 +101,20 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
                         }
                     }
                 }
-            } else if input.contains("SnykCode") {
-                scanner = "snyk".to_string();
+            } else if schema.contains("sarif") {
+                let run = data.get("runs").and_then(|v| v.as_array()).and_then(|v| v.get(0));
+                let driver = run.and_then(|v| v.get("tool")).and_then(|v| v.get("driver")).and_then(|v| v.get("name"));
+                let tool = driver.and_then(|v| v.as_str()).unwrap_or("unknown");
+
+                if tool == "SnykCode" {
+                    scanner = "snyk".to_string();
+                } else if tool == "CodeQL" {
+                    scanner = "codeql".to_string();
+                } else {
+                    eprintln!("{} is not supported as this time.", tool);
+                    std::process::exit(1);
+                }
+
                 if let Some(runs) = data.get("runs").and_then(|v| v.as_array()) {
                     for run in runs {
                         if let Some(results) = run.get("results").and_then(|v| v.as_array()) {
