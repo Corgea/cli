@@ -92,7 +92,7 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
         Ok(data) => {
             let schema = data.get("$schema").and_then(|v| v.as_str()).unwrap_or("unknown");
 
-            if input.contains("semgrep.ruleset") {
+            if input.contains("semgrep.dev") {
                 scanner = "semgrep".to_string();
                 if let Some(results) = data.get("results").and_then(|v| v.as_array()) {
                     for result in results {
