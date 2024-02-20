@@ -5,6 +5,7 @@ use reqwest::header;
 use uuid::Uuid;
 use std::path::Path;
 use std::process::Command;
+use crate::cicd::{*};
 
 pub fn run_command(base_cmd: &String, mut command: Command) -> String {
     match which::which(base_cmd) {
@@ -152,13 +153,26 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
 }
 
 fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: String, save_to_file: bool) {
+    let in_ci = running_in_ci();
+    let ci_platform = which_ci();
+    let github_env_vars = get_github_env_vars();
+
     let run_id = Uuid::new_v4().to_string();
     let token = config.get_token();
     let base_url = config.get_url();
     let current_dir = std::env::current_dir().expect("Failed to get current directory");
-    let project = current_dir.file_name().expect("Failed to get directory name").to_str().expect("Failed to convert OsStr to str").to_string();
+    let project;
+
+    if in_ci {
+        project = format!("{}-{}",
+                          github_env_vars.get("GITHUB_REPOSITORY").expect("Failed to get GITHUB_REPOSITORY").to_string(),
+                          github_env_vars.get("GITHUB_PR").expect("Failed to get GITHUB_REPOSITORY").to_string())
+    } else {
+        project = current_dir.file_name().expect("Failed to get directory name").to_str().expect("Failed to convert OsStr to str").to_string();
+    }
+
     let scan_upload_url = format!(
-        "{}/api/cli/scan-upload?token={}&engine={}&run_id={}&project={}", base_url, token, scanner, run_id, project
+        "{}/api/cli/scan-upload?token={}&engine={}&run_id={}&project={}&ci={}&ci_platform={}", base_url, token, scanner, run_id, project, in_ci, ci_platform
     );
     let git_config_upload_url = format!(
         "{}/api/cli/git-config-upload?token={}&run_id={}", base_url, token, run_id
