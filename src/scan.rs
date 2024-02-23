@@ -250,6 +250,30 @@ fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: Stri
         }
     }
 
+    if in_ci {
+        let ci_data_upload_url = format!(
+            "{}/api/cli/ci-data-upload?token={}&run_id={}&platform={}", base_url, token, run_id, ci_platform
+        );
+
+        let mut github_env_vars_json = serde_json::Map::new();
+        for (key, value) in github_env_vars {
+            github_env_vars_json.insert(key, Value::String(value));
+        }
+
+        let github_env_vars_json_string = match serde_json::to_string(&github_env_vars_json) {
+            Ok(json_string) => json_string,
+            Err(e) => {
+                eprintln!("Failed to serialize JSON: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        let res = client.post(ci_data_upload_url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(github_env_vars_json_string)
+            .send();
+    }
+
     if save_to_file {
         let mut file_path = std::env::current_dir().expect("Failed to get current directory");
         file_path.push(format!("corgea_{}_{}_report.json", scanner, run_id));
