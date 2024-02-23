@@ -5,6 +5,7 @@ use reqwest::header;
 use uuid::Uuid;
 use std::path::Path;
 use std::process::Command;
+use crate::cicd::{*};
 
 pub fn run_command(base_cmd: &String, mut command: Command) -> String {
     match which::which(base_cmd) {
@@ -152,13 +153,26 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
 }
 
 fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: String, save_to_file: bool) {
+    let in_ci = running_in_ci();
+    let ci_platform = which_ci();
+    let github_env_vars = get_github_env_vars();
+
     let run_id = Uuid::new_v4().to_string();
     let token = config.get_token();
     let base_url = config.get_url();
     let current_dir = std::env::current_dir().expect("Failed to get current directory");
-    let project = current_dir.file_name().expect("Failed to get directory name").to_str().expect("Failed to convert OsStr to str").to_string();
+    let project;
+
+    if in_ci {
+        project = format!("{}-{}",
+                          github_env_vars.get("GITHUB_REPOSITORY").expect("Failed to get GITHUB_REPOSITORY").to_string(),
+                          github_env_vars.get("GITHUB_PR").expect("Failed to get GITHUB_REPOSITORY").to_string())
+    } else {
+        project = current_dir.file_name().expect("Failed to get directory name").to_str().expect("Failed to convert OsStr to str").to_string();
+    }
+
     let scan_upload_url = format!(
-        "{}/api/cli/scan-upload?token={}&engine={}&run_id={}&project={}", base_url, token, scanner, run_id, project
+        "{}/api/cli/scan-upload?token={}&engine={}&run_id={}&project={}&ci={}&ci_platform={}", base_url, token, scanner, run_id, project, in_ci, ci_platform
     );
     let git_config_upload_url = format!(
         "{}/api/cli/git-config-upload?token={}&run_id={}", base_url, token, run_id
@@ -234,6 +248,30 @@ fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: Stri
                 eprintln!("Failed to send request: {}", e);
             }
         }
+    }
+
+    if in_ci {
+        let ci_data_upload_url = format!(
+            "{}/api/cli/ci-data-upload?token={}&run_id={}&platform={}", base_url, token, run_id, ci_platform
+        );
+
+        let mut github_env_vars_json = serde_json::Map::new();
+        for (key, value) in github_env_vars {
+            github_env_vars_json.insert(key, Value::String(value));
+        }
+
+        let github_env_vars_json_string = match serde_json::to_string(&github_env_vars_json) {
+            Ok(json_string) => json_string,
+            Err(e) => {
+                eprintln!("Failed to serialize JSON: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        let res = client.post(ci_data_upload_url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(github_env_vars_json_string)
+            .send();
     }
 
     if save_to_file {
