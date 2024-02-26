@@ -131,10 +131,6 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
                         }
                     }
                 }
-            } else {
-                eprintln!("No issues found in scan report or the report is not supported.");
-                eprintln!("Double check the correct scanner is being used and the report is in JSON format.");
-                std::process::exit(1);
             }
         }
         Err(e) => {
@@ -145,8 +141,8 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
     }
 
     if paths.len() == 0 {
-        eprintln!("No issues found in scan report. Nothing to do, exiting.");
-        std::process::exit(1);
+        eprintln!("No issues found in scan report, exiting.");
+        std::process::exit(0);
     }
 
     upload_scan(config, paths, scanner, input, save_to_file);
@@ -268,7 +264,7 @@ fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: Stri
             }
         };
 
-        let res = client.post(ci_data_upload_url)
+        let _res = client.post(ci_data_upload_url)
             .header(header::CONTENT_TYPE, "application/json")
             .body(github_env_vars_json_string)
             .send();
