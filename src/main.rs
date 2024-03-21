@@ -92,6 +92,8 @@ fn main() {
             }
         }
         Some(Commands::Scan { scanner }) => {
+            check_token_set(&corgea_config);
+
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config),
                 Scanner::Semgrep => scan::run_semgrep(&corgea_config)
