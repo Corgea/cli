@@ -47,7 +47,7 @@ pub fn run_semgrep(config: &Config) {
     println!("Running semgrep scan...");
     let base_command = "semgrep";
     let mut command = std::process::Command::new(base_command);
-    command.arg("ci").arg("--json");
+    command.arg("scan").arg("--config").arg("auto").arg("--json");
 
     let output = run_command(&base_command.to_string(), command);
 
