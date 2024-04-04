@@ -179,51 +179,14 @@ fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: Stri
     );
     let client = reqwest::blocking::Client::new();
 
-    let res = client.post(scan_upload_url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(input.clone())
-        .send();
-
-    match res {
-        Ok(response) => {
-            if response.status().is_success() {
-                println!("Successfully uploaded scan.");
-            } else {
-                eprintln!("Failed to upload scan: {}", response.status());
-            }
-        }
-        Err(e) => {
-            eprintln!("Failed to send request: {}", e);
-        }
-    }
-
-    println!("Uploading additional files...");
-
-    let git_config_path = Path::new(".git/config");
-
-    if git_config_path.exists() {
-        let form = reqwest::blocking::multipart::Form::new()
-            .file("file", git_config_path)
-            .expect("Failed to read file");
-
-        let client = reqwest::blocking::Client::new();
-        let res = client.post(&git_config_upload_url)
-            .multipart(form)
-            .send();
-
-        match res {
-            Ok(response) => {
-                if !response.status().is_success() {
-                    eprintln!("Failed to upload git config: {}", response.status());
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to send request: {}", e);
-            }
-        }
-    }
+    println!("Uploading required files for the scan...");
 
     for path in &paths {
+        if !Path::new(&path).exists() {
+            eprintln!("Required file {} not found which is required for the scan, exiting.", path);
+            std::process::exit(1);
+        }
+
         let src_upload_url = format!(
             "{}/api/cli/code-upload?token={}&run_id={}&path={}", base_url, token, run_id, path
         );
@@ -242,6 +205,54 @@ fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: Stri
             Ok(response) => {
                 if !response.status().is_success() {
                     eprintln!("Failed to upload file: {}", response.status());
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to send request: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    println!("Uploading the scan...");
+
+    // main scan upload
+    let res = client.post(scan_upload_url)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(input.clone())
+        .send();
+
+    match res {
+        Ok(response) => {
+            if response.status().is_success() {
+                println!("Successfully uploaded scan.");
+            } else {
+                eprintln!("Failed to upload scan: {}", response.status());
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to send request: {}", e);
+        }
+    }
+
+
+    let git_config_path = Path::new(".git/config");
+
+    if git_config_path.exists() {
+        let form = reqwest::blocking::multipart::Form::new()
+            .file("file", git_config_path)
+            .expect("Failed to read file");
+
+        let client = reqwest::blocking::Client::new();
+        let res = client.post(&git_config_upload_url)
+            .multipart(form)
+            .send();
+
+        match res {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    eprintln!("Failed to upload git config: {}", response.status());
                 }
             }
             Err(e) => {
@@ -285,6 +296,5 @@ fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: Stri
     }
 
     println!("Successfully scanned using {} and uploaded to Corgea.", scanner);
-    println!("Found {} issues.", &paths.len());
-    println!("Go to https://www.corgea.app");
+    println!("Go to {base_url} to see results.");
 }
