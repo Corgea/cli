@@ -44,10 +44,12 @@ pub fn run_command(base_cmd: &String, mut command: Command) -> String {
 }
 
 pub fn run_semgrep(config: &Config) {
-    println!("Running semgrep scan...");
+    println!("Scanning with semgrep...");
     let base_command = "semgrep";
     let mut command = std::process::Command::new(base_command);
     command.arg("scan").arg("--config").arg("auto").arg("--json");
+
+    println!("Running \"semgrep scan --config auto --json\"");
 
     let output = run_command(&base_command.to_string(), command);
 
@@ -55,10 +57,12 @@ pub fn run_semgrep(config: &Config) {
 }
 
 pub fn run_snyk(config: &Config) {
-    println!("Running snyk scan...");
+    println!("Scanning with snyk...");
     let base_command = "snyk";
     let mut command = std::process::Command::new(base_command);
     command.arg("code").arg("test").arg("--json");
+
+    println!("Running \"snyk code test --json\"");
 
     let output = run_command(&base_command.to_string(), command);
 
