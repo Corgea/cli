@@ -30,12 +30,15 @@ jobs:
             target: x86
           - runner: ubuntu-latest
             target: aarch64
-            
+
     steps:
       - uses: actions/checkout@v4
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
+          before-script-linux: |
+            sudo apt-get update
+            sudo apt-get install -y libssl-dev
           target: ${{ matrix.platform.target }}
           args: --release --out dist
           sccache: 'true'
