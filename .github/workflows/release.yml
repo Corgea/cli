@@ -33,11 +33,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y libssl-dev
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          before-script-linux: |
-            apt-get update && apt-get install -y libssl-dev
           target: ${{ matrix.platform.target }}
           args: --release --out dist
           sccache: 'true'
