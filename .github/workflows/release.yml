@@ -33,10 +33,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -44,6 +40,14 @@ jobs:
           args: --release --out dist
           sccache: 'true'
           manylinux: auto
+          before-script-linux: |
+            # If we're running on rhel centos, install needed packages.
+            if command -v yum &> /dev/null; then
+                yum update -y && yum install -y perl-core openssl openssl-devel pkgconfig libatomic
+            else
+                # If we're running on debian-based system.
+                apt update -y && apt-get install -y libssl-dev openssl pkg-config
+            fi
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
