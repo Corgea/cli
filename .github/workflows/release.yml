@@ -38,7 +38,6 @@ jobs:
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist
-          sccache: 'true'
           manylinux: auto
           before-script-linux: |
             # If we're running on rhel centos, install needed packages.
@@ -70,7 +69,6 @@ jobs:
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist
-          sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -93,7 +91,6 @@ jobs:
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist
-          sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:

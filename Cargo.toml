@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 clap = {  version = "4.4.13", features = ["derive"] }
 dirs = "5.0.1"
-reqwest = {  version = "0.12", features = ["blocking", "json", "multipart", "rustls-tls", "rustls-tls-native-roots"] }
+reqwest = {  version = "0.12", features = ["blocking", "json", "multipart", "rustls-tls"] }
 toml = "0.8.8"
 serde = { version = "1.0.195", features = ["derive"] }
 serde_json = "1.0.111"
