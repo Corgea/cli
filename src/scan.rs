@@ -135,6 +135,25 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
                         }
                     }
                 }
+                // checkmarx
+            } else if input.contains("Cx") && data.get("results").is_some() && data.get("scanID").is_some() {
+                println!("Got a checkmarx scan");
+                scanner = "checkmarx".to_string();
+                if let Some(results) = data.get("results").and_then(|v| v.as_array()) {
+                    for result in results {
+                        if let Some(data) = result.get("data") {
+                            if let Some(nodes) = data.get("nodes").and_then(|v| v.as_array()) {
+                                for node in nodes {
+                                    if let Some(path) = node.get("fileName") {
+                                        if let Some(truncated_path) = path.as_str() {
+                                            paths.push(truncated_path.get(1..).unwrap_or("").to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         Err(e) => {
