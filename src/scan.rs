@@ -144,7 +144,7 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
                     for result in results {
                         if let Some(data) = result.get("data") {
                             if let Some(nodes) = data.get("nodes").and_then(|v| v.as_array()) {
-                                if let Some(node) = nodes.first() {
+                                for node in nodes {
                                     if let Some(path) = node.get("fileName") {
                                         if let Some(truncated_path) = path.as_str() {
                                             paths.push(truncated_path.get(1..).unwrap_or("").to_string());
