@@ -138,7 +138,6 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
                 }
                 // checkmarx
             } else if input.contains("Cx") && data.get("results").is_some() && data.get("scanID").is_some() {
-                println!("Got a checkmarx scan");
                 scanner = "checkmarx".to_string();
                 if let Some(results) = data.get("results").and_then(|v| v.as_array()) {
                     for result in results {
