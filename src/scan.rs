@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use serde_json::Value;
 use std::io::{self, Read};
 use crate::Config;
@@ -135,6 +136,24 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
                         }
                     }
                 }
+                // checkmarx
+            } else if input.contains("Cx") && data.get("results").is_some() && data.get("scanID").is_some() {
+                scanner = "checkmarx".to_string();
+                if let Some(results) = data.get("results").and_then(|v| v.as_array()) {
+                    for result in results {
+                        if let Some(data) = result.get("data") {
+                            if let Some(nodes) = data.get("nodes").and_then(|v| v.as_array()) {
+                                for node in nodes {
+                                    if let Some(path) = node.get("fileName") {
+                                        if let Some(truncated_path) = path.as_str() {
+                                            paths.push(truncated_path.get(1..).unwrap_or("").to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         Err(e) => {
@@ -181,10 +200,16 @@ fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: Stri
 
     println!("Uploading required files for the scan...");
 
+    let mut uploaded_paths = HashSet::new();
+
     for path in &paths {
         if !Path::new(&path).exists() {
             eprintln!("Required file {} not found which is required for the scan, exiting.", path);
             std::process::exit(1);
+        }
+
+        if uploaded_paths.contains(path) {
+            continue;
         }
 
         let src_upload_url = format!(
@@ -206,6 +231,8 @@ fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: Stri
                 if !response.status().is_success() {
                     eprintln!("Failed to upload file: {}", response.status());
                     std::process::exit(1);
+                } else {
+                    uploaded_paths.insert(path.clone());
                 }
             }
             Err(e) => {
