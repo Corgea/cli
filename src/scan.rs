@@ -7,6 +7,7 @@ use uuid::Uuid;
 use std::path::Path;
 use std::process::Command;
 use crate::cicd::{*};
+use crate::log::debug;
 
 pub fn run_command(base_cmd: &String, mut command: Command) -> String {
     match which::which(base_cmd) {
@@ -99,6 +100,7 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
             let schema = data.get("$schema").and_then(|v| v.as_str()).unwrap_or("unknown");
 
             if input.contains("semgrep.dev") {
+                debug("Detected semgrep schema");
                 scanner = "semgrep".to_string();
                 if let Some(results) = data.get("results").and_then(|v| v.as_array()) {
                     for result in results {
@@ -108,13 +110,16 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
                     }
                 }
             } else if schema.contains("sarif") {
+                debug("Detected sarif schema");
                 let run = data.get("runs").and_then(|v| v.as_array()).and_then(|v| v.get(0));
                 let driver = run.and_then(|v| v.get("tool")).and_then(|v| v.get("driver")).and_then(|v| v.get("name"));
                 let tool = driver.and_then(|v| v.as_str()).unwrap_or("unknown");
 
                 if tool == "SnykCode" {
+                    debug("Detected snyk version of sarif schema");
                     scanner = "snyk".to_string();
                 } else if tool == "CodeQL" {
+                    debug("Detected codeql version of sarif schema");
                     scanner = "codeql".to_string();
                 } else {
                     eprintln!("{} is not supported as this time.", tool);
@@ -138,6 +143,7 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
                 }
                 // checkmarx
             } else if input.contains("Cx") && data.get("results").is_some() && data.get("scanID").is_some() {
+                debug("Detected checkmarx schema");
                 scanner = "checkmarx".to_string();
                 if let Some(results) = data.get("results").and_then(|v| v.as_array()) {
                     for result in results {
@@ -183,6 +189,7 @@ fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: Stri
     let project;
 
     if in_ci {
+        debug("Running in CI");
         project = format!("{}-{}",
                           github_env_vars.get("GITHUB_REPOSITORY").expect("Failed to get GITHUB_REPOSITORY").to_string(),
                           github_env_vars.get("GITHUB_PR").expect("Failed to get GITHUB_REPOSITORY").to_string())
@@ -196,7 +203,10 @@ fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: Stri
     let git_config_upload_url = format!(
         "{}/api/cli/git-config-upload?token={}&run_id={}", base_url, token, run_id
     );
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5 * 60))
+        .build()
+        .expect("Failed to build client");
 
     println!("Uploading required files for the scan...");
 
@@ -215,13 +225,15 @@ fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: Stri
         let src_upload_url = format!(
             "{}/api/cli/code-upload?token={}&run_id={}&path={}", base_url, token, run_id, path
         );
+        debug(&format!("Uploading file: {}", path));
         let fp = Path::new(&path);
 
         let form = reqwest::blocking::multipart::Form::new()
             .file("file", fp)
             .expect("Failed to read file");
 
-        let client = reqwest::blocking::Client::new();
+
+        debug(&format!("POST: {}", src_upload_url));
         let res = client.post(&src_upload_url)
             .multipart(form)
             .send();
@@ -245,6 +257,7 @@ fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: Stri
     println!("Uploading the scan...");
 
     // main scan upload
+    debug(&format!("POST: {}", scan_upload_url));
     let res = client.post(scan_upload_url)
         .header(header::CONTENT_TYPE, "application/json")
         .body(input.clone())
@@ -267,11 +280,12 @@ fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: Stri
     let git_config_path = Path::new(".git/config");
 
     if git_config_path.exists() {
+        debug("Uploading .git/config");
         let form = reqwest::blocking::multipart::Form::new()
             .file("file", git_config_path)
             .expect("Failed to read file");
 
-        let client = reqwest::blocking::Client::new();
+        debug(&format!("POST: {}", git_config_upload_url));
         let res = client.post(&git_config_upload_url)
             .multipart(form)
             .send();
@@ -306,6 +320,7 @@ fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: Stri
             }
         };
 
+        debug(&format!("POST: {}", ci_data_upload_url));
         let _res = client.post(ci_data_upload_url)
             .header(header::CONTENT_TYPE, "application/json")
             .body(github_env_vars_json_string)
