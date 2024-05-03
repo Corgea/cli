@@ -2,6 +2,7 @@ mod login;
 mod config;
 mod scan;
 mod cicd;
+mod log;
 
 use std::str::FromStr;
 use clap::{Parser, Subcommand};
