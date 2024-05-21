@@ -390,5 +390,10 @@ fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: Stri
     }
 
     println!("Successfully scanned using {} and uploaded to Corgea.", scanner);
+
+    if upload_error_count > 0 {
+        println!("Failed to upload {} files, you may not see all fixes in Corgea.", upload_error_count);
+    }
+
     println!("Go to {base_url} to see results.");
 }
