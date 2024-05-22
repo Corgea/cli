@@ -281,7 +281,6 @@ fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: Stri
                     if !response.status().is_success() {
                         eprintln!("Failed to upload file {} {}... retrying", response.status(), path);
                         std::thread::sleep(std::time::Duration::from_secs(1));
-                        upload_error_count = upload_error_count + 1;
                         attempts += 1;
                     } else {
                         uploaded_count += 1;
@@ -297,6 +296,7 @@ fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: Stri
         }
 
         if attempts == 3 && !success {
+            upload_error_count += 1;
             eprintln!("Failed to upload file: {} after 3 attempts. skipping...", path);
         }
     }
