@@ -3,10 +3,14 @@ mod config;
 mod scan;
 mod cicd;
 mod log;
+mod scanners {
+    pub mod fortify;
+}
 
 use std::str::FromStr;
 use clap::{Parser, Subcommand};
 use config::Config;
+use scanners::fortify::parse as fortify_parse;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None, arg_required_else_help = true)]
@@ -79,8 +83,11 @@ fn main() {
                 Ok(true) => {
                     match report {
                         Some(report) => {
-                            // Use the provided report
-                            scan::read_file_report(&corgea_config, report);
+                            if report.ends_with(".fpr") {
+                                fortify_parse(&corgea_config, report);
+                            } else {
+                                scan::read_file_report(&corgea_config, report);
+                            }
                         }
                         None => {
                             // Read from stdin
