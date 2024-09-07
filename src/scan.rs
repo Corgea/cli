@@ -210,7 +210,7 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
     upload_scan(config, paths, scanner, input, save_to_file);
 }
 
-fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: String, save_to_file: bool) {
+pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: String, save_to_file: bool) {
     let in_ci = running_in_ci();
     let ci_platform = which_ci();
     let github_env_vars = get_github_env_vars();
