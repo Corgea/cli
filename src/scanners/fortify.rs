@@ -67,25 +67,64 @@ fn extract_file_path(scan_file: PathBuf) -> (String, Vec<String>) {
     xml_reader.config_mut().trim_text(true);
 
     let mut buf = Vec::new();
+    let mut in_vulnerability = false;
 
     loop {
         match xml_reader.read_event_into(&mut buf) {
-            Ok(Event::Empty(ref e)) if e.name().as_ref() == b"SourceLocation" => {
-                for attr_result in e.attributes() {
-                    match attr_result {
-                        Ok(attr) => {
-                            let key = attr.key.into_inner();
+            Ok(Event::Start(ref e)) => {
+                let e_name = e.name();
+                let tag_name = e_name.as_ref();
 
-                            if key == b"path" {
-                                if let Ok(value) = attr.unescape_value() {
-                                    if !paths.contains(&value.to_string()) {
-                                        paths.push(value.to_string());
+                if tag_name == b"Vulnerability" {
+                    in_vulnerability = true;
+                } else if tag_name == b"SourceLocation" && in_vulnerability {
+                    for attr_result in e.attributes() {
+                        match attr_result {
+                            Ok(attr) => {
+                                let attr_key = attr.key.as_ref();
+                                if attr_key == b"path" {
+                                    if let Ok(value) = attr.unescape_value() {
+                                        let path_str = value.to_string();
+                                        if !paths.contains(&path_str) {
+                                            paths.push(path_str);
+                                        }
                                     }
                                 }
                             }
+                            Err(e) => println!("Error processing attribute: {}", e),
                         }
-                        Err(e) => println!("Error processing attribute: {}", e),
                     }
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                let e_name = e.name();
+                let tag_name = e_name.as_ref();
+
+                if tag_name == b"SourceLocation" && in_vulnerability {
+                    for attr_result in e.attributes() {
+                        match attr_result {
+                            Ok(attr) => {
+                                let attr_key = attr.key.as_ref();
+                                if attr_key == b"path" {
+                                    if let Ok(value) = attr.unescape_value() {
+                                        let path_str = value.to_string();
+                                        if !paths.contains(&path_str) {
+                                            paths.push(path_str);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => println!("Error processing attribute: {}", e),
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let e_name = e.name();
+                let tag_name = e_name.as_ref();
+
+                if tag_name == b"Vulnerability" {
+                    in_vulnerability = false;
                 }
             }
             Ok(Event::Eof) => break,
