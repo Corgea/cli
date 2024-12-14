@@ -52,7 +52,7 @@ impl FromStr for Scanner {
             "snyk" => Ok(Scanner::Snyk),
             "semgrep" => Ok(Scanner::Semgrep),
             "blast" => Ok(Scanner::Blast),
-            _ => Err("Only snyk and semgrep are valid scanners."),
+            _ => Err("Only snyk, semgrep and blast are valid scanners."),
         }
     }
 }
