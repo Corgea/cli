@@ -83,7 +83,10 @@ pub fn run_snyk(config: &Config) {
 }
 
 pub fn run_blast(config: &Config) {
-    println!("\nScanning with \x1b[31mblast\x1b[0m 🚀🚀🚀");
+    println!(
+        "\nScanning with {} 🚀🚀🚀",
+        utils::set_text_color("blast", utils::TerminalColor::Red)
+    );
     let temp_path = "./.corgea/tmp";
     let project_name = utils::get_current_working_directory().unwrap_or("unknown".to_string());
     let zip_path = format!("{}/{}.zip", temp_path, project_name);
@@ -113,12 +116,9 @@ pub fn run_blast(config: &Config) {
             std::process::exit(1);
         }
     }
-    let mut scan_id = String::new();
     println!("\n\nSubmitting scan to Corgea:");
-    match upload_zip(&zip_path, &config.get_token(), &config.get_url(), &project_name, repo_info) {
-        Ok(result) => {
-            scan_id = result;
-        },
+    let scan_id = match upload_zip(&zip_path, &config.get_token(), &config.get_url(), &project_name, repo_info) {
+        Ok(result) => result,
         Err(e) => {
             eprintln!("\n\nOh no! We encountered an issue while uploading the zip file '{}' to the server.\nPlease ensure that:
     - Blast is enabled on your Corgea account.
@@ -133,7 +133,7 @@ pub fn run_blast(config: &Config) {
             );
             std::process::exit(1);
         },
-    }
+    };
 
     match utils::delete_directory(temp_path) {
         Ok(_) => { },
@@ -144,12 +144,10 @@ pub fn run_blast(config: &Config) {
             );
         }
     }
-    //print the url in green
     print!(
-        "\n\nScan has started with ID: {}.\n\nYou can view it populate at the link:\n\x1b[32m{}/scan?scan_id={}\x1b[0m\n\n",
+        "\n\nScan has started with ID: {}.\n\nYou can view it populate at the link:\n{}\n\n",
         scan_id,
-        config.get_url(),
-        scan_id
+        utils::set_text_color(&format!("{}/scan?scan_id={}", config.get_url(), scan_id), utils::TerminalColor::Green)
     );
 
     // Create loading animation
@@ -185,12 +183,13 @@ pub fn run_blast(config: &Config) {
             }
         }
     }
+    print!("{}", utils::set_text_color("", utils::TerminalColor::Reset));
     println!(
-        "\r\x1b[97m╭────────────────────────────────────────────╮\x1b[0m\n\
-         \x1b[97m│ {: <42} │\x1b[0m\n\
-         \x1b[97m│   🎉🎉 Scan Completed Successfully! 🎉🎉   │\x1b[0m\n\
-         \x1b[97m│ {: <42} │\x1b[0m\n\
-         \x1b[97m╰────────────────────────────────────────────╯\x1b[0m\n",
+        "\r╭────────────────────────────────────────────╮\n\
+         │ {: <42} │\n\
+         │   🎉🎉 Scan Completed Successfully! 🎉🎉   │\n\
+         │ {: <42} │\n\
+         ╰────────────────────────────────────────────╯\n",
         " ", 
         " "
     );
@@ -198,24 +197,27 @@ pub fn run_blast(config: &Config) {
     match report_scan_status(&config.get_url(), &config.get_token(), &project_name) {
         Ok(_) => {
             println!(
-                "\n\nYou can view the scan results at the following link:\n\
-            \x1b[32m{}/scan?scan_id={}\x1b[0m",
-                config.get_url(),
-                scan_id
+                "\n\nYou can view the scan results at the following link:\n{}",
+                utils::set_text_color(&format!("{}/scan?scan_id={}", config.get_url(), scan_id), utils::TerminalColor::Green)
             );
             print!("\n\nThank you for using Corgea! 😊\n\n")
         },
         Err(e) => {
             eprintln!(
-                "\n\n\x1b[31mFailed to report the scan status for project: '{}'.\x1b[0m\n\n\
-    However, the scan results may still be accessible at the following link:\n\n\
-    \x1b[34m{}/scan?project_name={}\x1b[0m\n\n\
-    \n\nPlease check your network connection, authentication token, and server URL:\n\n\
-    - Server URL: {}\n\
-    - Error details: {}\n",
-                project_name,
-                config.get_url(),
-                project_name,
+                "\n\n{}\n\n\
+                However, the scan results may still be accessible at the following link:\n\n\
+                {}\n\n\
+                \n\nPlease check your network connection, authentication token, and server URL:\n\n\
+                - Server URL: {}\n\
+                - Error details: {}\n",
+                utils::set_text_color(
+                    &format!("Failed to report the scan status for project: '{}'.", project_name),
+                    utils::TerminalColor::Red
+                ),
+                utils::set_text_color(
+                    &format!("{}/scan?scan_id={}", config.get_url(), scan_id),
+                    utils::TerminalColor::Blue
+                ),
                 config.get_url(),
                 e
             );
@@ -734,12 +736,11 @@ fn report_scan_status(url: &str, token: &str, project: &str) -> Result<(), Box<d
         }
 
         // Print total issues
-        println!("\x1b[31mTotal issues found: {}\x1b[0m", total_issues);
+        println!(
+            "Total issues found: {}",
+            utils::set_text_color(&total_issues.to_string(), utils::TerminalColor::Red)
+        );
 
-        
-        // for (classification, count) in classification_counts {
-        //     println!("{}: {}", classification, count);
-        // }
     } else {
         println!("🎉✨ No vulnerabilities found! Your project is squeaky clean and secure! 🚀🔒");
     }

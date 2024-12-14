@@ -21,4 +21,4 @@ quick-xml = "0.36.1"
 ignore = "0.4"
 globset = "0.4"
 termcolor = "1.1"
-git2 = "0.16"
+git2 = { version = "0.16", default-features = false }

@@ -171,10 +171,26 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
     Ok(Some(RepoInfo { branch, repo_url, sha }))
 }
 
+pub fn set_text_color(txt: &str, color: TerminalColor) -> String {
+    let color_code = match color {
+        TerminalColor::Red => "\x1b[31m",
+        TerminalColor::Green => "\x1b[32m",
+        TerminalColor::Blue => "\x1b[34m",
+        TerminalColor::Reset => "\x1b[0m",
+    };
+    return format!("{}{}{}", color_code, txt, "\x1b[0m");
+}
 
 #[derive(Debug)]
 pub struct RepoInfo {
     pub branch: Option<String>,
     pub repo_url: Option<String>,
     pub sha: Option<String>,
+}
+
+pub enum TerminalColor {
+    Reset,
+    Red,
+    Green,
+    Blue,
 }
