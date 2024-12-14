@@ -2,6 +2,7 @@ mod login;
 mod config;
 mod scan;
 mod cicd;
+mod utils;
 mod log;
 mod scanners {
     pub mod fortify;
@@ -40,6 +41,7 @@ enum Commands {
 enum Scanner {
     Snyk,
     Semgrep,
+    Blast,
 }
 
 impl FromStr for Scanner {
@@ -49,6 +51,7 @@ impl FromStr for Scanner {
         match s {
             "snyk" => Ok(Scanner::Snyk),
             "semgrep" => Ok(Scanner::Semgrep),
+            "blast" => Ok(Scanner::Blast),
             _ => Err("Only snyk and semgrep are valid scanners."),
         }
     }
@@ -104,7 +107,8 @@ fn main() {
 
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config),
-                Scanner::Semgrep => scan::run_semgrep(&corgea_config)
+                Scanner::Semgrep => scan::run_semgrep(&corgea_config),
+                Scanner::Blast => scan::run_blast(&corgea_config)
             }
         }
         None => {
