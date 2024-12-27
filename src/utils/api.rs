@@ -138,14 +138,16 @@ pub fn upload_zip(file_path: &str , token: &str, url: &str, project_name: &str, 
 }
 
 
-pub fn get_scan_issues(url: &str, token: &str, project: &str)  -> Result<ProjectIssuesResponse, Box<dyn std::error::Error>> {
-    let url = format!(
+pub fn get_scan_issues(url: &str, token: &str, project: &str, page: Option<u16>)  -> Result<ProjectIssuesResponse, Box<dyn std::error::Error>> {
+    let mut url = format!(
         "{}/api/cli/issues?token={}&project={}",
         url,
         token,
         project
     );
-
+    if let Some(p) = page {
+        url.push_str(&format!("&page={}", p));
+    }
     let response = match reqwest::blocking::get(&url) {
         Ok(res) => res,
         Err(e) => return Err(format!("Failed to send request: {}", e).into()),
@@ -211,7 +213,7 @@ pub fn query_scan_list(
     url: &str,
     token: &str,
     project: Option<&str>,
-    page: Option<u32>,
+    page: Option<u16>,
 ) -> Result<ScansResponse, Box<dyn Error>> {
     let url = format!("{}/api/scans", url);
     let page = page.unwrap_or(1);
@@ -268,6 +270,8 @@ pub struct Issue {
 pub struct ProjectIssuesResponse {    
     pub status: String,
     pub issues: Option<Vec<Issue>>,
+    pub page: u16,
+    pub total_pages: u16,
 }
 
 

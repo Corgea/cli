@@ -36,9 +36,8 @@ pub fn show_loading_message(message: &str, stop_signal: Arc<Mutex<bool>>) {
     loop {
         stdout.set_color(ColorSpec::new().set_fg(Some(spinner_colors[i % spinner_colors.len()])).set_bg(Some(Color::Black))).unwrap();
         let message = message.replace("[T]", &format!("{:.0}", start_time.elapsed().as_secs()));
-        print!("\r[{}] {}", spinner[i % spinner.len()], message);
+        print!("\r[{}] {}{}", spinner[i % spinner.len()], message, set_text_color("", TerminalColor::Reset));
         io::stdout().flush().unwrap();
-
         // Sleep for a bit before updating the spinner
         thread::sleep(time::Duration::from_millis(100));
 
@@ -66,64 +65,19 @@ pub fn set_text_color(txt: &str, color: TerminalColor) -> String {
 }
 
 pub fn show_welcome_message() {
-    let corgea_text = r#"
-      /$$$$$$                                                   
-     /$$__  $$                                                  
-    | $$  \__/  /$$$$$$   /$$$$$$   /$$$$$$   /$$$$$$   /$$$$$$ 
-    | $$       /$$__  $$ /$$__  $$ /$$__  $$ /$$__  $$ |____  $$
-    | $$      | $$  \ $$| $$  \__/| $$  \ $$| $$$$$$$$  /$$$$$$$
-    | $$    $$| $$  | $$| $$      | $$  | $$| $$_____/ /$$__  $$
-    |  $$$$$$/|  $$$$$$/| $$      |  $$$$$$$|  $$$$$$$|  $$$$$$$
-     \______/  \______/ |__/       \____  $$ \_______/ \_______/
-                                   /$$  \ $$                    
-                                  |  $$$$$$/                    
-                                   \______/                     
-    
-    "#;
-    println!("{}", set_text_color(corgea_text, TerminalColor::Green));
-} 
-
-pub fn print_ascii_art() -> String {
-    let corgea_title = r#"
-  ____                                
- / ___| ___   _ __  __ _   ___   __ _ 
-| |    / _ \ | '__|/ _` | / _ \ / _` |
-| |___| (_) || |  | (_| ||  __/| (_| |
- \____|\___/ |_|   \__, | \___| \__,_|
-                   |___/              
-"#;
     let dog_art = r#"
         |`-.__
         / ' _/
        ****`  
-      /    }} 
+      /    }}    Corgea
      /  \ /   
  \ /`   \\    
   `\    /_\\  
-   `~~~~~``~` "#;
-    let mut sum = String::new();
-    let corgea_lines = corgea_title.lines();
-    let dog_lines = dog_art.lines();
-    let mut corgea_iter = corgea_lines.into_iter();
-    let mut dog_iter = dog_lines.into_iter();
-    loop {
-        match (corgea_iter.next(), dog_iter.next()) {
-            (Some(corgea_line), Some(dog_line)) => {
-                sum.push_str(dog_line);
-                sum.push_str("  ");
-                sum.push_str(corgea_line);
-                sum.push_str("\n");
-            },
-            (Some(corgea_line), None) | (None, Some(corgea_line)) => {
-                sum.push_str(corgea_line);
-                sum.push_str("\n");
-            },
-            (None, None) => break,
-        }
-    }
-    sum
-}
-
+   `~~~~~``~`
+   
+   "#;
+    println!("{}", set_text_color(dog_art, TerminalColor::Green));
+} 
 
 pub fn format_code(code: &str) -> String {
     let mut formatted_code = String::new();

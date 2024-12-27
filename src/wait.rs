@@ -65,7 +65,7 @@ pub fn run(config: &Config, scan_id: Option<String>) {
         );
         blast::wait_for_scan(config, &scan_id);
     } else {
-        print!("Scan has been processed successfully!");
+        print!("Scan has been processed successfully!\n");
     }
 
     match blast::report_scan_status(&config.get_url(), &config.get_token(), &project_name) {

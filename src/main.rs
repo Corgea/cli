@@ -60,6 +60,9 @@ enum Commands {
         #[arg(short, long)]
         issues: bool,
 
+        #[arg(short, long, value_parser = clap::value_parser!(u16))]
+        page: Option<u16>,
+
         #[arg(long)]
         json: bool
     },
@@ -98,10 +101,6 @@ impl FromStr for Scanner {
 
 fn main() {
     let cli = Cli::parse();
-    let command_args = format!("{:?}", cli);
-    if !command_args.contains("json: true") {
-        utils::terminal::show_welcome_message();
-    }
     let mut corgea_config = Config::load().expect("Failed to load config");
     fn verify_token_and_exit_when_fail (config: &Config) {
         if config.get_token().is_empty() {
@@ -170,15 +169,16 @@ fn main() {
             verify_token_and_exit_when_fail(&corgea_config);
             wait::run(&corgea_config, scan_id.clone());
         }
-        Some(Commands::List { issues , json}) => {
+        Some(Commands::List { issues , json, page}) => {
             verify_token_and_exit_when_fail(&corgea_config);
-            list::run(&corgea_config, issues, json);
+            list::run(&corgea_config, issues, json, page);
         }
         Some(Commands::Inspect { issue, json, id}) => {
             verify_token_and_exit_when_fail(&corgea_config);
             inspect::run(&corgea_config, issue, json, id)
         }
         None => {
+            utils::terminal::show_welcome_message();
             let _ = Cli::command().print_help();
             println!();
         }

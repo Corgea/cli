@@ -1,17 +1,18 @@
 use crate::utils;
 use crate::config::Config;
 use std::path::Path;
+use serde_json::json;
 
-pub fn run(config: &Config, issues: &bool, json: &bool) {
+pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>) {
     let small_column_length = 5;
     let column_length = 8;
     let medium_column_length = 20;
     let long_column_length = 40;
     let separator = " ";
     let project_name = utils::generic::get_current_working_directory().unwrap_or("unknown".to_string());
-
+    println!("");
     if *issues {
-        let issues_response = match utils::api::get_scan_issues(&config.get_url(), &config.get_token(), &project_name) {
+        let issues_response = match utils::api::get_scan_issues(&config.get_url(), &config.get_token(), &project_name, *page) {
             Ok(response) => response,
             Err(e) => {
                 if e.to_string().contains("404") {
@@ -30,7 +31,12 @@ pub fn run(config: &Config, issues: &bool, json: &bool) {
 
 
         if *json {
-            println!("{}", serde_json::to_string_pretty(&issues_response.issues).unwrap());
+            let output = json!({
+                "page": issues_response.page,
+                "total_pages": issues_response.total_pages,
+                "results": issues_response.issues
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
             return;
         }
         println!("{:<long_width$}{}{: <width$}{}{: <small_width$}{}{: <long_width$}{}{: <small_width$}", 
@@ -66,14 +72,17 @@ pub fn run(config: &Config, issues: &bool, json: &bool) {
                 (*issue).id, separator, classification_display, separator, issue.urgency, separator, shortened_path, separator, issue.line_num, 
                 width = column_length, long_width=long_column_length, small_width=small_column_length);
         }
-    
+        println!("\n\n{:-<20}", "-");
+        println!("Showing page {} of {}.", issues_response.page, issues_response.total_pages);
     } else {
-        let scans = match utils::api::query_scan_list(&config.get_url(), &config.get_token(), None, None) {
+        let (scans, page, total_pages) = match utils::api::query_scan_list(&config.get_url(), &config.get_token(), Some(&project_name), *page) {
             Ok(scans) => {
+                let page = scans.page;
+                let total_pages = scans.total_pages;
                 let filtered_scans: Vec<utils::api::ScanResponse> = scans.scans.into_iter()
                     .filter(|scan| scan.project == project_name)
                     .collect();
-                filtered_scans
+                (filtered_scans, page, total_pages)
             },
             Err(e) => {
                 if e.to_string().contains("404") {
@@ -90,7 +99,12 @@ pub fn run(config: &Config, issues: &bool, json: &bool) {
             }
         };
         if *json {
-            println!("{}", serde_json::to_string_pretty(&scans).unwrap());
+            let output = json!({
+                "page": page,
+                "total_pages": total_pages,
+                "results": scans
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
             return;
         }
 
@@ -116,5 +130,7 @@ pub fn run(config: &Config, issues: &bool, json: &bool) {
                scan.id, separator, scan.project, separator, scan.processed, separator, formatted_repo, separator, scan.branch.clone().unwrap_or("N/A".to_string()), 
                width = column_length, long_width=long_column_length, med_width=medium_column_length);
         }
+        println!("\n\n{:-<20}", "-");
+        println!("Showing page {} of {}.", page, total_pages);
     }
 }
