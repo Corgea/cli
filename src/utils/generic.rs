@@ -1,7 +1,4 @@
-use std::io::{self, Write};
-use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
-use std::{thread, time};
-use std::sync::{Arc, Mutex};
+use std::io;
 use std::path::Path;
 use zip::{write::FileOptions, ZipWriter};
 use ignore::WalkBuilder;
@@ -9,56 +6,6 @@ use globset::{GlobSetBuilder, Glob};
 use std::fs::{self, File};
 use std::env;
 use git2::Repository;
-
-pub fn show_progress_bar(progress: f32) -> () {
-    let total_bar_length = 50;
-    if progress == -1.0 {
-        print!("\r{}", " ".repeat(50));
-        io::stdout().flush().unwrap();
-        return;
-    }
-    let filled_length = (progress * total_bar_length as f32).round() as usize;
-    let empty_length = total_bar_length - filled_length;
-
-    let bar = format!(
-        "[{}{}] {:.2}%",
-        "=".repeat(filled_length),
-        " ".repeat(empty_length),
-        progress * 100.0
-    );
-
-    print!("\r{}", bar);
-    io::stdout().flush().unwrap();
-}
-
-pub fn show_loading_message(message: &str, stop_signal: Arc<Mutex<bool>>) {
-    let spinner = vec!["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
-    let spinner_colors = vec![Color::Cyan, Color::Magenta, Color::Yellow, Color::Green];
-    let start_time = time::Instant::now();
-    let mut i = 0;
-    let mut stdout = StandardStream::stdout(ColorChoice::Always);
-    print!("{} ", message);
-    io::stdout().flush().unwrap();
-    loop {
-        stdout.set_color(ColorSpec::new().set_fg(Some(spinner_colors[i % spinner_colors.len()])).set_bg(Some(Color::Black))).unwrap();
-        let message = message.replace("[TIME]", &format!("{:.0}", start_time.elapsed().as_secs()));
-        print!("\r[{}] {}", spinner[i % spinner.len()], message);
-        io::stdout().flush().unwrap();
-
-        // Sleep for a bit before updating the spinner
-        thread::sleep(time::Duration::from_millis(100));
-
-        // Check for stop signal
-        if *stop_signal.lock().unwrap() {
-            break;
-        }
-
-        i = (i + 1) % spinner.len();
-    }
-    io::stdout().flush().unwrap();
-    stdout.reset().unwrap();
-}
-
 
 pub fn create_zip_from_filtered_files<P: AsRef<Path>>(
     directory: P,
@@ -171,15 +118,6 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
     Ok(Some(RepoInfo { branch, repo_url, sha }))
 }
 
-pub fn set_text_color(txt: &str, color: TerminalColor) -> String {
-    let color_code = match color {
-        TerminalColor::Red => "\x1b[31m",
-        TerminalColor::Green => "\x1b[32m",
-        TerminalColor::Blue => "\x1b[34m",
-        TerminalColor::Reset => "\x1b[0m",
-    };
-    return format!("{}{}{}", color_code, txt, "\x1b[0m");
-}
 
 #[derive(Debug)]
 pub struct RepoInfo {
@@ -188,9 +126,3 @@ pub struct RepoInfo {
     pub sha: Option<String>,
 }
 
-pub enum TerminalColor {
-    Reset,
-    Red,
-    Green,
-    Blue,
-}
