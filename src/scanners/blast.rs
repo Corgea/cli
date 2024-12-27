@@ -38,7 +38,7 @@ pub fn run(config: &Config, fail_on: Option<String>) {
         Ok(_) => { },
         Err(e) => {
             eprintln!(
-                "\n\nUh-oh! We couldn't create the compressed file at '{}'.\nThis might be due to insufficient permissions, invalid file paths, or a file system error.\nPlease check the directory and try again.\nError details:\n{}\n\n", 
+                "\n\nUh-oh! We couldn't package your project at '{}'.\nThis might be due to insufficient permissions, invalid file paths, or a file system error.\nPlease check the directory and try again.\nError details:\n{}\n\n", 
                 zip_path, e
             );
             std::process::exit(1);
