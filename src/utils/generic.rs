@@ -118,7 +118,20 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
     Ok(Some(RepoInfo { branch, repo_url, sha }))
 }
 
-
+pub fn get_status(status: &str) -> &str {
+    match status.to_lowercase().as_str() {
+        "fix available" | "fix_available" => "Fix Available",
+        "processing" => "Processing",
+        "false positive" | "false_positive" => "False Positive",
+        "on hold" | "on_hold" => "On Hold",
+        "unsupported" => "Unsupported",
+        "plan" => "Plan",
+        "complete" => "Complete",
+        "scanning" => "Scanning",
+        "failed" => "Failed",
+        _ => status,
+    }
+}
 #[derive(Debug)]
 pub struct RepoInfo {
     pub branch: Option<String>,

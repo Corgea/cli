@@ -3,6 +3,7 @@ use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use std::{thread, time};
 use std::sync::{Arc, Mutex};
 use crate::utils;
+use regex::Regex;
 
 pub fn show_progress_bar(progress: f32) -> () {
     let total_bar_length = 50;
@@ -86,19 +87,82 @@ pub fn format_code(code: &str) -> String {
 
     for capture in regex.captures_iter(code) {
         if let Some(matched) = capture.get(1) {
-            // Append text before the code block
             formatted_code.push_str(&code[last_end..capture.get(0).unwrap().start()]);
-            // Format the code block
             formatted_code.push_str(&format!("`{}`", utils::terminal::set_text_color(matched.as_str(), utils::terminal::TerminalColor::Green)));
             last_end = capture.get(0).unwrap().end();
         }
     }
-    // Append any remaining text after the last code block
     formatted_code.push_str(&code[last_end..]);
 
     formatted_code
 }
 
+pub fn format_diff(diff: &str) -> String {
+    let mut formatted_diff = String::new();
+    let regex = Regex::new(r"(@@.*?@@)").unwrap();
+
+    for line in diff.lines() {
+        let formatted_line = if line.starts_with("diff --git") {
+            format!("{}\n", line)
+        } else if line.starts_with("index") {
+            format!("{}\n", set_text_color(line, TerminalColor::Blue))
+        } else if line.starts_with("---") {
+            format!("{}\n", set_text_color(line, TerminalColor::Red))
+        } else if line.starts_with("+++") {
+            format!("{}\n", set_text_color(line, TerminalColor::Green))
+        } else if line.starts_with("@@") {
+            let formatted_text = regex.replace_all(line, |caps: &regex::Captures| {
+                set_text_color(&caps[0], TerminalColor::Blue) 
+            });
+            format!("{}\n", formatted_text) 
+        } else if line.starts_with("-") {
+            format!("{}\n", set_text_color(line, TerminalColor::Red))
+        } else if line.starts_with("+") {
+            format!("{}\n", set_text_color(line, TerminalColor::Green))
+        } else {
+            format!("{}\n", line)
+        };
+
+        formatted_diff.push_str(&formatted_line);
+    }
+
+    formatted_diff
+}
+
+pub fn clear_line(length: usize) {
+    print!("{:width$}\r", " ", width = length + 1);
+}
+
+pub fn print_with_pagination(str: &str) {
+    let mut stdout = io::stdout();
+    let mut lines = str.lines();
+    let mut buffer = String::new();
+    let stdin = io::stdin();
+    let message ="-- More -- (Press Enter to continue, Ctrl+C to exit)";
+
+    loop {
+        clear_line(message.len());
+        for _ in 0..5 {
+            if let Some(line) = lines.next() {
+                println!("{}", line);
+            } else {
+                clear_line(message.len());
+                return;
+            }
+
+        }
+
+        print!("{}", message);
+        stdout.flush().unwrap();
+
+        buffer.clear();
+        stdin.read_line(&mut buffer).unwrap();
+
+
+        print!("\x1B[2K\x1B[1A");
+        stdout.flush().unwrap();
+    }
+}
 
 pub enum TerminalColor {
     Reset,

@@ -124,8 +124,14 @@ pub fn run(config: &Config, fail_on: Option<String>) {
                 }
             },
             "HI" => {
-                if let Some(hi_count) = classifications.get("HI") {
-                    if *hi_count > 0 {
+                if classifications.get("CR").map_or(false, |&count| count > 0) ||
+                    classifications.get("HI").map_or(false, |&count| count > 0) {
+                    std::process::exit(1);
+                }
+            },
+            "CR" => {
+                if let Some(cr_count) = classifications.get("CR") {
+                    if *cr_count > 0 {
                         std::process::exit(1);
                     }
                 }
@@ -199,7 +205,7 @@ pub fn check_scan_status(scan_id: &str, url: &str, token: &str) -> Result<bool, 
 }
 
 
-pub fn report_scan_status(url: &str, token: &str, project: &str) -> Result<HashMap<String, usize>, Box<dyn std::error::Error>> {
+pub fn fetch_and_group_scan_issues(url: &str, token: &str, project: &str) -> Result<HashMap<String, usize>, Box<dyn std::error::Error>> {
     let body = match utils::api::get_scan_issues(url, token, project, None) {
         Ok(issues) => issues,
         Err(err) => {
@@ -207,29 +213,38 @@ pub fn report_scan_status(url: &str, token: &str, project: &str) -> Result<HashM
         }
     };
     let issues = body.issues.unwrap_or_default();
-    let total_issues = issues.len();
     let mut classification_counts: HashMap<String, usize> = HashMap::new();
     if body.status == "ok" && issues.len() > 0 {
         for issue in &issues {
             *classification_counts.entry(issue.urgency.clone()).or_insert(0) += 1;
         }
-        println!("Scan Resuts:-\n");
-        println!("{:<20} | {}", "Classification", "Count");
-        println!("{:-<20} | {}", "", "");
+    }
+    Ok(classification_counts)
+}
 
-        let order = vec!["HI", "ME", "LO"];
-        for classification in order {
-            if let Some(count) = classification_counts.get(classification) {
-                println!("{:<20} | {}", classification, count);
-            }
+pub fn report_scan_status(url: &str, token: &str, project: &str) ->  Result<HashMap<String, usize>, Box<dyn std::error::Error>>{
+    let classification_counts = match fetch_and_group_scan_issues(url, token, project) {
+        Ok(counts) => counts,
+        Err(e) => {
+            return Err(e);
         }
+    };
+    let total_issues = classification_counts.values().sum::<usize>();
+    println!("Scan Results:-\n");
+    println!("{:<20} | {}", "Classification", "Count");
+    println!("{:-<20} | {}", "", "");
 
-        println!("{:-<20} | {}", "", "");
-        println!("{:<20} | {}", "Total", total_issues);
-    } else {
-        println!("🎉✨ No vulnerabilities found! Your project is squeaky clean and secure! 🚀🔒");
+    let order = vec!["CR", "HI", "ME", "LO"];
+    for classification in order {
+        if let Some(count) = classification_counts.get(classification) {
+            println!("{:<20} | {}", classification, count);
+        } else {
+            println!("{:<20} | {}", classification, 0);
+        }
     }
 
-    Ok(classification_counts)
+    println!("{:-<20} | {}", "", "");
+    println!("{:<20} | {}", "Total", total_issues);
+    return Ok(classification_counts);
 }
 

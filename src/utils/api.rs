@@ -253,6 +253,10 @@ pub struct ScanResponse {
     pub branch: Option<String>,
     pub processed: bool,
     pub project: String,
+    pub engine: String,
+    pub created_at: String,
+    pub mark_failed: Option<bool>,
+    pub ready_to_process: Option<bool>,
 }
 
 
@@ -314,7 +318,7 @@ pub struct FalsePositiveDetails {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct FixDetails {
-    id: String,
-    diff: String,
-    explanation: String,
+    pub id: String,
+    pub diff: String,
+    pub explanation: String,
 }

@@ -12,14 +12,14 @@ pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>) {
     let project_name = utils::generic::get_current_working_directory().unwrap_or("unknown".to_string());
     println!("");
     if *issues {
-        let issues_response = match utils::api::get_scan_issues(&config.get_url(), &config.get_token(), &project_name, *page) {
+        let issues_response = match utils::api::get_scan_issues(&config.get_url(), &config.get_token(), &project_name, Some((*page).unwrap_or(1))) {
             Ok(response) => response,
             Err(e) => {
                 if e.to_string().contains("404") {
                     eprintln!("Project with name '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", project_name);
                 } else {
                     eprintln!(
-                        "\n\nUnable to fetch scan issues. Please check your connection and ensure that:\n\
+                        "Unable to fetch scan issues. Please check your connection and ensure that:\n\
                         - The server URL is reachable.\n\
                         - Your authentication token is valid.\n\n\
                         Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli"
@@ -89,7 +89,7 @@ pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>) {
                     eprintln!("Project with name '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", project_name);
                 } else {
                     eprintln!(
-                        "\n\nUnable to fetch scans. Please check your connection and ensure that:\n\
+                        "Unable to fetch scans. Please check your connection and ensure that:\n\
                         - The server URL is reachable.\n\
                         - Your authentication token is valid.\n\n\
                         Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli"
