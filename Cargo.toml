@@ -23,5 +23,3 @@ globset = "0.4"
 termcolor = "1.1"
 git2 = { version = "0.16", default-features = false }
 regex = "1"
-ctrlc = "3.2"
-figlet-rs = "0.1.5"
