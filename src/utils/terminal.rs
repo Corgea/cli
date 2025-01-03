@@ -163,6 +163,18 @@ pub fn print_with_pagination(str: &str) {
         stdout.flush().unwrap();
     }
 }
+pub fn prompt_to_continue_or_exit(message: Option<&str>) {
+    if let Some(message) = message {
+        println!("{}", message);
+    } else {
+        println!("Press Enter to continue, Ctrl+C to exit.");
+    }
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).unwrap();
+}
+
+
+
 pub fn print_table(table: Vec<Vec<String>>, page:  Option<u32>, total_pages: Option<u32>) {
     let columns = table.iter().enumerate().fold(vec![vec![]; table[0].len()], |mut acc, (_i, row)| {
         for (j, cell) in row.iter().enumerate() {

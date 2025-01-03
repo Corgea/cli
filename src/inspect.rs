@@ -50,15 +50,17 @@ pub fn run(
         } 
         if let Some(fix_details) = issue_details.fix {
             if *fix_explanation || show_everything {
-                println!("\nTo continue to viewing the fix explanation please press enter, otherwise Ctrl+C to exit.\n");
-                std::io::stdin().read_line(&mut input).unwrap();
+                if show_everything {
+                    utils::terminal::prompt_to_continue_or_exit(Some("\nTo continue to viewing the fix explanation please press enter, otherwise Ctrl+C to exit.\n".into()));
+                }
                 utils::terminal::print_with_pagination(&format!(
                     "Fix Explanation:\n\n{}\n-------------------------", utils::terminal::format_code(&fix_details.explanation)
                 ));
             }
             if *fix_diff || show_everything {   
-                println!("\nTo continue to viewing the diff of the fix please press enter, otherwise Ctrl+C to exit.\n");
-                std::io::stdin().read_line(&mut input).unwrap();
+                if show_everything {
+                    utils::terminal::prompt_to_continue_or_exit(Some("\nTo continue to viewing the diff of the fix please press enter, otherwise Ctrl+C to exit.\n".into()));
+                }
                 utils::terminal::print_with_pagination(&utils::terminal::format_diff(&fix_details.diff));
             }
         }
