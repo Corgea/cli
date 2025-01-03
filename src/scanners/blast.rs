@@ -206,7 +206,7 @@ pub fn check_scan_status(scan_id: &str, url: &str, token: &str) -> Result<bool, 
 
 
 pub fn fetch_and_group_scan_issues(url: &str, token: &str, project: &str) -> Result<HashMap<String, usize>, Box<dyn std::error::Error>> {
-    let body = match utils::api::get_scan_issues(url, token, project, None) {
+    let body = match utils::api::get_scan_issues(url, token, project, None, None) {
         Ok(issues) => issues,
         Err(err) => {
             return Err(format!("Failed to fetch scan issues: {}", err).into());

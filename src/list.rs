@@ -3,11 +3,11 @@ use crate::config::Config;
 use std::path::Path;
 use serde_json::json;
 
-pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>) {
+pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>, page_size: &Option<u16>) {
     let project_name = utils::generic::get_current_working_directory().unwrap_or("unknown".to_string());
     println!("");
     if *issues {
-        let issues_response = match utils::api::get_scan_issues(&config.get_url(), &config.get_token(), &project_name, Some((*page).unwrap_or(1))) {
+        let issues_response = match utils::api::get_scan_issues(&config.get_url(), &config.get_token(), &project_name, Some((*page).unwrap_or(1)), *page_size) {
             Ok(response) => response,
             Err(e) => {
                 if e.to_string().contains("404") {
@@ -79,7 +79,7 @@ pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>) {
         utils::terminal::print_table(table, Some(issues_response.page), Some(issues_response.total_pages));
     } else {
         
-        let (scans, page, total_pages) = match utils::api::query_scan_list(&config.get_url(), &config.get_token(), Some(&project_name), *page) {
+        let (scans, page, total_pages) = match utils::api::query_scan_list(&config.get_url(), &config.get_token(), Some(&project_name), *page, *page_size) {
             Ok(scans) => {
                 let page = scans.page;
                 let total_pages = scans.total_pages;

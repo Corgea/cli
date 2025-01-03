@@ -138,7 +138,13 @@ pub fn upload_zip(file_path: &str , token: &str, url: &str, project_name: &str, 
 }
 
 
-pub fn get_scan_issues(url: &str, token: &str, project: &str, page: Option<u16>)  -> Result<ProjectIssuesResponse, Box<dyn std::error::Error>> {
+pub fn get_scan_issues(
+    url: &str, 
+    token: &str, 
+    project: &str, 
+    page: Option<u16>,
+    page_size: Option<u16>
+)  -> Result<ProjectIssuesResponse, Box<dyn std::error::Error>> {
     let mut url = format!(
         "{}/api/cli/issues?token={}&project={}",
         url,
@@ -147,6 +153,11 @@ pub fn get_scan_issues(url: &str, token: &str, project: &str, page: Option<u16>)
     );
     if let Some(p) = page {
         url.push_str(&format!("&page={}", p));
+    }
+    if let Some(p_size) = page_size {
+        url.push_str(&format!("&page_size={}", p_size));
+    } else {
+        url.push_str("&page_size=30");
     }
     let response = match reqwest::blocking::get(&url) {
         Ok(res) => res,
@@ -214,11 +225,16 @@ pub fn query_scan_list(
     token: &str,
     project: Option<&str>,
     page: Option<u16>,
+    page_size: Option<u16>
 ) -> Result<ScansResponse, Box<dyn Error>> {
     let url = format!("{}/api/scans", url);
     let page = page.unwrap_or(1);
-
     let mut query_params = vec![("page", page.to_string())];
+    if let Some(p_size) = page_size {
+        query_params.push(("page_size", p_size.to_string()));
+    } else {
+        query_params.push(("page_size", "30".to_string()));
+    }
     query_params.push(("token", token.into()));
     if let Some(project) = project {
         query_params.push(("project", project.to_string()));
@@ -229,7 +245,7 @@ pub fn query_scan_list(
     let response = match client
         .get(url)
         .query(&query_params)
-        .send() { // Using blocking send
+        .send() {
             Ok(res) => res,
             Err(e) => return Err(format!("API request failed: {}", e).into()), 
         };

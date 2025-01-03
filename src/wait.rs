@@ -12,7 +12,7 @@ pub fn run(config: &Config, scan_id: Option<String>) {
         }
     };
 
-    let scans_result = utils::api::query_scan_list(&config.get_url(), &config.get_token(), Some(&project_name), Some(1));
+    let scans_result = utils::api::query_scan_list(&config.get_url(), &config.get_token(), Some(&project_name), Some(1), None);
     let scans: Vec<utils::api::ScanResponse> = match scans_result {
         Ok(result) => result.scans,
         Err(e) => {

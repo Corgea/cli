@@ -46,7 +46,7 @@ enum Commands {
         /// What scanner to use. Valid options are sempgrep and snyk.
         scanner: Scanner,
 
-        #[arg(short, long)]
+        #[arg(short, long, help = "Fail on a specific severity level. Valid options are CR, HI, ME, LO.")]
         fail_on: Option<String>,
     },
     /// Wait for the latest in progress scan
@@ -56,15 +56,17 @@ enum Commands {
     /// List something, by default it lists the scans
     #[command(alias = "ls")]
     List {
-        /// An optional args is the user want to list issues
-        #[arg(short, long)]
+        #[arg(short, long, help = "List issues instead of scans")]
         issues: bool,
 
         #[arg(short, long, value_parser = clap::value_parser!(u16))]
         page: Option<u16>,
 
-        #[arg(long)]
-        json: bool
+        #[arg(long, help = "Output the result in JSON format.")]
+        json: bool,
+
+        #[arg(long, value_parser = clap::value_parser!(u16), help = "Number of items per page")]
+        page_size: Option<u16>
     },
     /// Inspect something something, by default it will inspect a scan
     Inspect {
@@ -178,9 +180,9 @@ fn main() {
             verify_token_and_exit_when_fail(&corgea_config);
             wait::run(&corgea_config, scan_id.clone());
         }
-        Some(Commands::List { issues , json, page}) => {
+        Some(Commands::List { issues , json, page, page_size}) => {
             verify_token_and_exit_when_fail(&corgea_config);
-            list::run(&corgea_config, issues, json, page);
+            list::run(&corgea_config, issues, json, page, page_size);
         }
         Some(Commands::Inspect { issue, json, id, summary, fix, diff}) => {
             verify_token_and_exit_when_fail(&corgea_config);

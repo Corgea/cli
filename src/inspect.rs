@@ -41,8 +41,6 @@ pub fn run(
             print_section("Line Num", issue_details.issue.line_num);
             print_section("Status", utils::generic::get_status(&issue_details.issue.status));
         }
-        let mut input = String::new();
-
         if let Some(ref explanation) = issue_details.issue.explanation {
             if *summary || show_everything {
                 println!("Explanation:\n\n{}\n-------------------------", utils::terminal::format_code(explanation))
