@@ -23,3 +23,4 @@ globset = "0.4"
 termcolor = "1.1"
 git2 = { version = "0.16", default-features = false }
 regex = "1"
+chrono = "0.4"

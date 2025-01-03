@@ -69,11 +69,20 @@ enum Commands {
     /// Inspect something something, by default it will inspect a scan
     Inspect {
         /// An optional args is the user want to inspect issues
-        #[arg(short, long)]
+        #[arg(short, long, help = "Specify if you want to inspect issues.")]
         issue: bool,
 
-        #[arg(long)]
+        #[arg(long, help = "Output the result in JSON format.")]
         json: bool,
+
+        #[arg(long, short, help = "Display a summary only of the issue in the output (only if --issue is true).")]
+        summary: bool,
+
+        #[arg(long, short, help = "Display the fix explanations only in the output (only if --issue is true).")]
+        fix: bool,
+
+        #[arg(long, short, help = "Display the diff of the fix only in the output (only if --issue is true).")]
+        diff: bool,
 
         id: String,
     },
@@ -173,9 +182,9 @@ fn main() {
             verify_token_and_exit_when_fail(&corgea_config);
             list::run(&corgea_config, issues, json, page);
         }
-        Some(Commands::Inspect { issue, json, id}) => {
+        Some(Commands::Inspect { issue, json, id, summary, fix, diff}) => {
             verify_token_and_exit_when_fail(&corgea_config);
-            inspect::run(&corgea_config, issue, json, id)
+            inspect::run(&corgea_config, issue, json, summary, fix, diff, id)
         }
         None => {
             utils::terminal::show_welcome_message();

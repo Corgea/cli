@@ -142,7 +142,7 @@ pub fn print_with_pagination(str: &str) {
 
     loop {
         clear_line(message.len());
-        for _ in 0..5 {
+        for _ in 0..7 {
             if let Some(line) = lines.next() {
                 println!("{}", line);
             } else {

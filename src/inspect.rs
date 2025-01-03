@@ -2,13 +2,23 @@ use crate::utils;
 use crate::config::Config;
 use std::time::SystemTime;
 use crate::scanners;
-pub fn run(config: &Config, issues: &bool, json: &bool, id: &String) {
+pub fn run(
+    config: &Config, 
+    issues: &bool, 
+    json: &bool, 
+    summary: &bool, 
+    fix_explanation: &bool, 
+    fix_diff: &bool, 
+    id: &String,
+
+) {
     fn print_section(title: &str, value: impl ToString) {
         println!("{:<15}: {}", title, value.to_string());
         println!("-------------------------");
     }
     println!();
     if *issues {
+        let show_everything = !*summary && !*fix_explanation && !*fix_diff;
         let issue_details = match utils::api::get_issue(&config.get_url(), &config.get_token(), id) {
             Ok(issue) => issue,
             Err(e) => {
@@ -23,31 +33,34 @@ pub fn run(config: &Config, issues: &bool, json: &bool, id: &String) {
             println!("{}", serde_json::to_string_pretty(&issue_details).unwrap());
             return;
         }
-        print_section("Issue ID", &issue_details.issue.id);
-        print_section("Risk", &issue_details.issue.urgency);
-        print_section("Classification", &issue_details.issue.classification);
-        print_section("File Path", &issue_details.issue.file_path);
-        print_section("Line Num", issue_details.issue.line_num);
-        print_section("Status", utils::generic::get_status(&issue_details.issue.status));
+        if *summary || show_everything {
+            print_section("Issue ID", &issue_details.issue.id);
+            print_section("Urgency", &issue_details.issue.urgency);
+            print_section("Category", &issue_details.issue.classification);
+            print_section("File Path", &issue_details.issue.file_path);
+            print_section("Line Num", issue_details.issue.line_num);
+            print_section("Status", utils::generic::get_status(&issue_details.issue.status));
+        }
         let mut input = String::new();
 
         if let Some(ref explanation) = issue_details.issue.explanation {
-            println!("\nTo continue to viewing the issue explanation please press enter, otherwise Ctrl+C to exit.\n");
-            std::io::stdin().read_line(&mut input).unwrap();
-            utils::terminal::print_with_pagination(&format!(
-                "Explanation:\n\n{}\n-------------------------", utils::terminal::format_code(explanation)
-            ));
-
+            if *summary || show_everything {
+                println!("Explanation:\n\n{}\n-------------------------", utils::terminal::format_code(explanation))
+            }
         } 
         if let Some(fix_details) = issue_details.fix {
-            println!("\nTo continue to viewing the fix explanation please press enter, otherwise Ctrl+C to exit.\n");
-            std::io::stdin().read_line(&mut input).unwrap();
-            utils::terminal::print_with_pagination(&format!(
-                "Fix Explanation:\n\n{}\n-------------------------", utils::terminal::format_code(&fix_details.explanation)
-            ));
-            println!("\nTo continue to viewing the diff of the fix please press enter, otherwise Ctrl+C to exit.\n");
-            std::io::stdin().read_line(&mut input).unwrap();
-            utils::terminal::print_with_pagination(&utils::terminal::format_diff(&fix_details.diff));
+            if *fix_explanation || show_everything {
+                println!("\nTo continue to viewing the fix explanation please press enter, otherwise Ctrl+C to exit.\n");
+                std::io::stdin().read_line(&mut input).unwrap();
+                utils::terminal::print_with_pagination(&format!(
+                    "Fix Explanation:\n\n{}\n-------------------------", utils::terminal::format_code(&fix_details.explanation)
+                ));
+            }
+            if *fix_diff || show_everything {   
+                println!("\nTo continue to viewing the diff of the fix please press enter, otherwise Ctrl+C to exit.\n");
+                std::io::stdin().read_line(&mut input).unwrap();
+                utils::terminal::print_with_pagination(&utils::terminal::format_diff(&fix_details.diff));
+            }
         }
     } else {
         let scan_details = match utils::api::get_scan(&config.get_url(), &config.get_token(), id) {
@@ -76,7 +89,7 @@ pub fn run(config: &Config, issues: &bool, json: &bool, id: &String) {
         } else {
             utils::generic::get_status("Scanning")
         };
-        print_section("State", &state);
+        print_section("Status", &state);
         print_section("Project", &scan_details.project);
         print_section("Engine", &scan_details.engine);
         let created_at = chrono::DateTime::<chrono::Utc>::from(SystemTime::now()).format("%Y-%m-%d %H:%M:%S").to_string();

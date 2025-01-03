@@ -40,7 +40,7 @@ pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>) {
             return;
         }
         println!("{:<long_width$}{}{: <width$}{}{: <small_width$}{}{: <long_width$}{}{: <small_width$}", 
-            "Issue ID", separator, "Class", separator, "Risk", separator, "File Path", separator, "Line", 
+            "Issue ID", separator, "Category", separator, "Urgency", separator, "File Path", separator, "Line", 
             width = column_length, long_width=long_column_length, small_width=small_column_length);
         
         println!("");
@@ -108,7 +108,7 @@ pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>) {
             return;
         }
 
-        println!("{:<long_width$}{}{: <med_width$}{}{: <width$}{}{: <med_width$}{}{: <med_width$}", "Scan ID", separator, "Project", separator, "Done", separator, "Repo",  separator, "Branch", 
+        println!("{:<long_width$}{}{: <med_width$}{}{: <width$}{}{: <med_width$}{}{: <med_width$}", "Scan ID", separator, "Project", separator, "Status", separator, "Repo",  separator, "Branch", 
             width = column_length, long_width=long_column_length, med_width=medium_column_length);
         println!("");
     
@@ -127,7 +127,10 @@ pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>) {
             };
 
             println!("{:<long_width$}{}{: <med_width$}{}{: <width$}{}{: <med_width$}{}{: <med_width$}", 
-               scan.id, separator, scan.project, separator, scan.processed, separator, formatted_repo, separator, scan.branch.clone().unwrap_or("N/A".to_string()), 
+               scan.id, separator, scan.project, separator, 
+               if scan.processed { "Done" } else { "In Progress" },
+               separator, formatted_repo, separator, 
+               scan.branch.clone().unwrap_or("N/A".to_string()), 
                width = column_length, long_width=long_column_length, med_width=medium_column_length);
         }
         println!("\n\n{:-<20}", "-");
