@@ -4,11 +4,6 @@ use std::path::Path;
 use serde_json::json;
 
 pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>) {
-    let small_column_length = 5;
-    let column_length = 8;
-    let medium_column_length = 20;
-    let long_column_length = 40;
-    let separator = " ";
     let project_name = utils::generic::get_current_working_directory().unwrap_or("unknown".to_string());
     println!("");
     if *issues {
@@ -39,18 +34,22 @@ pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>) {
             println!("{}", serde_json::to_string_pretty(&output).unwrap());
             return;
         }
-        println!("{:<long_width$}{}{: <width$}{}{: <small_width$}{}{: <long_width$}{}{: <small_width$}", 
-            "Issue ID", separator, "Category", separator, "Urgency", separator, "File Path", separator, "Line", 
-            width = column_length, long_width=long_column_length, small_width=small_column_length);
-        
-        println!("");
+        let mut table = vec![
+            vec![
+                "Issue ID".to_string(),
+                "Category".to_string(),
+                "Urgency".to_string(),
+                "File Path".to_string(),
+                "Line".to_string(),
+            ],
+        ];
 
         for issue in &issues_response.issues.unwrap_or_default() {
             let classification_parts: Vec<&str> = issue.classification.split(':').collect();
             let classification_display = if classification_parts.len() > 1 {
-                classification_parts[0].trim()
+                classification_parts[0].trim().to_string()
             } else {
-                issue.classification.as_str() 
+                issue.classification.clone() 
             };
             let path = Path::new(&issue.file_path);
             let path_parts: Vec<&str> = path
@@ -64,17 +63,22 @@ pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>) {
                 } else {
                     path_parts[1]
                 };
-                format!("{}/../{}", base_part, path_parts[path_parts.len() - 1])
+                format!("{}/../{}", base_part, path_parts[path_parts.len() - 1]).to_string()
             } else {
                 issue.file_path.clone()
             };
-            println!("{:<long_width$}{}{: <width$}{}{: <small_width$}{}{: <long_width$}{}{: <small_width$}", 
-                (*issue).id, separator, classification_display, separator, issue.urgency, separator, shortened_path, separator, issue.line_num, 
-                width = column_length, long_width=long_column_length, small_width=small_column_length);
+            table.push(vec![
+                (*issue).id.clone(),
+                classification_display,
+                issue.urgency.clone(),
+                shortened_path,
+                issue.line_num.to_string(),
+            ]);
         }
-        println!("\n\n{:-<20}", "-");
-        println!("Showing page {} of {}.", issues_response.page, issues_response.total_pages);
+
+        utils::terminal::print_table(table, Some(issues_response.page), Some(issues_response.total_pages));
     } else {
+        
         let (scans, page, total_pages) = match utils::api::query_scan_list(&config.get_url(), &config.get_token(), Some(&project_name), *page) {
             Ok(scans) => {
                 let page = scans.page;
@@ -107,11 +111,16 @@ pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>) {
             println!("{}", serde_json::to_string_pretty(&output).unwrap());
             return;
         }
+        let mut table = vec![
+            vec![
+                "Scan ID".to_string(),
+                "Project".to_string(),
+                "Status".to_string(),
+                "Repo".to_string(),
+                "Branch".to_string(),
+            ],
+        ];
 
-        println!("{:<long_width$}{}{: <med_width$}{}{: <width$}{}{: <med_width$}{}{: <med_width$}", "Scan ID", separator, "Project", separator, "Status", separator, "Repo",  separator, "Branch", 
-            width = column_length, long_width=long_column_length, med_width=medium_column_length);
-        println!("");
-    
         for scan in &scans {
             let formatted_repo = scan.repo.clone().unwrap_or("N/A".to_string());
             let formatted_repo = if formatted_repo != "N/A" {
@@ -126,14 +135,15 @@ pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>) {
                 formatted_repo
             };
 
-            println!("{:<long_width$}{}{: <med_width$}{}{: <width$}{}{: <med_width$}{}{: <med_width$}", 
-               scan.id, separator, scan.project, separator, 
-               if scan.processed { "Done" } else { "In Progress" },
-               separator, formatted_repo, separator, 
-               scan.branch.clone().unwrap_or("N/A".to_string()), 
-               width = column_length, long_width=long_column_length, med_width=medium_column_length);
+            table.push(vec![
+                scan.id.clone(),
+                scan.project.clone(),
+                if scan.processed.unwrap_or(false) { "Completed".to_string() } else { "In-Progress".to_string() },
+                formatted_repo,
+                scan.branch.clone().unwrap_or("N/A".to_string()),
+            ]);
         }
-        println!("\n\n{:-<20}", "-");
-        println!("Showing page {} of {}.", page, total_pages);
+
+        utils::terminal::print_table(table, Some(page), Some(total_pages));
     }
 }

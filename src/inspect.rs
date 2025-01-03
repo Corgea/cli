@@ -64,7 +64,19 @@ pub fn run(
         }
     } else {
         let scan_details = match utils::api::get_scan(&config.get_url(), &config.get_token(), id) {
-            Ok(details) => details,
+            Ok(mut details) => {
+                let state = if details.mark_failed.unwrap_or(false) {
+                    utils::generic::get_status("Incomplete")
+                } else if details.processed.unwrap_or(false) {
+                    utils::generic::get_status("Complete")
+                } else if details.ready_to_process.unwrap_or(true) {
+                    utils::generic::get_status("Processing")
+                } else {
+                    utils::generic::get_status("Scanning")
+                };
+                details.status = Some(state.to_string());
+                details
+            },
             Err(e) => {
                 eprintln!("Failed to fetch scan details for scan ID {}: {}", id, e);
                 if e.to_string().contains("404") {
@@ -74,22 +86,23 @@ pub fn run(
             }
         };
         if *json {
-            println!("{}", serde_json::to_string_pretty(&scan_details).unwrap());
+            let scan_response_dto = utils::api::ScanResponseDTO {
+                id: scan_details.id,
+                repo: scan_details.repo,
+                branch: scan_details.branch,
+                project: scan_details.project,
+                engine: scan_details.engine,
+                created_at: scan_details.created_at,
+                status: scan_details.status,
+            };
+            println!("{}", serde_json::to_string_pretty(&scan_response_dto).unwrap());
             return;
         }
         print_section("Scan ID", &scan_details.id);
         print_section("Repository", scan_details.repo.as_deref().unwrap_or("N/A"));
         print_section("Branch", scan_details.branch.as_deref().unwrap_or("N/A"));
-        let state = if scan_details.mark_failed.unwrap_or(false) {
-            utils::generic::get_status("Incomplete")
-        } else if scan_details.processed {
-            utils::generic::get_status("Complete")
-        } else if scan_details.ready_to_process.unwrap_or(true) {
-            utils::generic::get_status("Processing")
-        } else {
-            utils::generic::get_status("Scanning")
-        };
-        print_section("Status", &state);
+
+        print_section("Status", scan_details.status.as_deref().unwrap_or("N/A"));
         print_section("Project", &scan_details.project);
         print_section("Engine", &scan_details.engine);
         let created_at = chrono::DateTime::<chrono::Utc>::from(SystemTime::now()).format("%Y-%m-%d %H:%M:%S").to_string();

@@ -44,7 +44,7 @@ pub fn run(config: &Config, scan_id: Option<String>) {
         },
         None => {
             match scans.get(0) {
-                Some(scan) => (scan.id.clone(), scan.processed),
+                Some(scan) => (scan.id.clone(), scan.processed.unwrap_or(false)),
                 None => {
                     eprintln!("Error querying scan list");
                     std::process::exit(1);

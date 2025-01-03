@@ -199,7 +199,7 @@ pub fn wait_for_scan(config: &Config, scan_id: &str) {
 
 pub fn check_scan_status(scan_id: &str, url: &str, token: &str) -> Result<bool, Box<dyn Error>> {
     match utils::api::get_scan(url, token, scan_id) {
-        Ok(scan) => Ok(scan.processed),
+        Ok(scan) => Ok(scan.processed.unwrap_or(false)),
         Err(e) => Err(e)
     }
 }

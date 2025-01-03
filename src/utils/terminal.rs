@@ -163,6 +163,31 @@ pub fn print_with_pagination(str: &str) {
         stdout.flush().unwrap();
     }
 }
+pub fn print_table(table: Vec<Vec<String>>, page:  Option<u32>, total_pages: Option<u32>) {
+    let columns = table.iter().enumerate().fold(vec![vec![]; table[0].len()], |mut acc, (_i, row)| {
+        for (j, cell) in row.iter().enumerate() {
+            acc[j].push(cell.clone());
+        }
+        acc
+    });
+    let column_lengths = columns.iter().map(|col| col.iter().map(|cell| cell.len()).max_by(|a, b| a.cmp(b)).unwrap_or(0)).collect::<Vec<_>>();
+    for (j, row) in table.iter().enumerate() {
+        for (i, cell) in row.iter().enumerate() {
+            print!("{:<width$}   ", cell, width = column_lengths[i]);
+        }
+        if j == 0 {
+            println!();
+        }
+        println!();
+    }
+    if let Some(page) = page {
+        if let Some(total_pages) = total_pages {
+            println!("\n\n{:-<20}", "-");
+            println!("Showing page {} of {}.", page, total_pages);
+        }
+    }
+}
+
 
 pub enum TerminalColor {
     Reset,

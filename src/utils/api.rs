@@ -247,16 +247,28 @@ pub fn query_scan_list(
 
 
 #[derive(Deserialize, Serialize, Debug)]
-pub struct ScanResponse {
+pub struct ScanResponseDTO {
     pub id: String,
     pub repo: Option<String>,
     pub branch: Option<String>,
-    pub processed: bool,
     pub project: String,
     pub engine: String,
     pub created_at: String,
+    pub status: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct ScanResponse  {
     pub mark_failed: Option<bool>,
     pub ready_to_process: Option<bool>,
+    pub processed: Option<bool>,
+    pub id: String,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    pub project: String,
+    pub engine: String,
+    pub created_at: String,
+    pub status: Option<String>,
 }
 
 
@@ -274,8 +286,8 @@ pub struct Issue {
 pub struct ProjectIssuesResponse {    
     pub status: String,
     pub issues: Option<Vec<Issue>>,
-    pub page: u16,
-    pub total_pages: u16,
+    pub page: u32,
+    pub total_pages: u32,
 }
 
 
