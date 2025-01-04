@@ -45,13 +45,8 @@ pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>, page
         ];
 
         for issue in &issues_response.issues.unwrap_or_default() {
-            let classification_parts: Vec<&str> = issue.classification.split(':').collect();
-            let classification_display = if classification_parts.len() > 1 {
-                classification_parts[0].trim().to_string()
-            } else {
-                issue.classification.clone() 
-            };
-            let path = Path::new(&issue.file_path);
+            let classification_display = issue.classification.id.clone();
+            let path = Path::new(&issue.location.file.path);
             let path_parts: Vec<&str> = path
                 .components()
                 .filter_map(|c| c.as_os_str().to_str())
@@ -65,14 +60,14 @@ pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>, page
                 };
                 format!("{}/../{}", base_part, path_parts[path_parts.len() - 1]).to_string()
             } else {
-                issue.file_path.clone()
+                issue.location.file.path.clone()
             };
             table.push(vec![
-                (*issue).id.clone(),
+                issue.id.clone(),
                 classification_display,
                 issue.urgency.clone(),
                 shortened_path,
-                issue.line_num.to_string(),
+                issue.location.line_number.to_string(),
             ]);
         }
 
@@ -138,7 +133,7 @@ pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>, page
             table.push(vec![
                 scan.id.clone(),
                 scan.project.clone(),
-                if scan.processed.unwrap_or(false) { "Completed".to_string() } else { "In-Progress".to_string() },
+                scan.status.clone(),
                 formatted_repo,
                 scan.branch.clone().unwrap_or("N/A".to_string()),
             ]);

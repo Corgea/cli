@@ -13,6 +13,7 @@ use serde_json::Value;
 
 
 const CHUNK_SIZE: usize = 50 * 1024 * 1024; // 50 MB
+const API_BASE: &str = "/api/v1";
 
 pub fn upload_zip(file_path: &str , token: &str, url: &str, project_name: &str, repo_info: Option<utils::generic::RepoInfo>) -> Result<String, Box<dyn std::error::Error>> {
     let client = reqwest::blocking::Client::builder()
@@ -37,7 +38,7 @@ pub fn upload_zip(file_path: &str , token: &str, url: &str, project_name: &str, 
         .text("json", json_object.to_string());
 
     let response_object = client
-        .post(format!("{}/api/start-scan", url))
+        .post(format!("{}{}/start-scan", url, API_BASE))
         .header("CORGEA-TOKEN", token)
         .query(&[
             ("scan_type", "blast"),
@@ -100,7 +101,7 @@ pub fn upload_zip(file_path: &str , token: &str, url: &str, project_name: &str, 
 
 
         let response = match client
-        .patch(format!("{}/api/start-scan/{}/", url, transfer_id))
+        .patch(format!("{}{}/start-scan/{}/", url, API_BASE, transfer_id))
         .header("CORGEA-TOKEN", token)
         .header("Upload-Offset", offset.to_string())
         .header("Upload-Length", file_size.to_string())
@@ -146,9 +147,9 @@ pub fn get_scan_issues(
     page_size: Option<u16>
 )  -> Result<ProjectIssuesResponse, Box<dyn std::error::Error>> {
     let mut url = format!(
-        "{}/api/cli/issues?token={}&project={}",
+        "{}{}/issues?project={}",
         url,
-        token,
+        API_BASE,
         project
     );
     if let Some(p) = page {
@@ -159,7 +160,11 @@ pub fn get_scan_issues(
     } else {
         url.push_str("&page_size=30");
     }
-    let response = match reqwest::blocking::get(&url) {
+    let client = reqwest::blocking::Client::new();
+    let mut headers = HeaderMap::new();
+    headers.insert("CORGEA-TOKEN", token.parse().unwrap());
+
+    let response = match client.get(&url).headers(headers).send() {
         Ok(res) => res,
         Err(e) => return Err(format!("Failed to send request: {}", e).into()),
     };
@@ -178,7 +183,7 @@ pub fn get_scan_issues(
 }
 
 pub fn get_scan(url: &str, token: &str, scan_id: &str) -> Result<ScanResponse, Box<dyn std::error::Error>>  {
-    let url = format!("{}/api/cli/scan/{}", url, scan_id); // Adjust URL if needed
+    let url = format!("{}{}/scan/{}", url, API_BASE, scan_id);
 
     let client = reqwest::blocking::Client::new();
 
@@ -200,19 +205,21 @@ pub fn get_scan(url: &str, token: &str, scan_id: &str) -> Result<ScanResponse, B
 }
 
 
-pub fn get_issue(url: &str, token: &str, issue: &str) -> Result<FullIssueRespone, Box<dyn std::error::Error>> {
+pub fn get_issue(url: &str, token: &str, issue: &str) -> Result<FullIssueResponse, Box<dyn std::error::Error>> {
     let url = format!(
-        "{}/api/cli/issue/{}?token={}",
+        "{}{}/issue/{}",
         url,
+        API_BASE,
         issue,
-        token,
     );
-
-    let response = match reqwest::blocking::get(&url) {
+    let client = reqwest::blocking::Client::new();
+    let mut headers = HeaderMap::new();
+    headers.insert("CORGEA-TOKEN", token.parse().unwrap());
+    let response = match client.get(&url).headers(headers).send() {
         Ok(res) => res,
         Err(e) => return Err(format!("Failed to send request: {}", e).into()),
     };
-    return match response.json::<FullIssueRespone>() {
+    return match response.json::<FullIssueResponse>() {
             Ok(body) => Ok(body),
             Err(e) => Err(format!("Failed to parse response: {}", e).into()),
     };
@@ -227,7 +234,7 @@ pub fn query_scan_list(
     page: Option<u16>,
     page_size: Option<u16>
 ) -> Result<ScansResponse, Box<dyn Error>> {
-    let url = format!("{}/api/scans", url);
+    let url = format!("{}{}/scans", url, API_BASE);
     let page = page.unwrap_or(1);
     let mut query_params = vec![("page", page.to_string())];
     if let Some(p_size) = page_size {
@@ -235,15 +242,17 @@ pub fn query_scan_list(
     } else {
         query_params.push(("page_size", "30".to_string()));
     }
-    query_params.push(("token", token.into()));
     if let Some(project) = project {
         query_params.push(("project", project.to_string()));
     }
 
 
     let client = reqwest::blocking::Client::new(); 
+    let mut headers = HeaderMap::new();
+    headers.insert("CORGEA-TOKEN", token.parse().unwrap());
     let response = match client
         .get(url)
+        .headers(headers)
         .query(&query_params)
         .send() {
             Ok(res) => res,
@@ -262,40 +271,16 @@ pub fn query_scan_list(
 
 
 
-#[derive(Deserialize, Serialize, Debug)]
-pub struct ScanResponseDTO {
-    pub id: String,
-    pub repo: Option<String>,
-    pub branch: Option<String>,
-    pub project: String,
-    pub engine: String,
-    pub created_at: String,
-    pub status: Option<String>,
-}
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct ScanResponse  {
-    pub mark_failed: Option<bool>,
-    pub ready_to_process: Option<bool>,
-    pub processed: Option<bool>,
     pub id: String,
+    pub project: String,
     pub repo: Option<String>,
     pub branch: Option<String>,
-    pub project: String,
+    pub status: String,
     pub engine: String,
     pub created_at: String,
-    pub status: Option<String>,
-}
-
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Issue {
-    pub id: String,
-    pub classification: String,
-    pub urgency: String,
-    pub hold_fix: bool,
-    pub file_path: String,
-    pub line_num: u32
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -317,36 +302,87 @@ pub struct ScansResponse {
 
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct FullIssueRespone {
+pub struct FullIssueResponse {
     pub status: String,
-    pub issue: IssueDetails,
-    pub fix: Option<FixDetails>,
+    pub issue: Issue,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct IssueDetails {
+pub struct Issue {
     pub id: String,
+    pub scan_id: Option<String>,
+    pub status: String,
     pub urgency: String,
-    pub description: String,
-    pub classification: String,
-    pub file_path: String,
-    pub line_num: u32,
-    pub on_hold: bool,
-    pub hold_reason: Option<String>,
-    pub explanation: Option<String>,
-    pub false_positive: Option<FalsePositiveDetails>,
-    pub status: String,
+    pub created_at: String,
+    pub classification: Classification,
+    pub location: Location,
+    pub details: Option<Details>,
+    pub auto_triage: AutoTriage,
+    pub auto_fix_suggestion: Option<AutoFixSuggestion>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct FalsePositiveDetails {
-    result: String,
-    reasoning: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct FixDetails {
+pub struct Classification {
     pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Location {
+    pub file: CorgeaFile,
+    pub line_number: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CorgeaFile {
+    pub name: String,
+    pub language: String,
+    pub path: String,
+    pub project: Project,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Project {
+    pub name: String,
+    pub branch: String,
+    pub git_sha: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Details {
+    pub explanation: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AutoFixSuggestion {
+    pub id: Option<String>,
+    pub status: String,
+    pub patch: Option<Patch>,
+    pub full_code: Option<FullCode>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Patch {
     pub diff: String,
     pub explanation: String,
 }
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct FullCode {
+    pub before: String,
+    pub after: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AutoTriage {
+    pub false_positive_detection: FalsePositiveDetection,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct FalsePositiveDetection {
+    pub status: String,
+    pub reasoning: Option<String>,
+}
+
+
