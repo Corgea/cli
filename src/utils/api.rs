@@ -332,6 +332,7 @@ pub struct Classification {
 pub struct Location {
     pub file: CorgeaFile,
     pub line_number: u32,
+    pub project: Project,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -339,7 +340,6 @@ pub struct CorgeaFile {
     pub name: String,
     pub language: String,
     pub path: String,
-    pub project: Project,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
