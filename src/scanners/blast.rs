@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 
 
-pub fn run(config: &Config, fail_on: Option<String>) {
+pub fn run(config: &Config, fail_on: Option<String>, fail: &bool) {
     println!(
         "\nScanning with BLAST 🚀🚀🚀"
     );
@@ -109,6 +109,28 @@ pub fn run(config: &Config, fail_on: Option<String>) {
             std::process::exit(1);
         }
     };
+    if *fail {
+        let blocking_rules = match utils::api::check_blocking_rules(&config.get_url(), &config.get_token(), &scan_id, None) {
+            Ok(rules) => rules,
+            Err(e) => {
+                eprintln!("Failed to check blocking rules: {}", e);
+                std::process::exit(1);
+            }
+        };
+        if blocking_rules.block {
+            println!("\nExiting with error code 1 due to some issues violating some blocking rules defined for this project.\nfor more details, please check the scan results at the link: {}\nAlternatively, you can run {} to view the issues list on your local machine.",
+            utils::terminal::set_text_color(
+                &format!("{}/scan?scan_id={}", config.get_url(), scan_id),
+                utils::terminal::TerminalColor::Green
+            ), 
+            utils::terminal::set_text_color(
+                &format!("corgea ls -i -s={}", scan_id),
+                utils::terminal::TerminalColor::Green
+            )
+        );
+            std::process::exit(1);
+        }
+    }
     print!("\n\nThank you for using Corgea! 🐕\n\n");
     if let Some(fail_on) = fail_on {
         match fail_on.as_str() {
@@ -206,7 +228,7 @@ pub fn check_scan_status(scan_id: &str, url: &str, token: &str) -> Result<bool, 
 
 
 pub fn fetch_and_group_scan_issues(url: &str, token: &str, project: &str) -> Result<HashMap<String, usize>, Box<dyn std::error::Error>> {
-    let body = match utils::api::get_scan_issues(url, token, project, None, None) {
+    let body = match utils::api::get_scan_issues(url, token, project, None, None, None) {
         Ok(issues) => issues,
         Err(err) => {
             return Err(format!("Failed to fetch scan issues: {}", err).into());

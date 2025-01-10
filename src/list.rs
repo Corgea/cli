@@ -3,45 +3,110 @@ use crate::config::Config;
 use std::path::Path;
 use serde_json::json;
 
-pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>, page_size: &Option<u16>) {
+pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>, page_size: &Option<u16>, scan_id: &Option<String>) {
     let project_name = utils::generic::get_current_working_directory().unwrap_or("unknown".to_string());
     println!("");
     if *issues {
-        let issues_response = match utils::api::get_scan_issues(&config.get_url(), &config.get_token(), &project_name, Some((*page).unwrap_or(1)), *page_size) {
+        let issues_response = match utils::api::get_scan_issues(&config.get_url(), &config.get_token(), &project_name, Some((*page).unwrap_or(1)), *page_size, scan_id.clone()) {
             Ok(response) => response,
             Err(e) => {
                 if e.to_string().contains("404") {
-                    eprintln!("Project with name '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", project_name);
+                    if scan_id.is_some() {
+                        eprintln!("Scan with ID '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", scan_id.as_ref().unwrap());
+                    } else {
+                        eprintln!("Project with name '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", project_name);
+                    }
                 } else {
                     eprintln!(
                         "Unable to fetch scan issues. Please check your connection and ensure that:\n\
                         - The server URL is reachable.\n\
                         - Your authentication token is valid.\n\n\
-                        Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli"
+                        Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli {}",
+                        e
                     );
                 }
                 std::process::exit(1);
             }
         };
+        let mut render_blocking_rules = false;
+        let mut blocking_rules: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+        if scan_id.is_some() {
+            let mut page: u32 = 1;
+            loop {
+                match utils::api::check_blocking_rules(&config.get_url(), &config.get_token(), scan_id.as_ref().unwrap(), Some(page)) {
+                    Ok(rules) => {
+                        if rules.block {
+                            render_blocking_rules = true;
+                            for issue in rules.blocking_issues {
+                                blocking_rules.insert(issue.id, issue.triggered_by_rules.join(","));
+                            }
+                            if rules.total_pages == page {
+                                break;
+                            }
+                            page += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to check blocking rules: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
 
 
         if *json {
-            let output = json!({
+            let mut json = serde_json::json!({
                 "page": issues_response.page,
                 "total_pages": issues_response.total_pages,
-                "results": issues_response.issues
+                "results": &issues_response.issues
             });
+            if render_blocking_rules {
+                json["results"] = serde_json::json!(
+                    issues_response.issues.unwrap_or_default().iter().map(|issue| {
+                        serde_json::json!(
+                            utils::api::IssueWithBlockingRules {
+                                id: issue.id.clone(),
+                                scan_id: issue.scan_id.clone(),
+                                status: issue.status.clone(),
+                                urgency: issue.urgency.clone(),
+                                created_at: issue.created_at.clone(),
+                                classification: issue.classification.clone(),
+                                location: issue.location.clone(),
+                                details: issue.details.clone(),
+                                auto_triage: issue.auto_triage.clone(),
+                                auto_fix_suggestion: issue.auto_fix_suggestion.clone(),
+                                blocked: blocking_rules.contains_key(&issue.id),
+                                blocking_rules: if blocking_rules.contains_key(&issue.id) {
+                                    Some(vec![blocking_rules.get(&issue.id).unwrap().clone()])
+                                } else {
+                                    None
+                                }
+                            }
+                        )
+                    }).collect::<Vec<_>>()
+                );
+            }
+            let output = json!(json);
             println!("{}", serde_json::to_string_pretty(&output).unwrap());
             return;
         }
+        let mut table_header = vec![
+            "Issue ID".to_string(),
+            "Category".to_string(),
+            "Urgency".to_string(),
+            "File Path".to_string(),
+            "Line".to_string(),
+        ];
+        if render_blocking_rules {
+            table_header.push("Blocking".to_string());
+            table_header.push("Rule ID".to_string());
+        }
         let mut table = vec![
-            vec![
-                "Issue ID".to_string(),
-                "Category".to_string(),
-                "Urgency".to_string(),
-                "File Path".to_string(),
-                "Line".to_string(),
-            ],
+            table_header
         ];
 
         for issue in &issues_response.issues.unwrap_or_default() {
@@ -62,18 +127,22 @@ pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>, page
             } else {
                 issue.location.file.path.clone()
             };
-            table.push(vec![
+            let mut row = vec![
                 issue.id.clone(),
                 classification_display,
                 issue.urgency.clone(),
                 shortened_path,
                 issue.location.line_number.to_string(),
-            ]);
+            ];
+            if render_blocking_rules {
+                row.push(blocking_rules.get(&issue.id).is_some().to_string());
+                row.push(blocking_rules.get(&issue.id).unwrap_or(&"".to_string()).to_string());
+            }
+            table.push(row);
         }
 
         utils::terminal::print_table(table, Some(issues_response.page), Some(issues_response.total_pages));
     } else {
-        
         let (scans, page, total_pages) = match utils::api::query_scan_list(&config.get_url(), &config.get_token(), Some(&project_name), *page, *page_size) {
             Ok(scans) => {
                 let page = scans.page;

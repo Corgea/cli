@@ -144,16 +144,24 @@ pub fn get_scan_issues(
     token: &str, 
     project: &str, 
     page: Option<u16>,
-    page_size: Option<u16>
+    page_size: Option<u16>,
+    scan_id: Option<String>
 )  -> Result<ProjectIssuesResponse, Box<dyn std::error::Error>> {
-    let mut url = format!(
-        "{}{}/issues?project={}",
-        url,
-        API_BASE,
-        project
-    );
+    let mut seperator = "?";
+    let mut url = match scan_id {
+        Some(scan_id) => format!("{}{}/scan/{}/issues", url, API_BASE, scan_id),
+        None => {
+            seperator = "&";
+            format!(
+                "{}{}/issues?project={}",
+                url,
+                API_BASE,
+                project
+            )
+        }
+    };
     if let Some(p) = page {
-        url.push_str(&format!("&page={}", p));
+        url.push_str(&format!("{}page={}", seperator, p));
     }
     if let Some(p_size) = page_size {
         url.push_str(&format!("&page_size={}", p_size));
@@ -271,6 +279,41 @@ pub fn query_scan_list(
 
 
 
+pub fn check_blocking_rules(
+    url: &str,
+    token: &str,
+    sast_scan_id: &str,
+    page: Option<u32>
+) -> Result<BlockingRuleResponse, Box<dyn Error>> {
+    let url = format!("{}{}/sast_scans/{}/check_blocking_rules", url, API_BASE, sast_scan_id);
+    let page = page.unwrap_or(1);
+    let query_params = vec![("page", page.to_string())];
+
+    let client = reqwest::blocking::Client::new();
+    let mut headers = HeaderMap::new();
+    headers.insert("CORGEA-TOKEN", token.parse().unwrap());
+
+    let response = match client
+        .get(url)
+        .headers(headers)
+        .query(&query_params)
+        .send() {
+            Ok(res) => res,
+            Err(e) => return Err(format!("API request failed: {}", e).into()),
+        };
+
+    if response.status().is_success() {
+        let api_response: BlockingRuleResponse = response.json()?;
+        Ok(api_response)
+    } else {
+        Err(format!(
+            "API request failed with status: {}",
+            response.status()
+        ).into())
+    }
+}
+
+
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct ScanResponse  {
@@ -289,6 +332,7 @@ pub struct ProjectIssuesResponse {
     pub issues: Option<Vec<Issue>>,
     pub page: u32,
     pub total_pages: u32,
+    pub total_issues: Option<u32>
 }
 
 
@@ -322,39 +366,56 @@ pub struct Issue {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+pub struct IssueWithBlockingRules {
+    pub id: String,
+    pub scan_id: Option<String>,
+    pub status: String,
+    pub urgency: String,
+    pub created_at: String,
+    pub classification: Classification,
+    pub location: Location,
+    pub details: Option<Details>,
+    pub auto_triage: AutoTriage,
+    pub auto_fix_suggestion: Option<AutoFixSuggestion>,
+    pub blocked: bool,
+    pub blocking_rules: Option<Vec<String>>,
+}
+
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Classification {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Location {
     pub file: CorgeaFile,
     pub line_number: u32,
     pub project: Project,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CorgeaFile {
     pub name: String,
     pub language: String,
     pub path: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Project {
     pub name: String,
-    pub branch: String,
-    pub git_sha: String,
+    pub branch: Option<String>,
+    pub git_sha: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Details {
     pub explanation: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AutoFixSuggestion {
     pub id: Option<String>,
     pub status: String,
@@ -362,27 +423,39 @@ pub struct AutoFixSuggestion {
     pub full_code: Option<FullCode>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Patch {
     pub diff: String,
     pub explanation: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FullCode {
     pub before: String,
     pub after: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AutoTriage {
     pub false_positive_detection: FalsePositiveDetection,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FalsePositiveDetection {
     pub status: String,
     pub reasoning: Option<String>,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+pub struct BlockingRuleResponse {
+    pub block: bool,
+    pub blocking_issues: Vec<BlockingIssue>,
+    pub total_pages: u32,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct BlockingIssue {
+    pub id: String,
+    pub triggered_by_rules: Vec<String>
+}
 

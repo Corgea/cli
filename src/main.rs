@@ -46,8 +46,11 @@ enum Commands {
         /// What scanner to use. Valid options are sempgrep and snyk.
         scanner: Scanner,
 
-        #[arg(short, long, help = "Fail on a specific severity level. Valid options are CR, HI, ME, LO.")]
+        #[arg(long, help = "Fail on (exits with error code 1) a specific severity level . Valid options are CR, HI, ME, LO.")]
         fail_on: Option<String>,
+
+        #[arg(short, long, help = "Fail on (exits with error code 1) based on blocking rules defined in the web app.")]
+        fail: bool,
     },
     /// Wait for the latest in progress scan
     Wait {
@@ -58,6 +61,9 @@ enum Commands {
     List {
         #[arg(short, long, help = "List issues instead of scans")]
         issues: bool,
+
+        #[arg(short, long, help = "Specify the scan id to list issues for.")]
+        scan_id: Option<String>,
 
         #[arg(short, long, value_parser = clap::value_parser!(u16))]
         page: Option<u16>,
@@ -158,7 +164,7 @@ fn main() {
                 }
             }
         }
-        Some(Commands::Scan { scanner , fail_on }) => {
+        Some(Commands::Scan { scanner , fail_on, fail }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             if let Some(level) = fail_on {
                 if *scanner != Scanner::Blast {
@@ -170,19 +176,33 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+
+            if *fail && *scanner != Scanner::Blast {
+                eprintln!("fail is only supported with blast scanner.");
+                std::process::exit(1);
+            }
+
+            if *fail && fail_on.is_some() {
+                eprintln!("fail and fail_on cannot be used together.");
+                std::process::exit(1);
+            }
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config),
                 Scanner::Semgrep => scan::run_semgrep(&corgea_config),
-                Scanner::Blast => scanners::blast::run(&corgea_config, fail_on.clone())
+                Scanner::Blast => scanners::blast::run(&corgea_config, fail_on.clone(), fail)
             }
         }
         Some(Commands::Wait { scan_id }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             wait::run(&corgea_config, scan_id.clone());
         }
-        Some(Commands::List { issues , json, page, page_size}) => {
+        Some(Commands::List { issues , json, page, page_size, scan_id}) => {
             verify_token_and_exit_when_fail(&corgea_config);
-            list::run(&corgea_config, issues, json, page, page_size);
+            if scan_id.is_some() && !*issues {
+                println!("scan_id option is only supported for issues list command.");
+                std::process::exit(1);
+            }
+            list::run(&corgea_config, issues, json, page, page_size, scan_id);
         }
         Some(Commands::Inspect { issue, json, id, summary, fix, diff}) => {
             verify_token_and_exit_when_fail(&corgea_config);
