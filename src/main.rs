@@ -41,9 +41,10 @@ enum Commands {
         /// Option path to JSON report to upload
         report: Option<String>,
     },
-    /// Scan the current directory. Supports semgrep and snyk.
+    /// Scan the current directory. Supports blast, semgrep and snyk.
     Scan {
-        /// What scanner to use. Valid options are sempgrep and snyk.
+        /// What scanner to use. Valid options are blast, semgrep and snyk.
+        #[arg(default_value = "blast")]
         scanner: Scanner,
 
         #[arg(long, help = "Fail on (exits with error code 1) a specific severity level . Valid options are CR, HI, ME, LO.")]

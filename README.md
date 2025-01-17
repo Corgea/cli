@@ -35,38 +35,38 @@ corgea login <token>
 
 ### Using venv (Python Virtual Environment)
 1. Create and activate a virtual environment:
-   **** 
+   ``` 
    python -m venv .venv
    source .venv/bin/activate  # On Unix/macOS
    .venv\Scripts\activate     # On Windows
-   ****
+   ```
 
 2. Install dependencies:
-   ****
-   pip install -r requirements.txt
-   ****
+   ```
+   pip install maturin
+   ```
 
 3. Build and install the package in development mode:
-   ****
+   ```
    maturin develop
-   ****
+   ```
 
 ### Using Conda
 1. Create and activate a conda environment:
-   ****
+   ```
    conda create -n corgea-cli python=3.8
    conda activate corgea-cli
-   ****
+   ```
 
 2. Install dependencies:
-   ****
-   pip install -r requirements.txt
-   ****
+   ```
+   pip install maturin
+   ```
 
 3. Build and install the package in development mode:
-   ****
+   ```
    maturin develop
-   ****
+   ```
 
 Note: After making changes to Rust code, you'll need to run `maturin develop` again to rebuild the package.
 
