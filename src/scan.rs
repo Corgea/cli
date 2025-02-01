@@ -2,12 +2,12 @@ use std::collections::HashSet;
 use serde_json::Value;
 use std::io::{self, Read};
 use crate::Config;
-use reqwest::header;
 use uuid::Uuid;
 use std::path::Path;
 use std::process::Command;
 use crate::cicd::{*};
 use crate::log::debug;
+use reqwest::header;
 
 pub fn run_command(base_cmd: &String, mut command: Command) -> String {
     match which::which(base_cmd) {
@@ -405,3 +405,5 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
 
     println!("Go to {base_url} to see results.");
 }
+
+
