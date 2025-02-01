@@ -1,5 +1,6 @@
 # Corgea CLI
-Corgea one-line command to upload SAST results. This command will run your scanner, and send the vulnerabilities report to Corgea for analysis.
+Corgea CLI is a powerful developer tool that helps you find and fix security vulnerabilities in your code. Using our AI-powered scanner (blast) and our platform, Corgea identifies complex security issues like business logic flaws, authentication vulnerabilities, and other hard-to-find bugs. The CLI provides commands to scan your codebase, inspect findings, and interact with fixes - all designed with a great developer experience in mind.
+
 
 For full documentation, visit https://docs.corgea.app/cli
 
