@@ -229,10 +229,18 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
     } else {
         project = current_dir.file_name().expect("Failed to get directory name").to_str().expect("Failed to convert OsStr to str").to_string();
     }
+    let repo_data = std::env::var("REPO_DATA").unwrap_or_else(|_| "".to_string()); //encoded data to forward.
 
-    let scan_upload_url = format!(
-        "{}/api/cli/scan-upload?token={}&engine={}&run_id={}&project={}&ci={}&ci_platform={}", base_url, token, scanner, run_id, project, in_ci, ci_platform
-    );
+    let scan_upload_url = if repo_data.is_empty() {
+        format!(
+            "{}/api/cli/scan-upload?token={}&engine={}&run_id={}&project={}&ci={}&ci_platform={}", base_url, token, scanner, run_id, project, in_ci, ci_platform
+        )
+    } else {
+        format!(
+            "{}/api/cli/scan-upload?token={}&engine={}&run_id={}&project={}&ci={}&ci_platform={}&repo_data={}", base_url, token, scanner, run_id, project, in_ci, ci_platform, repo_data
+        )
+    };
+
     let git_config_upload_url = format!(
         "{}/api/cli/git-config-upload?token={}&run_id={}", base_url, token, run_id
     );
