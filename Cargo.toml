@@ -1,14 +1,20 @@
 [package]
 name = "corgea"
-version = "1.5.0"
+version = "1.5.1"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap = {  version = "4.4.13", features = ["derive"] }
+clap = { version = "4.4.13", features = ["derive"] }
 dirs = "5.0.1"
-reqwest = {  version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "multipart",
+    "rustls-tls",
+    "rustls-tls-native-roots",
+] }
 toml = "0.8.8"
 serde = { version = "1.0.195", features = ["derive"] }
 serde_json = "1.0.111"
@@ -21,6 +27,6 @@ quick-xml = "0.36.1"
 ignore = "0.4"
 globset = "0.4"
 termcolor = "1.1"
-git2 = { version = "0.16", default-features = false }
+git2 = { version = "0.20.0", default-features = false }
 regex = "1"
 chrono = "0.4"
