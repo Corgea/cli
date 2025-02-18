@@ -15,6 +15,22 @@ use serde_json::Value;
 const CHUNK_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 const API_BASE: &str = "/api/v1";
 
+fn check_for_warnings(headers: &HeaderMap, status: StatusCode) {
+    if let Some(warning) = headers.get("warning") {
+        let warnings = warning.to_str().unwrap().split(',');
+        for warning in warnings {
+            let code = warning.trim().split(' ').next().unwrap();
+            if code == "299" {
+                eprintln!("This version of the Corgea plugin is deprecated. Please upgrade to the latest version to ensure continued support and better performance.");
+            }
+        }
+    }
+    if status == StatusCode::GONE {
+        eprintln!("Support for this extension version has dropped. Please upgrade Corgea extension immediately to continue using it.");
+        std::process::exit(1);
+    }
+}
+
 pub fn upload_zip(file_path: &str , token: &str, url: &str, project_name: &str, repo_info: Option<utils::generic::RepoInfo>) -> Result<String, Box<dyn std::error::Error>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5 * 60))
@@ -46,7 +62,10 @@ pub fn upload_zip(file_path: &str , token: &str, url: &str, project_name: &str, 
         .multipart(form)
         .send();
     let response_object = match response_object {
-        Ok(response) => response,
+        Ok(response) => {
+            check_for_warnings(response.headers(), response.status());
+            response
+        },
         Err(err) => return Err(format!("Network error: Unable to reach the server. Please try again later. Error: {}", err).into()),
     };
     let response_status = response_object.status();
@@ -111,7 +130,10 @@ pub fn upload_zip(file_path: &str , token: &str, url: &str, project_name: &str, 
         ])
         .multipart(form)
         .send() {
-            Ok(response) => response,
+            Ok(response) => {
+                check_for_warnings(response.headers(), response.status());
+                response
+            },
             Err(e) => {
                 return Err(format!("Failed to send request: {}", e).into());
             }
@@ -173,7 +195,10 @@ pub fn get_scan_issues(
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
 
     let response = match client.get(&url).headers(headers).send() {
-        Ok(res) => res,
+        Ok(res) => {
+            check_for_warnings(res.headers(), res.status());
+            res
+        },
         Err(e) => return Err(format!("Failed to send request: {}", e).into()),
     };
     match response.json::<ProjectIssuesResponse>() {
@@ -204,6 +229,8 @@ pub fn get_scan(url: &str, token: &str, scan_id: &str) -> Result<ScanResponse, B
         .send()
         .map_err(|e| format!("Failed to send request: {}", e))?; 
 
+    check_for_warnings(response.headers(), response.status());
+
     if response.status().is_success() {
         let scan_response: ScanResponse = response.json().map_err(|e| format!("Failed to parse response: {}", e))?;
         Ok(scan_response)
@@ -224,7 +251,10 @@ pub fn get_issue(url: &str, token: &str, issue: &str) -> Result<FullIssueRespons
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
     let response = match client.get(&url).headers(headers).send() {
-        Ok(res) => res,
+        Ok(res) => {
+            check_for_warnings(res.headers(), res.status());
+            res
+        },
         Err(e) => return Err(format!("Failed to send request: {}", e).into()),
     };
     return match response.json::<FullIssueResponse>() {
@@ -263,7 +293,10 @@ pub fn query_scan_list(
         .headers(headers)
         .query(&query_params)
         .send() {
-            Ok(res) => res,
+            Ok(res) => {
+                check_for_warnings(res.headers(), res.status());
+                res
+            },
             Err(e) => return Err(format!("API request failed: {}", e).into()), 
         };
         if response.status().is_success() {
@@ -278,6 +311,30 @@ pub fn query_scan_list(
 }
 
 
+pub fn verify_token(token: &str, corgea_url: &str) -> Result<bool, Box<dyn Error>> {
+    let url = format!("{}{}/cli/verify", corgea_url, API_BASE);
+    let client = reqwest::blocking::Client::new();
+    let mut headers = HeaderMap::new();
+    headers.insert("CORGEA-TOKEN", token.parse().unwrap());
+
+    let response = client
+        .get(url)
+        .headers(headers)
+        .send()?;
+
+    check_for_warnings(response.headers(), response.status());
+
+    if response.status().is_success() {
+        let body: HashMap<String, String> = response.json()?;
+
+        Ok(body.get("status").map(|s| s == "ok").unwrap_or(false))
+    } else {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Request failed with status: {}", response.status()),
+        )))
+    }
+}
 
 pub fn check_blocking_rules(
     url: &str,
@@ -298,7 +355,10 @@ pub fn check_blocking_rules(
         .headers(headers)
         .query(&query_params)
         .send() {
-            Ok(res) => res,
+            Ok(res) => {
+                check_for_warnings(res.headers(), res.status());
+                res
+            },
             Err(e) => return Err(format!("API request failed: {}", e).into()),
         };
 
