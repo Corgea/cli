@@ -1,0 +1,45 @@
+name: Update Homebrew Formula
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-formula:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Get Latest PyPI Version
+        id: get_version
+        run: |
+          VERSION=$(curl -s https://pypi.org/pypi/corgea-cli/json | jq -r .info.version)
+          echo "Latest version: $VERSION"
+          echo "version=$VERSION" >> $GITHUB_ENV
+
+      - name: Get Latest Source Tarball URL
+        id: get_tarball
+        run: |
+          URL=$(curl -s https://pypi.org/pypi/corgea-cli/json | jq -r '.urls[] | select(.packagetype=="sdist") | .url')
+          echo "Tarball URL: $URL"
+          echo "tarball_url=$URL" >> $GITHUB_ENV
+
+      - name: Get SHA256 Hash
+        id: get_sha
+        run: |
+          curl -o corgea-cli.tar.gz ${{ env.tarball_url }}
+          SHA256=$(shasum -a 256 corgea-cli.tar.gz | awk '{print $1}')
+          echo "SHA256: $SHA256"
+          echo "sha256=$SHA256" >> $GITHUB_ENV
+
+      - name: Update Homebrew Formula
+        run: |
+          brew bump-formula-pr --strict corgea-cli \
+            --url=${{ env.tarball_url }} \
+            --sha256=${{ env.sha256 }} \
+            --no-browse \
+            --no-fork \
+            --force
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
