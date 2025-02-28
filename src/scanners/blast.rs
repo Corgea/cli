@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 
 
-pub fn run(config: &Config, fail_on: Option<String>, fail: &bool) {
+pub fn run(config: &Config, fail_on: Option<String>, fail: &bool, only_uncommitted: &bool) {
     println!(
         "\nScanning with BLAST 🚀🚀🚀"
     );
@@ -34,14 +34,53 @@ pub fn run(config: &Config, fail_on: Option<String>, fail: &bool) {
             std::process::exit(1);
         }
     }
-    match utils::generic::create_zip_from_filtered_files(".", None, &zip_path) {
-        Ok(_) => { },
-        Err(e) => {
-            eprintln!(
-                "\n\nUh-oh! We couldn't package your project at '{}'.\nThis might be due to insufficient permissions, invalid file paths, or a file system error.\nPlease check the directory and try again.\nError details:\n{}\n\n", 
-                zip_path, e
-            );
-            std::process::exit(1);
+
+    if *only_uncommitted {
+        match utils::generic::get_untracked_and_modified_files("./") {
+            Ok(files) => {
+                let files_to_zip: Vec<(std::path::PathBuf, std::path::PathBuf)> = files
+                    .iter()
+                    .map(|file| (std::path::PathBuf::from(file), std::path::PathBuf::from(file)))
+                    .collect();
+                println!("\nFiles to be submitted for partial scan:\n");
+                for (index, (_, original)) in files_to_zip.iter().enumerate() {
+                    println!("{}: {}", index + 1, original.display());
+                }
+                if files_to_zip.is_empty() {
+                    eprintln!(
+                        "\n\nOops! It seems there are no uncommitted changes to scan in your project.\nPlease ensure you have made changes that need to be scanned.\n\n", 
+                    );
+                    std::process::exit(1);
+                }
+                match utils::generic::create_zip_from_list_of_files(files_to_zip, &zip_path, None) {
+                    Ok(_) => {},
+                    Err(e) => {
+                        eprintln!(
+                            "\n\nUh-oh! We couldn't package your project at '{}'.\nThis might be due to insufficient permissions, invalid file paths, or a file system error.\nPlease check the directory and try again.\nError details:\n{}\n\n", 
+                            zip_path, e
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "\n\nFailed to retrieve untracked and modified files.\nError details:\n{}\n\n", 
+                    e
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match utils::generic::create_zip_from_filtered_files(".", None, &zip_path) {
+            Ok(_) => { },
+            Err(e) => {
+                eprintln!(
+                    "\n\nUh-oh! We couldn't package your project at '{}'.\nThis might be due to insufficient permissions, invalid file paths, or a file system error.\nPlease check the directory and try again.\nError details:\n{}\n\n", 
+                    zip_path, e
+                );
+                std::process::exit(1);
+            }
         }
     }
     println!("\n\nSubmitting scan to Corgea:");
