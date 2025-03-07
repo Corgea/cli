@@ -50,6 +50,9 @@ enum Commands {
         #[arg(long, help = "Fail on (exits with error code 1) a specific severity level . Valid options are CR, HI, ME, LO.")]
         fail_on: Option<String>,
 
+        #[arg(long, help = "Only scan uncommitted changes.")]
+        only_uncommitted: bool,
+
         #[arg(short, long, help = "Fail on (exits with error code 1) based on blocking rules defined in the web app.")]
         fail: bool,
     },
@@ -165,7 +168,7 @@ fn main() {
                 }
             }
         }
-        Some(Commands::Scan { scanner , fail_on, fail }) => {
+        Some(Commands::Scan { scanner , fail_on, fail, only_uncommitted }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             if let Some(level) = fail_on {
                 if *scanner != Scanner::Blast {
@@ -190,7 +193,7 @@ fn main() {
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config),
                 Scanner::Semgrep => scan::run_semgrep(&corgea_config),
-                Scanner::Blast => scanners::blast::run(&corgea_config, fail_on.clone(), fail)
+                Scanner::Blast => scanners::blast::run(&corgea_config, fail_on.clone(), fail, only_uncommitted)
             }
         }
         Some(Commands::Wait { scan_id }) => {
