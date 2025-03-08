@@ -1,4 +1,3 @@
-mod login;
 mod config;
 mod scan;
 mod wait;
@@ -125,7 +124,7 @@ fn main() {
             eprintln!("No token set.\nPlease run 'corgea login' to authenticate.\nFor more info checkout our docs at Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli");
             std::process::exit(1);
         }
-        match login::verify_token(config.get_token().as_str(), config.get_url().as_str()) {
+        match utils::api::verify_token(config.get_token().as_str(), config.get_url().as_str()) {
             Ok(true) => {
                 return;
             }
@@ -141,7 +140,7 @@ fn main() {
     }
     match &cli.command {
         Some(Commands::Login { token }) => {
-            match login::verify_token(token, corgea_config.get_url().as_str()) {
+            match utils::api::verify_token(token, corgea_config.get_url().as_str()) {
                 Ok(true) => {
                     corgea_config.set_token(token.clone()).expect("Failed to set token");
                     println!("Successfully authenticated to Corgea.")
