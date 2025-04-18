@@ -31,7 +31,14 @@ fn check_for_warnings(headers: &HeaderMap, status: StatusCode) {
     }
 }
 
-pub fn upload_zip(file_path: &str , token: &str, url: &str, project_name: &str, repo_info: Option<utils::generic::RepoInfo>) -> Result<String, Box<dyn std::error::Error>> {
+pub fn upload_zip(
+    file_path: &str , 
+    token: &str, 
+    url: &str, 
+    project_name: &str, 
+    repo_info: Option<utils::generic::RepoInfo>,
+    scan_type: Option<String>
+) -> Result<String, Box<dyn std::error::Error>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5 * 60))
         .build()
@@ -117,7 +124,9 @@ pub fn upload_zip(file_path: &str , token: &str, url: &str, project_name: &str, 
                 form = form.part("sha", multipart::Part::text(sha.to_string()));
             }
         }
-
+        if let Some(scan_type) = scan_type.clone() {
+            form = form.part("scan_type", multipart::Part::text(scan_type.to_string()));
+        }
 
         let response = match client
         .patch(format!("{}{}/start-scan/{}/", url, API_BASE, transfer_id))

@@ -1,6 +1,6 @@
 use crate::utils::terminal;
 
-pub fn setup_pre_commit_hook() {
+pub fn setup_pre_commit_hook(include_default_scan_types: bool) {
     println!("Setting up pre-commit hook...");
 
     // Check if we're in a git repo
@@ -36,11 +36,36 @@ pub fn setup_pre_commit_hook() {
         }
     }
 
+    // Determine scan types to include
+    let mut scan_types = Vec::new();
+    if include_default_scan_types {
+        scan_types.push("pii");
+        scan_types.push("secrets");
+    } else {
+        if terminal::ask_yes_no("Include base scan?", true) {
+            scan_types.push("base");
+        }
+        if terminal::ask_yes_no("Include policy scan?", true) {
+            scan_types.push("policy");
+        }
+        if terminal::ask_yes_no("Include pii scan?", true) {
+            scan_types.push("pii");
+        }
+        if terminal::ask_yes_no("Include secrets scan?", true) {
+            scan_types.push("secrets");
+        }
+        if terminal::ask_yes_no("Include malicious scan?", true) {
+            scan_types.push("malicious");
+        }
+    }
+
+    // Determine fail-on severity levels to include
+
     // Create pre-commit hook content
-    let hook_content = r#"#!/bin/sh
+    let hook_content = format!(r#"#!/bin/sh
 # Corgea pre-commit hook
-corgea scan --only-uncommitted
-"#;
+corgea scan blast --only-uncommitted --fail-on 'CR,HI,ME,LO' --scan-type {}
+"#, scan_types.join(","));
 
     // Write pre-commit hook
     std::fs::write(&pre_commit_path, hook_content).unwrap_or_else(|e| {
@@ -48,7 +73,6 @@ corgea scan --only-uncommitted
         std::process::exit(1);
     });
 
-    // Make hook executable
     #[cfg(unix)]
     std::fs::set_permissions(&pre_commit_path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .unwrap_or_else(|e| {
