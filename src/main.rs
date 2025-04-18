@@ -5,11 +5,12 @@ mod list;
 mod inspect;
 mod cicd;
 mod log;
+mod setup_hooks;
 mod scanners {
     pub mod fortify;
     pub mod blast;
 }
-mod utils{
+mod utils {
     pub mod terminal;
     pub mod generic;
     pub mod api;
@@ -97,6 +98,8 @@ enum Commands {
 
         id: String,
     },
+    /// Setup a git hook, currently only pre-commit is supported
+    SetupHooks,
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -185,10 +188,16 @@ fn main() {
                 std::process::exit(1);
             }
 
+            if *only_uncommitted && *scanner != Scanner::Blast {
+                eprintln!("only_uncommitted is only supported with blast scanner.");
+                std::process::exit(1);
+            }
+
             if *fail && fail_on.is_some() {
                 eprintln!("fail and fail_on cannot be used together.");
                 std::process::exit(1);
             }
+            
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config),
                 Scanner::Semgrep => scan::run_semgrep(&corgea_config),
@@ -210,6 +219,9 @@ fn main() {
         Some(Commands::Inspect { issue, json, id, summary, fix, diff}) => {
             verify_token_and_exit_when_fail(&corgea_config);
             inspect::run(&corgea_config, issue, json, summary, fix, diff, id)
+        }
+        Some(Commands::SetupHooks) => {
+            setup_hooks::setup_pre_commit_hook();
         }
         None => {
             utils::terminal::show_welcome_message();
