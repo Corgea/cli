@@ -160,6 +160,32 @@ pub fn upload_zip(file_path: &str , token: &str, url: &str, project_name: &str, 
     Err("Failed to upload file".into())
 }
 
+pub fn get_all_issues(url: &str, token: &str, project: &str, scan_id: Option<String>) -> Result<Vec<Issue>, Box<dyn std::error::Error>> {
+    let mut all_issues = Vec::new();
+    let mut current_page: u32 = 1;
+    
+    loop {
+        let response = match get_scan_issues(url, token, project, Some(current_page as u16), Some(30), scan_id.clone()) {
+            Ok(response) => response,
+            Err(e) => return Err(format!("Failed to get scan issues: {}", e).into())
+        };
+        
+        if let Some(mut issues) = response.issues {
+            if issues.is_empty() {
+                break;
+            }
+            all_issues.append(&mut issues);
+            if current_page >= response.total_pages {
+                break;
+            }
+            current_page += 1;
+        } else {
+            return Err("No issues found in response".into());
+        }
+    }
+
+    Ok(all_issues)
+}
 
 pub fn get_scan_issues(
     url: &str, 
@@ -312,7 +338,7 @@ pub fn query_scan_list(
 
 
 pub fn verify_token(token: &str, corgea_url: &str) -> Result<bool, Box<dyn Error>> {
-    let url = format!("{}{}/cli/verify", corgea_url, API_BASE);
+    let url = format!("{}{}/verify", corgea_url, API_BASE);
     let client = reqwest::blocking::Client::new();
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
