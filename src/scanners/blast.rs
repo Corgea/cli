@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 pub fn run(config: &Config, fail_on: Option<String>, fail: &bool, only_uncommitted: &bool) {
     println!(
-        "\nScanning with BLAST 🚀🚀🚀"
+        "\nScanning with BLAST 🚀🚀🚀\n\n"
     );
     let temp_dir = env::temp_dir().join(format!("corgea/tmp/{}", Uuid::new_v4()));
     fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
@@ -35,6 +35,12 @@ pub fn run(config: &Config, fail_on: Option<String>, fail: &bool, only_uncommitt
         }
     }
 
+    let stop_signal = Arc::new(Mutex::new(false));
+    let stop_signal_clone = Arc::clone(&stop_signal);
+    let packaging_thread = thread::spawn(move || {
+        utils::terminal::show_loading_message("Packaging your project... ([T]s)", stop_signal_clone);
+    });
+
     if *only_uncommitted {
         match utils::generic::get_untracked_and_modified_files("./") {
             Ok(files) => {
@@ -42,11 +48,14 @@ pub fn run(config: &Config, fail_on: Option<String>, fail: &bool, only_uncommitt
                     .iter()
                     .map(|file| (std::path::PathBuf::from(file), std::path::PathBuf::from(file)))
                     .collect();
-                println!("\nFiles to be submitted for partial scan:\n");
+                println!("\rFiles to be submitted for partial scan:\n");
                 for (index, (_, original)) in files_to_zip.iter().enumerate() {
                     println!("{}: {}", index + 1, original.display());
                 }
+                print!("\n\n");
                 if files_to_zip.is_empty() {
+                    *stop_signal.lock().unwrap() = true;
+                    print!("\r{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset));
                     eprintln!(
                         "\n\nOops! It seems there are no uncommitted changes to scan in your project.\nPlease ensure you have made changes that need to be scanned.\n\n", 
                     );
@@ -55,6 +64,8 @@ pub fn run(config: &Config, fail_on: Option<String>, fail: &bool, only_uncommitt
                 match utils::generic::create_zip_from_list_of_files(files_to_zip, &zip_path, None) {
                     Ok(_) => {},
                     Err(e) => {
+                        *stop_signal.lock().unwrap() = true;
+                        print!("\r{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset));
                         eprintln!(
                             "\n\nUh-oh! We couldn't package your project at '{}'.\nThis might be due to insufficient permissions, invalid file paths, or a file system error.\nPlease check the directory and try again.\nError details:\n{}\n\n", 
                             zip_path, e
@@ -64,6 +75,8 @@ pub fn run(config: &Config, fail_on: Option<String>, fail: &bool, only_uncommitt
                 }
             },
             Err(e) => {
+                *stop_signal.lock().unwrap() = true;
+                print!("\r{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset));
                 eprintln!(
                     "\n\nFailed to retrieve untracked and modified files.\nError details:\n{}\n\n", 
                     e
@@ -75,6 +88,8 @@ pub fn run(config: &Config, fail_on: Option<String>, fail: &bool, only_uncommitt
         match utils::generic::create_zip_from_filtered_files(".", None, &zip_path) {
             Ok(_) => { },
             Err(e) => {
+                *stop_signal.lock().unwrap() = true;
+                print!("\r{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset));
                 eprintln!(
                     "\n\nUh-oh! We couldn't package your project at '{}'.\nThis might be due to insufficient permissions, invalid file paths, or a file system error.\nPlease check the directory and try again.\nError details:\n{}\n\n", 
                     zip_path, e
@@ -83,6 +98,9 @@ pub fn run(config: &Config, fail_on: Option<String>, fail: &bool, only_uncommitt
             }
         }
     }
+    *stop_signal.lock().unwrap() = true;
+    let _ = packaging_thread.join();
+    print!("\r{}Project packaged successfully.\n", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Green));
     println!("\n\nSubmitting scan to Corgea:");
     let scan_id = match utils::api::upload_zip(&zip_path, &config.get_token(), &config.get_url(), &project_name, repo_info) {
         Ok(result) => result,
@@ -108,7 +126,7 @@ pub fn run(config: &Config, fail_on: Option<String>, fail: &bool, only_uncommitt
     print!(
         "\n\nScan has started with ID: {}.\n\nYou can view it populate at the link:\n{}\n\n",
         scan_id,
-        utils::terminal::set_text_color(&format!("{}/scan?scan_id={}", config.get_url(), scan_id), utils::terminal::TerminalColor::Green)
+        utils::terminal::set_text_color(&format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id), utils::terminal::TerminalColor::Green)
     );
 
     print!(
@@ -122,7 +140,7 @@ pub fn run(config: &Config, fail_on: Option<String>, fail: &bool, only_uncommitt
         Ok(issues_classes) => {
             println!(
                 "\n\nYou can view the scan results at the following link:\n{}",
-                utils::terminal::set_text_color(&format!("{}/scan?scan_id={}", config.get_url(), scan_id), utils::terminal::TerminalColor::Green)
+                utils::terminal::set_text_color(&format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id), utils::terminal::TerminalColor::Green)
             );
             issues_classes
         },
@@ -139,7 +157,7 @@ pub fn run(config: &Config, fail_on: Option<String>, fail: &bool, only_uncommitt
                     utils::terminal::TerminalColor::Red
                 ),
                 utils::terminal::set_text_color(
-                    &format!("{}/scan?scan_id={}", config.get_url(), scan_id),
+                    &format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id),
                     utils::terminal::TerminalColor::Blue
                 ),
                 config.get_url(),
@@ -159,7 +177,7 @@ pub fn run(config: &Config, fail_on: Option<String>, fail: &bool, only_uncommitt
         if blocking_rules.block {
             println!("\nExiting with error code 1 due to some issues violating some blocking rules defined for this project.\nfor more details, please check the scan results at the link: {}\nAlternatively, you can run {} to view the issues list on your local machine.",
             utils::terminal::set_text_color(
-                &format!("{}/scan?scan_id={}", config.get_url(), scan_id),
+                &format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id),
                 utils::terminal::TerminalColor::Green
             ), 
             utils::terminal::set_text_color(
@@ -267,15 +285,14 @@ pub fn check_scan_status(scan_id: &str, url: &str, token: &str) -> Result<bool, 
 
 
 pub fn fetch_and_group_scan_issues(url: &str, token: &str, project: &str) -> Result<HashMap<String, usize>, Box<dyn std::error::Error>> {
-    let body = match utils::api::get_scan_issues(url, token, project, None, None, None) {
+    let issues = match utils::api::get_all_issues(url, token, project, None) {
         Ok(issues) => issues,
         Err(err) => {
             return Err(format!("Failed to fetch scan issues: {}", err).into());
         }
     };
-    let issues = body.issues.unwrap_or_default();
     let mut classification_counts: HashMap<String, usize> = HashMap::new();
-    if body.status == "ok" && issues.len() > 0 {
+    if !issues.is_empty() {
         for issue in &issues {
             *classification_counts.entry(issue.urgency.clone()).or_insert(0) += 1;
         }

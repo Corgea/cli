@@ -57,7 +57,7 @@ pub fn run(config: &Config, scan_id: Option<String>) {
         print!(
             "\n\nWaiting for scan with ID: {}.\n\nYou can view it populate at the link:\n{}\n\n",
             scan_id,
-            utils::terminal::set_text_color(&format!("{}/scan?scan_id={}", config.get_url(), scan_id), utils::terminal::TerminalColor::Green)
+            utils::terminal::set_text_color(&format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id), utils::terminal::TerminalColor::Green)
         );
         print!(
            "{}",
@@ -72,7 +72,7 @@ pub fn run(config: &Config, scan_id: Option<String>) {
         Ok(_) => {
             println!(
                 "\n\nYou can view the scan results at the following link:\n{}",
-                utils::terminal::set_text_color(&format!("{}/scan?scan_id={}", config.get_url(), scan_id), utils::terminal::TerminalColor::Green)
+                utils::terminal::set_text_color(&format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id), utils::terminal::TerminalColor::Green)
             );
         },
         Err(e) => {
@@ -88,7 +88,7 @@ pub fn run(config: &Config, scan_id: Option<String>) {
                     utils::terminal::TerminalColor::Red
                 ),
                 utils::terminal::set_text_color(
-                    &format!("{}/scan?scan_id={}", config.get_url(), scan_id),
+                    &format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id),
                     utils::terminal::TerminalColor::Blue
                 ),
                 config.get_url(),
