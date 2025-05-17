@@ -59,6 +59,13 @@ enum Commands {
         #[arg(
             short,
             long,
+            help = "Specify the policies to use by their ids. can use comma separated values to specify multiple policies."
+        )]
+        policy: Option<String>,
+
+        #[arg(
+            short,
+            long,
             help = "Specify the scan type. By default, a full scan is run, which includes all scan types. You can choose to run a partial scan by specifying one or more of the following types: base AI blast (base), malicious code detection (malicious), policy checks (policy), secret detection (secrets), and PII scan (pii). Use comma-separated values to run multiple types, e.g., 'policy,secrets,pii'."
         )]
         scan_type: Option<String>,
@@ -180,7 +187,7 @@ fn main() {
                 }
             }
         }
-        Some(Commands::Scan { scanner , fail_on, fail, only_uncommitted, scan_type }) => {
+        Some(Commands::Scan { scanner , fail_on, fail, only_uncommitted, scan_type, policy }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             if let Some(level) = fail_on {
                 if *scanner != Scanner::Blast {
@@ -222,11 +229,26 @@ fn main() {
                     }
                 }
             }
-
+            if let Some(policy) = policy {
+                if policy.is_empty() {
+                    eprintln!("policy cannot be empty.");
+                    std::process::exit(1);
+                }
+                let policy_ids: Vec<_> = policy.split(',').map(|t| t.trim()).collect();
+                for policy_id in policy_ids {
+                    if policy_id.is_empty() {
+                        eprintln!("One of the policy ids passed is empty.");
+                        std::process::exit(1);
+                    }
+                }
+                if scan_type.is_none() {
+                    eprintln!("\nWarning: you didn't specify an only policy scan, so all other types of scans will run as well.");
+                }
+            }
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config),
                 Scanner::Semgrep => scan::run_semgrep(&corgea_config),
-                Scanner::Blast => scanners::blast::run(&corgea_config, fail_on.clone(), fail, only_uncommitted, scan_type.clone())
+                Scanner::Blast => scanners::blast::run(&corgea_config, fail_on.clone(), fail, only_uncommitted, scan_type.clone(), policy.clone())
             }
         }
         Some(Commands::Wait { scan_id }) => {

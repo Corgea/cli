@@ -37,7 +37,8 @@ pub fn upload_zip(
     url: &str, 
     project_name: &str, 
     repo_info: Option<utils::generic::RepoInfo>,
-    scan_type: Option<String>
+    scan_type: Option<String>,
+    policy: Option<String>
 ) -> Result<String, Box<dyn std::error::Error>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5 * 60))
@@ -127,6 +128,9 @@ pub fn upload_zip(
         if let Some(scan_type) = scan_type.clone() {
             form = form.part("scan_type", multipart::Part::text(scan_type.to_string()));
         }
+        if let Some(policy) = policy.clone() {
+            form = form.part("target_policies", multipart::Part::text(policy.to_string()));
+        }
 
         let response = match client
         .patch(format!("{}{}/start-scan/{}/", url, API_BASE, transfer_id))
@@ -148,7 +152,11 @@ pub fn upload_zip(
             }
         };
         if !response.status().is_success() {
-            return Err(format!("Failed to upload file: {}", response.status()).into());
+            let status_code = response.status();
+            if status_code.is_client_error() && response.text().unwrap().contains("Invalid policy ids") {
+                return Err("Invalid policy ids passed. Please check the policy ids and try again.".into());
+            }
+            return Err(format!("Failed to upload file: {}", status_code).into());
 
         }
         utils::terminal::show_progress_bar(offset as f32 / file_size as f32);
