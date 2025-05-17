@@ -2,6 +2,7 @@ use crate::utils;
 use crate::config::Config;
 use std::path::Path;
 use serde_json::json;
+use crate::log::debug;
 
 pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>, page_size: &Option<u16>, scan_id: &Option<String>) {
     let project_name = utils::generic::get_current_working_directory().unwrap_or("unknown".to_string());
@@ -10,6 +11,7 @@ pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>, page
         let issues_response = match utils::api::get_scan_issues(&config.get_url(), &config.get_token(), &project_name, Some((*page).unwrap_or(1)), *page_size, scan_id.clone()) {
             Ok(response) => response,
             Err(e) => {
+                debug(&format!("Error Sending Request: {}", e.to_string()));
                 if e.to_string().contains("404") {
                     if scan_id.is_some() {
                         eprintln!("Scan with ID '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", scan_id.as_ref().unwrap());
@@ -141,13 +143,13 @@ pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>, page
             table.push(row);
         }
 
-        utils::terminal::print_table(table, Some(issues_response.page), Some(issues_response.total_pages));
+        utils::terminal::print_table(table, issues_response.page, issues_response.total_pages);
     } else {
         let (scans, page, total_pages) = match utils::api::query_scan_list(&config.get_url(), &config.get_token(), Some(&project_name), *page, *page_size) {
             Ok(scans) => {
                 let page = scans.page;
                 let total_pages = scans.total_pages;
-                let filtered_scans: Vec<utils::api::ScanResponse> = scans.scans.into_iter()
+                let filtered_scans: Vec<utils::api::ScanResponse> = scans.scans.unwrap_or_default().into_iter()
                     .filter(|scan| scan.project == project_name)
                     .collect();
                 (filtered_scans, page, total_pages)
@@ -208,6 +210,6 @@ pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>, page
             ]);
         }
 
-        utils::terminal::print_table(table, Some(page), Some(total_pages));
+        utils::terminal::print_table(table, page, total_pages);
     }
 }

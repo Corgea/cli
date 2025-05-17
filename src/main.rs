@@ -34,7 +34,13 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Authenticate to Corgea
-    Login { token: String },
+    Login { 
+        token: String,
+
+        #[arg(long, help = "The url of the corgea instance to use. defaults to https://www.corgea.app")]
+        url: Option<String>,
+    
+     },
     /// Upload a scan report to Corgea via STDIN or a file
     Upload {
         /// Option path to JSON report to upload
@@ -142,10 +148,13 @@ fn main() {
         }
     }
     match &cli.command {
-        Some(Commands::Login { token }) => {
-            match utils::api::verify_token(token, corgea_config.get_url().as_str()) {
+        Some(Commands::Login { token, url }) => {
+            match utils::api::verify_token(token, url.as_deref().unwrap_or(corgea_config.get_url().as_str())) {
                 Ok(true) => {
                     corgea_config.set_token(token.clone()).expect("Failed to set token");
+                    if let Some(url) = url {
+                        corgea_config.set_url(url.clone()).expect("Failed to set url");
+                    }
                     println!("Successfully authenticated to Corgea.")
                 }
                 Ok(false) => println!("Invalid token provided."),

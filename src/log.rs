@@ -1,7 +1,8 @@
-use std::env;
+use crate::config::Config;  
 
 pub fn debug(input: &str) {
-    if env::var("DEBUG").is_ok() {
-        println!("DEBUG: {}", input);
+    let config = Config::load().expect("Failed to load config");
+    if config.get_debug() == 1 {
+        println!("DEBUG: {}\n", input);
     }
 }

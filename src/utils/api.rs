@@ -10,7 +10,7 @@ use std::io::Read;
 use std::path::Path;
 use reqwest::{blocking::multipart, blocking::multipart::{Form, Part}};
 use serde_json::Value;
-
+use crate::log::debug;
 
 const CHUNK_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 const API_BASE: &str = "/api/v1";
@@ -175,8 +175,10 @@ pub fn get_all_issues(url: &str, token: &str, project: &str, scan_id: Option<Str
                 break;
             }
             all_issues.append(&mut issues);
-            if current_page >= response.total_pages {
-                break;
+            if let Some(total_pages) = response.total_pages {
+                if current_page >= total_pages {
+                    break;
+                }
             }
             current_page += 1;
         } else {
@@ -220,6 +222,9 @@ pub fn get_scan_issues(
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
 
+    debug(&format!("Sending request to URL: {}", url));
+    debug(&format!("Headers: {:?}", headers));
+
     let response = match client.get(&url).headers(headers).send() {
         Ok(res) => {
             check_for_warnings(res.headers(), res.status());
@@ -227,17 +232,18 @@ pub fn get_scan_issues(
         },
         Err(e) => return Err(format!("Failed to send request: {}", e).into()),
     };
-    match response.json::<ProjectIssuesResponse>() {
-        Ok(body) => {
-            if body.status == "ok" {
-                return Ok(body)
-            } else if body.status == "no_project_found" {
-                return Err("Project not found 404".into());
-            } else {
-                return Err("Server error 500".into());
-            }
-        },
-        Err(e) => Err(format!("Failed to parse response: {}", e).into()),
+    let response_text = response.text()?;
+    let project_issues_response: ProjectIssuesResponse = serde_json::from_str(&response_text).map_err(|e| {
+        debug(&format!("Failed to parse response: {}. Response body: {}", e, response_text));
+        format!("Failed to parse response: {}", e)
+    })?;
+    
+    if project_issues_response.status == "ok" {
+        Ok(project_issues_response)
+    } else if project_issues_response.status == "no_project_found" {
+        Err("Project not found 404".into())
+    } else {
+        Err("Server error 500".into())
     }
 }
 
@@ -248,7 +254,8 @@ pub fn get_scan(url: &str, token: &str, scan_id: &str) -> Result<ScanResponse, B
 
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
-
+    debug(&format!("Sending request to URL: {}", url));
+    debug(&format!("Headers: {:?}", headers));
     let response = client
         .get(&url)
         .headers(headers)
@@ -258,7 +265,11 @@ pub fn get_scan(url: &str, token: &str, scan_id: &str) -> Result<ScanResponse, B
     check_for_warnings(response.headers(), response.status());
 
     if response.status().is_success() {
-        let scan_response: ScanResponse = response.json().map_err(|e| format!("Failed to parse response: {}", e))?;
+        let response_text = response.text()?;
+        let scan_response: ScanResponse = serde_json::from_str(&response_text).map_err(|e| {
+            debug(&format!("Failed to parse response: {}. Response body: {}", e, response_text));
+            format!("Failed to parse response: {}", e)
+        })?;
         Ok(scan_response)
     } else {
         Err(format!("Error: Unable to fetch scan status. Status code: {}", response.status()).into())
@@ -276,6 +287,8 @@ pub fn get_issue(url: &str, token: &str, issue: &str) -> Result<FullIssueRespons
     let client = reqwest::blocking::Client::new();
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
+    debug(&format!("Sending request to URL: {}", url));
+    debug(&format!("Headers: {:?}", headers));
     let response = match client.get(&url).headers(headers).send() {
         Ok(res) => {
             check_for_warnings(res.headers(), res.status());
@@ -283,9 +296,13 @@ pub fn get_issue(url: &str, token: &str, issue: &str) -> Result<FullIssueRespons
         },
         Err(e) => return Err(format!("Failed to send request: {}", e).into()),
     };
-    return match response.json::<FullIssueResponse>() {
-            Ok(body) => Ok(body),
-            Err(e) => Err(format!("Failed to parse response: {}", e).into()),
+    let response_text = response.text()?;
+    return match serde_json::from_str::<FullIssueResponse>(&response_text) {
+        Ok(body) => Ok(body),
+        Err(e) => {
+            debug(&format!("Failed to parse response: {}. Response body: {}", e, response_text));
+            Err(format!("Failed to parse response: {}", e).into())
+        },
     };
 }
 
@@ -314,6 +331,8 @@ pub fn query_scan_list(
     let client = reqwest::blocking::Client::new(); 
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
+    debug(&format!("Sending request to URL: {}", url));
+    debug(&format!("Headers: {:?}", headers));
     let response = match client
         .get(url)
         .headers(headers)
@@ -326,7 +345,11 @@ pub fn query_scan_list(
             Err(e) => return Err(format!("API request failed: {}", e).into()), 
         };
         if response.status().is_success() {
-            let api_response: ScansResponse = response.json()?; 
+            let response_text = response.text()?;
+            let api_response: ScansResponse = serde_json::from_str(&response_text).map_err(|e| {
+                debug(&format!("Failed to parse response: {}. Response body: {}", e, response_text));
+                format!("Failed to parse response: {}", e)
+            })?;
             Ok(api_response)
         } else {
             Err(format!(
@@ -342,6 +365,8 @@ pub fn verify_token(token: &str, corgea_url: &str) -> Result<bool, Box<dyn Error
     let client = reqwest::blocking::Client::new();
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
+    debug(&format!("Sending request to URL: {}", url));
+    debug(&format!("Headers: {:?}", headers));
 
     let response = client
         .get(url)
@@ -351,14 +376,18 @@ pub fn verify_token(token: &str, corgea_url: &str) -> Result<bool, Box<dyn Error
     check_for_warnings(response.headers(), response.status());
 
     if response.status().is_success() {
-        let body: HashMap<String, String> = response.json()?;
+        let body_text = response.text()?;
+        let body: HashMap<String, String> = match serde_json::from_str(&body_text) {
+            Ok(json) => json,
+            Err(e) => {
+                debug(&format!("Failed to parse response as JSON: {}. Response body: {}", e, body_text));
+                return Err(format!("Failed to parse response").into());
+            }
+        };
 
         Ok(body.get("status").map(|s| s == "ok").unwrap_or(false))
     } else {
-        Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Request failed with status: {}", response.status()),
-        )))
+        Err(format!("Request failed with status: {}", response.status()).into())
     }
 }
 
@@ -416,8 +445,8 @@ pub struct ScanResponse  {
 pub struct ProjectIssuesResponse {    
     pub status: String,
     pub issues: Option<Vec<Issue>>,
-    pub page: u32,
-    pub total_pages: u32,
+    pub page: Option<u32>,
+    pub total_pages: Option<u32>,
     pub total_issues: Option<u32>
 }
 
@@ -425,9 +454,9 @@ pub struct ProjectIssuesResponse {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ScansResponse {
     pub status: String,
-    pub page: u32,
-    pub total_pages: u32,
-    pub scans: Vec<ScanResponse>,
+    pub page: Option<u32>,
+    pub total_pages: Option<u32>,
+    pub scans: Option<Vec<ScanResponse>>,
 }
 
 
