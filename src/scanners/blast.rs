@@ -10,7 +10,14 @@ use uuid::Uuid;
 
 
 
-pub fn run(config: &Config, fail_on: Option<String>, fail: &bool, only_uncommitted: &bool) {
+pub fn run(
+    config: &Config, 
+    fail_on: Option<String>, 
+    fail: &bool, 
+    only_uncommitted: &bool,
+    scan_type: Option<String>,
+    policy: Option<String>,
+) {
     println!(
         "\nScanning with BLAST 🚀🚀🚀\n\n"
     );
@@ -102,7 +109,7 @@ pub fn run(config: &Config, fail_on: Option<String>, fail: &bool, only_uncommitt
     let _ = packaging_thread.join();
     print!("\r{}Project packaged successfully.\n", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Green));
     println!("\n\nSubmitting scan to Corgea:");
-    let scan_id = match utils::api::upload_zip(&zip_path, &config.get_token(), &config.get_url(), &project_name, repo_info) {
+    let scan_id = match utils::api::upload_zip(&zip_path, &config.get_token(), &config.get_url(), &project_name, repo_info, scan_type, policy) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("\n\nOh no! We encountered an issue while uploading the zip file '{}' to the server.\nPlease ensure that:
