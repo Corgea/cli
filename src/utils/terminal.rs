@@ -175,7 +175,7 @@ pub fn prompt_to_continue_or_exit(message: Option<&str>) {
 
 
 
-pub fn print_table(table: Vec<Vec<String>>, page:  Option<u32>, total_pages: Option<u32>) {
+pub fn print_table(table: Vec<Vec<String>>, page: Option<u32>, total_pages: Option<u32>) {
     let columns = table.iter().enumerate().fold(vec![vec![]; table[0].len()], |mut acc, (_i, row)| {
         for (j, cell) in row.iter().enumerate() {
             acc[j].push(cell.clone());
@@ -192,11 +192,8 @@ pub fn print_table(table: Vec<Vec<String>>, page:  Option<u32>, total_pages: Opt
         }
         println!();
     }
-    if let Some(page) = page {
-        if let Some(total_pages) = total_pages {
-            println!("\n\n{:-<20}", "-");
-            println!("Showing page {} of {}.", page, total_pages);
-        }
+    if let (Some(page), Some(total_pages)) = (page, total_pages) {
+        println!("\nPage {} of {}", page, total_pages);
     }
 }
 
