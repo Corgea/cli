@@ -368,7 +368,7 @@ pub fn check_blocking_rules(
     sast_scan_id: &str,
     page: Option<u32>
 ) -> Result<BlockingRuleResponse, Box<dyn Error>> {
-    let url = format!("{}{}/sast_scans/{}/check_blocking_rules", url, API_BASE, sast_scan_id);
+    let url = format!("{}{}/scan/{}/check_blocking_rules", url, API_BASE, sast_scan_id);
     let page = page.unwrap_or(1);
     let query_params = vec![("page", page.to_string())];
 
