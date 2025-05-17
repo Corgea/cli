@@ -77,11 +77,17 @@ impl Config {
     }
 
     pub fn get_url(&self) -> String {
-        if let Ok(corgea_url) = env::var("CORGEA_URL") {
-            return corgea_url;
-        }
+        let url = if let Ok(corgea_url) = env::var("CORGEA_URL") {
+            corgea_url
+        } else {
+            self.url.clone()
+        };
 
-        return self.url.clone();
+        if url.ends_with('/') {
+            url.trim_end_matches('/').to_string()
+        } else {
+            url
+        }
     }
 
     pub fn get_token(&self) -> String {
