@@ -173,7 +173,25 @@ pub fn prompt_to_continue_or_exit(message: Option<&str>) {
     std::io::stdin().read_line(&mut input).unwrap();
 }
 
-
+pub fn ask_yes_no(question: &str, should_default: bool) -> bool {
+    loop {
+        print!("{} (y/n): ", question);
+        io::stdout().flush().unwrap();
+        
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        
+        match input.trim().to_lowercase().as_str() {
+            "y" | "yes" => return true,
+            "n" | "no" => return false,
+            _ => if should_default {
+                return true;
+            } else {
+                println!("Please answer with yes/y or no/n");
+            }
+        }
+    }
+}
 
 pub fn print_table(table: Vec<Vec<String>>, page: Option<u32>, total_pages: Option<u32>) {
     let columns = table.iter().enumerate().fold(vec![vec![]; table[0].len()], |mut acc, (_i, row)| {
