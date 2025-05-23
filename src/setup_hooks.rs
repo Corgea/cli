@@ -64,7 +64,7 @@ pub fn setup_pre_commit_hook(include_default_scan_types: bool) {
     // Create pre-commit hook content
     let hook_content = format!(r#"#!/bin/sh
 # Corgea pre-commit hook
-corgea scan blast --only-uncommitted --fail-on 'CR,HI,ME,LO' --scan-type {}
+corgea scan blast --only-uncommitted --fail-on LO --scan-type {}
 "#, scan_types.join(","));
 
     // Write pre-commit hook

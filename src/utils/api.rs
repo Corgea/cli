@@ -126,7 +126,7 @@ pub fn upload_zip(
             }
         }
         if let Some(scan_type) = scan_type.clone() {
-            form = form.part("scan_type", multipart::Part::text(scan_type.to_string()));
+            form = form.part("scan_configs", multipart::Part::text(scan_type.to_string()));
         }
         if let Some(policy) = policy.clone() {
             form = form.part("target_policies", multipart::Part::text(policy.to_string()));
