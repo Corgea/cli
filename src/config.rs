@@ -58,6 +58,10 @@ impl Config {
 
     pub fn set_token(&mut self, token: String) -> io::Result<()> {
         self.token = token;
+        self.save()
+    }
+
+    pub fn save(&self) -> io::Result<()> {
         let toml = toml::to_string(self).expect("Failed to serialize config");
 
         let file_path = Self::config_path()?;
@@ -67,12 +71,23 @@ impl Config {
         Ok(())
     }
 
-    pub fn get_url(&self) -> String {
-        if let Ok(corgea_url) = env::var("CORGEA_URL") {
-            return corgea_url;
-        }
+    pub fn set_url(&mut self, url: String) -> io::Result<()> {
+        self.url = url;
+        self.save()
+    }
 
-        return self.url.clone();
+    pub fn get_url(&self) -> String {
+        let url = if let Ok(corgea_url) = env::var("CORGEA_URL") {
+            corgea_url
+        } else {
+            self.url.clone()
+        };
+
+        if url.ends_with('/') {
+            url.trim_end_matches('/').to_string()
+        } else {
+            url
+        }
     }
 
     pub fn get_token(&self) -> String {
@@ -81,5 +96,12 @@ impl Config {
         }
 
         return self.token.clone();
+    }
+    pub fn get_debug(&self) -> i8 {
+        if let Ok(corgea_debug) = env::var("CORGEA_DEBUG") {
+            return corgea_debug.parse::<i8>().unwrap_or(0);
+        }
+
+        return self.debug;
     }
 }
