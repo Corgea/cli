@@ -5,11 +5,12 @@ mod list;
 mod inspect;
 mod cicd;
 mod log;
+mod setup_hooks;
 mod scanners {
     pub mod fortify;
     pub mod blast;
 }
-mod utils{
+mod utils {
     pub mod terminal;
     pub mod generic;
     pub mod api;
@@ -60,6 +61,20 @@ enum Commands {
 
         #[arg(short, long, help = "Fail on (exits with error code 1) based on blocking rules defined in the web app.")]
         fail: bool,
+
+        #[arg(
+            short,
+            long,
+            help = "Specify the policies to use by their ids. can use comma separated values to specify multiple policies."
+        )]
+        policy: Option<String>,
+
+        #[arg(
+            short,
+            long,
+            help = "Specify the scan type. By default, a full scan is run, which includes all scan types. You can choose to run a partial scan by specifying one or more of the following types: base AI blast (base), malicious code detection (malicious), policy checks (policy), secret detection (secrets), and PII scan (pii). Use comma-separated values to run multiple types, e.g., 'policy,secrets,pii'."
+        )]
+        scan_type: Option<String>,
     },
     /// Wait for the latest in progress scan
     Wait {
@@ -102,6 +117,11 @@ enum Commands {
         diff: bool,
 
         id: String,
+    },
+    /// Setup a git hook, currently only pre-commit is supported
+    SetupHooks {
+        #[arg(long, short, help = "Include default config (scan types are pii, secrets and fail on levels are CR, HI, ME, LO).")]
+        default_config: bool,
     },
 }
 
@@ -176,7 +196,7 @@ fn main() {
                 }
             }
         }
-        Some(Commands::Scan { scanner , fail_on, fail, only_uncommitted }) => {
+        Some(Commands::Scan { scanner , fail_on, fail, only_uncommitted, scan_type, policy }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             if let Some(level) = fail_on {
                 if *scanner != Scanner::Blast {
@@ -194,14 +214,50 @@ fn main() {
                 std::process::exit(1);
             }
 
+            if *only_uncommitted && *scanner != Scanner::Blast {
+                eprintln!("only_uncommitted is only supported with blast scanner.");
+                std::process::exit(1);
+            }
+
             if *fail && fail_on.is_some() {
                 eprintln!("fail and fail_on cannot be used together.");
                 std::process::exit(1);
             }
+
+            if let Some(scan_type) = scan_type {
+                if scan_type.is_empty() {
+                    eprintln!("scan_type cannot be empty.");
+                    std::process::exit(1);
+                }
+                let supported_scan_types = ["base", "malicious", "policy", "secrets", "pii"];
+                let scan_types: Vec<_> = scan_type.split(',').map(|t| t.trim()).collect();
+                for scan in scan_types {
+                    if !supported_scan_types.contains(&scan) {
+                        eprintln!("Invalid scan_type: {}. Supported types are: base, malicious, policy, secrets, pii.", scan);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            if let Some(policy) = policy {
+                if policy.is_empty() {
+                    eprintln!("policy cannot be empty.");
+                    std::process::exit(1);
+                }
+                let policy_ids: Vec<_> = policy.split(',').map(|t| t.trim()).collect();
+                for policy_id in policy_ids {
+                    if policy_id.is_empty() {
+                        eprintln!("One of the policy ids passed is empty.");
+                        std::process::exit(1);
+                    }
+                }
+                if scan_type.is_none() {
+                    eprintln!("\nWarning: you didn't specify an only policy scan, so all other types of scans will run as well.");
+                }
+            }
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config),
                 Scanner::Semgrep => scan::run_semgrep(&corgea_config),
-                Scanner::Blast => scanners::blast::run(&corgea_config, fail_on.clone(), fail, only_uncommitted)
+                Scanner::Blast => scanners::blast::run(&corgea_config, fail_on.clone(), fail, only_uncommitted, scan_type.clone(), policy.clone())
             }
         }
         Some(Commands::Wait { scan_id }) => {
@@ -219,6 +275,9 @@ fn main() {
         Some(Commands::Inspect { issue, json, id, summary, fix, diff}) => {
             verify_token_and_exit_when_fail(&corgea_config);
             inspect::run(&corgea_config, issue, json, summary, fix, diff, id)
+        }
+        Some(Commands::SetupHooks { default_config }) => {
+            setup_hooks::setup_pre_commit_hook(*default_config);
         }
         None => {
             utils::terminal::show_welcome_message();
