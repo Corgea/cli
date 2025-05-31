@@ -126,6 +126,11 @@ pub fn upload_zip(
             }
         }
         if let Some(scan_type) = scan_type.clone() {
+            let scan_type = if scan_type.contains("blast") {
+                "base".to_string()
+            } else {
+                scan_type
+            };
             form = form.part("scan_configs", multipart::Part::text(scan_type.to_string()));
         }
         if let Some(policy) = policy.clone() {
