@@ -72,7 +72,7 @@ enum Commands {
         #[arg(
             short,
             long,
-            help = "Specify the scan type. By default, a full scan is run, which includes all scan types. You can choose to run a partial scan by specifying one or more of the following types: base AI blast (base), malicious code detection (malicious), policy checks (policy), secret detection (secrets), and PII scan (pii). Use comma-separated values to run multiple types, e.g., 'policy,secrets,pii'."
+            help = "Specify the scan type. By default, a full scan is run, which includes all scan types. You can choose to run a partial scan by specifying one or more of the following types: base AI blast (blast), malicious code detection (malicious), policy checks (policy), secret detection (secrets), and PII scan (pii). Use comma-separated values to run multiple types, e.g., 'policy,secrets,pii'."
         )]
         scan_type: Option<String>,
     },
@@ -229,11 +229,11 @@ fn main() {
                     eprintln!("scan_type cannot be empty.");
                     std::process::exit(1);
                 }
-                let supported_scan_types = ["base", "malicious", "policy", "secrets", "pii"];
+                let supported_scan_types = ["blast", "malicious", "policy", "secrets", "pii"];
                 let scan_types: Vec<_> = scan_type.split(',').map(|t| t.trim()).collect();
                 for scan in scan_types {
                     if !supported_scan_types.contains(&scan) {
-                        eprintln!("Invalid scan_type: {}. Supported types are: base, malicious, policy, secrets, pii.", scan);
+                        eprintln!("Invalid scan_type: {}. Supported types are: blast, malicious, policy, secrets, pii.", scan);
                         std::process::exit(1);
                     }
                 }

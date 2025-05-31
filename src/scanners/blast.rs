@@ -19,8 +19,16 @@ pub fn run(
     policy: Option<String>,
 ) {
     println!(
-        "\nScanning with BLAST 🚀🚀🚀\n\n"
+        "\nScanning with BLAST 🚀🚀🚀"
     );
+
+    if let Some(scan_type) = &scan_type {
+        println!("Running Scan Type: {}", scan_type);
+    }
+    if let Some(policy) = &policy {
+        println!("Including only specified policies for policy scan: {}", policy);
+    }
+    println!("\n\n");
     let temp_dir = env::temp_dir().join(format!("corgea/tmp/{}", Uuid::new_v4()));
     fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
     let project_name = utils::generic::get_current_working_directory().unwrap_or("unknown".to_string());
