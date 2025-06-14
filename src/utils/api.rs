@@ -298,6 +298,30 @@ pub fn get_scan(url: &str, token: &str, scan_id: &str) -> Result<ScanResponse, B
     }
 }
 
+pub fn get_scan_report(url: &str, token: &str, scan_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let url = format!("{}{}/scan/{}/report", url, API_BASE, scan_id);
+
+    let client = reqwest::blocking::Client::new();
+    let mut headers = HeaderMap::new();
+    headers.insert("CORGEA-TOKEN", token.parse().unwrap());
+
+    debug(&format!("Sending request to URL: {}", url));
+    debug(&format!("Headers: {:?}", headers));
+
+    let response = client
+        .get(&url)
+        .headers(headers)
+        .send()
+        .map_err(|e| format!("Failed to send request: {}", e))?;
+
+    check_for_warnings(response.headers(), response.status());
+
+    if response.status().is_success() {
+        Ok(response.text()?)
+    } else {
+        Err(format!("Error: Unable to fetch scan report. Status code: {}", response.status()).into())
+    }
+}
 
 pub fn get_issue(url: &str, token: &str, issue: &str) -> Result<FullIssueResponse, Box<dyn std::error::Error>> {
     let url = format!(
@@ -595,4 +619,3 @@ pub struct BlockingIssue {
     pub id: String,
     pub triggered_by_rules: Vec<String>
 }
-

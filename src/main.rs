@@ -75,6 +75,12 @@ enum Commands {
             help = "Specify the scan type. By default, a full scan is run, which includes all scan types. You can choose to run a partial scan by specifying one or more of the following types: base AI blast (blast), malicious code detection (malicious), policy checks (policy), secret detection (secrets), and PII scan (pii). Use comma-separated values to run multiple types, e.g., 'policy,secrets,pii'."
         )]
         scan_type: Option<String>,
+
+        #[arg(long, help = "Output the result to a file in a specific format. Valid options are json, html.")]
+        out_format: Option<String>,
+
+        #[arg(short, long, help = "Output the result to a file. you can use the out_format option to specify the format of the output file.")]
+        out_file: Option<String>,
     },
     /// Wait for the latest in progress scan
     Wait {
@@ -196,7 +202,7 @@ fn main() {
                 }
             }
         }
-        Some(Commands::Scan { scanner , fail_on, fail, only_uncommitted, scan_type, policy }) => {
+        Some(Commands::Scan { scanner , fail_on, fail, only_uncommitted, scan_type, policy, out_format, out_file }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             if let Some(level) = fail_on {
                 if *scanner != Scanner::Blast {
@@ -216,6 +222,21 @@ fn main() {
 
             if *only_uncommitted && *scanner != Scanner::Blast {
                 eprintln!("only_uncommitted is only supported with blast scanner.");
+                std::process::exit(1);
+            }
+
+            if out_file.is_some() && *scanner != Scanner::Blast {
+                eprintln!("out_file is only supported with blast scanner.");
+                std::process::exit(1);
+            }
+
+            if out_format.is_some() && *scanner != Scanner::Blast {
+                eprintln!("out_format is only supported with blast scanner.");
+                std::process::exit(1);
+            }
+
+            if out_file.is_some() && !out_format.is_some() || !out_file.is_some() && out_format.is_some() {
+                eprintln!("out_file and out_format must be used together.");
                 std::process::exit(1);
             }
 
@@ -257,7 +278,7 @@ fn main() {
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config),
                 Scanner::Semgrep => scan::run_semgrep(&corgea_config),
-                Scanner::Blast => scanners::blast::run(&corgea_config, fail_on.clone(), fail, only_uncommitted, scan_type.clone(), policy.clone())
+                Scanner::Blast => scanners::blast::run(&corgea_config, fail_on.clone(), fail, only_uncommitted, scan_type.clone(), policy.clone(), out_format.clone(), out_file.clone())
             }
         }
         Some(Commands::Wait { scan_id }) => {
