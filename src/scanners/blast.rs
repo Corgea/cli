@@ -17,6 +17,8 @@ pub fn run(
     only_uncommitted: &bool,
     scan_type: Option<String>,
     policy: Option<String>,
+    out_format: Option<String>,
+    out_file: Option<String>,
 ) {
     println!(
         "\nScanning with BLAST 🚀🚀🚀"
@@ -203,7 +205,39 @@ pub fn run(
             std::process::exit(1);
         }
     }
+
+    if let Some(out_file) = out_file {
+        if let Some(out_format) = out_format {
+            if out_format == "json" {
+                let issues = match utils::api::get_all_issues(&config.get_url(), &config.get_token(), &project_name, Some(scan_id.clone())) {
+                    Ok(issues) => issues,
+                    Err(e) => {
+                        eprintln!("\n\nFailed to fetch issues: {}\n\n", e);
+                        std::process::exit(1);
+                    }
+                };
+                let json = serde_json::to_string_pretty(&issues).unwrap();
+                let report_json= serde_json::to_string_pretty(&classifications).unwrap();
+                let results_json = format!("{{\"issues\": {}, \"report\": {}}}", json, report_json);
+                fs::write(out_file.clone(), results_json).expect("Failed to write JSON file, check if the file path is valid and you have the necessary permissions to write to it.");
+                println!("\n\nScan results written to: {}\n\n", out_file.clone());
+            }
+            else if out_format == "html" {
+                let report = match utils::api::get_scan_report(&config.get_url(), &config.get_token(), &scan_id) {
+                    Ok(html) => html,
+                    Err(e) => {
+                        eprintln!("\n\nFailed to fetch scan report: {}\n\n", e);
+                        std::process::exit(1);
+                    }
+                };
+                fs::write(out_file.clone(), report).expect("Failed to write HTML file, check if the file path is valid and you have the necessary permissions to write to it.");
+                println!("\n\nScan report written to: {}\n\n", out_file.clone());
+            }
+        }
+    }
+
     print!("\n\nThank you for using Corgea! 🐕\n\n");
+
     if let Some(fail_on) = fail_on {
         match fail_on.as_str() {
             "LO" => {
