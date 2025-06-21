@@ -88,7 +88,12 @@ pub fn create_zip_from_list_of_files<P: AsRef<Path>>(
 }
 
 pub fn get_untracked_and_modified_files(repo_path: &str) -> Result<Vec<String>, git2::Error> {
-    let repo = Repository::open(repo_path)?;
+    // Try to find the repository by walking up the directory tree
+    let repo = match Repository::discover(repo_path) {
+        Ok(repo) => repo,
+        Err(e) => return Err(e),
+    };
+    
     let mut changed_files = Vec::new();
 
     let statuses = repo.statuses(None)?;
@@ -105,9 +110,6 @@ pub fn get_untracked_and_modified_files(repo_path: &str) -> Result<Vec<String>, 
     Ok(changed_files)
 }
 
-
-
-
 pub fn create_path_if_not_exists<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = path.as_ref();
     if !path.exists() {
@@ -116,6 +118,17 @@ pub fn create_path_if_not_exists<P: AsRef<Path>>(path: P) -> io::Result<()> {
     Ok(())
 }
 
+pub fn get_repo_path(dir: &str) -> Result<String, git2::Error> {
+    let repo = match Repository::discover(dir) {
+        Ok(repo) => repo,
+        Err(e) => return Err(e),
+    };
+    Ok(repo.path().to_string_lossy().to_string())
+}
+
+pub fn is_git_repo(dir: &str) -> bool {
+    get_repo_path(dir).is_ok()
+}
 
 pub fn delete_directory<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = path.as_ref();
@@ -125,13 +138,11 @@ pub fn delete_directory<P: AsRef<Path>>(path: P) -> io::Result<()> {
     Ok(())
 }
 
-
 pub fn get_current_working_directory() -> Option<String> {
     env::current_dir()
         .ok()
         .and_then(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
 }
-
 
 pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
     let repo = match Repository::open(Path::new(dir)) {
@@ -170,6 +181,7 @@ pub fn get_status(status: &str) -> &str {
         _ => status,
     }
 }
+
 #[derive(Debug)]
 pub struct RepoInfo {
     pub branch: Option<String>,
