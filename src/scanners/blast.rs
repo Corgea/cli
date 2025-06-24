@@ -20,6 +20,10 @@ pub fn run(
     out_format: Option<String>,
     out_file: Option<String>,
 ) {
+    if *only_uncommitted && !utils::generic::is_git_repo("./") {
+        eprintln!("This is not a git repository. Without a git repository Corgea CLI can't determine which files have been modified or added thus only a full scan is possible.");
+        std::process::exit(1);
+    }
     println!(
         "\nScanning with BLAST 🚀🚀🚀"
     );
