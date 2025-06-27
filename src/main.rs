@@ -92,6 +92,9 @@ enum Commands {
         #[arg(short, long, help = "List issues instead of scans")]
         issues: bool,
 
+        #[arg(long, short = 'c', help = "List SCA (Software Composition Analysis) issues instead of regular issues")]
+        sca_issues: bool,
+
         #[arg(short, long, help = "Specify the scan id to list issues for.")]
         scan_id: Option<String>,
 
@@ -104,7 +107,7 @@ enum Commands {
         #[arg(long, value_parser = clap::value_parser!(u16), help = "Number of items per page")]
         page_size: Option<u16>
     },
-    /// Inspect something something, by default it will inspect a scan
+    /// Inspect something, by default it will inspect a scan
     Inspect {
         /// An optional args is the user want to inspect issues
         #[arg(short, long, help = "Specify if you want to inspect issues.")]
@@ -285,15 +288,19 @@ fn main() {
             verify_token_and_exit_when_fail(&corgea_config);
             wait::run(&corgea_config, scan_id.clone());
         }
-        Some(Commands::List { issues , json, page, page_size, scan_id}) => {
+        Some(Commands::List { issues , json, page, page_size, scan_id, sca_issues}) => {
             verify_token_and_exit_when_fail(&corgea_config);
-            if scan_id.is_some() && !*issues {
+            if *issues && *sca_issues {
+                eprintln!("Cannot use both --issues and --sca-issues at the same time.");
+                std::process::exit(1);
+            }
+            if scan_id.is_some() && !*issues && !*sca_issues {
                 println!("scan_id option is only supported for issues list command.");
                 std::process::exit(1);
             }
-            list::run(&corgea_config, issues, json, page, page_size, scan_id);
+            list::run(&corgea_config, issues, sca_issues, json, page, page_size, scan_id);
         }
-        Some(Commands::Inspect { issue, json, id, summary, fix, diff}) => {
+        Some(Commands::Inspect { issue, json, id, summary, fix, diff }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             inspect::run(&corgea_config, issue, json, summary, fix, diff, id)
         }
