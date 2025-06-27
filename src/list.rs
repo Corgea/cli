@@ -4,10 +4,89 @@ use std::path::Path;
 use serde_json::json;
 use crate::log::debug;
 
-pub fn run(config: &Config, issues: &bool, json: &bool, page: &Option<u16>, page_size: &Option<u16>, scan_id: &Option<String>) {
+pub fn run(config: &Config, issues: &bool, sca_issues: &bool, json: &bool, page: &Option<u16>, page_size: &Option<u16>, scan_id: &Option<String>) {
     let project_name = utils::generic::get_current_working_directory().unwrap_or("unknown".to_string());
     println!("");
-    if *issues {
+    if *sca_issues {
+        let sca_issues_response = match utils::api::get_sca_issues(&config.get_url(), &config.get_token(), Some((*page).unwrap_or(1)), *page_size, scan_id.clone()) {
+            Ok(response) => response,
+            Err(e) => {
+                debug(&format!("Error Sending Request: {}", e.to_string()));
+                if e.to_string().contains("404") {
+                    if scan_id.is_some() {
+                        eprintln!("Scan with ID '{}' doesn't exist or has no SCA issues. Please run 'corgea scan' to create a new scan for this project.", scan_id.as_ref().unwrap());
+                    } else {
+                        eprintln!("No SCA issues found for project '{}'. Please run 'corgea scan' to create a new scan for this project.", project_name);
+                    }
+                } else {
+                    eprintln!(
+                        "Unable to fetch SCA issues. Please check your connection and ensure that:\n\
+                        - The server URL is reachable.\n\
+                        - Your authentication token is valid.\n\n\
+                        Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli {}",
+                        e
+                    );
+                }
+                std::process::exit(1);
+            }
+        };
+
+        if *json {
+            let output = serde_json::json!({
+                "page": sca_issues_response.page,
+                "total_pages": sca_issues_response.total_pages,
+                "total_issues": sca_issues_response.total_issues,
+                "results": &sca_issues_response.issues
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+            return;
+        }
+
+        let mut table = vec![
+            vec![
+                "Issue ID".to_string(),
+                "Package".to_string(),
+                "Version".to_string(),
+                "Fix Version".to_string(),
+                "Severity".to_string(),
+                "CVE".to_string(),
+                "Ecosystem".to_string(),
+                "File Path".to_string(),
+            ],
+        ];
+
+        for issue in &sca_issues_response.issues {
+            let path = Path::new(&issue.location.path);
+            let path_parts: Vec<&str> = path
+                .components()
+                .filter_map(|c| c.as_os_str().to_str())
+                .collect();
+
+            let shortened_path = if path_parts.len() > 2 {
+                let base_part = if path_parts[0].len() > 1 {
+                    path_parts[0]
+                } else {
+                    path_parts[1]
+                };
+                format!("{}/../{}", base_part, path_parts[path_parts.len() - 1]).to_string()
+            } else {
+                issue.location.path.clone()
+            };
+
+            table.push(vec![
+                issue.id.clone(),
+                issue.package.name.clone(),
+                issue.package.version.clone(),
+                issue.package.fix_version.clone().unwrap_or("N/A".to_string()),
+                issue.severity.clone(),
+                issue.cve.clone().unwrap_or("N/A".to_string()),
+                issue.package.ecosystem.clone(),
+                shortened_path,
+            ]);
+        }
+
+        utils::terminal::print_table(table, Some(sca_issues_response.page), Some(sca_issues_response.total_pages));
+    } else if *issues {
         let issues_response = match utils::api::get_scan_issues(&config.get_url(), &config.get_token(), &project_name, Some((*page).unwrap_or(1)), *page_size, scan_id.clone()) {
             Ok(response) => response,
             Err(e) => {

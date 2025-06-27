@@ -450,6 +450,9 @@ pub fn check_blocking_rules(
     let client = reqwest::blocking::Client::new();
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
+    debug(&format!("Sending request to URL: {}", url));
+    debug(&format!("Headers: {:?}", headers));
+    debug(&format!("Query params: {:?}", query_params));
 
     let response = match client
         .get(url)
@@ -458,20 +461,96 @@ pub fn check_blocking_rules(
         .send() {
             Ok(res) => {
                 check_for_warnings(res.headers(), res.status());
+                debug(&format!("Response status: {}", res.status()));
+                debug(&format!("Response headers: {:?}", res.headers()));
                 res
             },
             Err(e) => return Err(format!("API request failed: {}", e).into()),
         };
 
     if response.status().is_success() {
-        let api_response: BlockingRuleResponse = response.json()?;
+        let response_text = response.text()?;
+        let api_response: BlockingRuleResponse = serde_json::from_str(&response_text).map_err(|e| {
+            debug(&format!("Failed to parse response: {}. Response body: {}", e, response_text));
+            format!("Failed to parse response: {}", e)
+        })?;
         Ok(api_response)
     } else {
+        let status = response.status();
+        let response_text = response.text()?;
+        debug(&format!("Response body: {}", response_text));
         Err(format!(
             "API request failed with status: {}",
-            response.status()
+            status
         ).into())
     }
+}
+
+
+pub fn get_sca_issues(
+    url: &str,
+    token: &str,
+    page: Option<u16>,
+    page_size: Option<u16>,
+    scan_id: Option<String>
+) -> Result<SCAIssuesResponse, Box<dyn std::error::Error>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("Failed to build client");
+
+    let mut query_params = vec![];
+    if let Some(page) = page {
+        query_params.push(("page", page.to_string()));
+    }
+    if let Some(page_size) = page_size {
+        query_params.push(("page_size", page_size.to_string()));
+    }
+
+    let endpoint = if let Some(scan_id) = scan_id {
+        format!("{}{}/scan/{}/issues/sca", url, API_BASE, scan_id)
+    } else {
+        format!("{}{}/issues/sca", url, API_BASE)
+    };
+
+    debug(&format!("Sending request to URL: {}", endpoint));
+    debug(&format!("Query params: {:?}", query_params));
+    debug(&format!("Token: {}", token));
+
+    let response = client
+        .get(&endpoint)
+        .header("CORGEA-TOKEN", token)
+        .query(&query_params)
+        .send();
+
+    let response = match response {
+        Ok(response) => {
+            check_for_warnings(response.headers(), response.status());
+            debug(&format!("Response status: {}", response.status()));
+            debug(&format!("Response headers: {:?}", response.headers()));
+            response
+        },
+        Err(err) => return Err(format!("Network error: Unable to reach the server. Please try again later. Error: {}", err).into()),
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        if status == StatusCode::NOT_FOUND {
+            return Err("SCA issues not found. Please check the scan ID or ensure the scan has SCA issues.".into());
+        }
+        return Err(format!("Request failed with status: {}", status).into());
+    }
+
+    let response_text = response.text()?;
+    let response_data: SCAIssuesResponse = match serde_json::from_str(&response_text) {
+        Ok(json) => json,
+        Err(e) => {
+            debug(&format!("Failed to parse response: {}. Response body: {}", e, response_text));
+            return Err("Error parsing server response. Please try again later.".into())
+        },
+    };
+
+    Ok(response_data)
 }
 
 
@@ -619,3 +698,38 @@ pub struct BlockingIssue {
     pub id: String,
     pub triggered_by_rules: Vec<String>
 }
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct SCAIssue {
+    pub id: String,
+    pub created_at: String,
+    pub description: String,
+    pub details: String,
+    pub severity: String,
+    pub cve: Option<String>,
+    pub package: SCAPackage,
+    pub location: SCALocation,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct SCAPackage {
+    pub name: String,
+    pub version: String,
+    pub ecosystem: String,
+    pub fix_version: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct SCALocation {
+    pub path: String,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct SCAIssuesResponse {
+    pub status: String,
+    pub issues: Vec<SCAIssue>,
+    pub page: u32,
+    pub total_pages: u32,
+    pub total_issues: u32,
+}
+
