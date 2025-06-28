@@ -156,9 +156,16 @@ pub fn run(
     );
 
     wait_for_scan(config, &scan_id);
+    let stop_signal = Arc::new(Mutex::new(false));
+    let stop_signal_clone = Arc::clone(&stop_signal);
+    let results_thread = thread::spawn(move || {
+        utils::terminal::show_loading_message("Collecting scan results... ([T]s)", stop_signal_clone);
+    });
 
     let classifications = match report_scan_status(&config.get_url(), &config.get_token(), &project_name) {
         Ok(issues_classes) => {
+            *stop_signal.lock().unwrap() = true;
+            let _ = results_thread.join();
             println!(
                 "\n\nYou can view the scan results at the following link:\n{}",
                 utils::terminal::set_text_color(&format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id), utils::terminal::TerminalColor::Green)
@@ -166,13 +173,16 @@ pub fn run(
             issues_classes
         },
         Err(e) => {
+            *stop_signal.lock().unwrap() = true;
+            let _ = results_thread.join();
             eprintln!(
-                "\n\n{}\n\n\
+                "\r{}\n\n{}\n\n\
                 However, the scan results may still be accessible at the following link:\n\n\
                 {}\n\n\
                 \n\nPlease check your network connection, authentication token, and server URL:\n\n\
                 - Server URL: {}\n\
                 - Error details: {}\n",
+                utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset),
                 utils::terminal::set_text_color(
                     &format!("Failed to report the scan status for project: '{}'.", project_name),
                     utils::terminal::TerminalColor::Red
@@ -212,6 +222,12 @@ pub fn run(
 
     if let Some(out_file) = out_file {
         if let Some(out_format) = out_format {
+            let stop_signal = Arc::new(Mutex::new(false));
+            let stop_signal_clone = Arc::clone(&stop_signal);
+            let results_thread = thread::spawn(move || {
+                utils::terminal::show_loading_message("Generating scan report... ([T]s)", stop_signal_clone);
+            });
+
             if out_format == "json" {
                 let issues = match utils::api::get_all_issues(&config.get_url(), &config.get_token(), &project_name, Some(scan_id.clone())) {
                     Ok(issues) => issues,
@@ -220,10 +236,21 @@ pub fn run(
                         std::process::exit(1);
                     }
                 };
+                let sca_issues = match utils::api::get_all_sca_issues(&config.get_url(), &config.get_token(), &project_name, Some(scan_id.clone())) {
+                    Ok(issues) => issues,
+                    Err(e) => {
+                        eprintln!("\n\nFailed to fetch SCA issues: {}\n\n", e);
+                        std::process::exit(1);
+                    }
+                };
                 let json = serde_json::to_string_pretty(&issues).unwrap();
+                let sca_json = serde_json::to_string_pretty(&sca_issues).unwrap();
                 let report_json= serde_json::to_string_pretty(&classifications).unwrap();
-                let results_json = format!("{{\"issues\": {}, \"report\": {}}}", json, report_json);
+                let results_json = format!("{{\"issues\": {}, \"sca_issues\": {}, \"report\": {}}}", json, sca_json, report_json);
+                *stop_signal.lock().unwrap() = true;
+                let _ = results_thread.join();
                 fs::write(out_file.clone(), results_json).expect("Failed to write JSON file, check if the file path is valid and you have the necessary permissions to write to it.");
+                utils::terminal::clear_previous_line();
                 println!("\n\nScan results written to: {}\n\n", out_file.clone());
             }
             else if out_format == "html" {
@@ -234,7 +261,10 @@ pub fn run(
                         std::process::exit(1);
                     }
                 };
-                fs::write(out_file.clone(), report).expect("Failed to write HTML file, check if the file path is valid and you have the necessary permissions to write to it.");
+                *stop_signal.lock().unwrap() = true;
+                let _ = results_thread.join();
+                fs::write(out_file.clone(), report).expect("\n\nFailed to write HTML file, check if the file path is valid and you have the necessary permissions to write to it.");
+                utils::terminal::clear_previous_line();
                 println!("\n\nScan report written to: {}\n\n", out_file.clone());
             }
         }
@@ -360,8 +390,10 @@ pub fn report_scan_status(url: &str, token: &str, project: &str) ->  Result<Hash
             return Err(e);
         }
     };
+
     let total_issues = classification_counts.values().sum::<usize>();
-    println!("Scan Results:-\n");
+    utils::terminal::clear_previous_line();
+    println!("\rScan Results:-\n");
     println!("{:<20} | {}", "Classification", "Count");
     println!("{:-<20} | {}", "", "");
 
