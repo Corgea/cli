@@ -133,6 +133,10 @@ pub fn clear_line(length: usize) {
     print!("{:width$}\r", " ", width = length + 1);
 }
 
+pub fn clear_previous_line() {
+    print!("\r{}{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset), " ".repeat(100));
+}
+
 pub fn print_with_pagination(str: &str) {
     let mut stdout = io::stdout();
     let mut lines = str.lines();

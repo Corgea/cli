@@ -78,7 +78,7 @@ pub fn run(config: &Config, issues: &bool, sca_issues: &bool, json: &bool, page:
                 issue.package.name.clone(),
                 issue.package.version.clone(),
                 issue.package.fix_version.clone().unwrap_or("N/A".to_string()),
-                issue.severity.clone(),
+                issue.severity.clone().unwrap_or("N/A".to_string()),
                 issue.cve.clone().unwrap_or("N/A".to_string()),
                 issue.package.ecosystem.clone(),
                 shortened_path,
