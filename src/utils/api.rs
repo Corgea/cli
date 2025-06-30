@@ -553,7 +553,35 @@ pub fn get_sca_issues(
     Ok(response_data)
 }
 
+pub fn get_all_sca_issues(
+    url: &str,
+    token: &str,
+    _project: &str,
+    scan_id: Option<String>
+) -> Result<Vec<SCAIssue>, Box<dyn std::error::Error>> {
+    let mut all_issues = Vec::new();
+    let mut current_page: u32 = 1;
+    
+    loop {
+        let response = match get_sca_issues(url, token, Some(current_page as u16), Some(30), scan_id.clone()) {
+            Ok(response) => response,
+            Err(e) => return Err(format!("Failed to get SCA issues: {}", e).into())
+        };
+        
+        if response.issues.is_empty() {
+            break;
+        }
+        
+        all_issues.extend(response.issues);
+        
+        if current_page >= response.total_pages {
+            break;
+        }
+        current_page += 1;
+    }
 
+    Ok(all_issues)
+}
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct ScanResponse  {
@@ -703,9 +731,9 @@ pub struct BlockingIssue {
 pub struct SCAIssue {
     pub id: String,
     pub created_at: String,
-    pub description: String,
-    pub details: String,
-    pub severity: String,
+    pub description: Option<String>,
+    pub details: Option<String>,
+    pub severity: Option<String>,
     pub cve: Option<String>,
     pub package: SCAPackage,
     pub location: SCALocation,
