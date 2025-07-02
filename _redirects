@@ -1,4 +1,3 @@
-/x86_64_linux/latest https://github.com/Corgea/cli/releases/download/v1.3.0/corgea_win_amd64.zip 302
-/x86_64_windows/latest https://github.com/Corgea/cli/releases/download/v1.3.0/corgea_win_amd64.zip 302
-/aarch64_darwin/latest https://github.com/Corgea/cli/releases/download/v1.3.0/corgea_macosx_11_0_arm64.zip 302
-/x86_64_darwin/latest https://github.com/Corgea/cli/releases/download/v1.3.0/corgea_macosx_10_12_x86_64.zip 302
+/x86_64_linux/latest https://github.com/Corgea/cli/releases/download/v.1.6.3/corgea_linux_x86_64.zip 302
+/x86_64_windows/latest https://github.com/Corgea/cli/releases/download/v.1.6.3/corgea_windows_x64.zip 302
+/aarch64_darwin/latest https://github.com/Corgea/cli/releases/download/v.1.6.3/corgea_macos_aarch64.zip 302
