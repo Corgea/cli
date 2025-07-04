@@ -1,13 +1,10 @@
 name: Native Binary Release
 
 on:
-  # workflow_run:
-  #   workflows: ["CI"]
-  #   types:
-  #     - completed
-  push:
-    branches:
-      - testing-native-binaries
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
 
 permissions:
   contents: write
@@ -15,9 +12,9 @@ permissions:
 jobs:
   native-binaries:
     name: Build and Upload Native Binaries
-    # if: >
-    #   github.event.workflow_run.conclusion == 'success' &&
-    #   startsWith(github.event.workflow_run.head_branch, 'refs/tags/')
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'refs/tags/')
     strategy:
       matrix:
         include:
