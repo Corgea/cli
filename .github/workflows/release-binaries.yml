@@ -46,7 +46,7 @@ jobs:
 
       - name: Archive Binary
         run: |
-          BIN_NAME="corgea-cli${{ matrix.ext }}"
+          BIN_NAME="corgea${{ matrix.ext }}"
           TARGET_DIR="target/${{ matrix.target }}/release"
           ARCHIVE_NAME="${BIN_NAME}-${{ matrix.target }}.zip"
           cd $TARGET_DIR
