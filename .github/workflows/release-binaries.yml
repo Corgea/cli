@@ -1,0 +1,66 @@
+name: Native Binary Release
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+
+permissions:
+  contents: write
+
+jobs:
+  native-binaries:
+    name: Build and Upload Native Binaries
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'refs/tags/')
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            ext: ""
+          - os: macos-14
+            target: aarch64-apple-darwin
+            ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-gnu
+            ext: ".exe"
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build Binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Archive Binary
+        run: |
+          BIN_NAME="corgea${{ matrix.ext }}"
+          TARGET_DIR="target/${{ matrix.target }}/release"
+          ARCHIVE_NAME="${BIN_NAME}-${{ matrix.target }}.zip"
+          cd $TARGET_DIR
+          zip -j "../../../$ARCHIVE_NAME" "$BIN_NAME"
+        shell: bash
+
+      - name: Upload Based on Event Type
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.zip"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload as Artifact (for branches)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: "*.zip"
