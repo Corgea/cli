@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::{env, fs, io};
 use toml;
+use crate::utils::generic;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -83,11 +84,7 @@ impl Config {
             self.url.clone()
         };
 
-        if url.ends_with('/') {
-            url.trim_end_matches('/').to_string()
-        } else {
-            url
-        }
+        generic::process_url(&url)
     }
 
     pub fn get_token(&self) -> String {

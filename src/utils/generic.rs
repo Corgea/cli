@@ -6,6 +6,7 @@ use globset::{GlobSetBuilder, Glob};
 use std::fs::{self, File};
 use std::env;
 use git2::Repository;
+use tracing::instrument;
 
 pub fn create_zip_from_filtered_files<P: AsRef<Path>>(
     directory: P,
@@ -144,6 +145,8 @@ pub fn get_current_working_directory() -> Option<String> {
         .and_then(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
 }
 
+
+#[instrument]
 pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
     let repo = match Repository::open(Path::new(dir)) {
         Ok(repo) => repo,
@@ -181,7 +184,19 @@ pub fn get_status(status: &str) -> &str {
         _ => status,
     }
 }
+pub fn process_url(url: &str) -> String {
+    let mut processed_url = if url.ends_with('/') {
+        url.trim_end_matches('/').to_string()
+    } else {
+        url.to_string()
+    };
 
+    if !processed_url.starts_with("http://") && !processed_url.starts_with("https://") {
+        processed_url = format!("https://{}", processed_url);
+    }
+
+    processed_url
+}
 #[derive(Debug)]
 pub struct RepoInfo {
     pub branch: Option<String>,

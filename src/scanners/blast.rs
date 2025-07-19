@@ -22,7 +22,7 @@ pub fn run(
 ) {
     if *only_uncommitted && !utils::generic::is_git_repo("./") {
         eprintln!("This is not a git repository. Without a git repository Corgea CLI can't determine which files have been modified or added thus only a full scan is possible.");
-        std::process::exit(1);
+        return;
     }
     println!(
         "\nScanning with BLAST 🚀🚀🚀"
@@ -52,7 +52,7 @@ pub fn run(
                 "\n\nOops! Something went wrong while creating the directory at '{}'.\nPlease check if you have the necessary permissions or if the path is valid.\nError details:\n{}\n\n", 
                 temp_dir.display(), e
             );
-            std::process::exit(1);
+            return;
         }
     }
 
@@ -126,7 +126,7 @@ pub fn run(
     let scan_id = match utils::api::upload_zip(&zip_path, &config.get_token(), &config.get_url(), &project_name, repo_info, scan_type, policy) {
         Ok(result) => result,
         Err(e) => {
-            eprintln!("\n\nOh no! We encountered an issue while uploading the zip file '{}' to the server.\nPlease ensure that:
+            let error_message = format!("[CUSTOM]\n\nOh no! We encountered an issue while uploading the zip file '{}' to the server.\nPlease ensure that:
     - Blast is enabled on your Corgea account.
     - Your network connection is stable.
     - The server URL '{}' is correct.
@@ -139,7 +139,7 @@ pub fn run(
                 config.get_url(),
                 e
             );
-            std::process::exit(1);
+            panic!("{}", error_message);
         },
     };
 
