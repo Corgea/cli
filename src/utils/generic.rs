@@ -97,12 +97,26 @@ pub fn get_untracked_and_modified_files(repo_path: &str) -> Result<Vec<String>, 
     let mut changed_files = Vec::new();
 
     let statuses = repo.statuses(None)?;
+    
+    let globs_to_ignore = [
+        "**/.vs/**",
+        "**/.vscode/**",
+        "**/.idea/**",
+    ];
+    let mut glob_builder = GlobSetBuilder::new();
+    for &pattern in &globs_to_ignore {
+        glob_builder.add(Glob::new(pattern).unwrap());
+    }
+    let glob_set = glob_builder.build().unwrap();
 
     for entry in statuses.iter() {
         let status = entry.status();
         let file_path = entry.path().unwrap_or("").to_string();
 
-        if status.contains(git2::Status::WT_NEW) || status.contains(git2::Status::WT_MODIFIED) || status.contains(git2::Status::WT_DELETED) {
+        let ignore_file = glob_set.is_match(&file_path);
+        if (status.contains(git2::Status::WT_NEW) && !status.contains(git2::Status::IGNORED) && !ignore_file) 
+            || status.contains(git2::Status::WT_MODIFIED) 
+            || status.contains(git2::Status::WT_DELETED) {
             changed_files.push(file_path);
         }
     }
