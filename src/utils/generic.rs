@@ -48,7 +48,6 @@ pub fn create_zip_from_list_of_files<P: AsRef<Path>>(
         "**/tmp/**",
         "**/migrations/**",
         "**/python*/site-packages/**",
-        "**/*.csv",
         "**/*.mmdb",
         "**/*.css",
         "**/*.less",
