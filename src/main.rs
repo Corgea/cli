@@ -9,6 +9,7 @@ mod setup_hooks;
 mod scanners {
     pub mod fortify;
     pub mod blast;
+    pub mod parsers;
 }
 mod utils {
     pub mod terminal;
