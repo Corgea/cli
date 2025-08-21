@@ -15,9 +15,11 @@ mod utils {
     pub mod terminal;
     pub mod generic;
     pub mod api;
+    pub mod github;
 }
 
-use std::str::FromStr;
+
+use std::{str::FromStr};
 use clap::{Parser, Subcommand, CommandFactory};
 use config::Config;
 use scanners::fortify::parse as fortify_parse;
@@ -155,9 +157,30 @@ impl FromStr for Scanner {
     }
 }
 
+fn check_latest_version() {
+    let latest_version = utils::github::get_latest_release_version("Corgea/cli");
+    let current_version = env!("CARGO_PKG_VERSION");
+  
+    match latest_version {
+        Ok(latest) => {
+            if latest != current_version {
+                println!("{}", utils::terminal::set_text_color(
+                    &format!("A new version of Corgea CLI is available: {} (current: {})", latest, current_version),
+                    utils::terminal::TerminalColor::Red
+                ));
+                println!("Update with: pip install --upgrade corgea-cli");
+                println!();
+            }
+        }
+        Err(_) => { 
+            // ignore the error
+        }
+    }
+}
 fn main() {
     let cli = Cli::parse();
     let mut corgea_config = Config::load().expect("Failed to load config");
+    check_latest_version();
     fn verify_token_and_exit_when_fail (config: &Config) {
         if config.get_token().is_empty() {
             eprintln!("No token set.\nPlease run 'corgea login' to authenticate.\nFor more info checkout our docs at Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli");
