@@ -15,6 +15,7 @@ mod utils {
     pub mod terminal;
     pub mod generic;
     pub mod api;
+    pub mod err;
 }
 
 use std::str::FromStr;
@@ -156,39 +157,36 @@ impl FromStr for Scanner {
 }
 
 fn main() {
+    dotenv::dotenv().ok();
     let cli = Cli::parse();
-    let mut corgea_config = Config::load().expect("Failed to load config");
-    fn verify_token_and_exit_when_fail (config: &Config) {
-        if config.get_token().is_empty() {
-            eprintln!("No token set.\nPlease run 'corgea login' to authenticate.\nFor more info checkout our docs at Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli");
-            std::process::exit(1);
-        }
-        match utils::api::verify_token(config.get_token().as_str(), config.get_url().as_str()) {
-            Ok(true) => {
-                return;
-            }
-            Ok(false) => {
-                println!("Invalid token provided.\nPlease run 'corgea login' to authenticate.\nFor more info checkout our docs at Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli");
-                std::process::exit(1);
-            },
-            Err(e) => {
-                eprintln!("Error occurred: {}", e);
-                std::process::exit(1);
-            }
-        }
-    }
+    let corgea_config = Config::load().expect("Failed to load config");
+    let _guard = utils::err::init_error_reporting();
+    execute_command(cli, corgea_config);
+
+    utils::err::wait_for_sentry_to_flush();
+
+}
+
+
+fn execute_command(cli: Cli, mut corgea_config: Config) {
     match &cli.command {
         Some(Commands::Login { token, url }) => {
-            match utils::api::verify_token(token, url.as_deref().unwrap_or(corgea_config.get_url().as_str())) {
-                Ok(true) => {
+            match utils::api::verify_token(token, utils::generic::process_url(url.as_deref().unwrap_or(corgea_config.get_url().as_str())).as_str()) {
+                Ok(_ ) => {
                     corgea_config.set_token(token.clone()).expect("Failed to set token");
                     if let Some(url) = url {
                         corgea_config.set_url(url.clone()).expect("Failed to set url");
                     }
                     println!("Successfully authenticated to Corgea.")
                 }
-                Ok(false) => println!("Invalid token provided."),
-                Err(e) => eprintln!("Error occurred: {}", e),
+                Err(e) => {
+                    if e.to_string().contains("401") || e.to_string().contains("403") {
+                        println!("Invalid token provided.");
+                        return;
+                    } else {
+                        panic!("[CUSTOM] Something went wrong validating your API token. Please try again later.\nDetails: {}", e.to_string());
+                    }
+                }
             }
         }
         Some(Commands::Upload { report }) => {
@@ -211,68 +209,68 @@ fn main() {
             if let Some(level) = fail_on {
                 if *scanner != Scanner::Blast {
                     eprintln!("fail_on is only supported with blast scanner.");
-                    std::process::exit(1);
+                    return;
                 }
                 if !["CR", "HI", "LO", "ME"].contains(&level.as_str()) {
                     eprintln!("Invalid fail_on option. Expected one of 'CR', 'HI', 'ME', 'LO'.");
-                    std::process::exit(1);
+                    return;
                 }
             }
 
             if *fail && *scanner != Scanner::Blast {
                 eprintln!("fail is only supported with blast scanner.");
-                std::process::exit(1);
+                return;
             }
 
             if *only_uncommitted && *scanner != Scanner::Blast {
                 eprintln!("only_uncommitted is only supported with blast scanner.");
-                std::process::exit(1);
+                return;
             }
 
             if out_file.is_some() && *scanner != Scanner::Blast {
                 eprintln!("out_file is only supported with blast scanner.");
-                std::process::exit(1);
+                return;
             }
 
             if out_format.is_some() && *scanner != Scanner::Blast {
                 eprintln!("out_format is only supported with blast scanner.");
-                std::process::exit(1);
+                return;
             }
 
             if out_file.is_some() && !out_format.is_some() || !out_file.is_some() && out_format.is_some() {
                 eprintln!("out_file and out_format must be used together.");
-                std::process::exit(1);
+                return;
             }
 
             if *fail && fail_on.is_some() {
                 eprintln!("fail and fail_on cannot be used together.");
-                std::process::exit(1);
+                return;
             }
 
             if let Some(scan_type) = scan_type {
                 if scan_type.is_empty() {
                     eprintln!("scan_type cannot be empty.");
-                    std::process::exit(1);
+                    return;
                 }
                 let supported_scan_types = ["blast", "malicious", "policy", "secrets", "pii"];
                 let scan_types: Vec<_> = scan_type.split(',').map(|t| t.trim()).collect();
                 for scan in scan_types {
                     if !supported_scan_types.contains(&scan) {
                         eprintln!("Invalid scan_type: {}. Supported types are: blast, malicious, policy, secrets, pii.", scan);
-                        std::process::exit(1);
+                        return;
                     }
                 }
             }
             if let Some(policy) = policy {
                 if policy.is_empty() {
                     eprintln!("policy cannot be empty.");
-                    std::process::exit(1);
+                    return;
                 }
                 let policy_ids: Vec<_> = policy.split(',').map(|t| t.trim()).collect();
                 for policy_id in policy_ids {
                     if policy_id.is_empty() {
                         eprintln!("One of the policy ids passed is empty.");
-                        std::process::exit(1);
+                        return;
                     }
                 }
                 if scan_type.is_none() {
@@ -293,11 +291,11 @@ fn main() {
             verify_token_and_exit_when_fail(&corgea_config);
             if *issues && *sca_issues {
                 eprintln!("Cannot use both --issues and --sca-issues at the same time.");
-                std::process::exit(1);
+                return;
             }
             if scan_id.is_some() && !*issues && !*sca_issues {
                 println!("scan_id option is only supported for issues list command.");
-                std::process::exit(1);
+                return;
             }
             list::run(&corgea_config, issues, sca_issues, json, page, page_size, scan_id);
         }
@@ -312,6 +310,27 @@ fn main() {
             utils::terminal::show_welcome_message();
             let _ = Cli::command().print_help();
             println!();
+        }
+    }
+}
+
+fn verify_token_and_exit_when_fail (config: &Config) {
+    if config.get_token().is_empty() {
+        eprintln!("No token set.\nPlease run 'corgea login' to authenticate.\nFor more info checkout our docs at Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli");
+        std::process::exit(1);
+    }
+    match utils::api::verify_token(config.get_token().as_str(), config.get_url().as_str()) {
+        Ok(response ) => {
+            utils::err::attach_user_info_to_error_reporting(&response.user);
+            return;
+        }
+        Err(err) => {
+            if err.to_string().contains("401") || err.to_string().contains("403") {
+                println!("Invalid token provided.\nPlease run 'corgea login' to authenticate.\nFor more info checkout our docs at Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli");
+                std::process::exit(1);
+            } else {
+                panic!("[CUSTOM] Something went wrong validating your API token. Please try again later.\nDetails: {}", err.to_string());
+            }
         }
     }
 }

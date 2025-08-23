@@ -6,6 +6,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+sentry = { version = "0.41.0", features = ["tracing"] }
+sentry-tracing = "0.41.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
 clap = { version = "4.4.13", features = ["derive"] }
 dirs = "5.0.1"
 reqwest = { version = "0.12", default-features = false, features = [
@@ -30,3 +34,8 @@ termcolor = "1.1"
 git2 = { version = "0.20.0", default-features = false }
 regex = "1"
 chrono = "0.4"
+dotenv = "0.15"
+
+[profile.release]
+debug = true
+split-debuginfo = "packed"
