@@ -191,60 +191,164 @@ async fn handle_callback(
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         body { 
             font-family: 'Inter', sans-serif;
-            text-align: center; 
-            padding: 50px; 
-            background: rgb(33, 37, 41);
-            color: white;
             margin: 0;
+            padding: 0;
+            background: #f8f9fa;
             min-height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
         }
         .container {
-            background: rgba(245, 108, 38, 0.1);
-            border: 2px solid #F56C26;
-            border-radius: 12px;
-            padding: 40px;
-            box-shadow: 0 4px 20px rgba(245, 108, 38, 0.3);
-            max-width: 400px;
+            background: white;
+            text-align: center;
+            padding: 60px 40px;
+            border-radius: 16px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
+            max-width: 500px;
+            width: 90%;
+        }
+        .success-icon {
+            width: 80px;
+            height: 80px;
+            background: #F56C26;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 30px;
+            color: white;
+            font-size: 40px;
+            font-weight: bold;
         }
         h1 { 
-            color: #F56C26; 
-            margin-bottom: 20px; 
-            font-size: 28px;
+            color: #333;
+            margin: 0 0 10px 0;
+            font-size: 32px;
+            font-weight: 700;
+        }
+        .subtitle {
+            color: #666;
+            font-size: 16px;
+            margin-bottom: 40px;
+        }
+        .next-steps {
+            background: #f8f9fa;
+            border-radius: 12px;
+            padding: 24px;
+            margin: 30px 0;
+            text-align: left;
+        }
+        .next-steps h3 {
+            color: #333;
+            font-size: 18px;
             font-weight: 600;
+            margin: 0 0 16px 0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
-        .success-icon { 
-            font-size: 48px; 
-            margin-bottom: 20px; 
+        .step {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            margin-bottom: 12px;
+            padding: 8px 0;
+        }
+        .step:last-child {
+            margin-bottom: 0;
+        }
+        .step-icon {
+            width: 24px;
+            height: 24px;
+            background: #F56C26;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 12px;
+            font-weight: bold;
+            flex-shrink: 0;
+            margin-top: 2px;
+        }
+        .step-content {
+            flex: 1;
+        }
+        .step-title {
+            color: #333;
+            font-weight: 500;
+            margin-bottom: 4px;
+        }
+        .step-description {
+            color: #666;
+            font-size: 14px;
+            line-height: 1.4;
+        }
+        .return-button {
+            background: #F56C26;
+            color: white;
+            border: none;
+            padding: 12px 32px;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            margin: 20px 0;
+        }
+        .return-button:hover {
+            background: #e55a1f;
+        }
+        .footer {
+            color: #999;
+            font-size: 12px;
+            margin-top: 20px;
+        }
+        .footer a {
             color: #F56C26;
-        }
-        .message { 
-            font-size: 18px; 
-            margin-bottom: 30px; 
-            color: #e9ecef;
-        }
-        .instruction { 
-            font-size: 14px; 
-            color: #adb5bd;
+            text-decoration: none;
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Authorization Successful!</h1>
-        <div class="message">Your Corgea CLI has been authorized.</div>
-        <div class="instruction">You can now close this browser tab and return to your terminal.</div>
+        <div class="success-icon"><i class="fas fa-check"></i></div>
+        <h1>Successfully Signed In!</h1>
+        <div class="subtitle">Your CLI is now authenticated with Corgea</div>
+        
+        <div class="next-steps">
+            <h3><i class="fas fa-bolt"></i> Next Steps</h3>
+            <div class="steps">
+                <div class="step">
+                    <div class="step-icon"><i class="fas fa-terminal"></i></div>
+                    <div class="step-content">
+                        <div class="step-title">Return to your CLI</div>
+                        <div class="step-description">Go back to your terminal and start running security scans on your codebase</div>
+                    </div>
+                </div>
+                <div class="step">
+                    <div class="step-icon"><i class="fas fa-play"></i></div>
+                    <div class="step-content">
+                        <div class="step-title">Run Your First Scan</div>
+                        <div class="step-description">Use the Corgea CLI commands to analyze your code for security vulnerabilities</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+
+        <div class="footer">
+            Authentication successful - Ready to scan with Corgea AI<br>
+            Need help? - <a href="https://docs.corgea.app/">Documentation</a>
+        </div>
     </div>
     <script>
-        // Auto-close tab after 3 seconds
-        setTimeout(() => {
-            window.close();
-        }, 3000);
+        // Simple script for any future functionality
     </script>
 </body>
 </html>
