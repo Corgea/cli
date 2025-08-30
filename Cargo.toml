@@ -30,3 +30,10 @@ termcolor = "1.1"
 git2 = { version = "0.20.0", default-features = false }
 regex = "1"
 chrono = "0.4"
+tokio = { version = "1.0", features = ["full"] }
+hyper = { version = "1.0", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+url = "2.5"
+open = "5.0"
+urlencoding = "2.1"
