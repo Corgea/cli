@@ -15,6 +15,18 @@ use crate::log::debug;
 const CHUNK_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 const API_BASE: &str = "/api/v1";
 
+pub fn http_client() -> reqwest::blocking::Client {
+    let mut builder =
+        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5 * 30));
+
+    if let Ok(https_proxy) = std::env::var("https_proxy") {
+        debug(&format!("https_proxy detected: {}", https_proxy));
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+
+    builder.build().expect("Failed to build http client")
+}
+
 fn check_for_warnings(headers: &HeaderMap, status: StatusCode) {
     if let Some(warning) = headers.get("warning") {
         let warnings = warning.to_str().unwrap().split(',');
@@ -32,19 +44,15 @@ fn check_for_warnings(headers: &HeaderMap, status: StatusCode) {
 }
 
 pub fn upload_zip(
-    file_path: &str , 
-    token: &str, 
-    url: &str, 
-    project_name: &str, 
+    file_path: &str,
+    token: &str,
+    url: &str,
+    project_name: &str,
     repo_info: Option<utils::generic::RepoInfo>,
     scan_type: Option<String>,
     policy: Option<String>
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5 * 60))
-        .build()
-        .expect("Failed to build client");
-
+    let client = http_client();
     let file_size = std::fs::metadata(file_path)?.len();
     let file_name = Path::new(file_path)
         .file_name()
@@ -104,10 +112,10 @@ pub fn upload_zip(
         }
 
         let chunk = &buffer[..bytes_read];
- 
+
         let mut form = Form::new()
         .part(
-            "chunk_data", 
+            "chunk_data",
             Part::bytes(chunk.to_vec())
                 .file_name(file_name.to_string())
                 .mime_str("application/octet-stream")?,
@@ -178,20 +186,20 @@ pub fn upload_zip(
             }
         }
     }
-    
+
     Err("Failed to upload file".into())
 }
 
 pub fn get_all_issues(url: &str, token: &str, project: &str, scan_id: Option<String>) -> Result<Vec<Issue>, Box<dyn std::error::Error>> {
     let mut all_issues = Vec::new();
     let mut current_page: u32 = 1;
-    
+
     loop {
         let response = match get_scan_issues(url, token, project, Some(current_page as u16), Some(30), scan_id.clone()) {
             Ok(response) => response,
             Err(e) => return Err(format!("Failed to get scan issues: {}", e).into())
         };
-        
+
         if let Some(mut issues) = response.issues {
             if issues.is_empty() {
                 break;
@@ -212,9 +220,9 @@ pub fn get_all_issues(url: &str, token: &str, project: &str, scan_id: Option<Str
 }
 
 pub fn get_scan_issues(
-    url: &str, 
-    token: &str, 
-    project: &str, 
+    url: &str,
+    token: &str,
+    project: &str,
     page: Option<u16>,
     page_size: Option<u16>,
     scan_id: Option<String>
@@ -240,7 +248,7 @@ pub fn get_scan_issues(
     } else {
         url.push_str("&page_size=30");
     }
-    let client = reqwest::blocking::Client::new();
+    let client = http_client();
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
 
@@ -259,7 +267,7 @@ pub fn get_scan_issues(
         debug(&format!("Failed to parse response: {}. Response body: {}", e, response_text));
         format!("Failed to parse response: {}", e)
     })?;
-    
+
     if project_issues_response.status == "ok" {
         Ok(project_issues_response)
     } else if project_issues_response.status == "no_project_found" {
@@ -272,7 +280,7 @@ pub fn get_scan_issues(
 pub fn get_scan(url: &str, token: &str, scan_id: &str) -> Result<ScanResponse, Box<dyn std::error::Error>>  {
     let url = format!("{}{}/scan/{}", url, API_BASE, scan_id);
 
-    let client = reqwest::blocking::Client::new();
+    let client = http_client();
 
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
@@ -282,7 +290,7 @@ pub fn get_scan(url: &str, token: &str, scan_id: &str) -> Result<ScanResponse, B
         .get(&url)
         .headers(headers)
         .send()
-        .map_err(|e| format!("Failed to send request: {}", e))?; 
+        .map_err(|e| format!("Failed to send request: {}", e))?;
 
     check_for_warnings(response.headers(), response.status());
 
@@ -301,7 +309,7 @@ pub fn get_scan(url: &str, token: &str, scan_id: &str) -> Result<ScanResponse, B
 pub fn get_scan_report(url: &str, token: &str, scan_id: &str) -> Result<String, Box<dyn std::error::Error>> {
     let url = format!("{}{}/scan/{}/report", url, API_BASE, scan_id);
 
-    let client = reqwest::blocking::Client::new();
+    let client = http_client();
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
 
@@ -330,7 +338,7 @@ pub fn get_issue(url: &str, token: &str, issue: &str) -> Result<FullIssueRespons
         API_BASE,
         issue,
     );
-    let client = reqwest::blocking::Client::new();
+    let client = http_client();
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
     debug(&format!("Sending request to URL: {}", url));
@@ -374,7 +382,7 @@ pub fn query_scan_list(
     }
 
 
-    let client = reqwest::blocking::Client::new(); 
+    let client = http_client();
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
     debug(&format!("Sending request to URL: {}", url));
@@ -388,7 +396,7 @@ pub fn query_scan_list(
                 check_for_warnings(res.headers(), res.status());
                 res
             },
-            Err(e) => return Err(format!("API request failed: {}", e).into()), 
+            Err(e) => return Err(format!("API request failed: {}", e).into()),
         };
         if response.status().is_success() {
             let response_text = response.text()?;
@@ -408,14 +416,14 @@ pub fn query_scan_list(
 
 pub fn verify_token(token: &str, corgea_url: &str) -> Result<bool, Box<dyn Error>> {
     let url = format!("{}{}/verify", corgea_url, API_BASE);
-    let client = reqwest::blocking::Client::new();
+    let client = http_client();
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
     debug(&format!("Sending request to URL: {}", url));
     debug(&format!("Headers: {:?}", headers));
 
     let response = client
-        .get(url)
+        .get(&url)
         .headers(headers)
         .send()?;
 
@@ -447,7 +455,7 @@ pub fn check_blocking_rules(
     let page = page.unwrap_or(1);
     let query_params = vec![("page", page.to_string())];
 
-    let client = reqwest::blocking::Client::new();
+    let client = http_client();
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
     debug(&format!("Sending request to URL: {}", url));
@@ -494,11 +502,7 @@ pub fn get_sca_issues(
     page_size: Option<u16>,
     scan_id: Option<String>
 ) -> Result<SCAIssuesResponse, Box<dyn std::error::Error>> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("Failed to build client");
-
+    let client = http_client();
     let mut query_params = vec![];
     if let Some(page) = page {
         query_params.push(("page", page.to_string()));
@@ -561,19 +565,19 @@ pub fn get_all_sca_issues(
 ) -> Result<Vec<SCAIssue>, Box<dyn std::error::Error>> {
     let mut all_issues = Vec::new();
     let mut current_page: u32 = 1;
-    
+
     loop {
         let response = match get_sca_issues(url, token, Some(current_page as u16), Some(30), scan_id.clone()) {
             Ok(response) => response,
             Err(e) => return Err(format!("Failed to get SCA issues: {}", e).into())
         };
-        
+
         if response.issues.is_empty() {
             break;
         }
-        
+
         all_issues.extend(response.issues);
-        
+
         if current_page >= response.total_pages {
             break;
         }
@@ -595,7 +599,7 @@ pub struct ScanResponse  {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct ProjectIssuesResponse {    
+pub struct ProjectIssuesResponse {
     pub status: String,
     pub issues: Option<Vec<Issue>>,
     pub page: Option<u32>,
@@ -760,4 +764,3 @@ pub struct SCAIssuesResponse {
     pub total_pages: u32,
     pub total_issues: u32,
 }
-
