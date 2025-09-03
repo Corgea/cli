@@ -21,7 +21,11 @@ pub fn http_client() -> reqwest::blocking::Client {
 
     if let Ok(https_proxy) = std::env::var("https_proxy") {
         debug(&format!("https_proxy detected: {}", https_proxy));
-        builder = builder.danger_accept_invalid_certs(true);
+
+        if std::env::var("CORGEA_ACCEPT_CERT").is_ok() {
+            debug(&format!("Skipping CA cert validation"));
+            builder = builder.danger_accept_invalid_certs(true);
+        }
     }
 
     builder.build().expect("Failed to build http client")
