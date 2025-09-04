@@ -2,8 +2,10 @@ name: Native Binary Release
 
 on:
   push:
+    branches:
+      - fix-windows-build
     tags:
-      - '*'
+      - "*"
   workflow_dispatch:
 
 permissions:
@@ -38,14 +40,24 @@ jobs:
       - name: Build Binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Archive Binary
+      - name: Archive Binary (Unix)
+        if: runner.os != 'Windows'
         run: |
           BIN_NAME="corgea${{ matrix.ext }}"
           TARGET_DIR="target/${{ matrix.target }}/release"
           ARCHIVE_NAME="${BIN_NAME}-${{ matrix.target }}.zip"
-          cd $TARGET_DIR
+          cd "$TARGET_DIR"
           zip -j "../../../$ARCHIVE_NAME" "$BIN_NAME"
         shell: bash
+
+      - name: Archive Binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $BinName = "corgea${{ matrix.ext }}"
+          $TargetDir = "target/${{ matrix.target }}/release"
+          $ArchiveName = "$BinName-${{ matrix.target }}.zip"
+          Compress-Archive -Path "$TargetDir\$BinName" -DestinationPath "$ArchiveName" -Force
 
       - name: Upload Based on Event Type
         if: startsWith(github.ref, 'refs/tags/')
