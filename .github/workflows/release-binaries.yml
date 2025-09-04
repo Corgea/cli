@@ -2,10 +2,6 @@ name: Native Binary Release
 
 on:
   push:
-    branches:
-      - fix-windows-build
-    tags:
-      - "*"
   workflow_dispatch:
 
 permissions:
