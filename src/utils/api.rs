@@ -89,17 +89,30 @@ pub fn upload_zip(
         Err(err) => return Err(format!("Network error: Unable to reach the server. Please try again later. Error: {}", err).into()),
     };
     let response_status = response_object.status();
-    let response: HashMap<String, Value> = match response_object.json() {
-        Ok(json) => json,
-        Err(_) => return Err("Error getting server response, Please try again later.".into()),
-    };
-
+    let response_text = response_object.text()?;
+    
     if response_status != StatusCode::OK {
-        let message = response.get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("An unknown error occurred. Please try again or contact support.");
-        return Err(format!("Request failed: {}", message).into());
+        debug(&format!("Initial scan request failed with status: {}. Response body: {}", response_status, response_text));
+        
+        if response_status == StatusCode::BAD_REQUEST {
+            if let Ok(error_response) = serde_json::from_str::<HashMap<String, Value>>(&response_text) {
+                if let Some(message) = error_response.get("message").and_then(Value::as_str) {
+                    return Err(format!("Request failed: {}", message).into());
+                }
+            }
+            return Err(format!("Request failed (400): {}", response_text).into());
+        }
+        
+        return Err("Error getting server response, Please try again later.".into());
     }
+    
+    let response: HashMap<String, Value> = match serde_json::from_str(&response_text) {
+        Ok(json) => json,
+        Err(_) => {
+            debug(&format!("Failed to parse initial scan response as JSON. Response body: {}", response_text));
+            return Err("Error getting server response, Please try again later.".into());
+        },
+    };
 
     let transfer_id = match response["transfer_id"].as_str() {
         Some(transfer_id) => transfer_id,
@@ -170,9 +183,22 @@ pub fn upload_zip(
         };
         if !response.status().is_success() {
             let status_code = response.status();
-            if status_code.is_client_error() && response.text().unwrap().contains("Invalid policy ids") {
+            let response_text = response.text().unwrap_or_else(|_| "Unable to read response body".to_string());
+            debug(&format!("Chunk upload failed with status: {}. Response body: {}", status_code, response_text));
+            
+            if status_code.is_client_error() && response_text.contains("Invalid policy ids") {
                 return Err("Invalid policy ids passed. Please check the policy ids and try again.".into());
             }
+            
+            if status_code == StatusCode::BAD_REQUEST {
+                if let Ok(error_response) = serde_json::from_str::<HashMap<String, Value>>(&response_text) {
+                    if let Some(message) = error_response.get("message").and_then(Value::as_str) {
+                        return Err(format!("Upload failed: {}", message).into());
+                    }
+                }
+                return Err(format!("Upload failed (400): {}", response_text).into());
+            }
+            
             return Err(format!("Failed to upload file: {}", status_code).into());
 
         }
