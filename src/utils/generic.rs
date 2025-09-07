@@ -7,6 +7,29 @@ use std::fs::{self, File};
 use std::env;
 use git2::Repository;
 
+// Global exclude globs used across multiple functions
+const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
+    "**/tests/**",
+    "**/.corgea/**",
+    "**/test/**",
+    "**/spec/**",
+    "**/specs/**",
+    "**/node_modules/**",
+    "**/tmp/**",
+    "**/migrations/**",
+    "**/python*/site-packages/**",
+    "**/*.mmdb",
+    "**/*.css",
+    "**/*.less",
+    "**/*.scss",
+    "**/*.map",
+    "**/*.env",
+    "**/*.sh",
+    "**/.vs/**",
+    "**/.vscode/**",
+    "**/.idea/**",
+];
+
 pub fn create_zip_from_filtered_files<P: AsRef<Path>>(
     directory: P,
     exclude_globs: Option<&[&str]>,
@@ -38,24 +61,7 @@ pub fn create_zip_from_list_of_files<P: AsRef<Path>>(
     output_zip: P,
     exclude_globs: Option<&[&str]>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let exclude_globs = exclude_globs.unwrap_or(&[
-        "**/tests/**",
-        "**/.corgea/**",
-        "**/test/**",
-        "**/spec/**",
-        "**/specs/**",
-        "**/node_modules/**",
-        "**/tmp/**",
-        "**/migrations/**",
-        "**/python*/site-packages/**",
-        "**/*.mmdb",
-        "**/*.css",
-        "**/*.less",
-        "**/*.scss",
-        "**/*.map",
-        "**/*.env",
-        "**/*.sh",
-    ]);
+    let exclude_globs = exclude_globs.unwrap_or(DEFAULT_EXCLUDE_GLOBS);
 
     let mut glob_builder = GlobSetBuilder::new();
     for &pattern in exclude_globs {
@@ -97,13 +103,8 @@ pub fn get_untracked_and_modified_files(repo_path: &str) -> Result<Vec<String>, 
 
     let statuses = repo.statuses(None)?;
     
-    let globs_to_ignore = [
-        "**/.vs/**",
-        "**/.vscode/**",
-        "**/.idea/**",
-    ];
     let mut glob_builder = GlobSetBuilder::new();
-    for &pattern in &globs_to_ignore {
+    for &pattern in DEFAULT_EXCLUDE_GLOBS {
         glob_builder.add(Glob::new(pattern).unwrap());
     }
     let glob_set = glob_builder.build().unwrap();

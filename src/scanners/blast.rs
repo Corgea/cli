@@ -78,7 +78,7 @@ pub fn run(
                     *stop_signal.lock().unwrap() = true;
                     print!("\r{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset));
                     eprintln!(
-                        "\n\nOops! It seems there are no uncommitted changes to scan in your project.\nPlease ensure you have made changes that need to be scanned.\n\n", 
+                        "\n\nOops! It seems there are no scannable uncommitted changes in your project.\nYou may have uncommitted changes, but none match the types of files we can scan.\n\n"
                     );
                     std::process::exit(1);
                 }
