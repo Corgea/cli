@@ -336,8 +336,12 @@ pub fn get_scan(url: &str, token: &str, scan_id: &str) -> Result<ScanResponse, B
     }
 }
 
-pub fn get_scan_report(url: &str, token: &str, scan_id: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let url = format!("{}{}/scan/{}/report", url, API_BASE, scan_id);
+pub fn get_scan_report(url: &str, token: &str, scan_id: &str, format: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    let url = if let Some(fmt) = format {
+        format!("{}{}/scan/{}/report?format={}", url, API_BASE, scan_id, fmt)
+    } else {
+        format!("{}{}/scan/{}/report", url, API_BASE, scan_id)
+    };
 
     let client = http_client();
     let mut headers = HeaderMap::new();
