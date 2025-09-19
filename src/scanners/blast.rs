@@ -254,7 +254,7 @@ pub fn run(
                 println!("\n\nScan results written to: {}\n\n", out_file.clone());
             }
             else if out_format == "html" {
-                let report = match utils::api::get_scan_report(&config.get_url(), &config.get_token(), &scan_id) {
+                let report = match utils::api::get_scan_report(&config.get_url(), &config.get_token(), &scan_id, None) {
                     Ok(html) => html,
                     Err(e) => {
                         eprintln!("\n\nFailed to fetch scan report: {}\n\n", e);
@@ -264,6 +264,20 @@ pub fn run(
                 *stop_signal.lock().unwrap() = true;
                 let _ = results_thread.join();
                 fs::write(out_file.clone(), report).expect("\n\nFailed to write HTML file, check if the file path is valid and you have the necessary permissions to write to it.");
+                utils::terminal::clear_previous_line();
+                println!("\n\nScan report written to: {}\n\n", out_file.clone());
+            }
+            else if out_format == "sarif" {
+                let report = match utils::api::get_scan_report(&config.get_url(), &config.get_token(), &scan_id, Some("sarif")) {
+                    Ok(sarif) => sarif,
+                    Err(e) => {
+                        eprintln!("\n\nFailed to fetch SARIF report: {}\n\n", e);
+                        std::process::exit(1);
+                    }
+                };
+                *stop_signal.lock().unwrap() = true;
+                let _ = results_thread.join();
+                fs::write(out_file.clone(), report).expect("\n\nFailed to write SARIF file, check if the file path is valid and you have the necessary permissions to write to it.");
                 utils::terminal::clear_previous_line();
                 println!("\n\nScan report written to: {}\n\n", out_file.clone());
             }
