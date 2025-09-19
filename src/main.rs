@@ -183,24 +183,32 @@ fn main() {
     }
     match &cli.command {
         Some(Commands::Login { token, url, scope }) => {
-            match token {
-                // Token provided - use traditional token-based login
-                Some(token) => {
-                    match utils::api::verify_token(token, url.as_deref().unwrap_or(corgea_config.get_url().as_str())) {
+            let effective_token = token.clone().or_else(|| utils::generic::get_env_var_if_exists("CORGEA_TOKEN"));
+            
+            match effective_token {
+                Some(token_value) => {
+                    let token_source = if token.is_some() { "parameter" } else { "CORGEA_TOKEN environment variable" };
+                    match utils::api::verify_token(&token_value, url.as_deref().unwrap_or(corgea_config.get_url().as_str())) {
                         Ok(true) => {
-                            corgea_config.set_token(token.clone()).expect("Failed to set token");
+                            corgea_config.set_token(token_value.clone()).expect("Failed to set token");
                             if let Some(url) = url {
                                 corgea_config.set_url(url.clone()).expect("Failed to set url");
                             }
-                            println!("Successfully authenticated to Corgea.")
+                            println!("Successfully authenticated to Corgea using token from {}.", token_source)
                         }
-                        Ok(false) => println!("Invalid token provided."),
-                        Err(e) => eprintln!("Error occurred: {}", e),
+                        Ok(false) => println!("Invalid token provided from {}.", token_source),
+                        Err(e) => {
+                            if e.to_string().contains("401") {
+                                println!("Invalid token provided from {}.", token_source);
+                                std::process::exit(1);
+                            }
+                            eprintln!("Error occurred: {}", e);
+                            std::process::exit(1);
+                        },
                     }
                 }
-                // No token provided - use OAuth flow
+                // No token available - use OAuth flow
                 None => {
-                    // If URL is provided with OAuth, show a warning since OAuth determines the URL
                     if url.is_some() && scope.is_some() {
                         eprintln!("Warning: --url option is ignored when using OAuth flow with --scope. The scope determines the domain.");
                     }
