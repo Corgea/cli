@@ -132,16 +132,26 @@ pub fn create_path_if_not_exists<P: AsRef<Path>>(path: P) -> io::Result<()> {
     Ok(())
 }
 
-pub fn get_repo_path(dir: &str) -> Result<String, git2::Error> {
-    let repo = match Repository::discover(dir) {
-        Ok(repo) => repo,
-        Err(e) => return Err(e),
-    };
-    Ok(repo.path().to_string_lossy().to_string())
-}
 
-pub fn is_git_repo(dir: &str) -> bool {
-    get_repo_path(dir).is_ok()
+pub fn is_git_repo(dir: &str) -> Result<bool, git2::Error> {
+    let git_path = Path::new(dir).join(".git");
+    if git_path.exists() {
+        return Ok(true);
+    }
+    
+    // Fall back to the more expensive discover method for cases like:
+    // - We're in a subdirectory of a git repo
+    // - .git is a file (worktrees, submodules)
+    match Repository::discover(dir) {
+        Ok(_) => Ok(true),
+        Err(e) => {
+            if e.code() == git2::ErrorCode::NotFound {
+                Ok(false)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 pub fn delete_directory<P: AsRef<Path>>(path: P) -> io::Result<()> {
