@@ -20,9 +20,20 @@ pub fn run(
     out_format: Option<String>,
     out_file: Option<String>,
 ) {
-    if *only_uncommitted && !utils::generic::is_git_repo("./") {
-        eprintln!("This is not a git repository. Without a git repository Corgea CLI can't determine which files have been modified or added thus only a full scan is possible.");
-        std::process::exit(1);
+    if *only_uncommitted {
+        match utils::generic::is_git_repo("./") {
+            Ok(false) => {
+                eprintln!("This is not a git repository. Without a git repository Corgea CLI can't determine which files have been modified or added thus only a full scan is possible.");
+                std::process::exit(1);
+            },
+            Err(e) => {
+                eprintln!("Error checking git repository information: {}. Without a git repository Corgea CLI can't determine which files have been modified or added thus only a full scan is possible.", e);
+                std::process::exit(1);
+            },
+            Ok(true) => {
+                // Continue with the git repo logic
+            }
+        }
     }
     println!(
         "\nScanning with BLAST 🚀🚀🚀"
@@ -78,7 +89,7 @@ pub fn run(
                     *stop_signal.lock().unwrap() = true;
                     print!("\r{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset));
                     eprintln!(
-                        "\n\nOops! It seems there are no uncommitted changes to scan in your project.\nPlease ensure you have made changes that need to be scanned.\n\n", 
+                        "\n\nOops! It seems there are no scannable uncommitted changes in your project.\nYou may have uncommitted changes, but none match the types of files we can scan.\n\n"
                     );
                     std::process::exit(1);
                 }
@@ -254,7 +265,7 @@ pub fn run(
                 println!("\n\nScan results written to: {}\n\n", out_file.clone());
             }
             else if out_format == "html" {
-                let report = match utils::api::get_scan_report(&config.get_url(), &config.get_token(), &scan_id) {
+                let report = match utils::api::get_scan_report(&config.get_url(), &config.get_token(), &scan_id, None) {
                     Ok(html) => html,
                     Err(e) => {
                         eprintln!("\n\nFailed to fetch scan report: {}\n\n", e);
@@ -264,6 +275,20 @@ pub fn run(
                 *stop_signal.lock().unwrap() = true;
                 let _ = results_thread.join();
                 fs::write(out_file.clone(), report).expect("\n\nFailed to write HTML file, check if the file path is valid and you have the necessary permissions to write to it.");
+                utils::terminal::clear_previous_line();
+                println!("\n\nScan report written to: {}\n\n", out_file.clone());
+            }
+            else if out_format == "sarif" {
+                let report = match utils::api::get_scan_report(&config.get_url(), &config.get_token(), &scan_id, Some("sarif")) {
+                    Ok(sarif) => sarif,
+                    Err(e) => {
+                        eprintln!("\n\nFailed to fetch SARIF report: {}\n\n", e);
+                        std::process::exit(1);
+                    }
+                };
+                *stop_signal.lock().unwrap() = true;
+                let _ = results_thread.join();
+                fs::write(out_file.clone(), report).expect("\n\nFailed to write SARIF file, check if the file path is valid and you have the necessary permissions to write to it.");
                 utils::terminal::clear_previous_line();
                 println!("\n\nScan report written to: {}\n\n", out_file.clone());
             }

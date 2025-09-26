@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::io::{self, Read};
-use crate::Config;
+use crate::{utils, Config};
 use uuid::Uuid;
 use std::path::Path;
 use std::process::Command;
@@ -98,14 +98,14 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
     let cleaned_input = input.trim_start_matches('\u{feff}').trim();
 
     let parser_factory = ScanParserFactory::new();
-    
+
     match parser_factory.parse_scan_data(cleaned_input) {
         Ok(parse_result) => {
             if parse_result.paths.is_empty() {
                 eprintln!("No issues found in scan report, exiting.");
                 std::process::exit(0);
             }
-            
+
             upload_scan(config, parse_result.paths, parse_result.scanner, cleaned_input.to_string(), save_to_file);
         }
         Err(error_message) => {
@@ -149,10 +149,7 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
     let git_config_upload_url = format!(
         "{}/api/cli/git-config-upload?token={}&run_id={}", base_url, token, run_id
     );
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5 * 60))
-        .build()
-        .expect("Failed to build client");
+    let client = utils::api::http_client();
 
     println!("Uploading required files for the scan...");
 
@@ -310,5 +307,3 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
 
     println!("Go to {base_url} to see results.");
 }
-
-

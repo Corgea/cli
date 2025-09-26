@@ -1,6 +1,6 @@
 [package]
 name = "corgea"
-version = "1.6.5"
+version = "1.6.7"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -8,12 +8,12 @@ edition = "2021"
 [dependencies]
 clap = { version = "4.4.13", features = ["derive"] }
 dirs = "5.0.1"
-reqwest = { version = "0.12", default-features = false, features = [
+reqwest = { version = "0.12.23", default-features = false, features = [
     "blocking",
     "json",
     "multipart",
-    "rustls-tls",
-    "rustls-tls-native-roots",
+    "native-tls",
+    "system-proxy",
 ] }
 toml = "0.8.8"
 serde = { version = "1.0.195", features = ["derive"] }
@@ -37,3 +37,6 @@ http-body-util = "0.1"
 url = "2.5"
 open = "5.0"
 urlencoding = "2.1"
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
