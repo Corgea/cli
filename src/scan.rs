@@ -56,7 +56,9 @@ pub fn run_semgrep(config: &Config) {
 
     let output = run_command(&base_command.to_string(), command);
 
-    parse_scan(config, output, true);
+    if let Some(scan_id) = parse_scan(config, output, true) {
+        crate::wait::run(config, Some(scan_id));
+    }
 }
 
 pub fn run_snyk(config: &Config) {
@@ -69,14 +71,16 @@ pub fn run_snyk(config: &Config) {
 
     let output = run_command(&base_command.to_string(), command);
 
-    parse_scan(config, output, true);
+    if let Some(scan_id) = parse_scan(config, output, true) {
+        crate::wait::run(config, Some(scan_id));
+    }
 }
 
 pub fn read_stdin_report(config: &Config) {
     let mut input = String::new();
     let _ = io::stdin().read_to_string(&mut input);
 
-    parse_scan(config, input, false);
+    let _ = parse_scan(config, input, false);
 }
 
 pub fn read_file_report(config: &Config, file_path: &str) {
@@ -88,10 +92,10 @@ pub fn read_file_report(config: &Config, file_path: &str) {
         }
     };
 
-    parse_scan(config, input, false);
+    let _ = parse_scan(config, input, false);
 }
 
-pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
+pub fn parse_scan(config: &Config, input: String, save_to_file: bool) -> Option<String> {
     debug("Parsing the scan report");
 
     // Remove BOM (Byte Order Mark) if present
@@ -106,7 +110,7 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
                 std::process::exit(0);
             }
 
-            upload_scan(config, parse_result.paths, parse_result.scanner, cleaned_input.to_string(), save_to_file);
+            return upload_scan(config, parse_result.paths, parse_result.scanner, cleaned_input.to_string(), save_to_file);
         }
         Err(error_message) => {
             eprintln!("{}", error_message);
@@ -115,7 +119,7 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
     }
 }
 
-pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: String, save_to_file: bool) {
+pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: String, save_to_file: bool) -> Option<String> {
     let in_ci = running_in_ci();
     let ci_platform = which_ci();
     let github_env_vars = get_github_env_vars();
@@ -225,9 +229,37 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
         .body(input.clone())
         .send();
 
+    let mut sast_scan_id: Option<String> = None;
+
     match res {
         Ok(response) => {
             if response.status().is_success() {
+                let body_text = match response.text() {
+                    Ok(text) => text,
+                    Err(e) => {
+                        eprintln!("Failed to read response body: {}", e);
+                        String::new()
+                    }
+                };
+
+                if !body_text.is_empty() {
+                    match serde_json::from_str::<Value>(&body_text) {
+                        Ok(json) => {
+                            if let Some(id_val) = json.get("sast_scan_id") {
+                                if let Some(id_str) = id_val.as_str() {
+                                    println!("Scan ID: {}", id_str);
+                                    sast_scan_id = Some(id_str.to_string());
+                                } else if let Some(id_num) = id_val.as_i64() {
+                                    println!("Scan ID: {}", id_num);
+                                    sast_scan_id = Some(id_num.to_string());
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to parse response JSON: {}", e);
+                        }
+                    }
+                }
                 println!("Successfully uploaded scan.");
             } else {
                 eprintln!("Failed to upload scan: {}", response.status());
@@ -306,4 +338,6 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
     }
 
     println!("Go to {base_url} to see results.");
+
+    sast_scan_id
 }
