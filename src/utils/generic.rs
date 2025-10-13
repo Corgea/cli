@@ -168,6 +168,13 @@ pub fn get_current_working_directory() -> Option<String> {
         .and_then(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
 }
 
+pub fn get_env_var_if_exists(var_name: &str) -> Option<String> {
+    match env::var(var_name) {
+        Ok(value) if !value.trim().is_empty() => Some(value),
+        _ => None,
+    }
+}
+
 pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
     let repo = match Repository::open(Path::new(dir)) {
         Ok(repo) => repo,

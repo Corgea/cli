@@ -6,6 +6,7 @@ mod inspect;
 mod cicd;
 mod log;
 mod setup_hooks;
+mod authorize;
 mod scanners {
     pub mod fortify;
     pub mod blast;
@@ -37,12 +38,15 @@ struct Cli {
 enum Commands {
     /// Authenticate to Corgea
     Login { 
-        token: String,
+        #[arg(help = "API token (if not provided, will use OAuth flow)")]
+        token: Option<String>,
 
         #[arg(long, help = "The url of the corgea instance to use. defaults to https://www.corgea.app")]
         url: Option<String>,
-    
-     },
+
+        #[arg(long, help = "Scope to use for custom domain (e.g., 'ikea' for ikea.corgea.app). Only used with OAuth flow")]
+        scope: Option<String>,
+    },
     /// Upload a scan report to Corgea via STDIN or a file
     Upload {
         /// Option path to JSON report to upload
@@ -178,17 +182,45 @@ fn main() {
         }
     }
     match &cli.command {
-        Some(Commands::Login { token, url }) => {
-            match utils::api::verify_token(token, url.as_deref().unwrap_or(corgea_config.get_url().as_str())) {
-                Ok(true) => {
-                    corgea_config.set_token(token.clone()).expect("Failed to set token");
-                    if let Some(url) = url {
-                        corgea_config.set_url(url.clone()).expect("Failed to set url");
+        Some(Commands::Login { token, url, scope }) => {
+            let effective_token = token.clone().or_else(|| utils::generic::get_env_var_if_exists("CORGEA_TOKEN"));
+            
+            match effective_token {
+                Some(token_value) => {
+                    let token_source = if token.is_some() { "parameter" } else { "CORGEA_TOKEN environment variable" };
+                    match utils::api::verify_token(&token_value, url.as_deref().unwrap_or(corgea_config.get_url().as_str())) {
+                        Ok(true) => {
+                            corgea_config.set_token(token_value.clone()).expect("Failed to set token");
+                            if let Some(url) = url {
+                                corgea_config.set_url(url.clone()).expect("Failed to set url");
+                            }
+                            println!("Successfully authenticated to Corgea using token from {}.", token_source)
+                        }
+                        Ok(false) => println!("Invalid token provided from {}.", token_source),
+                        Err(e) => {
+                            if e.to_string().contains("401") {
+                                println!("Invalid token provided from {}.", token_source);
+                                std::process::exit(1);
+                            }
+                            eprintln!("Error occurred: {}", e);
+                            std::process::exit(1);
+                        },
                     }
-                    println!("Successfully authenticated to Corgea.")
                 }
-                Ok(false) => println!("Invalid token provided."),
-                Err(e) => eprintln!("Error occurred: {}", e),
+                // No token available - use OAuth flow
+                None => {
+                    if url.is_some() && scope.is_some() {
+                        eprintln!("Warning: --url option is ignored when using OAuth flow with --scope. The scope determines the domain.");
+                    }
+                    
+                    match authorize::run(scope.clone(), url.clone()) {
+                        Ok(()) => {},
+                        Err(e) => {
+                            eprintln!("Authorization failed: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
             }
         }
         Some(Commands::Upload { report }) => {

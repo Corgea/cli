@@ -448,6 +448,34 @@ pub fn query_scan_list(
 }
 
 
+pub fn exchange_code_for_token(
+    base_url: &str,
+    code: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let client = reqwest::blocking::Client::new();
+    let exchange_url = format!("{}{}/authorize", base_url, API_BASE);
+    
+    let response = client
+        .get(&exchange_url)
+        .query(&[("code", code)])
+        .send()?;
+    
+    if response.status().is_success() {
+        let response_json: HashMap<String, serde_json::Value> = response.json()?;
+        
+        if let Some(user_token) = response_json.get("user_token") {
+            if let Some(user_token_str) = user_token.as_str() {
+                return Ok(user_token_str.to_string());
+            }
+        }
+        
+        Err("User token not found in response".into())
+    } else {
+        let error_text = response.text().unwrap_or_else(|_| "Unknown error".to_string());
+        Err(format!("Failed to exchange code for user token: {}", error_text).into())
+    }
+}
+
 pub fn verify_token(token: &str, corgea_url: &str) -> Result<bool, Box<dyn Error>> {
     let url = format!("{}{}/verify", corgea_url, API_BASE);
     let client = http_client();
