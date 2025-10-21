@@ -9,22 +9,22 @@ pub struct CheckmarxCliParser;
 impl ScanParser for CheckmarxCliParser {
     fn detect(&self, input: &str) -> bool {
         if let Ok(data) = serde_json::from_str::<Value>(input) {
-            data.get("totalCount").is_some() 
-                && data.get("results").is_some() 
+            data.get("totalCount").is_some()
+                && data.get("results").is_some()
                 && data.get("scanID").is_some()
         } else {
             false
         }
     }
-    
+
     fn parse(&self, input: &str) -> Option<ParseResult> {
         debug("Detected checkmarx cli schema");
-        
+
         let data: Value = match serde_json::from_str(input) {
             Ok(data) => data,
             Err(_) => return None,
         };
-        
+
         let mut paths = Vec::new();
         if let Some(results) = data.get("results").and_then(|v| v.as_array()) {
             for result in results {
@@ -41,13 +41,13 @@ impl ScanParser for CheckmarxCliParser {
                 }
             }
         }
-        
+
         Some(ParseResult {
             paths,
             scanner: "checkmarx".to_string(),
         })
     }
-    
+
     fn scanner_name(&self) -> &str {
         "checkmarx-cli"
     }
@@ -63,15 +63,15 @@ impl ScanParser for CheckmarxWebParser {
             false
         }
     }
-    
+
     fn parse(&self, input: &str) -> Option<ParseResult> {
         debug("Detected checkmarx web schema");
-        
+
         let data: Value = match serde_json::from_str(input) {
             Ok(data) => data,
             Err(_) => return None,
         };
-        
+
         let mut paths = Vec::new();
         if let Some(scan_results) = data.get("scanResults") {
             if let Some(sast) = scan_results.get("sast") {
@@ -98,13 +98,13 @@ impl ScanParser for CheckmarxWebParser {
                 }
             }
         }
-        
+
         Some(ParseResult {
             paths,
             scanner: "checkmarx".to_string(),
         })
     }
-    
+
     fn scanner_name(&self) -> &str {
         "checkmarx-web"
     }
@@ -117,9 +117,9 @@ impl CheckmarxXmlParser {
         debug("Detected checkmarx xml schema");
         let mut paths = Vec::new();
         let mut reader = Reader::from_str(input);
-        
+
         let mut buf = Vec::new();
-        
+
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
@@ -136,6 +136,15 @@ impl CheckmarxXmlParser {
                                 }
                             }
                         }
+                    } else if e.name().as_ref() == b"FileName" {
+                        if let Ok(Event::Text(text)) = reader.read_event_into(&mut buf) {
+                            if let Ok(file_name) = std::str::from_utf8(text.as_ref()) {
+                                let clean_path = file_name.trim_start_matches('/').trim_start_matches('\\');
+                                if !clean_path.is_empty() {
+                                    paths.push(clean_path.to_string());
+                                }
+                            }
+                        }
                     }
                 }
                 Ok(Event::Eof) => break,
@@ -147,7 +156,7 @@ impl CheckmarxXmlParser {
             }
             buf.clear();
         }
-        
+
         Some(ParseResult {
             paths,
             scanner: "checkmarx".to_string(),
@@ -159,14 +168,12 @@ impl ScanParser for CheckmarxXmlParser {
     fn detect(&self, input: &str) -> bool {
         input.trim().starts_with("<?xml") && input.contains("<CxXMLResults")
     }
-    
+
     fn parse(&self, input: &str) -> Option<ParseResult> {
         self.parse_xml_content(input)
     }
-    
+
     fn scanner_name(&self) -> &str {
         "checkmarx-xml"
     }
 }
-
-
