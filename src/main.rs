@@ -81,7 +81,7 @@ enum Commands {
         )]
         scan_type: Option<String>,
 
-        #[arg(long, help = "Output the result to a file in a specific format. Valid options are json, html, sarif.")]
+        #[arg(long, help = "Output the result to a file in a specific format. Valid options are json, html, sarif, markdown.")]
         out_format: Option<String>,
 
         #[arg(short, long, help = "Output the result to a file. you can use the out_format option to specify the format of the output file.")]
@@ -277,8 +277,8 @@ fn main() {
             }
 
             if let Some(format) = out_format {
-                if !["json", "html", "sarif"].contains(&format.as_str()) {
-                    eprintln!("Invalid out_format option. Expected one of 'json', 'html', 'sarif'.");
+                if !["json", "html", "sarif", "markdown"].contains(&format.as_str()) {
+                    eprintln!("Invalid out_format option. Expected one of 'json', 'html', 'sarif', 'markdown'.");
                     std::process::exit(1);
                 }
             }

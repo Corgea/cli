@@ -292,6 +292,20 @@ pub fn run(
                 utils::terminal::clear_previous_line();
                 println!("\n\nScan report written to: {}\n\n", out_file.clone());
             }
+            else if out_format == "markdown" {
+                let report = match utils::api::get_scan_report(&config.get_url(), &config.get_token(), &scan_id, Some("markdown")) {
+                    Ok(markdown) => markdown,
+                    Err(e) => {
+                        eprintln!("\n\nFailed to fetch Markdown report: {}\n\n", e);
+                        std::process::exit(1);
+                    }
+                };
+                *stop_signal.lock().unwrap() = true;
+                let _ = results_thread.join();
+                fs::write(out_file.clone(), report).expect("\n\nFailed to write Markdown file, check if the file path is valid and you have the necessary permissions to write to it.");
+                utils::terminal::clear_previous_line();
+                println!("\n\nScan report written to: {}\n\n", out_file.clone());
+            }
         }
     }
 
