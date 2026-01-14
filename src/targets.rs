@@ -2,8 +2,9 @@ use std::collections::HashSet;
 use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 use globset::{Glob, GlobSetBuilder};
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use git2::{Repository, StatusOptions, Delta};
+use crate::utils::generic::OVERRIDE_INCLUDE_PATTERNS;
 
 #[derive(Debug)]
 pub struct TargetResolutionResult {
@@ -423,8 +424,17 @@ fn resolve_glob(pattern: &str, repo_root: &Path) -> Result<Vec<PathBuf>, String>
 
     let mut files = Vec::new();
     
+    let mut override_builder = OverrideBuilder::new(repo_root);
+    for pattern in OVERRIDE_INCLUDE_PATTERNS {
+        override_builder.add(&format!("!{}", pattern))
+            .map_err(|e| format!("Failed to add override pattern: {}", e))?;
+    }
+    let overrides = override_builder.build()
+        .map_err(|e| format!("Failed to build overrides: {}", e))?;
+    
     let walker = WalkBuilder::new(repo_root)
         .standard_filters(true)
+        .overrides(overrides)
         .build();
 
     for result in walker {

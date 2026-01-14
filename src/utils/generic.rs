@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use zip::{write::FileOptions, ZipWriter};
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use globset::{GlobSetBuilder, Glob};
 use std::fs::{self, File};
 use std::env;
@@ -29,6 +29,11 @@ const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
     "**/.vs/**",
     "**/.vscode/**",
     "**/.idea/**",
+];
+
+// Patterns to include even if ignored by .gitignore
+pub const OVERRIDE_INCLUDE_PATTERNS: &[&str] = &[
+    "**/project.assets.json",
 ];
 
 /// Create a zip file from a target specification or full repository scan.
@@ -70,8 +75,18 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
             .collect()
     } else {
         let directory = Path::new(".");
+        
+        let mut override_builder = OverrideBuilder::new(directory);
+        for pattern in OVERRIDE_INCLUDE_PATTERNS {
+            override_builder.add(&format!("!{}", pattern))
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to add override pattern: {}", e)))?;
+        }
+        let overrides = override_builder.build()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to build overrides: {}", e)))?;
+        
         let walker = WalkBuilder::new(directory)
             .standard_filters(true)
+            .overrides(overrides)
             .build();
 
         let mut files = Vec::new();
