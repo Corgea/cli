@@ -223,11 +223,43 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
     println!("Uploading the scan...");
 
     // main scan upload
-    debug(&format!("POST: {}", scan_upload_url));
-    let res = client.post(scan_upload_url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(input.clone())
-        .send();
+    let input_bytes = input.as_bytes();
+    let input_size = input_bytes.len();
+    let max_upload_size = 100 * 1024 * 1024;
+    let chunk_size = 1024 * 1024;
+    let res = if input_size > max_upload_size {
+        let total_chunks = (input_size + chunk_size - 1) / chunk_size;
+        debug(&format!("Uploading scan in {} chunks", total_chunks));
+        let mut offset = 0usize;
+        let mut last_response = None;
+
+        for (index, chunk) in input_bytes.chunks(chunk_size).enumerate() {
+            debug(&format!("POST: {} (chunk {}/{})", scan_upload_url, index + 1, total_chunks));
+            let response = client.post(&scan_upload_url)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Upload-Offset", offset.to_string())
+                .header("Upload-Length", input_size.to_string())
+                .body(chunk.to_vec())
+                .send();
+            let should_break = match &response {
+                Ok(res) => !res.status().is_success(),
+                Err(_) => true,
+            };
+            last_response = Some(response);
+            if should_break {
+                break;
+            }
+            offset += chunk.len();
+        }
+
+        last_response.expect("Failed to upload scan.")
+    } else {
+        debug(&format!("POST: {}", scan_upload_url));
+        client.post(&scan_upload_url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(input.clone())
+            .send()
+    };
 
     let mut sast_scan_id: Option<String> = None;
 
