@@ -225,8 +225,8 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
     // main scan upload
     let input_bytes = input.as_bytes();
     let input_size = input_bytes.len();
-    let max_upload_size = 100 * 1024 * 1024;
-    let chunk_size = 1024 * 1024;
+    let max_upload_size = 50 * 1024 * 1024; // 50mb
+    let chunk_size = 1024 * 1024; // 1mb
     let res = if input_size > max_upload_size {
         let total_chunks = (input_size + chunk_size - 1) / chunk_size;
         debug(&format!("Uploading scan in {} chunks", total_chunks));
