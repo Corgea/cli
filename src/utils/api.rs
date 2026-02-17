@@ -15,6 +15,10 @@ use crate::log::debug;
 const CHUNK_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 const API_BASE: &str = "/api/v1";
 
+fn get_source() -> String {
+    std::env::var("CORGEA_SOURCE").unwrap_or_else(|_| "cli".to_string())
+}
+
 pub fn http_client() -> reqwest::blocking::Client {
     let mut builder =
         reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5 * 30));
@@ -76,6 +80,7 @@ pub fn upload_zip(
     let response_object = client
         .post(format!("{}{}/start-scan", url, API_BASE))
         .header("CORGEA-TOKEN", token)
+        .header("CORGEA-SOURCE", get_source())
         .query(&[
             ("scan_type", "blast"),
         ])
@@ -165,6 +170,7 @@ pub fn upload_zip(
         let response = match client
         .patch(format!("{}{}/start-scan/{}/", url, API_BASE, transfer_id))
         .header("CORGEA-TOKEN", token)
+        .header("CORGEA-SOURCE", get_source())
         .header("Upload-Offset", offset.to_string())
         .header("Upload-Length", file_size.to_string())
         .header("Upload-Name", file_name)
@@ -281,6 +287,7 @@ pub fn get_scan_issues(
     let client = http_client();
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
+    headers.insert("CORGEA-SOURCE", get_source().parse().unwrap());
 
     debug(&format!("Sending request to URL: {}", url));
     debug(&format!("Headers: {:?}", headers));
@@ -314,6 +321,7 @@ pub fn get_scan(url: &str, token: &str, scan_id: &str) -> Result<ScanResponse, B
 
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
+    headers.insert("CORGEA-SOURCE", get_source().parse().unwrap());
     debug(&format!("Sending request to URL: {}", url));
     debug(&format!("Headers: {:?}", headers));
     let response = client
@@ -346,6 +354,7 @@ pub fn get_scan_report(url: &str, token: &str, scan_id: &str, format: Option<&st
     let client = http_client();
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
+    headers.insert("CORGEA-SOURCE", get_source().parse().unwrap());
 
     debug(&format!("Sending request to URL: {}", url));
     debug(&format!("Headers: {:?}", headers));
@@ -375,6 +384,7 @@ pub fn get_issue(url: &str, token: &str, issue: &str) -> Result<FullIssueRespons
     let client = http_client();
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
+    headers.insert("CORGEA-SOURCE", get_source().parse().unwrap());
     debug(&format!("Sending request to URL: {}", url));
     debug(&format!("Headers: {:?}", headers));
     let response = match client.get(&url).headers(headers).send() {
@@ -419,6 +429,7 @@ pub fn query_scan_list(
     let client = http_client();
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
+    headers.insert("CORGEA-SOURCE", get_source().parse().unwrap());
     debug(&format!("Sending request to URL: {}", url));
     debug(&format!("Headers: {:?}", headers));
     let response = match client
@@ -457,6 +468,7 @@ pub fn exchange_code_for_token(
     
     let response = client
         .get(&exchange_url)
+        .header("CORGEA-SOURCE", get_source())
         .query(&[("code", code)])
         .send()?;
     
@@ -481,6 +493,7 @@ pub fn verify_token(token: &str, corgea_url: &str) -> Result<bool, Box<dyn Error
     let client = http_client();
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
+    headers.insert("CORGEA-SOURCE", get_source().parse().unwrap());
     debug(&format!("Sending request to URL: {}", url));
     debug(&format!("Headers: {:?}", headers));
 
@@ -520,6 +533,7 @@ pub fn check_blocking_rules(
     let client = http_client();
     let mut headers = HeaderMap::new();
     headers.insert("CORGEA-TOKEN", token.parse().unwrap());
+    headers.insert("CORGEA-SOURCE", get_source().parse().unwrap());
     debug(&format!("Sending request to URL: {}", url));
     debug(&format!("Headers: {:?}", headers));
     debug(&format!("Query params: {:?}", query_params));
@@ -586,6 +600,7 @@ pub fn get_sca_issues(
     let response = client
         .get(&endpoint)
         .header("CORGEA-TOKEN", token)
+        .header("CORGEA-SOURCE", get_source())
         .query(&query_params)
         .send();
 
