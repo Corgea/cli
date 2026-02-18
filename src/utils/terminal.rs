@@ -60,6 +60,7 @@ pub fn set_text_color(txt: &str, color: TerminalColor) -> String {
         TerminalColor::Red => "\x1b[31m",
         TerminalColor::Green => "\x1b[32m",
         TerminalColor::Blue => "\x1b[34m",
+        TerminalColor::Yellow => "\x1b[33m",
         TerminalColor::Reset => "\x1b[0m",
     };
     return format!("{}{}{}", color_code, txt, "\x1b[0m");
@@ -225,4 +226,5 @@ pub enum TerminalColor {
     Red,
     Green,
     Blue,
+    Yellow,
 }

@@ -17,6 +17,7 @@ mod utils {
     pub mod generic;
     pub mod api;
 }
+mod targets;
 
 use std::str::FromStr;
 use clap::{Parser, Subcommand, CommandFactory};
@@ -86,6 +87,18 @@ enum Commands {
 
         #[arg(short, long, help = "Output the result to a file. you can use the out_format option to specify the format of the output file.")]
         out_file: Option<String>,
+
+        #[arg(
+            long,
+            help = "Specify specific files, directories, glob patterns, or git selectors to scan. Accepts comma-separated values. Examples: 'src/,pyproject.toml', 'src/**/*.py', 'git:diff=origin/main...HEAD', 'git:staged', 'git:untracked', or '-' to read from stdin (newline-delimited). Use '-0' for NUL-delimited stdin."
+        )]
+        target: Option<String>,
+
+        #[arg(
+            long,
+            help = "The name of the Corgea project. Defaults to git repository name if found, otherwise to the current directory name."
+        )]
+        project_name: Option<String>,
     },
     /// Wait for the latest in progress scan
     Wait {
@@ -238,7 +251,7 @@ fn main() {
                 }
             }
         }
-        Some(Commands::Scan { scanner , fail_on, fail, only_uncommitted, scan_type, policy, out_format, out_file }) => {
+        Some(Commands::Scan { scanner , fail_on, fail, only_uncommitted, scan_type, policy, out_format, out_file, target, project_name }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             if let Some(level) = fail_on {
                 if *scanner != Scanner::Blast {
@@ -321,7 +334,7 @@ fn main() {
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config),
                 Scanner::Semgrep => scan::run_semgrep(&corgea_config),
-                Scanner::Blast => scanners::blast::run(&corgea_config, fail_on.clone(), fail, only_uncommitted, scan_type.clone(), policy.clone(), out_format.clone(), out_file.clone())
+                Scanner::Blast => scanners::blast::run(&corgea_config, fail_on.clone(), fail, only_uncommitted, scan_type.clone(), policy.clone(), out_format.clone(), out_file.clone(), target.clone(), project_name.clone())
             }
         }
         Some(Commands::Wait { scan_id }) => {

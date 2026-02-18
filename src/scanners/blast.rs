@@ -1,5 +1,6 @@
 use crate::utils;
 use crate::config::Config;
+use crate::targets;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::error::Error;
@@ -19,7 +20,15 @@ pub fn run(
     policy: Option<String>,
     out_format: Option<String>,
     out_file: Option<String>,
+    target: Option<String>,
+    project_name: Option<String>,
 ) {
+    // Validate that only_uncommitted and target are not used together
+    if *only_uncommitted && target.is_some() {
+        eprintln!("--only_uncommitted and --target cannot be used together.");
+        std::process::exit(1);
+    }
+
     if *only_uncommitted {
         match utils::generic::is_git_repo("./") {
             Ok(false) => {
@@ -48,7 +57,7 @@ pub fn run(
     println!("\n\n");
     let temp_dir = env::temp_dir().join(format!("corgea/tmp/{}", Uuid::new_v4()));
     fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
-    let project_name = utils::generic::get_current_working_directory().unwrap_or("unknown".to_string());
+    let project_name = utils::generic::determine_project_name(project_name.as_deref());
     let zip_path = format!("{}/{}.zip", temp_dir.display(), project_name);
     let repo_info = match utils::generic::get_repo_info("./") {
         Ok(info) => info,
@@ -73,61 +82,98 @@ pub fn run(
         utils::terminal::show_loading_message("Packaging your project... ([T]s)", stop_signal_clone);
     });
 
-    if *only_uncommitted {
-        match utils::generic::get_untracked_and_modified_files("./") {
-            Ok(files) => {
-                let files_to_zip: Vec<(std::path::PathBuf, std::path::PathBuf)> = files
-                    .iter()
-                    .map(|file| (std::path::PathBuf::from(file), std::path::PathBuf::from(file)))
-                    .collect();
-                println!("\rFiles to be submitted for partial scan:\n");
-                for (index, (_, original)) in files_to_zip.iter().enumerate() {
-                    println!("{}: {}", index + 1, original.display());
-                }
-                print!("\n\n");
-                if files_to_zip.is_empty() {
+    let target_str: Option<&str> = if *only_uncommitted {
+        Some("git:staged,git:modified,git:untracked")
+    } else {
+        target.as_deref()
+    };
+
+    if let Some(target_value) = target_str {
+        match targets::resolve_targets(target_value) {
+            Ok(result) => {
+                if result.files.is_empty() {
                     *stop_signal.lock().unwrap() = true;
+                    let _ = packaging_thread.join();
                     print!("\r{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset));
-                    eprintln!(
-                        "\n\nOops! It seems there are no scannable uncommitted changes in your project.\nYou may have uncommitted changes, but none match the types of files we can scan.\n\n"
-                    );
+                    eprintln!("\n\nError: target resolved to zero files.\n");
+                    eprintln!("Target value: {}\n", target_value);
+                    eprintln!("Segment results:");
+                    for segment_result in &result.segments {
+                        if let Some(ref error) = segment_result.error {
+                            eprintln!("  {}: ERROR - {}", segment_result.segment, error);
+                        } else {
+                            eprintln!("  {}: {} matches", segment_result.segment, segment_result.matches);
+                        }
+                    }
+                    eprintln!("\nPlease check your target specification and try again.\n");
                     std::process::exit(1);
                 }
-                match utils::generic::create_zip_from_list_of_files(files_to_zip, &zip_path, None) {
-                    Ok(_) => {},
-                    Err(e) => {
-                        *stop_signal.lock().unwrap() = true;
-                        print!("\r{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset));
-                        eprintln!(
-                            "\n\nUh-oh! We couldn't package your project at '{}'.\nThis might be due to insufficient permissions, invalid file paths, or a file system error.\nPlease check the directory and try again.\nError details:\n{}\n\n", 
-                            zip_path, e
-                        );
-                        std::process::exit(1);
+
+                let file_count = result.files.len();
+                if *only_uncommitted {
+                    println!("\rFiles to be submitted for partial scan:\n");
+                    for (index, file) in result.files.iter().enumerate() {
+                        if let Ok(relative) = file.strip_prefix(std::env::current_dir().unwrap_or_default()) {
+                            println!("{}: {}", index + 1, relative.display());
+                        } else {
+                            println!("{}: {}", index + 1, file.display());
+                        }
                     }
+                    println!();
+                } else {
+                    println!("Scanning {} files (target mode)", file_count);
+                    
+                    let display_count = std::cmp::min(20, file_count);
+                    for file in result.files.iter().take(display_count) {
+                        if let Ok(relative) = file.strip_prefix(std::env::current_dir().unwrap_or_default()) {
+                            println!("  {}", relative.display());
+                        } else {
+                            println!("  {}", file.display());
+                        }
+                    }
+                    if file_count > display_count {
+                        println!("  (+{} more)", file_count - display_count);
+                    }
+                    println!();
                 }
-            },
+            }
             Err(e) => {
                 *stop_signal.lock().unwrap() = true;
+                let _ = packaging_thread.join();
                 print!("\r{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset));
-                eprintln!(
-                    "\n\nFailed to retrieve untracked and modified files.\nError details:\n{}\n\n", 
-                    e
-                );
+                eprintln!("\n\nError resolving targets: {}\n", e);
                 std::process::exit(1);
             }
         }
-    } else {
-        match utils::generic::create_zip_from_filtered_files(".", None, &zip_path) {
-            Ok(_) => { },
-            Err(e) => {
+    }
+
+    match utils::generic::create_zip_from_target(target_str, &zip_path, None) {
+        Ok(added_files) => {
+            if added_files.is_empty() {
                 *stop_signal.lock().unwrap() = true;
+                let _ = packaging_thread.join();
                 print!("\r{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset));
-                eprintln!(
-                    "\n\nUh-oh! We couldn't package your project at '{}'.\nThis might be due to insufficient permissions, invalid file paths, or a file system error.\nPlease check the directory and try again.\nError details:\n{}\n\n", 
-                    zip_path, e
-                );
+                if *only_uncommitted {
+                    eprintln!(
+                        "\n\nOops! It seems there are no scannable uncommitted changes in your project.\nYou may have uncommitted changes, but none match the types of files we can scan.\n\n"
+                    );
+                } else {
+                    eprintln!(
+                        "\n\nOops! No valid files found to scan after filtering.\n\n"
+                    );
+                }
                 std::process::exit(1);
             }
+        },
+        Err(e) => {
+            *stop_signal.lock().unwrap() = true;
+            let _ = packaging_thread.join();
+            print!("\r{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset));
+            eprintln!(
+                "\n\nUh-oh! We couldn't package your project at '{}'.\nThis might be due to insufficient permissions, invalid file paths, or a file system error.\nPlease check the directory and try again.\nError details:\n{}\n\n", 
+                zip_path, e
+            );
+            std::process::exit(1);
         }
     }
     *stop_signal.lock().unwrap() = true;
