@@ -1,0 +1,27 @@
+name: Trigger AI Docs Sync on PR Merge
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  run-codex-docs-sync:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@v4
+
+      - name: Run AI Docs Sync
+        uses: Corgea/internal_actions/sync-docs-action@main
+        with:
+          token: ${{ secrets.DOCS_REPO_TOKEN }}
+          base_sha: ${{ github.event.pull_request.base.sha }}
+          head_sha: ${{ github.event.pull_request.head.sha }}
+          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          docs_repo_token: ${{ secrets.DOCS_REPO_TOKEN }}
+          docs_repo: "Corgea/docs"
+          docs_base_branch: "main"
+          pr_info: |
+            PR Title: ${{ github.event.pull_request.title }}
+            PR Description: ${{ github.event.pull_request.body }}
