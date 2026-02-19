@@ -1,0 +1,111 @@
+name: Publish npm Package
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish from (for example: v1.7.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish-npm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Validate Tag Matches package.json Version
+        env:
+          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          TAG_VERSION="${TAG_NAME#v}"
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+
+          echo "Tag version: ${TAG_VERSION}"
+          echo "Package version: ${PACKAGE_VERSION}"
+
+          if [ "${TAG_VERSION}" != "${PACKAGE_VERSION}" ]; then
+            echo "Tag (${TAG_VERSION}) must match package.json version (${PACKAGE_VERSION})."
+            exit 1
+          fi
+
+      - name: Wait for Release Assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          API_URL="https://api.github.com/repos/${REPO}/releases/tags/${TAG_NAME}"
+          ATTEMPTS=30
+          SLEEP_SECONDS=20
+          RELEASE_JSON="$(mktemp)"
+
+          for i in $(seq 1 "${ATTEMPTS}"); do
+            echo "Checking release assets (${i}/${ATTEMPTS})..."
+
+            if curl -fsS \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${API_URL}" > "${RELEASE_JSON}"; then
+              if node - "${RELEASE_JSON}" <<'NODE'
+const fs = require("node:fs");
+const releasePath = process.argv[2];
+const release = JSON.parse(fs.readFileSync(releasePath, "utf8"));
+const assets = new Set((release.assets || []).map((asset) => asset.name));
+
+const required = [
+  "corgea-aarch64-apple-darwin.zip",
+  "corgea-x86_64-apple-darwin.zip",
+  "corgea-aarch64-unknown-linux-gnu.zip",
+  "corgea-x86_64-unknown-linux-gnu.zip"
+];
+
+const missing = required.filter((name) => !assets.has(name));
+const hasWindowsAsset =
+  assets.has("corgea.exe-x86_64-pc-windows-gnu.zip") ||
+  assets.has("corgea-x86_64-pc-windows-gnu.zip");
+
+if (!hasWindowsAsset) {
+  missing.push("corgea.exe-x86_64-pc-windows-gnu.zip (or corgea-x86_64-pc-windows-gnu.zip)");
+}
+
+if (missing.length > 0) {
+  console.error(`Missing assets: ${missing.join(", ")}`);
+  process.exit(1);
+}
+
+console.log("All required release assets are available.");
+NODE
+              then
+                exit 0
+              fi
+            fi
+
+            sleep "${SLEEP_SECONDS}"
+          done
+
+          echo "Timed out waiting for release assets for tag ${TAG_NAME}."
+          exit 1
+
+      - name: Validate npm Package Contents
+        run: npm pack --dry-run
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public

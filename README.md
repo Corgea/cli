@@ -6,6 +6,11 @@ For full documentation, visit https://docs.corgea.app/cli
 
 ## Installation
 
+### Using npm
+```
+npm install -g corgea-cli
+```
+
 ### Using pip
 ```
 pip install corgea-cli
@@ -63,4 +68,3 @@ corgea login <token>
    ```
 
 Note: After making changes to Rust code, you'll need to run `maturin develop` again to rebuild the package.
-
