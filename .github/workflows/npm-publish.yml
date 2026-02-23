@@ -1,4 +1,4 @@
-name: Publish npm Package
+name: Publish npm Packages
 
 on:
   push:
@@ -15,13 +15,73 @@ permissions:
   contents: read
 
 jobs:
-  publish-npm:
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      release_ref: ${{ steps.resolve.outputs.release_ref }}
+      tag_name: ${{ steps.resolve.outputs.tag_name }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve Tag and Version
+        id: resolve
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG_NAME="${{ inputs.tag }}"
+            RELEASE_REF="refs/tags/${{ inputs.tag }}"
+          else
+            TAG_NAME="${{ github.ref_name }}"
+            RELEASE_REF="${{ github.ref }}"
+          fi
+
+          VERSION="${TAG_NAME#v}"
+          echo "release_ref=${RELEASE_REF}" >> "${GITHUB_OUTPUT}"
+          echo "tag_name=${TAG_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+  publish-platform-packages:
+    name: Publish ${{ matrix.package_name }}
+    needs:
+      - prepare
+      - validate-release
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            package_name: corgea-cli-linux-x64
+            package_dir: packages/corgea-cli-linux-x64
+            target: x86_64-unknown-linux-gnu
+            binary_name: corgea
+          - runner: ubuntu-24.04-arm
+            package_name: corgea-cli-linux-arm64
+            package_dir: packages/corgea-cli-linux-arm64
+            target: aarch64-unknown-linux-gnu
+            binary_name: corgea
+          - runner: macos-13
+            package_name: corgea-cli-darwin-x64
+            package_dir: packages/corgea-cli-darwin-x64
+            target: x86_64-apple-darwin
+            binary_name: corgea
+          - runner: macos-14
+            package_name: corgea-cli-darwin-arm64
+            package_dir: packages/corgea-cli-darwin-arm64
+            target: aarch64-apple-darwin
+            binary_name: corgea
+          - runner: windows-latest
+            package_name: corgea-cli-win32-x64
+            package_dir: packages/corgea-cli-win32-x64
+            target: x86_64-pc-windows-msvc
+            binary_name: corgea.exe
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          ref: ${{ needs.prepare.outputs.release_ref }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -29,83 +89,134 @@ jobs:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
-      - name: Validate Tag Matches package.json Version
-        env:
-          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build Binary
+        run: cargo build --release --target "${{ matrix.target }}"
+
+      - name: Stage Platform Package
         run: |
-          TAG_VERSION="${TAG_NAME#v}"
-          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          node scripts/npm/prepare-platform-package.js \
+            "${{ matrix.package_dir }}" \
+            "${{ matrix.target }}" \
+            "${{ matrix.binary_name }}" \
+            "${{ needs.prepare.outputs.version }}"
 
-          echo "Tag version: ${TAG_VERSION}"
-          echo "Package version: ${PACKAGE_VERSION}"
-
-          if [ "${TAG_VERSION}" != "${PACKAGE_VERSION}" ]; then
-            echo "Tag (${TAG_VERSION}) must match package.json version (${PACKAGE_VERSION})."
-            exit 1
+      - name: Publish Platform Package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PACKAGE_NAME: ${{ matrix.package_name }}
+          PACKAGE_DIR: ${{ matrix.package_dir }}
+          PACKAGE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
+            echo "${PACKAGE_NAME}@${PACKAGE_VERSION} already exists on npm, skipping."
+            exit 0
           fi
 
-      - name: Wait for Release Assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-        run: |
-          API_URL="https://api.github.com/repos/${REPO}/releases/tags/${TAG_NAME}"
-          ATTEMPTS=30
-          SLEEP_SECONDS=20
-          RELEASE_JSON="$(mktemp)"
+          npm publish "${PACKAGE_DIR}" --access public
 
-          for i in $(seq 1 "${ATTEMPTS}"); do
-            echo "Checking release assets (${i}/${ATTEMPTS})..."
+  publish-main-package:
+    name: Publish corgea-cli
+    needs:
+      - prepare
+      - validate-release
+      - publish-platform-packages
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.release_ref }}
 
-            if curl -fsS \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              "${API_URL}" > "${RELEASE_JSON}"; then
-              if node - "${RELEASE_JSON}" <<'NODE'
-const fs = require("node:fs");
-const releasePath = process.argv[2];
-const release = JSON.parse(fs.readFileSync(releasePath, "utf8"));
-const assets = new Set((release.assets || []).map((asset) => asset.name));
-
-const required = [
-  "corgea-aarch64-apple-darwin.zip",
-  "corgea-x86_64-apple-darwin.zip",
-  "corgea-aarch64-unknown-linux-gnu.zip",
-  "corgea-x86_64-unknown-linux-gnu.zip"
-];
-
-const missing = required.filter((name) => !assets.has(name));
-const hasWindowsAsset =
-  assets.has("corgea.exe-x86_64-pc-windows-gnu.zip") ||
-  assets.has("corgea-x86_64-pc-windows-gnu.zip");
-
-if (!hasWindowsAsset) {
-  missing.push("corgea.exe-x86_64-pc-windows-gnu.zip (or corgea-x86_64-pc-windows-gnu.zip)");
-}
-
-if (missing.length > 0) {
-  console.error(`Missing assets: ${missing.join(", ")}`);
-  process.exit(1);
-}
-
-console.log("All required release assets are available.");
-NODE
-              then
-                exit 0
-              fi
-            fi
-
-            sleep "${SLEEP_SECONDS}"
-          done
-
-          echo "Timed out waiting for release assets for tag ${TAG_NAME}."
-          exit 1
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
 
       - name: Validate npm Package Contents
         run: npm pack --dry-run
 
-      - name: Publish to npm
+      - name: Publish corgea-cli
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+          PACKAGE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if npm view "corgea-cli@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
+            echo "corgea-cli@${PACKAGE_VERSION} already exists on npm, skipping."
+            exit 0
+          fi
+
+          npm publish --access public
+
+  validate-release:
+    name: Validate Release Metadata
+    needs: prepare
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.release_ref }}
+
+      - name: Validate package versions
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const releaseVersion = process.env.RELEASE_VERSION;
+          const rootPackage = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const optionalDependencies = rootPackage.optionalDependencies || {};
+
+          const errors = [];
+          const platformPackageNames = new Set();
+
+          if (rootPackage.version !== releaseVersion) {
+            errors.push(`package.json version ${rootPackage.version} does not match release version ${releaseVersion}`);
+          }
+
+          const packageRoot = "packages";
+          const platformDirs = fs.readdirSync(packageRoot, { withFileTypes: true })
+            .filter((entry) => entry.isDirectory())
+            .map((entry) => path.join(packageRoot, entry.name));
+
+          for (const packageDir of platformDirs) {
+            const packageJsonPath = path.join(packageDir, "package.json");
+            const platformPackage = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+            const expectedVersion = optionalDependencies[platformPackage.name];
+            platformPackageNames.add(platformPackage.name);
+
+            if (!expectedVersion) {
+              errors.push(`missing optional dependency entry for ${platformPackage.name}`);
+              continue;
+            }
+
+            if (expectedVersion !== releaseVersion) {
+              errors.push(`optional dependency ${platformPackage.name} has version ${expectedVersion}, expected ${releaseVersion}`);
+            }
+          }
+
+          for (const dependencyName of Object.keys(optionalDependencies)) {
+            if (!platformPackageNames.has(dependencyName)) {
+              errors.push(`optional dependency ${dependencyName} has no matching package under packages/`);
+            }
+          }
+
+          if (errors.length > 0) {
+            console.error(errors.join("\n"));
+            process.exit(1);
+          }
+          NODE

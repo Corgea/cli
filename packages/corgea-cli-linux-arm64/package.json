@@ -1,0 +1,24 @@
+{
+  "name": "corgea-cli-linux-arm64",
+  "version": "1.7.2",
+  "description": "Linux arm64 binary for Corgea CLI.",
+  "license": "LGPL-2.1-only",
+  "homepage": "https://corgea.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Corgea/cli.git"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "vendor",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
