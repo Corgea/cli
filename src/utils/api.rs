@@ -47,6 +47,11 @@ fn check_for_warnings(headers: &HeaderMap, status: StatusCode) {
     }
 }
 
+pub struct UploadZipResult {
+    pub scan_id: String,
+    pub project_id: Option<String>,
+}
+
 pub fn upload_zip(
     file_path: &str,
     token: &str,
@@ -55,7 +60,7 @@ pub fn upload_zip(
     repo_info: Option<utils::generic::RepoInfo>,
     scan_type: Option<String>,
     policy: Option<String>
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<UploadZipResult, Box<dyn std::error::Error>> {
     let client = http_client();
     let file_size = std::fs::metadata(file_path)?.len();
     let file_name = Path::new(file_path)
@@ -210,7 +215,12 @@ pub fn upload_zip(
             print!("\n");
             let body: HashMap<String, Value> = response.json()?;
             if let Some(scan_id_value) = body.get("scan_id") {
-                return Ok(scan_id_value.as_str().unwrap().to_string());
+                let scan_id = scan_id_value.as_str().unwrap().to_string();
+                let project_id = body.get("project_id").and_then(|v| {
+                    v.as_str().map(|s| s.to_string())
+                        .or_else(|| v.as_i64().map(|n| n.to_string()))
+                });
+                return Ok(UploadZipResult { scan_id, project_id });
             } else {
                 return Err("Failed to get scan_id from response".into());
             }

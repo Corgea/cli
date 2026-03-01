@@ -180,7 +180,7 @@ pub fn run(
     let _ = packaging_thread.join();
     print!("\r{}Project packaged successfully.\n", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Green));
     println!("\n\nSubmitting scan to Corgea:");
-    let scan_id = match utils::api::upload_zip(&zip_path, &config.get_token(), &config.get_url(), &project_name, repo_info, scan_type, policy) {
+    let upload_result = match utils::api::upload_zip(&zip_path, &config.get_token(), &config.get_url(), &project_name, repo_info, scan_type, policy) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("\n\nOh no! We encountered an issue while uploading the zip file '{}' to the server.\nPlease ensure that:
@@ -188,7 +188,7 @@ pub fn run(
     - Your network connection is stable.
     - The server URL '{}' is correct.
     - Your authentication token is valid.\n\n
-
+    
     Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli
 
     Error details:\n\n {}",
@@ -200,11 +200,17 @@ pub fn run(
         },
     };
 
+    let scan_id = upload_result.scan_id;
+    let scan_url = match &upload_result.project_id {
+        Some(pid) => format!("{}/project/{}/?scan_id={}", config.get_url(), pid, scan_id),
+        None => format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id),
+    };
+
     let _ = utils::generic::delete_directory(&temp_dir);
     print!(
         "\n\nScan has started with ID: {}.\n\nYou can view it populate at the link:\n{}\n\n",
         scan_id,
-        utils::terminal::set_text_color(&format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id), utils::terminal::TerminalColor::Green)
+        utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
     );
 
     print!(
@@ -225,7 +231,7 @@ pub fn run(
             let _ = results_thread.join();
             println!(
                 "\n\nYou can view the scan results at the following link:\n{}",
-                utils::terminal::set_text_color(&format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id), utils::terminal::TerminalColor::Green)
+                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
             );
             issues_classes
         },
@@ -244,10 +250,7 @@ pub fn run(
                     &format!("Failed to report the scan status for project: '{}'.", project_name),
                     utils::terminal::TerminalColor::Red
                 ),
-                utils::terminal::set_text_color(
-                    &format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id),
-                    utils::terminal::TerminalColor::Blue
-                ),
+                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Blue),
                 config.get_url(),
                 e
             );
@@ -264,10 +267,7 @@ pub fn run(
         };
         if blocking_rules.block {
             println!("\nExiting with error code 1 due to some issues violating some blocking rules defined for this project.\nfor more details, please check the scan results at the link: {}\nAlternatively, you can run {} to view the issues list on your local machine.",
-            utils::terminal::set_text_color(
-                &format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id),
-                utils::terminal::TerminalColor::Green
-            ), 
+            utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green),
             utils::terminal::set_text_color(
                 &format!("corgea ls -i -s={}", scan_id),
                 utils::terminal::TerminalColor::Green
