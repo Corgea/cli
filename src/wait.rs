@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::scanners::blast;
 
 
-pub fn run(config: &Config, scan_id: Option<String>) {
+pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>) {
     let project_name = match utils::generic::get_current_working_directory() {
         Some(name) => name,
         None => {
@@ -53,11 +53,16 @@ pub fn run(config: &Config, scan_id: Option<String>) {
         }
     };
 
+    let scan_url = match &project_id {
+        Some(pid) => format!("{}/project/{}/?scan_id={}", config.get_url(), pid, scan_id),
+        None => format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id),
+    };
+
     if !processed {
         print!(
             "\n\nWaiting for scan with ID: {}.\n\nYou can view it populate at the link:\n{}\n\n",
             scan_id,
-            utils::terminal::set_text_color(&format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id), utils::terminal::TerminalColor::Green)
+            utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
         );
         print!(
            "{}",
@@ -72,7 +77,7 @@ pub fn run(config: &Config, scan_id: Option<String>) {
         Ok(_) => {
             println!(
                 "\n\nYou can view the scan results at the following link:\n{}",
-                utils::terminal::set_text_color(&format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id), utils::terminal::TerminalColor::Green)
+                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
             );
         },
         Err(e) => {
@@ -87,10 +92,7 @@ pub fn run(config: &Config, scan_id: Option<String>) {
                     &format!("Failed to report the scan status for project: '{}'.", project_name),
                     utils::terminal::TerminalColor::Red
                 ),
-                utils::terminal::set_text_color(
-                    &format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id),
-                    utils::terminal::TerminalColor::Blue
-                ),
+                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Blue),
                 config.get_url(),
                 e
             );

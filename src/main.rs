@@ -339,7 +339,7 @@ fn main() {
         }
         Some(Commands::Wait { scan_id }) => {
             verify_token_and_exit_when_fail(&corgea_config);
-            wait::run(&corgea_config, scan_id.clone());
+            wait::run(&corgea_config, scan_id.clone(), None);
         }
         Some(Commands::List { issues , json, page, page_size, scan_id, sca_issues}) => {
             verify_token_and_exit_when_fail(&corgea_config);

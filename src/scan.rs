@@ -46,6 +46,11 @@ pub fn run_command(base_cmd: &String, mut command: Command) -> String {
     }
 }
 
+pub struct ScanUploadResult {
+    pub scan_id: String,
+    pub project_id: Option<String>,
+}
+
 pub fn run_semgrep(config: &Config) {
     println!("Scanning with semgrep...");
     let base_command = "semgrep";
@@ -56,8 +61,8 @@ pub fn run_semgrep(config: &Config) {
 
     let output = run_command(&base_command.to_string(), command);
 
-    if let Some(scan_id) = parse_scan(config, output, true) {
-        crate::wait::run(config, Some(scan_id));
+    if let Some(result) = parse_scan(config, output, true) {
+        crate::wait::run(config, Some(result.scan_id), result.project_id);
     }
 }
 
@@ -71,8 +76,8 @@ pub fn run_snyk(config: &Config) {
 
     let output = run_command(&base_command.to_string(), command);
 
-    if let Some(scan_id) = parse_scan(config, output, true) {
-        crate::wait::run(config, Some(scan_id));
+    if let Some(result) = parse_scan(config, output, true) {
+        crate::wait::run(config, Some(result.scan_id), result.project_id);
     }
 }
 
@@ -95,7 +100,7 @@ pub fn read_file_report(config: &Config, file_path: &str) {
     let _ = parse_scan(config, input, false);
 }
 
-pub fn parse_scan(config: &Config, input: String, save_to_file: bool) -> Option<String> {
+pub fn parse_scan(config: &Config, input: String, save_to_file: bool) -> Option<ScanUploadResult> {
     debug("Parsing the scan report");
 
     // Remove BOM (Byte Order Mark) if present
@@ -112,6 +117,7 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) -> Option<
 
             return upload_scan(config, parse_result.paths, parse_result.scanner, cleaned_input.to_string(), save_to_file);
         }
+
         Err(error_message) => {
             eprintln!("{}", error_message);
             std::process::exit(1);
@@ -119,7 +125,7 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) -> Option<
     }
 }
 
-pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: String, save_to_file: bool) -> Option<String> {
+pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: String, save_to_file: bool) -> Option<ScanUploadResult> {
     let in_ci = running_in_ci();
     let ci_platform = which_ci();
     let github_env_vars = get_github_env_vars();
@@ -262,6 +268,7 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
     };
 
     let mut sast_scan_id: Option<String> = None;
+    let mut project_id: Option<String> = None;
 
     match res {
         Ok(response) => {
@@ -284,6 +291,13 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
                                 } else if let Some(id_num) = id_val.as_i64() {
                                     println!("Scan ID: {}", id_num);
                                     sast_scan_id = Some(id_num.to_string());
+                                }
+                            }
+                            if let Some(pid_val) = json.get("project_id") {
+                                if let Some(pid_str) = pid_val.as_str() {
+                                    project_id = Some(pid_str.to_string());
+                                } else if let Some(pid_num) = pid_val.as_i64() {
+                                    project_id = Some(pid_num.to_string());
                                 }
                             }
                         }
@@ -371,5 +385,5 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
 
     println!("Go to {base_url} to see results.");
 
-    sast_scan_id
+    sast_scan_id.map(|scan_id| ScanUploadResult { scan_id, project_id })
 }
