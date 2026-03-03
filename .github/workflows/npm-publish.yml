@@ -65,7 +65,7 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       - name: Set package version from tag
-        run: npm version "${{ needs.prepare.outputs.version }}-beta.1" --no-git-tag-version
+        run: npm version "${{ needs.prepare.outputs.version }}-beta.2" --no-git-tag-version
 
       - name: Download release binaries
         env:
