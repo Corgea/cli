@@ -16,17 +16,14 @@
   },
   "files": [
     "bin",
+    "vendor",
     "README.md",
     "LICENSE"
   ],
   "engines": {
     "node": ">=18"
   },
-  "optionalDependencies": {
-    "corgea-cli-darwin-arm64": "1.7.2",
-    "corgea-cli-darwin-x64": "1.7.2",
-    "corgea-cli-linux-arm64": "1.7.2",
-    "corgea-cli-linux-x64": "1.7.2",
-    "corgea-cli-win32-x64": "1.7.2"
+  "devDependencies": {
+    "fflate": "^0.8.2"
   }
 }

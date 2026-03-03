@@ -1,9 +1,10 @@
-name: Publish npm Packages
+name: Publish npm Package
 
 on:
-  push:
-    tags:
-      - "*"
+  workflow_run:
+    workflows: ["Native Binary Release"]
+    types:
+      - completed
   workflow_dispatch:
     inputs:
       tag:
@@ -17,8 +18,15 @@ permissions:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    # For workflow_run: only proceed when triggered by a tag push that succeeded.
+    # For workflow_dispatch: always proceed.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        startsWith(github.event.workflow_run.head_branch, 'v')
+      )
     outputs:
-      release_ref: ${{ steps.resolve.outputs.release_ref }}
       tag_name: ${{ steps.resolve.outputs.tag_name }}
       version: ${{ steps.resolve.outputs.version }}
     steps:
@@ -28,103 +36,17 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG_NAME="${{ inputs.tag }}"
-            RELEASE_REF="refs/tags/${{ inputs.tag }}"
           else
-            TAG_NAME="${{ github.ref_name }}"
-            RELEASE_REF="${{ github.ref }}"
+            TAG_NAME="${{ github.event.workflow_run.head_branch }}"
           fi
 
           VERSION="${TAG_NAME#v}"
-          echo "release_ref=${RELEASE_REF}" >> "${GITHUB_OUTPUT}"
           echo "tag_name=${TAG_NAME}" >> "${GITHUB_OUTPUT}"
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
 
-  publish-platform-packages:
-    name: Publish ${{ matrix.package_name }}
-    needs:
-      - prepare
-      - validate-release
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            package_name: corgea-cli-linux-x64
-            package_dir: packages/corgea-cli-linux-x64
-            target: x86_64-unknown-linux-gnu
-            binary_name: corgea
-          - runner: ubuntu-24.04-arm
-            package_name: corgea-cli-linux-arm64
-            package_dir: packages/corgea-cli-linux-arm64
-            target: aarch64-unknown-linux-gnu
-            binary_name: corgea
-          - runner: macos-13
-            package_name: corgea-cli-darwin-x64
-            package_dir: packages/corgea-cli-darwin-x64
-            target: x86_64-apple-darwin
-            binary_name: corgea
-          - runner: macos-14
-            package_name: corgea-cli-darwin-arm64
-            package_dir: packages/corgea-cli-darwin-arm64
-            target: aarch64-apple-darwin
-            binary_name: corgea
-          - runner: windows-latest
-            package_name: corgea-cli-win32-x64
-            package_dir: packages/corgea-cli-win32-x64
-            target: x86_64-pc-windows-msvc
-            binary_name: corgea.exe
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare.outputs.release_ref }}
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Build Binary
-        run: cargo build --release --target "${{ matrix.target }}"
-
-      - name: Stage Platform Package
-        run: |
-          node scripts/npm/prepare-platform-package.js \
-            "${{ matrix.package_dir }}" \
-            "${{ matrix.target }}" \
-            "${{ matrix.binary_name }}" \
-            "${{ needs.prepare.outputs.version }}"
-
-      - name: Publish Platform Package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          PACKAGE_NAME: ${{ matrix.package_name }}
-          PACKAGE_DIR: ${{ matrix.package_dir }}
-          PACKAGE_VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
-            echo "${PACKAGE_NAME}@${PACKAGE_VERSION} already exists on npm, skipping."
-            exit 0
-          fi
-
-          npm publish "${PACKAGE_DIR}" --access public
-
-  publish-main-package:
+  publish:
     name: Publish corgea-cli
-    needs:
-      - prepare
-      - validate-release
-      - publish-platform-packages
+    needs: prepare
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -133,7 +55,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.release_ref }}
+          ref: refs/tags/${{ needs.prepare.outputs.tag_name }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -141,8 +63,22 @@ jobs:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
-      - name: Validate npm Package Contents
-        run: npm pack --dry-run
+      - name: Set package version from tag
+        run: npm version "${{ needs.prepare.outputs.version }}" --no-git-tag-version
+
+      - name: Download release binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+        run: |
+          mkdir -p release-assets
+          gh release download "$TAG_NAME" --dir release-assets
+
+      - name: Install dev dependencies
+        run: npm install --include=dev
+
+      - name: Bundle binaries into vendor/
+        run: node scripts/npm/bundle-binaries.js release-assets
 
       - name: Publish corgea-cli
         env:
@@ -155,68 +91,3 @@ jobs:
           fi
 
           npm publish --access public
-
-  validate-release:
-    name: Validate Release Metadata
-    needs: prepare
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare.outputs.release_ref }}
-
-      - name: Validate package versions
-        env:
-          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          node - <<'NODE'
-          const fs = require("node:fs");
-          const path = require("node:path");
-
-          const releaseVersion = process.env.RELEASE_VERSION;
-          const rootPackage = JSON.parse(fs.readFileSync("package.json", "utf8"));
-          const optionalDependencies = rootPackage.optionalDependencies || {};
-
-          const errors = [];
-          const platformPackageNames = new Set();
-
-          if (rootPackage.version !== releaseVersion) {
-            errors.push(`package.json version ${rootPackage.version} does not match release version ${releaseVersion}`);
-          }
-
-          const packageRoot = "packages";
-          const platformDirs = fs.readdirSync(packageRoot, { withFileTypes: true })
-            .filter((entry) => entry.isDirectory())
-            .map((entry) => path.join(packageRoot, entry.name));
-
-          for (const packageDir of platformDirs) {
-            const packageJsonPath = path.join(packageDir, "package.json");
-            const platformPackage = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
-            const expectedVersion = optionalDependencies[platformPackage.name];
-            platformPackageNames.add(platformPackage.name);
-
-            if (!expectedVersion) {
-              errors.push(`missing optional dependency entry for ${platformPackage.name}`);
-              continue;
-            }
-
-            if (expectedVersion !== releaseVersion) {
-              errors.push(`optional dependency ${platformPackage.name} has version ${expectedVersion}, expected ${releaseVersion}`);
-            }
-          }
-
-          for (const dependencyName of Object.keys(optionalDependencies)) {
-            if (!platformPackageNames.has(dependencyName)) {
-              errors.push(`optional dependency ${dependencyName} has no matching package under packages/`);
-            }
-          }
-
-          if (errors.length > 0) {
-            console.error(errors.join("\n"));
-            process.exit(1);
-          }
-          NODE
