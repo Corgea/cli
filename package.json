@@ -1,6 +1,6 @@
 {
   "name": "@corgea/cli",
-  "version": "1.7.2",
+  "version": "0.0.0",
   "description": "The Corgea CLI. Scan for vulnerabilities, create fixes.",
   "license": "LGPL-2.1-only",
   "homepage": "https://corgea.com",
