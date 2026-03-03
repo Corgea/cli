@@ -1,6 +1,7 @@
 name: Publish npm Package
 
 on:
+  push:
   workflow_run:
     workflows: ["Native Binary Release"]
     types:
