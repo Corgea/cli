@@ -1,7 +1,6 @@
 name: Publish npm Package
 
 on:
-  push:
   workflow_run:
     workflows: ["Native Binary Release"]
     types:
@@ -20,7 +19,6 @@ jobs:
   prepare:
     runs-on: ubuntu-latest
     if: >
-      github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
       (
         github.event.workflow_run.conclusion == 'success' &&
@@ -34,10 +32,7 @@ jobs:
         id: resolve
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            # TEMPORARY: hardcoded tag for local testing — remove before merging
-            TAG_NAME="v1.7.2"
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG_NAME="${{ inputs.tag }}"
           else
             TAG_NAME="${{ github.event.workflow_run.head_branch }}"
@@ -57,6 +52,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.prepare.outputs.tag_name }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
