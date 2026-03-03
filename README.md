@@ -8,9 +8,9 @@ For full documentation, visit https://docs.corgea.app/cli
 
 ### Using npm
 ```
-npm install -g corgea-cli
+npm install -g @corgea/cli
 ```
-The npm package resolves a platform-specific optional dependency (for example, `corgea-cli-linux-x64`) that contains the native `corgea` binary.
+The npm package bundles native binaries for all supported platforms. The correct binary for your OS and architecture is selected automatically at runtime.
 
 ### Using pip
 ```
