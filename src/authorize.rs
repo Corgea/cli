@@ -526,3 +526,40 @@ fn parse_query_params(query: &str) -> HashMap<String, String> {
         .collect()
 }
 
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener as StdTcpListener;
+    use tokio::time::{timeout, Duration};
+
+    fn reserve_ephemeral_port() -> u16 {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
+        listener.local_addr().expect("failed to get local addr").port()
+    }
+
+    #[test]
+    fn parse_query_params_decodes_values() {
+        let params = parse_query_params("code=a%20b&error_description=needs%2Blogin");
+
+        assert_eq!(params.get("code"), Some(&"a b".to_string()));
+        assert_eq!(params.get("error_description"), Some(&"needs+login".to_string()));
+    }
+
+    #[tokio::test]
+    async fn start_callback_server_returns_without_waiting_for_second_connection() {
+        let port = reserve_ephemeral_port();
+        let auth_code = Arc::new(Mutex::new(Some("test-code".to_string())));
+
+        let returned_code = timeout(
+            Duration::from_millis(300),
+            start_callback_server(port, auth_code),
+        )
+        .await
+        .expect("callback server timed out")
+        .expect("callback server should return code");
+
+        assert_eq!(returned_code, "test-code");
+    }
+}
