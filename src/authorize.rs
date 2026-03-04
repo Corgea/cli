@@ -137,32 +137,36 @@ async fn start_callback_server(
     };
     
     loop {
-        let (stream, _) = listener.accept().await?;
-        let io = TokioIo::new(stream);
-        let auth_code_clone = auth_code.clone();
-        
-        let service = service_fn(move |req| {
-            handle_callback(req, auth_code_clone.clone())
-        });
-        
-        tokio::task::spawn(async move {
-            if let Err(err) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await
-            {
-                eprintln!("Error serving connection: {:?}", err);
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (stream, _) = accept_result?;
+                let io = TokioIo::new(stream);
+                let auth_code_clone = auth_code.clone();
+
+                let service = service_fn(move |req| {
+                    handle_callback(req, auth_code_clone.clone())
+                });
+
+                tokio::task::spawn(async move {
+                    if let Err(err) = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .await
+                    {
+                        eprintln!("Error serving connection: {:?}", err);
+                    }
+                });
             }
-        });
-        
-        // Check if we got the code
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+
+        // Check if we got the code.
+        // We must do this outside of `accept()` blocking so we don't miss a code
+        // that was set by the request task after a single callback request.
         if let Ok(code_guard) = auth_code.lock() {
             if let Some(code) = code_guard.as_ref() {
                 return Ok(code.clone());
             }
         }
-        
-        // Add a small delay to prevent busy waiting
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -521,5 +525,4 @@ fn parse_query_params(query: &str) -> HashMap<String, String> {
         })
         .collect()
 }
-
 
