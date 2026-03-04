@@ -1,0 +1,91 @@
+name: Publish npm Package
+
+on:
+  workflow_run:
+    workflows: ["Native Binary Release"]
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish from (for example: v1.7.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        startsWith(github.event.workflow_run.head_branch, 'v')
+      )
+    outputs:
+      tag_name: ${{ steps.resolve.outputs.tag_name }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve Tag and Version
+        id: resolve
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG_NAME="${{ inputs.tag }}"
+          else
+            TAG_NAME="${{ github.event.workflow_run.head_branch }}"
+          fi
+
+          VERSION="${TAG_NAME#v}"
+          echo "tag_name=${TAG_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+  publish:
+    name: Publish corgea-cli
+    needs: prepare
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.prepare.outputs.tag_name }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Set package version from tag
+        run: npm version "${{ needs.prepare.outputs.version }}" --no-git-tag-version
+
+      - name: Download release binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+        run: |
+          mkdir -p release-assets
+          gh release download "$TAG_NAME" --dir release-assets
+
+      - name: Install dev dependencies
+        run: npm install --include=dev
+
+      - name: Bundle binaries into vendor/
+        run: node scripts/npm/bundle-binaries.js release-assets
+
+      - name: Publish corgea-cli
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PACKAGE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if npm view "corgea-cli@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
+            echo "corgea-cli@${PACKAGE_VERSION} already exists on npm, skipping."
+            exit 0
+          fi
+
+          npm publish --access public

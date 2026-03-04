@@ -6,6 +6,12 @@ For full documentation, visit https://docs.corgea.app/cli
 
 ## Installation
 
+### Using npm
+```
+npm install -g @corgea/cli
+```
+The npm package bundles native binaries for all supported platforms. The correct binary for your OS and architecture is selected automatically at runtime.
+
 ### Using pip
 ```
 pip install corgea-cli
@@ -63,4 +69,3 @@ corgea login <token>
    ```
 
 Note: After making changes to Rust code, you'll need to run `maturin develop` again to rebuild the package.
-
