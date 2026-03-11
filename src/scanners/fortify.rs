@@ -9,7 +9,7 @@ use quick_xml::reader::Reader;
 use crate::Config;
 use crate::scan::upload_scan;
 
-pub fn parse(config: &Config, file_path: &str) {
+pub fn parse(config: &Config, file_path: &str, project_name: Option<String>) {
     let temp_dir = match TempDir::new() {
         Ok(dir) => dir,
         Err(e) => {
@@ -48,7 +48,7 @@ pub fn parse(config: &Config, file_path: &str) {
         }
 
         let (scan_data, paths) = extract_file_path(outpath);
-        let _scan_id = upload_scan(config, paths, "fortify".to_string(), scan_data, false);
+        let _scan_id = upload_scan(config, paths, "fortify".to_string(), scan_data, false, project_name);
     } else {
         println!("File 'audit.fvdl' not found in the archive");
     };

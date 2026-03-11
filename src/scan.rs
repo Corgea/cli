@@ -51,7 +51,7 @@ pub struct ScanUploadResult {
     pub project_id: Option<String>,
 }
 
-pub fn run_semgrep(config: &Config) {
+pub fn run_semgrep(config: &Config, project_name: Option<String>) {
     println!("Scanning with semgrep...");
     let base_command = "semgrep";
     let mut command = std::process::Command::new(base_command);
@@ -61,12 +61,12 @@ pub fn run_semgrep(config: &Config) {
 
     let output = run_command(&base_command.to_string(), command);
 
-    if let Some(result) = parse_scan(config, output, true) {
+    if let Some(result) = parse_scan(config, output, true, project_name) {
         crate::wait::run(config, Some(result.scan_id), result.project_id);
     }
 }
 
-pub fn run_snyk(config: &Config) {
+pub fn run_snyk(config: &Config, project_name: Option<String>) {
     println!("Scanning with snyk...");
     let base_command = "snyk";
     let mut command = std::process::Command::new(base_command);
@@ -76,19 +76,19 @@ pub fn run_snyk(config: &Config) {
 
     let output = run_command(&base_command.to_string(), command);
 
-    if let Some(result) = parse_scan(config, output, true) {
+    if let Some(result) = parse_scan(config, output, true, project_name) {
         crate::wait::run(config, Some(result.scan_id), result.project_id);
     }
 }
 
-pub fn read_stdin_report(config: &Config) {
+pub fn read_stdin_report(config: &Config, project_name: Option<String>) {
     let mut input = String::new();
     let _ = io::stdin().read_to_string(&mut input);
 
-    let _ = parse_scan(config, input, false);
+    let _ = parse_scan(config, input, false, project_name);
 }
 
-pub fn read_file_report(config: &Config, file_path: &str) {
+pub fn read_file_report(config: &Config, file_path: &str, project_name: Option<String>) {
     let input = match std::fs::read_to_string(file_path) {
         Ok(input) => input,
         Err(e) => {
@@ -97,10 +97,10 @@ pub fn read_file_report(config: &Config, file_path: &str) {
         }
     };
 
-    let _ = parse_scan(config, input, false);
+    let _ = parse_scan(config, input, false, project_name);
 }
 
-pub fn parse_scan(config: &Config, input: String, save_to_file: bool) -> Option<ScanUploadResult> {
+pub fn parse_scan(config: &Config, input: String, save_to_file: bool, project_name: Option<String>) -> Option<ScanUploadResult> {
     debug("Parsing the scan report");
 
     // Remove BOM (Byte Order Mark) if present
@@ -115,7 +115,7 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) -> Option<
                 std::process::exit(0);
             }
 
-            return upload_scan(config, parse_result.paths, parse_result.scanner, cleaned_input.to_string(), save_to_file);
+            return upload_scan(config, parse_result.paths, parse_result.scanner, cleaned_input.to_string(), save_to_file, project_name);
         }
 
         Err(error_message) => {
@@ -125,7 +125,7 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool) -> Option<
     }
 }
 
-pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: String, save_to_file: bool) -> Option<ScanUploadResult> {
+pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: String, save_to_file: bool, project_name: Option<String>) -> Option<ScanUploadResult> {
     let in_ci = running_in_ci();
     let ci_platform = which_ci();
     let github_env_vars = get_github_env_vars();
@@ -133,7 +133,6 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
     let run_id = Uuid::new_v4().to_string();
     let token = config.get_token();
     let base_url = config.get_url();
-    let current_dir = std::env::current_dir().expect("Failed to get current directory");
     let project;
 
     if in_ci {
@@ -142,7 +141,7 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
                           github_env_vars.get("GITHUB_REPOSITORY").expect("Failed to get GITHUB_REPOSITORY").to_string(),
                           github_env_vars.get("GITHUB_PR").expect("Failed to get GITHUB_REPOSITORY").to_string())
     } else {
-        project = current_dir.file_name().expect("Failed to get directory name").to_str().expect("Failed to convert OsStr to str").to_string();
+        project = utils::generic::determine_project_name(project_name.as_deref());
     }
     let repo_data = std::env::var("REPO_DATA").unwrap_or_else(|_| "".to_string()); //encoded data to forward.
 

@@ -52,6 +52,12 @@ enum Commands {
     Upload {
         /// Option path to JSON report to upload
         report: Option<String>,
+
+        #[arg(
+            long,
+            help = "The name of the Corgea project. Defaults to git repository name if found, otherwise to the current directory name."
+        )]
+        project_name: Option<String>,
     },
     /// Scan the current directory. Supports blast, semgrep and snyk.
     Scan {
@@ -236,18 +242,18 @@ fn main() {
                 }
             }
         }
-        Some(Commands::Upload { report }) => {
+        Some(Commands::Upload { report, project_name }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             match report {
                 Some(report) => {
                     if report.ends_with(".fpr") {
-                        fortify_parse(&corgea_config, report);
+                        fortify_parse(&corgea_config, report, project_name.clone());
                     } else {
-                        scan::read_file_report(&corgea_config, report);
+                        scan::read_file_report(&corgea_config, report, project_name.clone());
                     }
                 }
                 None => {
-                    scan::read_stdin_report(&corgea_config);
+                    scan::read_stdin_report(&corgea_config, project_name.clone());
                 }
             }
         }
@@ -332,8 +338,8 @@ fn main() {
                 }
             }
             match scanner {
-                Scanner::Snyk => scan::run_snyk(&corgea_config),
-                Scanner::Semgrep => scan::run_semgrep(&corgea_config),
+                Scanner::Snyk => scan::run_snyk(&corgea_config, project_name.clone()),
+                Scanner::Semgrep => scan::run_semgrep(&corgea_config, project_name.clone()),
                 Scanner::Blast => scanners::blast::run(&corgea_config, fail_on.clone(), fail, only_uncommitted, scan_type.clone(), policy.clone(), out_format.clone(), out_file.clone(), target.clone(), project_name.clone())
             }
         }
