@@ -1,15 +1,15 @@
-use std::fs::File;
-use std::io;
-use std::path::PathBuf;
-use zip::ZipArchive;
-use tempfile::TempDir;
-use std::io::{Read, BufReader};
+use crate::scan::upload_scan;
+use crate::Config;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
-use crate::Config;
-use crate::scan::upload_scan;
+use std::fs::File;
+use std::io;
+use std::io::{BufReader, Read};
+use std::path::PathBuf;
+use tempfile::TempDir;
+use zip::ZipArchive;
 
-pub fn parse(config: &Config, file_path: &str) {
+pub fn parse(config: &Config, file_path: &str, project_name: Option<&str>) {
     let temp_dir = match TempDir::new() {
         Ok(dir) => dir,
         Err(e) => {
@@ -48,7 +48,14 @@ pub fn parse(config: &Config, file_path: &str) {
         }
 
         let (scan_data, paths) = extract_file_path(outpath);
-        let _scan_id = upload_scan(config, paths, "fortify".to_string(), scan_data, false);
+        let _scan_id = upload_scan(
+            config,
+            paths,
+            "fortify".to_string(),
+            scan_data,
+            false,
+            project_name,
+        );
     } else {
         println!("File 'audit.fvdl' not found in the archive");
     };
@@ -61,7 +68,9 @@ fn extract_file_path(scan_file: PathBuf) -> (String, Vec<String>) {
     let mut reader = BufReader::new(file);
 
     let mut contents = String::new();
-    reader.read_to_string(&mut contents).expect("Unable to read file");
+    reader
+        .read_to_string(&mut contents)
+        .expect("Unable to read file");
 
     let mut xml_reader = Reader::from_str(&contents);
     xml_reader.config_mut().trim_text(true);
