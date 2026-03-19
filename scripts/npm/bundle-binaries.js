@@ -6,11 +6,11 @@ const path = require("node:path");
 const { unzipSync } = require("fflate");
 
 const TARGETS = [
-  { triple: "x86_64-unknown-linux-gnu",  binary: "corgea" },
+  { triple: "x86_64-unknown-linux-musl", binary: "corgea" },
   { triple: "aarch64-unknown-linux-gnu", binary: "corgea" },
-  { triple: "x86_64-apple-darwin",       binary: "corgea" },
-  { triple: "aarch64-apple-darwin",      binary: "corgea" },
-  { triple: "x86_64-pc-windows-msvc",    binary: "corgea.exe" },
+  { triple: "x86_64-apple-darwin", binary: "corgea" },
+  { triple: "aarch64-apple-darwin", binary: "corgea" },
+  { triple: "x86_64-pc-windows-msvc", binary: "corgea.exe" },
 ];
 
 function fail(message) {
@@ -43,7 +43,9 @@ for (const { triple, binary } of TARGETS) {
   const zipBuffer = fs.readFileSync(archivePath);
   const entries = unzipSync(new Uint8Array(zipBuffer));
 
-  const entry = Object.entries(entries).find(([name]) => path.basename(name) === binary);
+  const entry = Object.entries(entries).find(
+    ([name]) => path.basename(name) === binary,
+  );
   if (!entry) {
     fail(`binary "${binary}" not found inside ${archiveName}`);
   }
