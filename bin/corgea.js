@@ -9,7 +9,7 @@ function resolveTargetTriple() {
   switch (process.platform) {
     case "linux":
     case "android":
-      if (process.arch === "x64") return "x86_64-unknown-linux-gnu";
+      if (process.arch === "x64") return "x86_64-unknown-linux-musl";
       if (process.arch === "arm64") return "aarch64-unknown-linux-gnu";
       return null;
     case "darwin":
@@ -26,7 +26,9 @@ function resolveTargetTriple() {
 
 const targetTriple = resolveTargetTriple();
 if (!targetTriple) {
-  throw new Error(`Unsupported platform: ${process.platform} (${process.arch})`);
+  throw new Error(
+    `Unsupported platform: ${process.platform} (${process.arch})`,
+  );
 }
 
 const binaryName = process.platform === "win32" ? "corgea.exe" : "corgea";
@@ -36,7 +38,7 @@ const binaryPath = path.join(vendorRoot, targetTriple, "corgea", binaryName);
 if (!existsSync(binaryPath)) {
   throw new Error(
     `Corgea binary not found at ${binaryPath}.\n` +
-    `Try reinstalling: npm install -g corgea-cli@latest`
+      `Try reinstalling: npm install -g corgea-cli@latest`,
   );
 }
 
