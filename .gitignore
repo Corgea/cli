@@ -5,3 +5,10 @@
 *.zip
 node_modules/
 /packages/*/vendor/
+
+.env*
+*.pem
+*.key
+scan.json
+test.json
+src/test_data.swift

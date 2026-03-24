@@ -2,6 +2,8 @@ name: Native Binary Release
 
 on:
   push:
+    tags:
+      - '*'
   workflow_dispatch:
     inputs:
       tag:
@@ -40,7 +42,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -72,7 +74,7 @@ jobs:
 
       - name: Upload to GitHub Release (tags)
         if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: "corgea-${{ matrix.target }}.zip"
@@ -81,7 +83,7 @@ jobs:
 
       - name: Upload as Artifact (branches)
         if: ${{ !startsWith(github.ref, 'refs/tags/') && inputs.tag == '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binaries-${{ matrix.target }}
           path: "corgea-${{ matrix.target }}.zip"

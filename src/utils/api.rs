@@ -605,7 +605,7 @@ pub fn get_sca_issues(
 
     debug(&format!("Sending request to URL: {}", endpoint));
     debug(&format!("Query params: {:?}", query_params));
-    debug(&format!("Token: {}", token));
+    debug(&format!("Token: ...{}", &token[token.len().saturating_sub(4)..]));
 
     let response = client
         .get(&endpoint)

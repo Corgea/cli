@@ -1,0 +1,5 @@
+# Require review for CI/CD and security-sensitive files
+.github/ @Corgea/engineering
+Cargo.toml @Corgea/engineering
+Cargo.lock @Corgea/engineering
+pyproject.toml @Corgea/engineering

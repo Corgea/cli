@@ -147,16 +147,16 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
 
     let scan_upload_url = if repo_data.is_empty() {
         format!(
-            "{}/api/cli/scan-upload?token={}&engine={}&run_id={}&project={}&ci={}&ci_platform={}", base_url, token, scanner, run_id, project, in_ci, ci_platform
+            "{}/api/cli/scan-upload?engine={}&run_id={}&project={}&ci={}&ci_platform={}", base_url, scanner, run_id, project, in_ci, ci_platform
         )
     } else {
         format!(
-            "{}/api/cli/scan-upload?token={}&engine={}&run_id={}&project={}&ci={}&ci_platform={}&repo_data={}", base_url, token, scanner, run_id, project, in_ci, ci_platform, repo_data
+            "{}/api/cli/scan-upload?engine={}&run_id={}&project={}&ci={}&ci_platform={}&repo_data={}", base_url, scanner, run_id, project, in_ci, ci_platform, repo_data
         )
     };
 
     let git_config_upload_url = format!(
-        "{}/api/cli/git-config-upload?token={}&run_id={}", base_url, token, run_id
+        "{}/api/cli/git-config-upload?run_id={}", base_url, run_id
     );
     let client = utils::api::http_client();
 
@@ -177,7 +177,7 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
         }
 
         let src_upload_url = format!(
-            "{}/api/cli/code-upload?token={}&run_id={}&path={}", base_url, token, run_id, path
+            "{}/api/cli/code-upload?run_id={}&path={}", base_url, run_id, path
         );
         debug(&format!("Uploading file: {}", path));
         let fp = Path::new(&path);
@@ -192,6 +192,7 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
 
             debug(&format!("POST: {}", src_upload_url));
             let res = client.post(&src_upload_url)
+                .header("CORGEA-TOKEN", &token)
                 .multipart(form)
                 .send();
 
@@ -241,6 +242,7 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
         for (index, chunk) in input_bytes.chunks(chunk_size).enumerate() {
             debug(&format!("POST: {} (chunk {}/{})", scan_upload_url, index + 1, total_chunks));
             let response = client.post(&scan_upload_url)
+                .header("CORGEA-TOKEN", &token)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("Upload-Offset", offset.to_string())
                 .header("Upload-Length", input_size.to_string())
@@ -261,6 +263,7 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
     } else {
         debug(&format!("POST: {}", scan_upload_url));
         client.post(&scan_upload_url)
+            .header("CORGEA-TOKEN", &token)
             .header(header::CONTENT_TYPE, "application/json")
             .body(input.clone())
             .send()
@@ -326,6 +329,7 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
 
         debug(&format!("POST: {}", git_config_upload_url));
         let res = client.post(&git_config_upload_url)
+            .header("CORGEA-TOKEN", &token)
             .multipart(form)
             .send();
 
@@ -343,7 +347,7 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
 
     if in_ci {
         let ci_data_upload_url = format!(
-            "{}/api/cli/ci-data-upload?token={}&run_id={}&platform={}", base_url, token, run_id, ci_platform
+            "{}/api/cli/ci-data-upload?run_id={}&platform={}", base_url, run_id, ci_platform
         );
 
         let mut github_env_vars_json = serde_json::Map::new();
@@ -361,6 +365,7 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
 
         debug(&format!("POST: {}", ci_data_upload_url));
         let _res = client.post(ci_data_upload_url)
+            .header("CORGEA-TOKEN", &token)
             .header(header::CONTENT_TYPE, "application/json")
             .body(github_env_vars_json_string)
             .send();
