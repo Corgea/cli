@@ -164,7 +164,5 @@ corgea scan --out-format sarif --out-file report.sarif
 ## Troubleshooting
 
 - **"token invalid" or authentication errors**: The user needs to authenticate with Corgea. Ask them to run `corgea login` (browser OAuth) or `corgea login <API_TOKEN>` to set up credentials. For single-tenant instances, use `corgea login --url https://<instance>.corgea.app <TOKEN>`. Tokens can also be set via the `CORGEA_API_TOKEN` environment variable.
-- **Scan hangs or timeouts**: Set `CORGEA_DEBUG=1` for verbose output and check network connectivity to the Corgea instance.
 - **Third-party scanner not found**: `semgrep` or `snyk` must be installed and on `PATH`.
 - **Upload failures**: The CLI retries 3 times per file. Check file paths and permissions.
-- **Behind a proxy**: Set `https_proxy` and optionally `CORGEA_ACCEPT_CERT=1`.
