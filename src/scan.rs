@@ -231,8 +231,23 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
     let input_bytes = input.as_bytes();
     let input_size = input_bytes.len();
     let max_upload_size = 50 * 1024 * 1024; // 50mb
-    let chunk_size = 1024 * 1024; // 1mb
-    let res = if input_size > max_upload_size {
+    let chunk_size = match std::env::var("DEBUG_CORGEA_OVERRIDE_REPORT_CHUNK_SIZE") {
+        Ok(val) => {
+            match val.parse::<usize>() {
+                Ok(mb) if mb > 0 => {
+                    debug(&format!("Overriding report chunk size to {} MB", mb));
+                    mb * 1024 * 1024
+                }
+                _ => {
+                    eprintln!("Invalid DEBUG_CORGEA_OVERRIDE_REPORT_CHUNK_SIZE value '{}', using default 1 MB", val);
+                    1024 * 1024
+                }
+            }
+        }
+        Err(_) => 1024 * 1024, // default 1mb
+    };
+    let is_chunked = input_size > max_upload_size;
+    let res = if is_chunked {
         let total_chunks = (input_size + chunk_size - 1) / chunk_size;
         debug(&format!("Uploading scan in {} chunks", total_chunks));
         let mut offset = 0usize;
@@ -246,8 +261,38 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
                 .header("Upload-Length", input_size.to_string())
                 .body(chunk.to_vec())
                 .send();
+
             let should_break = match &response {
-                Ok(res) => !res.status().is_success(),
+                Ok(res) => {
+                    if !res.status().is_success() {
+                        true
+                    } else {
+                        if let Some(server_offset) = res.headers().get("Upload-Offset") {
+                            let expected_offset = offset + chunk.len();
+                            if let Ok(server_offset_str) = server_offset.to_str() {
+                                if let Ok(server_offset_val) = server_offset_str.parse::<usize>() {
+                                    if server_offset_val != expected_offset {
+                                        eprintln!(
+                                            "Upload offset mismatch on chunk {}/{}: server has {} bytes but expected {}. \
+                                            This may indicate that chunks are being routed to different server instances. \
+                                            Please contact support.",
+                                            index + 1, total_chunks, server_offset_val, expected_offset
+                                        );
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    }
+                },
                 Err(_) => true,
             };
             last_response = Some(response);
@@ -268,6 +313,8 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
 
     let mut sast_scan_id: Option<String> = None;
     let mut project_id: Option<String> = None;
+
+    let mut upload_failed = false;
 
     match res {
         Ok(response) => {
@@ -305,13 +352,21 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
                         }
                     }
                 }
-                println!("Successfully uploaded scan.");
+
+                if is_chunked && sast_scan_id.is_none() {
+                    eprintln!("Failed to upload scan: server did not return a scan ID after all chunks were sent. The scan was not created on the platform.");
+                    upload_failed = true;
+                } else {
+                    println!("Successfully uploaded scan.");
+                }
             } else {
                 eprintln!("Failed to upload scan: {}", response.status());
+                upload_failed = true;
             }
         }
         Err(e) => {
             eprintln!("Failed to send request: {}", e);
+            upload_failed = true;
         }
     }
 
@@ -374,6 +429,10 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
             Ok(_) => println!("Successfully saved scan to {}", file_path.display()),
             Err(e) => eprintln!("Failed to save scan to {}: {}", file_path.display(), e)
         }
+    }
+
+    if upload_failed {
+        std::process::exit(1);
     }
 
     println!("Successfully scanned using {} and uploaded to Corgea.", scanner);
