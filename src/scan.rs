@@ -198,7 +198,10 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
             match res {
                 Ok(response) => {
                     if !response.status().is_success() {
-                        eprintln!("Failed to upload file {} {}... retrying", response.status(), path);
+                        let status = response.status();
+                        let body = response.text().unwrap_or_else(|_| "Unable to read response body".to_string());
+                        debug(&format!("Code upload failed with status: {}. Response body: {}", status, body));
+                        eprintln!("Failed to upload file {} {}... retrying", status, path);
                         std::thread::sleep(std::time::Duration::from_secs(1));
                         attempts += 1;
                     } else {
@@ -307,7 +310,10 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
                 }
                 println!("Successfully uploaded scan.");
             } else {
-                eprintln!("Failed to upload scan: {}", response.status());
+                let status = response.status();
+                let body = response.text().unwrap_or_else(|_| "Unable to read response body".to_string());
+                debug(&format!("Scan upload failed with status: {}. Response body: {}", status, body));
+                eprintln!("Failed to upload scan: {}", status);
             }
         }
         Err(e) => {
