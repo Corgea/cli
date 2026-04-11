@@ -19,20 +19,100 @@ fn get_source() -> String {
     std::env::var("CORGEA_SOURCE").unwrap_or_else(|_| "cli".to_string())
 }
 
-pub fn http_client() -> reqwest::blocking::Client {
-    let mut builder =
-        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5 * 30));
+static COOKIE_JAR: std::sync::LazyLock<std::sync::Arc<reqwest::cookie::Jar>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(reqwest::cookie::Jar::default()));
 
-    if let Ok(https_proxy) = std::env::var("https_proxy") {
-        debug(&format!("https_proxy detected: {}", https_proxy));
+static SHARED_CLIENT: std::sync::LazyLock<reqwest::blocking::Client> =
+    std::sync::LazyLock::new(|| {
+        let mut builder = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5 * 30))
+            .cookie_provider(COOKIE_JAR.clone());
 
-        if std::env::var("CORGEA_ACCEPT_CERT").is_ok() {
-            debug(&format!("Skipping CA cert validation"));
-            builder = builder.danger_accept_invalid_certs(true);
+        if let Ok(https_proxy) = std::env::var("https_proxy") {
+            debug(&format!("https_proxy detected: {}", https_proxy));
+
+            if std::env::var("CORGEA_ACCEPT_CERT").is_ok() {
+                debug(&format!("Skipping CA cert validation"));
+                builder = builder.danger_accept_invalid_certs(true);
+            }
         }
+
+        builder.build().expect("Failed to build http client")
+    });
+
+pub struct HttpClient {
+    inner: reqwest::blocking::Client,
+}
+
+pub struct DebugRequestBuilder {
+    client: reqwest::blocking::Client,
+    inner: reqwest::blocking::RequestBuilder,
+}
+
+impl HttpClient {
+    pub fn get<U: reqwest::IntoUrl>(&self, url: U) -> DebugRequestBuilder {
+        DebugRequestBuilder { client: self.inner.clone(), inner: self.inner.get(url) }
     }
 
-    builder.build().expect("Failed to build http client")
+    pub fn post<U: reqwest::IntoUrl>(&self, url: U) -> DebugRequestBuilder {
+        DebugRequestBuilder { client: self.inner.clone(), inner: self.inner.post(url) }
+    }
+
+    pub fn patch<U: reqwest::IntoUrl>(&self, url: U) -> DebugRequestBuilder {
+        DebugRequestBuilder { client: self.inner.clone(), inner: self.inner.patch(url) }
+    }
+}
+
+impl DebugRequestBuilder {
+    pub fn header<K, V>(self, key: K, value: V) -> Self
+    where
+        reqwest::header::HeaderName: TryFrom<K>,
+        <reqwest::header::HeaderName as TryFrom<K>>::Error: Into<http::Error>,
+        reqwest::header::HeaderValue: TryFrom<V>,
+        <reqwest::header::HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
+    {
+        Self { inner: self.inner.header(key, value), client: self.client }
+    }
+
+    pub fn headers(self, headers: reqwest::header::HeaderMap) -> Self {
+        Self { inner: self.inner.headers(headers), client: self.client }
+    }
+
+    pub fn query<T: Serialize + ?Sized>(self, query: &T) -> Self {
+        Self { inner: self.inner.query(query), client: self.client }
+    }
+
+    pub fn multipart(self, form: reqwest::blocking::multipart::Form) -> Self {
+        Self { inner: self.inner.multipart(form), client: self.client }
+    }
+
+    pub fn body<T: Into<reqwest::blocking::Body>>(self, body: T) -> Self {
+        Self { inner: self.inner.body(body), client: self.client }
+    }
+
+    pub fn send(self) -> reqwest::Result<reqwest::blocking::Response> {
+        use reqwest::cookie::CookieStore;
+
+        let request = self.inner.build()?;
+
+        debug(&format!("→ {} {}", request.method(), request.url()));
+        debug(&format!("  Request headers: {:?}", request.headers()));
+        match COOKIE_JAR.cookies(request.url()) {
+            Some(cookies) => debug(&format!("  Cookie: {}", cookies.to_str().unwrap_or("<binary>"))),
+            None => debug("  Cookie: (none in jar for this URL)"),
+        }
+
+        let response = self.client.execute(request)?;
+
+        debug(&format!("← {} {}", response.status(), response.url()));
+        debug(&format!("  Response headers: {:?}", response.headers()));
+
+        Ok(response)
+    }
+}
+
+pub fn http_client() -> HttpClient {
+    HttpClient { inner: SHARED_CLIENT.clone() }
 }
 
 fn check_for_warnings(headers: &HeaderMap, status: StatusCode) {
