@@ -12,7 +12,7 @@ pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>)
         }
     };
 
-    let scans_result = utils::api::query_scan_list(&config.get_url(), &config.get_token(), Some(&project_name), Some(1), None);
+    let scans_result = utils::api::query_scan_list(&config.get_url(), Some(&project_name), Some(1), None);
     let scans: Vec<utils::api::ScanResponse> = match scans_result {
         Ok(result) => result.scans.unwrap_or_default(),
         Err(e) => {
@@ -31,7 +31,7 @@ pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>)
     };
     let (scan_id, processed) = match scan_id {
         Some(scan_id) => {
-            let processed = match blast::check_scan_status(&scan_id, &config.get_url(), &config.get_token()) {
+            let processed = match blast::check_scan_status(&scan_id, &config.get_url()) {
                 Ok(processed) => processed,
                 Err(_) => {
                     eprintln!(
@@ -73,7 +73,7 @@ pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>)
         print!("Scan has been processed successfully!\n");
     }
 
-    match blast::report_scan_status(&config.get_url(), &config.get_token(), &project_name) {
+    match blast::report_scan_status(&config.get_url(), &project_name) {
         Ok(_) => {
             println!(
                 "\n\nYou can view the scan results at the following link:\n{}",

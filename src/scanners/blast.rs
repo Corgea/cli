@@ -180,7 +180,7 @@ pub fn run(
     let _ = packaging_thread.join();
     print!("\r{}Project packaged successfully.\n", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Green));
     println!("\n\nSubmitting scan to Corgea:");
-    let upload_result = match utils::api::upload_zip(&zip_path, &config.get_token(), &config.get_url(), &project_name, repo_info, scan_type, policy) {
+    let upload_result = match utils::api::upload_zip(&zip_path, &config.get_url(), &project_name, repo_info, scan_type, policy) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("\n\nOh no! We encountered an issue while uploading the zip file '{}' to the server.\nPlease ensure that:
@@ -225,7 +225,7 @@ pub fn run(
         utils::terminal::show_loading_message("Collecting scan results... ([T]s)", stop_signal_clone);
     });
 
-    let classifications = match report_scan_status(&config.get_url(), &config.get_token(), &project_name) {
+    let classifications = match report_scan_status(&config.get_url(), &project_name) {
         Ok(issues_classes) => {
             *stop_signal.lock().unwrap() = true;
             let _ = results_thread.join();
@@ -258,7 +258,7 @@ pub fn run(
         }
     };
     if *fail {
-        let blocking_rules = match utils::api::check_blocking_rules(&config.get_url(), &config.get_token(), &scan_id, None) {
+        let blocking_rules = match utils::api::check_blocking_rules(&config.get_url(), &scan_id, None) {
             Ok(rules) => rules,
             Err(e) => {
                 eprintln!("Failed to check blocking rules: {}", e);
@@ -286,14 +286,14 @@ pub fn run(
             });
 
             if out_format == "json" {
-                let issues = match utils::api::get_all_issues(&config.get_url(), &config.get_token(), &project_name, Some(scan_id.clone())) {
+                let issues = match utils::api::get_all_issues(&config.get_url(), &project_name, Some(scan_id.clone())) {
                     Ok(issues) => issues,
                     Err(e) => {
                         eprintln!("\n\nFailed to fetch issues: {}\n\n", e);
                         std::process::exit(1);
                     }
                 };
-                let sca_issues = match utils::api::get_all_sca_issues(&config.get_url(), &config.get_token(), &project_name, Some(scan_id.clone())) {
+                let sca_issues = match utils::api::get_all_sca_issues(&config.get_url(), &project_name, Some(scan_id.clone())) {
                     Ok(issues) => issues,
                     Err(e) => {
                         eprintln!("\n\nFailed to fetch SCA issues: {}\n\n", e);
@@ -311,7 +311,7 @@ pub fn run(
                 println!("\n\nScan results written to: {}\n\n", out_file.clone());
             }
             else if out_format == "html" {
-                let report = match utils::api::get_scan_report(&config.get_url(), &config.get_token(), &scan_id, None) {
+                let report = match utils::api::get_scan_report(&config.get_url(), &scan_id, None) {
                     Ok(html) => html,
                     Err(e) => {
                         eprintln!("\n\nFailed to fetch scan report: {}\n\n", e);
@@ -325,7 +325,7 @@ pub fn run(
                 println!("\n\nScan report written to: {}\n\n", out_file.clone());
             }
             else if out_format == "sarif" {
-                let report = match utils::api::get_scan_report(&config.get_url(), &config.get_token(), &scan_id, Some("sarif")) {
+                let report = match utils::api::get_scan_report(&config.get_url(), &scan_id, Some("sarif")) {
                     Ok(sarif) => sarif,
                     Err(e) => {
                         eprintln!("\n\nFailed to fetch SARIF report: {}\n\n", e);
@@ -339,7 +339,7 @@ pub fn run(
                 println!("\n\nScan report written to: {}\n\n", out_file.clone());
             }
             else if out_format == "markdown" {
-                let report = match utils::api::get_scan_report(&config.get_url(), &config.get_token(), &scan_id, Some("markdown")) {
+                let report = match utils::api::get_scan_report(&config.get_url(), &scan_id, Some("markdown")) {
                     Ok(markdown) => markdown,
                     Err(e) => {
                         eprintln!("\n\nFailed to fetch Markdown report: {}\n\n", e);
@@ -402,7 +402,7 @@ pub fn wait_for_scan(config: &Config, scan_id: &str) {
     
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
-            match check_scan_status(&scan_id, &config.get_url(), &config.get_token()) {
+            match check_scan_status(&scan_id, &config.get_url()) {
                 Ok(true) => {
                     *stop_signal.lock().unwrap() = true;
                     break;
@@ -444,16 +444,16 @@ pub fn wait_for_scan(config: &Config, scan_id: &str) {
 }
 
 
-pub fn check_scan_status(scan_id: &str, url: &str, token: &str) -> Result<bool, Box<dyn Error>> {
-    match utils::api::get_scan(url, token, scan_id) {
+pub fn check_scan_status(scan_id: &str, url: &str) -> Result<bool, Box<dyn Error>> {
+    match utils::api::get_scan(url, scan_id) {
         Ok(scan) => Ok(scan.status == "complete"),
         Err(e) => Err(e)
     }
 }
 
 
-pub fn fetch_and_group_scan_issues(url: &str, token: &str, project: &str) -> Result<HashMap<String, usize>, Box<dyn std::error::Error>> {
-    let issues = match utils::api::get_all_issues(url, token, project, None) {
+pub fn fetch_and_group_scan_issues(url: &str, project: &str) -> Result<HashMap<String, usize>, Box<dyn std::error::Error>> {
+    let issues = match utils::api::get_all_issues(url, project, None) {
         Ok(issues) => issues,
         Err(err) => {
             return Err(format!("Failed to fetch scan issues: {}", err).into());
@@ -468,8 +468,8 @@ pub fn fetch_and_group_scan_issues(url: &str, token: &str, project: &str) -> Res
     Ok(classification_counts)
 }
 
-pub fn report_scan_status(url: &str, token: &str, project: &str) ->  Result<HashMap<String, usize>, Box<dyn std::error::Error>>{
-    let classification_counts = match fetch_and_group_scan_issues(url, token, project) {
+pub fn report_scan_status(url: &str, project: &str) ->  Result<HashMap<String, usize>, Box<dyn std::error::Error>>{
+    let classification_counts = match fetch_and_group_scan_issues(url, project) {
         Ok(counts) => counts,
         Err(e) => {
             return Err(e);
