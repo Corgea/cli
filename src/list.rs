@@ -8,7 +8,7 @@ pub fn run(config: &Config, issues: &bool, sca_issues: &bool, json: &bool, page:
     let project_name = utils::generic::get_current_working_directory().unwrap_or("unknown".to_string());
     println!("");
     if *sca_issues {
-        let sca_issues_response = match utils::api::get_sca_issues(&config.get_url(), &config.get_token(), Some((*page).unwrap_or(1)), *page_size, scan_id.clone()) {
+        let sca_issues_response = match utils::api::get_sca_issues(&config.get_url(), Some((*page).unwrap_or(1)), *page_size, scan_id.clone()) {
             Ok(response) => response,
             Err(e) => {
                 debug(&format!("Error Sending Request: {}", e.to_string()));
@@ -87,7 +87,7 @@ pub fn run(config: &Config, issues: &bool, sca_issues: &bool, json: &bool, page:
 
         utils::terminal::print_table(table, Some(sca_issues_response.page), Some(sca_issues_response.total_pages));
     } else if *issues {
-        let issues_response = match utils::api::get_scan_issues(&config.get_url(), &config.get_token(), &project_name, Some((*page).unwrap_or(1)), *page_size, scan_id.clone()) {
+        let issues_response = match utils::api::get_scan_issues(&config.get_url(), &project_name, Some((*page).unwrap_or(1)), *page_size, scan_id.clone()) {
             Ok(response) => response,
             Err(e) => {
                 debug(&format!("Error Sending Request: {}", e.to_string()));
@@ -115,7 +115,7 @@ pub fn run(config: &Config, issues: &bool, sca_issues: &bool, json: &bool, page:
         if scan_id.is_some() {
             let mut page: u32 = 1;
             loop {
-                match utils::api::check_blocking_rules(&config.get_url(), &config.get_token(), scan_id.as_ref().unwrap(), Some(page)) {
+                match utils::api::check_blocking_rules(&config.get_url(), scan_id.as_ref().unwrap(), Some(page)) {
                     Ok(rules) => {
                         if rules.block {
                             render_blocking_rules = true;
@@ -224,7 +224,7 @@ pub fn run(config: &Config, issues: &bool, sca_issues: &bool, json: &bool, page:
 
         utils::terminal::print_table(table, issues_response.page, issues_response.total_pages);
     } else {
-        let (scans, page, total_pages) = match utils::api::query_scan_list(&config.get_url(), &config.get_token(), Some(&project_name), *page, *page_size) {
+        let (scans, page, total_pages) = match utils::api::query_scan_list(&config.get_url(), Some(&project_name), *page, *page_size) {
             Ok(scans) => {
                 let page = scans.page;
                 let total_pages = scans.total_pages;

@@ -19,6 +19,32 @@ fn get_source() -> String {
     std::env::var("CORGEA_SOURCE").unwrap_or_else(|_| "cli".to_string())
 }
 
+fn is_jwt(token: &str) -> bool {
+    let parts: Vec<&str> = token.splitn(4, '.').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty())
+}
+
+fn auth_headers(token: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if is_jwt(token) {
+        headers.insert(
+            "Authorization",
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+    } else {
+        headers.insert("CORGEA-TOKEN", token.parse().unwrap());
+    }
+    headers.insert("CORGEA-SOURCE", get_source().parse().unwrap());
+    headers
+}
+
+static AUTH_TOKEN: std::sync::LazyLock<std::sync::RwLock<String>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(String::new()));
+
+pub fn set_auth_token(token: &str) {
+    *AUTH_TOKEN.write().unwrap() = token.to_string();
+}
+
 static COOKIE_JAR: std::sync::LazyLock<std::sync::Arc<reqwest::cookie::Jar>> =
     std::sync::LazyLock::new(|| std::sync::Arc::new(reqwest::cookie::Jar::default()));
 
@@ -74,10 +100,6 @@ impl DebugRequestBuilder {
         Self { inner: self.inner.header(key, value), client: self.client }
     }
 
-    pub fn headers(self, headers: reqwest::header::HeaderMap) -> Self {
-        Self { inner: self.inner.headers(headers), client: self.client }
-    }
-
     pub fn query<T: Serialize + ?Sized>(self, query: &T) -> Self {
         Self { inner: self.inner.query(query), client: self.client }
     }
@@ -93,7 +115,14 @@ impl DebugRequestBuilder {
     pub fn send(self) -> reqwest::Result<reqwest::blocking::Response> {
         use reqwest::cookie::CookieStore;
 
-        let request = self.inner.build()?;
+        let token = AUTH_TOKEN.read().unwrap().clone();
+        let builder = if !token.is_empty() {
+            self.inner.headers(auth_headers(&token))
+        } else {
+            self.inner
+        };
+
+        let request = builder.build()?;
 
         debug(&format!("→ {} {}", request.method(), request.url()));
         debug(&format!("  Request headers: {:?}", request.headers()));
@@ -138,7 +167,6 @@ pub struct UploadZipResult {
 
 pub fn upload_zip(
     file_path: &str,
-    token: &str,
     url: &str,
     project_name: &str,
     repo_info: Option<utils::generic::RepoInfo>,
@@ -164,8 +192,6 @@ pub fn upload_zip(
 
     let response_object = client
         .post(format!("{}{}/start-scan", url, API_BASE))
-        .header("CORGEA-TOKEN", token)
-        .header("CORGEA-SOURCE", get_source())
         .query(&[
             ("scan_type", "blast"),
         ])
@@ -254,8 +280,6 @@ pub fn upload_zip(
 
         let response = match client
         .patch(format!("{}{}/start-scan/{}/", url, API_BASE, transfer_id))
-        .header("CORGEA-TOKEN", token)
-        .header("CORGEA-SOURCE", get_source())
         .header("Upload-Offset", offset.to_string())
         .header("Upload-Length", file_size.to_string())
         .header("Upload-Name", file_name)
@@ -316,12 +340,12 @@ pub fn upload_zip(
     Err("Failed to upload file".into())
 }
 
-pub fn get_all_issues(url: &str, token: &str, project: &str, scan_id: Option<String>) -> Result<Vec<Issue>, Box<dyn std::error::Error>> {
+pub fn get_all_issues(url: &str, project: &str, scan_id: Option<String>) -> Result<Vec<Issue>, Box<dyn std::error::Error>> {
     let mut all_issues = Vec::new();
     let mut current_page: u32 = 1;
 
     loop {
-        let response = match get_scan_issues(url, token, project, Some(current_page as u16), Some(30), scan_id.clone()) {
+        let response = match get_scan_issues(url, project, Some(current_page as u16), Some(30), scan_id.clone()) {
             Ok(response) => response,
             Err(e) => return Err(format!("Failed to get scan issues: {}", e).into())
         };
@@ -347,7 +371,6 @@ pub fn get_all_issues(url: &str, token: &str, project: &str, scan_id: Option<Str
 
 pub fn get_scan_issues(
     url: &str,
-    token: &str,
     project: &str,
     page: Option<u16>,
     page_size: Option<u16>,
@@ -375,14 +398,10 @@ pub fn get_scan_issues(
         url.push_str("&page_size=30");
     }
     let client = http_client();
-    let mut headers = HeaderMap::new();
-    headers.insert("CORGEA-TOKEN", token.parse().unwrap());
-    headers.insert("CORGEA-SOURCE", get_source().parse().unwrap());
 
     debug(&format!("Sending request to URL: {}", url));
-    debug(&format!("Headers: {:?}", headers));
 
-    let response = match client.get(&url).headers(headers).send() {
+    let response = match client.get(&url).send() {
         Ok(res) => {
             check_for_warnings(res.headers(), res.status());
             res
@@ -404,19 +423,13 @@ pub fn get_scan_issues(
     }
 }
 
-pub fn get_scan(url: &str, token: &str, scan_id: &str) -> Result<ScanResponse, Box<dyn std::error::Error>>  {
+pub fn get_scan(url: &str, scan_id: &str) -> Result<ScanResponse, Box<dyn std::error::Error>>  {
     let url = format!("{}{}/scan/{}", url, API_BASE, scan_id);
 
     let client = http_client();
-
-    let mut headers = HeaderMap::new();
-    headers.insert("CORGEA-TOKEN", token.parse().unwrap());
-    headers.insert("CORGEA-SOURCE", get_source().parse().unwrap());
     debug(&format!("Sending request to URL: {}", url));
-    debug(&format!("Headers: {:?}", headers));
     let response = client
         .get(&url)
-        .headers(headers)
         .send()
         .map_err(|e| format!("Failed to send request: {}", e))?;
 
@@ -434,7 +447,7 @@ pub fn get_scan(url: &str, token: &str, scan_id: &str) -> Result<ScanResponse, B
     }
 }
 
-pub fn get_scan_report(url: &str, token: &str, scan_id: &str, format: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+pub fn get_scan_report(url: &str, scan_id: &str, format: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
     let url = if let Some(fmt) = format {
         format!("{}{}/scan/{}/report?format={}", url, API_BASE, scan_id, fmt)
     } else {
@@ -442,16 +455,11 @@ pub fn get_scan_report(url: &str, token: &str, scan_id: &str, format: Option<&st
     };
 
     let client = http_client();
-    let mut headers = HeaderMap::new();
-    headers.insert("CORGEA-TOKEN", token.parse().unwrap());
-    headers.insert("CORGEA-SOURCE", get_source().parse().unwrap());
 
     debug(&format!("Sending request to URL: {}", url));
-    debug(&format!("Headers: {:?}", headers));
 
     let response = client
         .get(&url)
-        .headers(headers)
         .send()
         .map_err(|e| format!("Failed to send request: {}", e))?;
 
@@ -464,7 +472,7 @@ pub fn get_scan_report(url: &str, token: &str, scan_id: &str, format: Option<&st
     }
 }
 
-pub fn get_issue(url: &str, token: &str, issue: &str) -> Result<FullIssueResponse, Box<dyn std::error::Error>> {
+pub fn get_issue(url: &str, issue: &str) -> Result<FullIssueResponse, Box<dyn std::error::Error>> {
     let url = format!(
         "{}{}/issue/{}",
         url,
@@ -472,12 +480,8 @@ pub fn get_issue(url: &str, token: &str, issue: &str) -> Result<FullIssueRespons
         issue,
     );
     let client = http_client();
-    let mut headers = HeaderMap::new();
-    headers.insert("CORGEA-TOKEN", token.parse().unwrap());
-    headers.insert("CORGEA-SOURCE", get_source().parse().unwrap());
     debug(&format!("Sending request to URL: {}", url));
-    debug(&format!("Headers: {:?}", headers));
-    let response = match client.get(&url).headers(headers).send() {
+    let response = match client.get(&url).send() {
         Ok(res) => {
             check_for_warnings(res.headers(), res.status());
             res
@@ -498,7 +502,6 @@ pub fn get_issue(url: &str, token: &str, issue: &str) -> Result<FullIssueRespons
 
 pub fn query_scan_list(
     url: &str,
-    token: &str,
     project: Option<&str>,
     page: Option<u16>,
     page_size: Option<u16>
@@ -517,14 +520,9 @@ pub fn query_scan_list(
 
 
     let client = http_client();
-    let mut headers = HeaderMap::new();
-    headers.insert("CORGEA-TOKEN", token.parse().unwrap());
-    headers.insert("CORGEA-SOURCE", get_source().parse().unwrap());
     debug(&format!("Sending request to URL: {}", url));
-    debug(&format!("Headers: {:?}", headers));
     let response = match client
         .get(url)
-        .headers(headers)
         .query(&query_params)
         .send() {
             Ok(res) => {
@@ -578,18 +576,13 @@ pub fn exchange_code_for_token(
     }
 }
 
-pub fn verify_token(token: &str, corgea_url: &str) -> Result<bool, Box<dyn Error>> {
+pub fn verify_token(corgea_url: &str) -> Result<bool, Box<dyn Error>> {
     let url = format!("{}{}/verify", corgea_url, API_BASE);
     let client = http_client();
-    let mut headers = HeaderMap::new();
-    headers.insert("CORGEA-TOKEN", token.parse().unwrap());
-    headers.insert("CORGEA-SOURCE", get_source().parse().unwrap());
     debug(&format!("Sending request to URL: {}", url));
-    debug(&format!("Headers: {:?}", headers));
 
     let response = client
         .get(&url)
-        .headers(headers)
         .send()?;
 
     check_for_warnings(response.headers(), response.status());
@@ -612,7 +605,6 @@ pub fn verify_token(token: &str, corgea_url: &str) -> Result<bool, Box<dyn Error
 
 pub fn check_blocking_rules(
     url: &str,
-    token: &str,
     sast_scan_id: &str,
     page: Option<u32>
 ) -> Result<BlockingRuleResponse, Box<dyn Error>> {
@@ -621,16 +613,11 @@ pub fn check_blocking_rules(
     let query_params = vec![("page", page.to_string())];
 
     let client = http_client();
-    let mut headers = HeaderMap::new();
-    headers.insert("CORGEA-TOKEN", token.parse().unwrap());
-    headers.insert("CORGEA-SOURCE", get_source().parse().unwrap());
     debug(&format!("Sending request to URL: {}", url));
-    debug(&format!("Headers: {:?}", headers));
     debug(&format!("Query params: {:?}", query_params));
 
     let response = match client
         .get(url)
-        .headers(headers)
         .query(&query_params)
         .send() {
             Ok(res) => {
@@ -663,7 +650,6 @@ pub fn check_blocking_rules(
 
 pub fn get_sca_issues(
     url: &str,
-    token: &str,
     page: Option<u16>,
     page_size: Option<u16>,
     scan_id: Option<String>
@@ -685,12 +671,9 @@ pub fn get_sca_issues(
 
     debug(&format!("Sending request to URL: {}", endpoint));
     debug(&format!("Query params: {:?}", query_params));
-    debug(&format!("Token: {}", token));
 
     let response = client
         .get(&endpoint)
-        .header("CORGEA-TOKEN", token)
-        .header("CORGEA-SOURCE", get_source())
         .query(&query_params)
         .send();
 
@@ -726,7 +709,6 @@ pub fn get_sca_issues(
 
 pub fn get_all_sca_issues(
     url: &str,
-    token: &str,
     _project: &str,
     scan_id: Option<String>
 ) -> Result<Vec<SCAIssue>, Box<dyn std::error::Error>> {
@@ -734,7 +716,7 @@ pub fn get_all_sca_issues(
     let mut current_page: u32 = 1;
 
     loop {
-        let response = match get_sca_issues(url, token, Some(current_page as u16), Some(30), scan_id.clone()) {
+        let response = match get_sca_issues(url, Some(current_page as u16), Some(30), scan_id.clone()) {
             Ok(response) => response,
             Err(e) => return Err(format!("Failed to get SCA issues: {}", e).into())
         };

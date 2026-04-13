@@ -131,8 +131,8 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
     let github_env_vars = get_github_env_vars();
 
     let run_id = Uuid::new_v4().to_string();
-    let token = config.get_token();
     let base_url = config.get_url();
+    let api_base = "/api/v1";
     let project;
 
     if in_ci {
@@ -143,20 +143,20 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
     } else {
         project = utils::generic::determine_project_name(project_name.as_deref());
     }
-    let repo_data = std::env::var("REPO_DATA").unwrap_or_else(|_| "".to_string()); //encoded data to forward.
+    let repo_data = std::env::var("REPO_DATA").unwrap_or_else(|_| "".to_string());
 
     let scan_upload_url = if repo_data.is_empty() {
         format!(
-            "{}/api/cli/scan-upload?token={}&engine={}&run_id={}&project={}&ci={}&ci_platform={}", base_url, token, scanner, run_id, project, in_ci, ci_platform
+            "{}{}/scan-upload?engine={}&run_id={}&project={}&ci={}&ci_platform={}", base_url, api_base, scanner, run_id, project, in_ci, ci_platform
         )
     } else {
         format!(
-            "{}/api/cli/scan-upload?token={}&engine={}&run_id={}&project={}&ci={}&ci_platform={}&repo_data={}", base_url, token, scanner, run_id, project, in_ci, ci_platform, repo_data
+            "{}{}/scan-upload?engine={}&run_id={}&project={}&ci={}&ci_platform={}&repo_data={}", base_url, api_base, scanner, run_id, project, in_ci, ci_platform, repo_data
         )
     };
 
     let git_config_upload_url = format!(
-        "{}/api/cli/git-config-upload?token={}&run_id={}", base_url, token, run_id
+        "{}{}/git-config-upload?run_id={}", base_url, api_base, run_id
     );
     let client = utils::api::http_client();
 
@@ -177,7 +177,7 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
         }
 
         let src_upload_url = format!(
-            "{}/api/cli/code-upload?token={}&run_id={}&path={}", base_url, token, run_id, path
+            "{}{}/code-upload?run_id={}&path={}", base_url, api_base, run_id, path
         );
         debug(&format!("Uploading file: {}", path));
         let fp = Path::new(&path);
@@ -404,7 +404,7 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
 
     if in_ci {
         let ci_data_upload_url = format!(
-            "{}/api/cli/ci-data-upload?token={}&run_id={}&platform={}", base_url, token, run_id, ci_platform
+            "{}{}/ci-data-upload?run_id={}&platform={}", base_url, api_base, run_id, ci_platform
         );
 
         let mut github_env_vars_json = serde_json::Map::new();

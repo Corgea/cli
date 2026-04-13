@@ -19,7 +19,7 @@ pub fn run(
     println!();
     if *issues {
         let show_everything = !*summary && !*fix_explanation && !*fix_diff;
-        let issue_details = match utils::api::get_issue(&config.get_url(), &config.get_token(), id) {
+        let issue_details = match utils::api::get_issue(&config.get_url(), id) {
             Ok(issue) => issue,
             Err(e) => {
                 eprintln!("Failed to fetch issue details for issue ID {} with error:\n{}", id, e);
@@ -69,7 +69,7 @@ pub fn run(
             }
         }
     } else {
-        let scan_details = match utils::api::get_scan(&config.get_url(), &config.get_token(), id) {
+        let scan_details = match utils::api::get_scan(&config.get_url(), id) {
             Ok(details) => details,
             Err(e) => {
                 eprintln!("Failed to fetch scan details for scan ID {}: {}", id, e);
@@ -92,7 +92,7 @@ pub fn run(
         print_section("Engine", &scan_details.engine);
         let created_at = chrono::DateTime::<chrono::Utc>::from(SystemTime::now()).format("%Y-%m-%d %H:%M:%S").to_string();
         print_section("Created At", &created_at);
-        match scanners::blast::fetch_and_group_scan_issues(&config.get_url(), &config.get_token(), &scan_details.project) {
+        match scanners::blast::fetch_and_group_scan_issues(&config.get_url(), &scan_details.project) {
             Ok(counts) => {
                 let total_issues = counts.values().sum::<usize>();
                 let order = vec!["CR", "HI", "ME", "LO"];

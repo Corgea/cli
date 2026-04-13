@@ -186,7 +186,8 @@ fn main() {
             eprintln!("No token set.\nPlease run 'corgea login' to authenticate.\nFor more info checkout our docs at Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli");
             std::process::exit(1);
         }
-        match utils::api::verify_token(config.get_token().as_str(), config.get_url().as_str()) {
+        utils::api::set_auth_token(&config.get_token());
+        match utils::api::verify_token(config.get_url().as_str()) {
             Ok(true) => {
                 return;
             }
@@ -207,7 +208,8 @@ fn main() {
             match effective_token {
                 Some(token_value) => {
                     let token_source = if token.is_some() { "parameter" } else { "CORGEA_TOKEN environment variable" };
-                    match utils::api::verify_token(&token_value, url.as_deref().unwrap_or(corgea_config.get_url().as_str())) {
+                    utils::api::set_auth_token(&token_value);
+                    match utils::api::verify_token(url.as_deref().unwrap_or(corgea_config.get_url().as_str())) {
                         Ok(true) => {
                             corgea_config.set_token(token_value.clone()).expect("Failed to set token");
                             if let Some(url) = url {
