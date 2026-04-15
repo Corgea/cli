@@ -21,6 +21,7 @@ pub fn run(
     out_format: Option<String>,
     out_file: Option<String>,
     target: Option<String>,
+    exclude: Option<String>,
     project_name: Option<String>,
 ) {
     // Validate that only_uncommitted and target are not used together
@@ -89,7 +90,7 @@ pub fn run(
     };
 
     if let Some(target_value) = target_str {
-        match targets::resolve_targets(target_value) {
+        match targets::resolve_targets_with_exclude(target_value, exclude.as_deref()) {
             Ok(result) => {
                 if result.files.is_empty() {
                     *stop_signal.lock().unwrap() = true;
@@ -147,7 +148,7 @@ pub fn run(
         }
     }
 
-    match utils::generic::create_zip_from_target(target_str, &zip_path, None) {
+    match utils::generic::create_zip_from_target(target_str, &zip_path, None, exclude.as_deref()) {
         Ok(added_files) => {
             if added_files.is_empty() {
                 *stop_signal.lock().unwrap() = true;

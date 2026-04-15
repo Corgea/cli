@@ -42,3 +42,6 @@ urlencoding = "2.1"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
+
+[dev-dependencies]
+tempfile = "3.12.0"
