@@ -18,11 +18,6 @@ pub struct TargetSegmentResult {
     pub error: Option<String>,
 }
 
-#[allow(dead_code)]
-pub fn resolve_targets(target_value: &str) -> Result<TargetResolutionResult, String> {
-    resolve_targets_with_exclude(target_value, None)
-}
-
 pub fn resolve_targets_with_exclude(target_value: &str, exclude: Option<&str>) -> Result<TargetResolutionResult, String> {
     let segments: Vec<String> = target_value
         .split(',')
