@@ -89,6 +89,10 @@ pub fn run(
         target.as_deref()
     };
 
+    if target_str.is_none() && exclude.is_some() {
+        println!("Excluding files matching: {}", exclude.as_deref().unwrap());
+    }
+
     if let Some(target_value) = target_str {
         match targets::resolve_targets_with_exclude(target_value, exclude.as_deref()) {
             Ok(result) => {
