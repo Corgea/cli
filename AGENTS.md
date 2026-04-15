@@ -16,5 +16,6 @@ Corgea CLI is a Rust-based command-line security scanning tool. It communicates 
 - The Rust toolchain must be **stable latest** (>=1.85). The default VM ships with 1.83 which is too old for the `time-core` crate's `edition2024` feature. The update script handles `rustup default stable`.
 - `python3.12-venv` system package is required for creating the `.venv` used by maturin.
 - The CLI requires a `CORGEA_TOKEN` (or `corgea login <token>`) to interact with the Corgea API. Without it, commands like `corgea scan`, `corgea list`, etc. return 401. This is expected behavior — the CLI itself is still fully functional.
+- `corgea login <token>` with `CORGEA_DEBUG=1` persists `debug = 1` into `~/.corgea/config.toml`. If you see debug output unexpectedly, edit that file and set `debug = 0`.
 - Config is stored at `~/.corgea/config.toml`.
 - Set `CORGEA_DEBUG=1` for verbose debug logging.
