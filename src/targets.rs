@@ -18,7 +18,7 @@ pub struct TargetSegmentResult {
     pub error: Option<String>,
 }
 
-pub fn resolve_targets(target_value: &str) -> Result<TargetResolutionResult, String> {
+pub fn resolve_targets_with_exclude(target_value: &str, exclude: Option<&str>) -> Result<TargetResolutionResult, String> {
     let segments: Vec<String> = target_value
         .split(',')
         .map(|s| s.trim().to_string())
@@ -40,6 +40,8 @@ pub fn resolve_targets(target_value: &str) -> Result<TargetResolutionResult, Str
         }
     }
 
+    let exclude_glob_set = build_exclude_glob_set(exclude)?;
+
     let mut all_files = Vec::new();
     let mut seen_files = HashSet::new();
     let mut segment_results = Vec::new();
@@ -58,6 +60,9 @@ pub fn resolve_targets(target_value: &str) -> Result<TargetResolutionResult, Str
                 for file in result {
                     match normalize_path(&file, &repo_root) {
                         Ok(normalized) => {
+                            if is_excluded_by_glob(&normalized, &repo_root, &exclude_glob_set) {
+                                continue;
+                            }
                             if seen_files.insert(normalized.clone()) {
                                 all_files.push(normalized);
                             }
@@ -98,6 +103,48 @@ pub fn resolve_targets(target_value: &str) -> Result<TargetResolutionResult, Str
         files: all_files,
         segments: segment_results,
     })
+}
+
+fn build_exclude_glob_set(exclude: Option<&str>) -> Result<Option<globset::GlobSet>, String> {
+    let exclude_str = match exclude {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return Ok(None),
+    };
+
+    let patterns: Vec<&str> = exclude_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+
+    let mut builder = GlobSetBuilder::new();
+    for pattern in &patterns {
+        let glob = Glob::new(pattern)
+            .map_err(|e| format!("Invalid exclude glob pattern '{}': {}", pattern, e))?;
+        builder.add(glob);
+    }
+    let glob_set = builder.build()
+        .map_err(|e| format!("Failed to build exclude glob set: {}", e))?;
+    Ok(Some(glob_set))
+}
+
+fn is_excluded_by_glob(file: &Path, repo_root: &Path, exclude_glob_set: &Option<globset::GlobSet>) -> bool {
+    let glob_set = match exclude_glob_set {
+        Some(gs) => gs,
+        None => return false,
+    };
+
+    if let Ok(relative) = file.strip_prefix(repo_root) {
+        return glob_set.is_match(relative);
+    }
+    glob_set.is_match(file)
+}
+
+pub fn build_user_exclude_glob_set(exclude: Option<&str>) -> Result<Option<globset::GlobSet>, String> {
+    build_exclude_glob_set(exclude)
+}
+
+pub fn is_file_excluded(file: &Path, base_dir: &Path, exclude_glob_set: &Option<globset::GlobSet>) -> bool {
+    is_excluded_by_glob(file, base_dir, exclude_glob_set)
 }
 
 fn resolve_segment(segment: &str, repo_root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -477,5 +524,119 @@ fn find_repo_root() -> Result<PathBuf, String> {
 
 fn is_git_repo(dir: &Path) -> bool {
     Repository::discover(dir).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn setup_test_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        Repository::init(base).unwrap();
+
+        fs::create_dir_all(base.join("src")).unwrap();
+        fs::create_dir_all(base.join("tests")).unwrap();
+        fs::create_dir_all(base.join("docs")).unwrap();
+
+        fs::write(base.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::write(base.join("src/lib.rs"), "pub fn hello() {}").unwrap();
+        fs::write(base.join("tests/test_main.rs"), "// test").unwrap();
+        fs::write(base.join("docs/readme.md"), "# readme").unwrap();
+        fs::write(base.join("config.toml"), "[config]").unwrap();
+
+        dir
+    }
+
+    #[test]
+    fn build_exclude_glob_set_returns_none_for_none() {
+        let result = build_exclude_glob_set(None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn build_exclude_glob_set_returns_none_for_empty() {
+        let result = build_exclude_glob_set(Some("")).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn build_exclude_glob_set_returns_some_for_valid_pattern() {
+        let result = build_exclude_glob_set(Some("tests/**")).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn build_exclude_glob_set_handles_comma_separated() {
+        let result = build_exclude_glob_set(Some("tests/**,docs/**")).unwrap();
+        assert!(result.is_some());
+        let gs = result.unwrap();
+        assert!(gs.is_match("tests/foo.rs"));
+        assert!(gs.is_match("docs/readme.md"));
+        assert!(!gs.is_match("src/main.rs"));
+    }
+
+    #[test]
+    fn build_exclude_glob_set_returns_error_for_invalid() {
+        let result = build_exclude_glob_set(Some("[invalid"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn is_excluded_by_glob_matches_relative_path() {
+        let gs = build_exclude_glob_set(Some("tests/**")).unwrap();
+        let repo_root = Path::new("/repo");
+        let file = Path::new("/repo/tests/test_main.rs");
+        assert!(is_excluded_by_glob(file, repo_root, &gs));
+    }
+
+    #[test]
+    fn is_excluded_by_glob_does_not_match_non_excluded() {
+        let gs = build_exclude_glob_set(Some("tests/**")).unwrap();
+        let repo_root = Path::new("/repo");
+        let file = Path::new("/repo/src/main.rs");
+        assert!(!is_excluded_by_glob(file, repo_root, &gs));
+    }
+
+    #[test]
+    fn is_excluded_by_glob_returns_false_for_none() {
+        let gs: Option<globset::GlobSet> = None;
+        let file = Path::new("/repo/tests/test_main.rs");
+        assert!(!is_excluded_by_glob(file, Path::new("/repo"), &gs));
+    }
+
+    #[test]
+    fn is_excluded_by_glob_wildcard_extension() {
+        let gs = build_exclude_glob_set(Some("**/*.md")).unwrap();
+        let repo_root = Path::new("/repo");
+        assert!(is_excluded_by_glob(Path::new("/repo/docs/readme.md"), repo_root, &gs));
+        assert!(!is_excluded_by_glob(Path::new("/repo/src/main.rs"), repo_root, &gs));
+    }
+
+    #[test]
+    fn is_excluded_filters_directory_files_correctly() {
+        let dir = setup_test_dir();
+        let base = dir.path();
+        let gs = build_exclude_glob_set(Some("tests/**,**/*.md")).unwrap();
+
+        assert!(!is_excluded_by_glob(&base.join("src/main.rs"), base, &gs));
+        assert!(!is_excluded_by_glob(&base.join("src/lib.rs"), base, &gs));
+        assert!(!is_excluded_by_glob(&base.join("config.toml"), base, &gs));
+        assert!(is_excluded_by_glob(&base.join("tests/test_main.rs"), base, &gs));
+        assert!(is_excluded_by_glob(&base.join("docs/readme.md"), base, &gs));
+    }
+
+    #[test]
+    fn is_excluded_with_none_includes_all() {
+        let dir = setup_test_dir();
+        let base = dir.path();
+        let gs: Option<globset::GlobSet> = None;
+
+        assert!(!is_excluded_by_glob(&base.join("src/main.rs"), base, &gs));
+        assert!(!is_excluded_by_glob(&base.join("tests/test_main.rs"), base, &gs));
+        assert!(!is_excluded_by_glob(&base.join("docs/readme.md"), base, &gs));
+    }
 }
 
