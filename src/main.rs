@@ -7,6 +7,7 @@ mod cicd;
 mod log;
 mod setup_hooks;
 mod authorize;
+mod verify_deps;
 mod scanners {
     pub mod fortify;
     pub mod blast;
@@ -155,6 +156,52 @@ enum Commands {
     SetupHooks {
         #[arg(long, short, help = "Include default config (scan types are pii, secrets and fail on levels are CR, HI, ME, LO).")]
         default_config: bool,
+    },
+    /// Verify installed dependencies against the registry to flag recently published versions.
+    /// Useful as a supply-chain tripwire: any dep whose installed version was published within
+    /// the configured threshold will be reported. Currently supports npm and Python.
+    VerifyDeps {
+        #[arg(
+            long,
+            short = 'e',
+            default_value = "all",
+            help = "Which ecosystem(s) to verify. Valid options are 'npm', 'python', or 'all' (default)."
+        )]
+        ecosystem: String,
+
+        #[arg(
+            long,
+            short = 't',
+            default_value = "2d",
+            help = "Recency threshold. Any dependency published within this window is flagged. Examples: '2d' (default), '48h', '30m', '1w'. Bare numbers are interpreted as days."
+        )]
+        threshold: String,
+
+        #[arg(
+            long,
+            help = "Include development dependencies (default: production only)."
+        )]
+        include_dev: bool,
+
+        #[arg(
+            long,
+            short = 'f',
+            help = "Exit with a non-zero status code if any recently published dependency is found."
+        )]
+        fail: bool,
+
+        #[arg(
+            long,
+            help = "Output the result as JSON instead of human-readable text."
+        )]
+        json: bool,
+
+        #[arg(
+            long,
+            short = 'p',
+            help = "Path to the project to verify. Defaults to the current directory."
+        )]
+        path: Option<String>,
     },
 }
 
@@ -367,6 +414,52 @@ fn main() {
         }
         Some(Commands::SetupHooks { default_config }) => {
             setup_hooks::setup_pre_commit_hook(*default_config);
+        }
+        Some(Commands::VerifyDeps { ecosystem, threshold, include_dev, fail, json, path }) => {
+            let parsed_ecosystem = match verify_deps::Ecosystem::parse(ecosystem) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(2);
+                }
+            };
+            let parsed_threshold = match verify_deps::parse_threshold(threshold) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Invalid --threshold: {}", e);
+                    std::process::exit(2);
+                }
+            };
+            let project_path = std::path::PathBuf::from(path.clone().unwrap_or_else(|| ".".to_string()));
+            let opts = verify_deps::VerifyOptions {
+                ecosystem: parsed_ecosystem,
+                threshold: parsed_threshold,
+                include_dev: *include_dev,
+                fail: *fail,
+                json: *json,
+                path: project_path,
+                npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
+                pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
+            };
+
+            match verify_deps::run(&opts) {
+                Ok(report) => {
+                    if opts.json {
+                        verify_deps::report::print_json(&report);
+                    } else {
+                        verify_deps::report::print_text(&report);
+                    }
+                    let recent = !report.recent().is_empty();
+                    let errors = !report.errors().is_empty();
+                    if (recent || errors) && opts.fail {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("verify-deps failed: {}", e);
+                    std::process::exit(2);
+                }
+            }
         }
         None => {
             utils::terminal::show_welcome_message();

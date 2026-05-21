@@ -148,6 +148,12 @@ corgea scan --fail-on CR --out-format sarif --out-file results.sarif
 corgea upload report.json --project-name my-app
 ```
 
+### Block builds that pull in a freshly-published dependency
+
+```bash
+corgea verify-deps --threshold 2d --fail
+```
+
 ### Export results
 
 ```bash
