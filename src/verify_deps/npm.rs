@@ -2,7 +2,8 @@
 //!
 //! Supported, in order of preference:
 //!  1. `package-lock.json` / `npm-shrinkwrap.json` (lockfile v1, v2, v3)
-//!  2. `yarn.lock` (Yarn classic, v1 syntax)
+//!  2. `pnpm-lock.yaml` (pnpm v5, v6, v7, v9)
+//!  3. `yarn.lock` (Yarn classic, v1 syntax)
 //!
 //! These produce *resolved* (pinned) versions so the registry lookup is
 //! exact. We deliberately do not parse `package.json` directly — its
@@ -18,6 +19,7 @@ use super::{Dependency, DependencyEcosystem, DiscoverResult};
 const SUPPORTED_FILES: &[&str] = &[
     "package-lock.json",
     "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
     "yarn.lock",
 ];
 
@@ -46,6 +48,7 @@ pub fn discover(project_dir: &Path, include_dev: bool) -> Result<DiscoverResult,
 
     let deps = match file_name {
         "package-lock.json" | "npm-shrinkwrap.json" => parse_npm_lock(&content, include_dev)?,
+        "pnpm-lock.yaml" => parse_pnpm_lock(&content, include_dev)?,
         "yarn.lock" => parse_yarn_lock(&content)?,
         _ => unreachable!(),
     };
@@ -320,6 +323,361 @@ fn yarn_key_name(key: &str) -> Option<String> {
     Some(name_part.to_string())
 }
 
+/// Parse a pnpm-lock.yaml file. Supports lockfile versions 5.x, 6.x,
+/// 7.x and 9.x — the format and key conventions vary across versions:
+///
+/// * v5/v6 keys in `packages:` use `/` separators:
+///     `/lodash/4.17.21:` or `/@types/node/20.10.5:`
+/// * v6+ keys may use `@` for the version separator:
+///     `/lodash@4.17.21:` or `/@types/node@20.10.5:`
+/// * v9 keys drop the leading `/` entirely:
+///     `lodash@4.17.21:` or `'@types/node@20.10.5':`
+///
+/// Versions can carry a peer-deps suffix that is *not* part of the
+/// resolved version — `(react@18.0.0)` in v9, `_react@18.0.0` in v6.
+/// Both must be stripped before lookup, since the registry only knows
+/// the bare semver version.
+///
+/// Dev/prod classification:
+/// * v6 packages have a `dev: true|false` field per entry — we use it.
+/// * v9 packages don't carry `dev:`. We instead consult the
+///   `importers:` section: a (name, version) that appears *only* in
+///   `devDependencies` of all importers (and never in `dependencies`)
+///   is treated as dev. This is best-effort: transitive deps that are
+///   only reached through a dev top-level package are still treated as
+///   non-dev, because resolving the full graph from a lockfile is out
+///   of scope here. Including those in production scans is the safer
+///   default for a supply-chain tripwire.
+pub(crate) fn parse_pnpm_lock(
+    content: &str,
+    include_dev: bool,
+) -> Result<Vec<Dependency>, String> {
+    let importers = parse_pnpm_importers(content);
+    let entries = parse_pnpm_packages(content)?;
+
+    let mut deps = Vec::new();
+    for entry in entries {
+        let key = (entry.name.clone(), entry.version.clone());
+        let dev = match entry.dev_field {
+            Some(d) => d,
+            None => {
+                let in_prod = importers.prod.contains(&key);
+                let in_dev = importers.dev.contains(&key);
+                in_dev && !in_prod
+            }
+        };
+        if !include_dev && dev {
+            continue;
+        }
+        if !is_registry_version(&entry.version) {
+            continue;
+        }
+        deps.push(Dependency {
+            name: entry.name,
+            version: entry.version,
+            ecosystem: DependencyEcosystem::Npm,
+            source: "pnpm-lock.yaml".to_string(),
+            dev,
+        });
+    }
+    Ok(deps)
+}
+
+#[derive(Debug, Default)]
+struct PnpmImporters {
+    prod: std::collections::BTreeSet<(String, String)>,
+    dev: std::collections::BTreeSet<(String, String)>,
+}
+
+#[derive(Debug)]
+struct PnpmPackageEntry {
+    name: String,
+    version: String,
+    dev_field: Option<bool>,
+}
+
+fn parse_pnpm_packages(content: &str) -> Result<Vec<PnpmPackageEntry>, String> {
+    let mut out = Vec::new();
+    let mut state = PackagesState::Outside;
+
+    let mut current_name: Option<String> = None;
+    let mut current_version: Option<String> = None;
+    let mut current_dev: Option<bool> = None;
+    let mut entry_indent: usize = 0;
+
+    for raw_line in content.lines() {
+        if raw_line.trim().is_empty() || raw_line.trim_start().starts_with('#') {
+            continue;
+        }
+        let indent = leading_spaces(raw_line);
+        let body = &raw_line[indent..];
+
+        if indent == 0 {
+            commit_pnpm_entry(&mut out, &mut current_name, &mut current_version, &mut current_dev);
+            state = if body.trim_end_matches(' ') == "packages:" {
+                PackagesState::Inside
+            } else {
+                PackagesState::Outside
+            };
+            continue;
+        }
+
+        if !matches!(state, PackagesState::Inside) {
+            continue;
+        }
+
+        if current_name.is_none() {
+            entry_indent = indent;
+        }
+
+        if indent == entry_indent && body.ends_with(':') {
+            commit_pnpm_entry(&mut out, &mut current_name, &mut current_version, &mut current_dev);
+
+            let key = body.trim_end_matches(':').trim();
+            if let Some((name, version)) = extract_pnpm_pkg_key(key) {
+                current_name = Some(name);
+                current_version = Some(version);
+                current_dev = None;
+            } else {
+                current_name = None;
+                current_version = None;
+                current_dev = None;
+            }
+        } else if indent > entry_indent {
+            if let Some(rest) = body.strip_prefix("dev:") {
+                let v = rest.trim();
+                if v == "true" {
+                    current_dev = Some(true);
+                } else if v == "false" {
+                    current_dev = Some(false);
+                }
+            }
+        }
+    }
+    commit_pnpm_entry(&mut out, &mut current_name, &mut current_version, &mut current_dev);
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackagesState {
+    Outside,
+    Inside,
+}
+
+fn commit_pnpm_entry(
+    out: &mut Vec<PnpmPackageEntry>,
+    name: &mut Option<String>,
+    version: &mut Option<String>,
+    dev: &mut Option<bool>,
+) {
+    if let (Some(n), Some(v)) = (name.take(), version.take()) {
+        out.push(PnpmPackageEntry {
+            name: n,
+            version: v,
+            dev_field: dev.take(),
+        });
+    } else {
+        *name = None;
+        *version = None;
+        *dev = None;
+    }
+}
+
+fn parse_pnpm_importers(content: &str) -> PnpmImporters {
+    let mut importers = PnpmImporters::default();
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Bucket {
+        Prod,
+        Dev,
+        None,
+    }
+
+    let mut active_bucket = Bucket::None;
+    let mut bucket_indent: usize = usize::MAX;
+    let mut in_importers_section = false;
+    let mut pending_name: Option<(String, usize)> = None;
+
+    for raw_line in content.lines() {
+        if raw_line.trim().is_empty() || raw_line.trim_start().starts_with('#') {
+            continue;
+        }
+        let indent = leading_spaces(raw_line);
+        let body = &raw_line[indent..];
+
+        if indent == 0 {
+            in_importers_section = body.trim_end_matches(' ') == "importers:";
+            if !in_importers_section {
+                if body.trim_end_matches(' ') == "dependencies:" {
+                    active_bucket = Bucket::Prod;
+                    bucket_indent = 0;
+                    pending_name = None;
+                    continue;
+                }
+                if body.trim_end_matches(' ') == "devDependencies:" {
+                    active_bucket = Bucket::Dev;
+                    bucket_indent = 0;
+                    pending_name = None;
+                    continue;
+                }
+                active_bucket = Bucket::None;
+                bucket_indent = usize::MAX;
+                pending_name = None;
+            } else {
+                active_bucket = Bucket::None;
+                bucket_indent = usize::MAX;
+                pending_name = None;
+            }
+            continue;
+        }
+
+        if in_importers_section {
+            let trimmed = body.trim_end();
+            if trimmed == "dependencies:" {
+                active_bucket = Bucket::Prod;
+                bucket_indent = indent;
+                pending_name = None;
+                continue;
+            }
+            if trimmed == "devDependencies:" {
+                active_bucket = Bucket::Dev;
+                bucket_indent = indent;
+                pending_name = None;
+                continue;
+            }
+        }
+
+        if active_bucket == Bucket::None || indent <= bucket_indent {
+            if indent <= bucket_indent {
+                active_bucket = Bucket::None;
+                bucket_indent = usize::MAX;
+                pending_name = None;
+            }
+            continue;
+        }
+
+        let (key_part, value_part) = match body.split_once(':') {
+            Some(x) => x,
+            None => continue,
+        };
+        let key = key_part.trim().trim_matches('\'').trim_matches('"');
+        let value = value_part.trim();
+
+        let expected_entry_indent = bucket_indent + 2;
+        if indent != expected_entry_indent {
+            if let Some((ref pkg, _)) = pending_name {
+                if key == "version" && !value.is_empty() {
+                    let version = strip_pnpm_peer_suffix(value.trim_matches('\'').trim_matches('"'));
+                    let pair = (pkg.clone(), version);
+                    match active_bucket {
+                        Bucket::Prod => {
+                            importers.prod.insert(pair);
+                        }
+                        Bucket::Dev => {
+                            importers.dev.insert(pair);
+                        }
+                        Bucket::None => {}
+                    }
+                    pending_name = None;
+                }
+            }
+            continue;
+        }
+
+        if value.is_empty() {
+            pending_name = Some((key.to_string(), indent));
+        } else {
+            let version = strip_pnpm_peer_suffix(value.trim_matches('\'').trim_matches('"'));
+            let pair = (key.to_string(), version);
+            match active_bucket {
+                Bucket::Prod => {
+                    importers.prod.insert(pair);
+                }
+                Bucket::Dev => {
+                    importers.dev.insert(pair);
+                }
+                Bucket::None => {}
+            }
+            pending_name = None;
+        }
+    }
+
+    importers
+}
+
+fn leading_spaces(line: &str) -> usize {
+    line.bytes().take_while(|b| *b == b' ').count()
+}
+
+fn extract_pnpm_pkg_key(raw_key: &str) -> Option<(String, String)> {
+    // Order of trims matters: pnpm v9 quotes the *whole* scoped key
+    // including the version (`'@types/node@20.10.5'`), and v5/v6 wrap
+    // the same shape with a leading `/`. Strip both, in either order,
+    // until the key stabilises.
+    let mut key = raw_key.trim().to_string();
+    for _ in 0..3 {
+        let trimmed = key
+            .trim_matches('\'')
+            .trim_matches('"')
+            .trim_start_matches('/')
+            .to_string();
+        if trimmed == key {
+            break;
+        }
+        key = trimmed;
+    }
+    let key_owned = strip_pnpm_peer_suffix(&key);
+    let key: &str = &key_owned;
+
+    if let Some(rest) = key.strip_prefix('@') {
+        let after_scope_idx = rest.find('/')?;
+        let post = &rest[after_scope_idx + 1..];
+        let sep_offset_at = post.find('@');
+        let sep_offset_slash = post.find('/');
+        let sep_offset = match (sep_offset_at, sep_offset_slash) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }?;
+        let name_end = 1 + after_scope_idx + 1 + sep_offset;
+        let name = &key[..name_end];
+        let version = &key[name_end + 1..];
+        if name.is_empty() || version.is_empty() {
+            return None;
+        }
+        Some((name.to_string(), version.to_string()))
+    } else {
+        let sep_at = key.find('@');
+        let sep_slash = key.find('/');
+        let sep = match (sep_at, sep_slash) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }?;
+        let name = &key[..sep];
+        let version = &key[sep + 1..];
+        if name.is_empty() || version.is_empty() {
+            return None;
+        }
+        Some((name.to_string(), version.to_string()))
+    }
+}
+
+fn strip_pnpm_peer_suffix(version: &str) -> String {
+    let v = version.trim();
+    let v = match v.find('(') {
+        Some(idx) => &v[..idx],
+        None => v,
+    };
+    let v = match v.find('_') {
+        Some(idx) => &v[..idx],
+        None => v,
+    };
+    v.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +793,236 @@ mod tests {
             Some("@s/b")
         );
         assert_eq!(extract_name_from_packages_key("").as_deref(), None);
+    }
+
+    #[test]
+    fn pnpm_pkg_key_v5() {
+        // v5: leading slash + slash version separator
+        assert_eq!(
+            extract_pnpm_pkg_key("/lodash/4.17.21"),
+            Some(("lodash".to_string(), "4.17.21".to_string()))
+        );
+        assert_eq!(
+            extract_pnpm_pkg_key("/@types/node/20.10.5"),
+            Some(("@types/node".to_string(), "20.10.5".to_string()))
+        );
+    }
+
+    #[test]
+    fn pnpm_pkg_key_v6() {
+        // v6: leading slash + at-sign version separator
+        assert_eq!(
+            extract_pnpm_pkg_key("/lodash@4.17.21"),
+            Some(("lodash".to_string(), "4.17.21".to_string()))
+        );
+        assert_eq!(
+            extract_pnpm_pkg_key("/@types/node@20.10.5"),
+            Some(("@types/node".to_string(), "20.10.5".to_string()))
+        );
+    }
+
+    #[test]
+    fn pnpm_pkg_key_v9() {
+        // v9: no leading slash; quoted scoped names
+        assert_eq!(
+            extract_pnpm_pkg_key("lodash@4.17.21"),
+            Some(("lodash".to_string(), "4.17.21".to_string()))
+        );
+        assert_eq!(
+            extract_pnpm_pkg_key("'@types/node@20.10.5'"),
+            Some(("@types/node".to_string(), "20.10.5".to_string()))
+        );
+        assert_eq!(
+            extract_pnpm_pkg_key("\"@types/node@20.10.5\""),
+            Some(("@types/node".to_string(), "20.10.5".to_string()))
+        );
+    }
+
+    #[test]
+    fn pnpm_pkg_key_strips_peer_suffix() {
+        // v9 paren style:
+        assert_eq!(
+            extract_pnpm_pkg_key("/foo@1.0.0(react@18.0.0)"),
+            Some(("foo".to_string(), "1.0.0".to_string()))
+        );
+        assert_eq!(
+            extract_pnpm_pkg_key("foo@1.0.0(react@18.0.0)(typescript@5.0.0)"),
+            Some(("foo".to_string(), "1.0.0".to_string()))
+        );
+        // v6 underscore style:
+        assert_eq!(
+            extract_pnpm_pkg_key("/foo/1.0.0_react@18.0.0"),
+            Some(("foo".to_string(), "1.0.0".to_string()))
+        );
+        assert_eq!(
+            extract_pnpm_pkg_key("/foo@1.0.0_react@18.0.0"),
+            Some(("foo".to_string(), "1.0.0".to_string()))
+        );
+    }
+
+    #[test]
+    fn pnpm_pkg_key_rejects_garbage() {
+        assert_eq!(extract_pnpm_pkg_key(""), None);
+        assert_eq!(extract_pnpm_pkg_key("/"), None);
+        assert_eq!(extract_pnpm_pkg_key("/lodash"), None);
+        assert_eq!(extract_pnpm_pkg_key("/@scope/no-version"), None);
+    }
+
+    #[test]
+    fn parses_pnpm_lock_v9() {
+        // Realistic pnpm v9 lockfile.
+        let lock = r#"lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+  .:
+    dependencies:
+      lodash:
+        specifier: ^4.17.21
+        version: 4.17.21
+      '@scope/lib':
+        specifier: ^1.0.0
+        version: 1.0.0
+    devDependencies:
+      typescript:
+        specifier: ^5.0.0
+        version: 5.4.5
+
+packages:
+  lodash@4.17.21:
+    resolution: {integrity: sha512-x}
+    engines: {node: '>=12'}
+
+  '@scope/lib@1.0.0':
+    resolution: {integrity: sha512-y}
+
+  typescript@5.4.5:
+    resolution: {integrity: sha512-z}
+    engines: {node: '>=14.17'}
+
+  some-transitive@2.0.0:
+    resolution: {integrity: sha512-w}
+"#;
+
+        let prod = parse_pnpm_lock(lock, false).unwrap();
+        let pairs: Vec<_> = prod
+            .iter()
+            .map(|d| (d.name.clone(), d.version.clone()))
+            .collect();
+        // typescript is dev-only top-level, should be excluded.
+        // some-transitive is unclassified — kept as prod (best-effort).
+        assert!(pairs.contains(&("lodash".to_string(), "4.17.21".to_string())));
+        assert!(pairs.contains(&("@scope/lib".to_string(), "1.0.0".to_string())));
+        assert!(pairs.contains(&("some-transitive".to_string(), "2.0.0".to_string())));
+        assert!(!pairs.contains(&("typescript".to_string(), "5.4.5".to_string())));
+
+        let all = parse_pnpm_lock(lock, true).unwrap();
+        let names: Vec<_> = all.iter().map(|d| d.name.clone()).collect();
+        assert!(names.contains(&"typescript".to_string()));
+        assert_eq!(all.len(), 4);
+    }
+
+    #[test]
+    fn parses_pnpm_lock_v6() {
+        // v6 layout: per-package `dev:` flag drives classification.
+        let lock = r#"lockfileVersion: '6.0'
+
+dependencies:
+  lodash:
+    specifier: ^4.17.21
+    version: 4.17.21
+
+devDependencies:
+  typescript:
+    specifier: ^5.0.0
+    version: 5.4.5
+
+packages:
+
+  /lodash@4.17.21:
+    resolution: {integrity: sha512-x}
+    dev: false
+
+  /typescript@5.4.5:
+    resolution: {integrity: sha512-z}
+    dev: true
+
+  /'@types/node@20.10.5':
+    resolution: {integrity: sha512-y}
+    dev: true
+"#;
+
+        let prod = parse_pnpm_lock(lock, false).unwrap();
+        let pairs: Vec<_> = prod
+            .iter()
+            .map(|d| (d.name.clone(), d.version.clone()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![("lodash".to_string(), "4.17.21".to_string())]
+        );
+
+        let all = parse_pnpm_lock(lock, true).unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn parses_pnpm_lock_v5_flat() {
+        let lock = r#"lockfileVersion: 5.4
+
+dependencies:
+  lodash: 4.17.21
+
+devDependencies:
+  typescript: 5.4.5
+
+packages:
+
+  /lodash/4.17.21:
+    resolution: {integrity: sha512-x}
+    dev: false
+
+  /typescript/5.4.5:
+    resolution: {integrity: sha512-z}
+    dev: true
+"#;
+        let prod = parse_pnpm_lock(lock, false).unwrap();
+        let pairs: Vec<_> = prod
+            .iter()
+            .map(|d| (d.name.clone(), d.version.clone()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![("lodash".to_string(), "4.17.21".to_string())]
+        );
+    }
+
+    #[test]
+    fn pnpm_lock_strips_peer_suffix_in_packages_section() {
+        let lock = r#"lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      consumer:
+        specifier: ^1.0.0
+        version: 1.0.0(react@18.2.0)
+
+packages:
+  consumer@1.0.0(react@18.2.0):
+    resolution: {integrity: sha512-x}
+  react@18.2.0:
+    resolution: {integrity: sha512-y}
+"#;
+        let deps = parse_pnpm_lock(lock, true).unwrap();
+        let pairs: Vec<_> = deps
+            .iter()
+            .map(|d| (d.name.clone(), d.version.clone()))
+            .collect();
+        assert!(pairs.contains(&("consumer".to_string(), "1.0.0".to_string())));
+        assert!(pairs.contains(&("react".to_string(), "18.2.0".to_string())));
     }
 }

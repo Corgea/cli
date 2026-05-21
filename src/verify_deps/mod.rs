@@ -244,8 +244,8 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
     if deps.is_empty() {
         return Err(format!(
             "no supported dependency manifests found in {}. Expected one of: \
-             package-lock.json, npm-shrinkwrap.json, yarn.lock, requirements.txt, \
-             Pipfile.lock, poetry.lock, uv.lock.",
+             package-lock.json, npm-shrinkwrap.json, pnpm-lock.yaml, yarn.lock, \
+             requirements.txt, Pipfile.lock, poetry.lock, uv.lock.",
             path.display()
         ));
     }

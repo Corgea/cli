@@ -109,6 +109,31 @@ corgea setup-hooks --default-config            # Default: secrets + PII, fail on
 
 Installs a pre-commit hook running `corgea scan blast --only-uncommitted`. Bypass with `git commit --no-verify`.
 
+### Verify Deps — `corgea verify-deps`
+
+Supply-chain tripwire: looks up every pinned dependency in the project against the public registry (npm or PyPI) and flags anything whose installed version was published within a configurable recency window. Useful for catching very-recent malicious version pushes before they get baked into a build.
+
+```bash
+corgea verify-deps                                  # 2-day window, prod deps, both ecosystems
+corgea verify-deps --threshold 7d                   # widen the window to 7 days
+corgea verify-deps --threshold 48h --fail           # exit 1 if any recent dep is found (CI gate)
+corgea verify-deps --ecosystem npm                  # only check npm deps
+corgea verify-deps --ecosystem python --include-dev # python only, include dev deps
+corgea verify-deps --path ./services/api            # check a different project
+corgea verify-deps --json                           # machine-readable output
+```
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--ecosystem` | `-e` | `npm`, `python`, or `all` (default) |
+| `--threshold` | `-t` | Recency window: `2d`, `48h`, `30m`, `1w`, etc. (default `2d`) |
+| `--include-dev` | | Include development dependencies |
+| `--fail` | `-f` | Exit non-zero if any recent dep is detected |
+| `--json` | | JSON output instead of human text |
+| `--path` | `-p` | Project directory (default: `.`) |
+
+Supported lockfiles (preferred → fallback): npm: `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml` (v5/v6/v9), `yarn.lock`. Python: `poetry.lock`, `Pipfile.lock`, `uv.lock`, `requirements.txt` (only `==`-pinned lines).
+
 ## Common Workflows
 
 ### Scan full project
