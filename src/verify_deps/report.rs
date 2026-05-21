@@ -24,12 +24,33 @@ pub fn print_text(report: &VerifyReport) {
     let ok_count = report.ok_count();
 
     println!(
-        "Checked {} dependencies — {} ok, {} recent, {} errors",
+        "Checked {} dependencies — {} ok, {} recent, {} errors, {} unpinned",
         report.outcomes.len(),
         ok_count,
         recent.len(),
         errors.len(),
+        report.unpinned_warnings.len(),
     );
+
+    if !report.unpinned_warnings.is_empty() {
+        println!();
+        println!(
+            "{}",
+            set_text_color(
+                "Unpinned dependencies (cannot be verified against the registry):",
+                TerminalColor::Yellow,
+            )
+        );
+        for w in &report.unpinned_warnings {
+            println!(
+                "  {} [{}] {}: {}",
+                set_text_color("?", TerminalColor::Yellow),
+                w.ecosystem.label(),
+                w.manifest,
+                w.reason,
+            );
+        }
+    }
 
     if !recent.is_empty() {
         println!();
@@ -77,7 +98,7 @@ pub fn print_text(report: &VerifyReport) {
         }
     }
 
-    if recent.is_empty() && errors.is_empty() {
+    if recent.is_empty() && errors.is_empty() && report.unpinned_warnings.is_empty() {
         println!(
             "{}",
             set_text_color(
@@ -130,6 +151,18 @@ pub fn print_json(report: &VerifyReport) {
         })
         .collect();
 
+    let unpinned: Vec<_> = report
+        .unpinned_warnings
+        .iter()
+        .map(|w| {
+            json!({
+                "ecosystem": w.ecosystem.label(),
+                "manifest": w.manifest,
+                "reason": w.reason,
+            })
+        })
+        .collect();
+
     let body = json!({
         "scanned_at": report.scanned_at.to_rfc3339(),
         "threshold_seconds": report.threshold.as_secs(),
@@ -139,8 +172,10 @@ pub fn print_json(report: &VerifyReport) {
             "ok": report.ok_count(),
             "recent": report.recent().len(),
             "errors": report.errors().len(),
+            "unpinned": report.unpinned_warnings.len(),
         },
         "results": outcomes,
+        "unpinned": unpinned,
     });
 
     println!("{}", serde_json::to_string_pretty(&body).unwrap());

@@ -192,6 +192,12 @@ enum Commands {
 
         #[arg(
             long,
+            help = "Exit with a non-zero status code if any dependency is unpinned (e.g. package.json without a lockfile, pyproject.toml/Pipfile without a matching lockfile, or unpinned `requirements.txt` lines). Independent of --fail."
+        )]
+        fail_unpinned: bool,
+
+        #[arg(
+            long,
             help = "Output the result as JSON instead of human-readable text."
         )]
         json: bool,
@@ -415,7 +421,7 @@ fn main() {
         Some(Commands::SetupHooks { default_config }) => {
             setup_hooks::setup_pre_commit_hook(*default_config);
         }
-        Some(Commands::VerifyDeps { ecosystem, threshold, include_dev, fail, json, path }) => {
+        Some(Commands::VerifyDeps { ecosystem, threshold, include_dev, fail, fail_unpinned, json, path }) => {
             let parsed_ecosystem = match verify_deps::Ecosystem::parse(ecosystem) {
                 Ok(e) => e,
                 Err(e) => {
@@ -436,6 +442,7 @@ fn main() {
                 threshold: parsed_threshold,
                 include_dev: *include_dev,
                 fail: *fail,
+                fail_unpinned: *fail_unpinned,
                 json: *json,
                 path: project_path,
                 npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
@@ -451,7 +458,11 @@ fn main() {
                     }
                     let recent = !report.recent().is_empty();
                     let errors = !report.errors().is_empty();
+                    let unpinned = report.has_unpinned();
                     if (recent || errors) && opts.fail {
+                        std::process::exit(1);
+                    }
+                    if unpinned && opts.fail_unpinned {
                         std::process::exit(1);
                     }
                 }

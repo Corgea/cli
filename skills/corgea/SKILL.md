@@ -117,6 +117,7 @@ Supply-chain tripwire: looks up every pinned dependency in the project against t
 corgea verify-deps                                  # 2-day window, prod deps, both ecosystems
 corgea verify-deps --threshold 7d                   # widen the window to 7 days
 corgea verify-deps --threshold 48h --fail           # exit 1 if any recent dep is found (CI gate)
+corgea verify-deps --fail-unpinned                  # exit 1 if any dep can't be verified because it isn't pinned
 corgea verify-deps --ecosystem npm                  # only check npm deps
 corgea verify-deps --ecosystem python --include-dev # python only, include dev deps
 corgea verify-deps --path ./services/api            # check a different project
@@ -129,6 +130,7 @@ corgea verify-deps --json                           # machine-readable output
 | `--threshold` | `-t` | Recency window: `2d`, `48h`, `30m`, `1w`, etc. (default `2d`) |
 | `--include-dev` | | Include development dependencies |
 | `--fail` | `-f` | Exit non-zero if any recent dep is detected |
+| `--fail-unpinned` | | Exit non-zero if any dep is unpinned (manifest with no lockfile, or unpinned `requirements.txt` line) |
 | `--json` | | JSON output instead of human text |
 | `--path` | `-p` | Project directory (default: `.`) |
 
@@ -177,6 +179,18 @@ corgea upload report.json --project-name my-app
 
 ```bash
 corgea verify-deps --threshold 2d --fail
+```
+
+### Require pinned, lockfile-resolved dependencies
+
+```bash
+corgea verify-deps --fail-unpinned
+```
+
+Use this together with `--fail` to gate both freshness and pinning in one CI step:
+
+```bash
+corgea verify-deps --threshold 2d --fail --fail-unpinned
 ```
 
 ### Export results

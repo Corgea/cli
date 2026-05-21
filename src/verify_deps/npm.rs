@@ -30,7 +30,29 @@ pub fn discover(project_dir: &Path, include_dev: bool) -> Result<DiscoverResult,
         .filter(|p| p.exists())
         .collect();
 
+    let mut warnings = Vec::new();
+
     if candidates.is_empty() {
+        // No lockfile. If there's a manifest with declared dependencies,
+        // surface it as an unpinned warning rather than an outright "no
+        // npm lockfile" error — the caller can decide whether to treat
+        // it as a fail (`--fail-unpinned`) or a soft warning.
+        let pkg_json = project_dir.join("package.json");
+        if pkg_json.exists() && package_json_has_deps(&pkg_json).unwrap_or(false) {
+            warnings.push(super::UnpinnedWarning {
+                ecosystem: DependencyEcosystem::Npm,
+                manifest: pkg_json.display().to_string(),
+                reason: format!(
+                    "package.json declares dependencies but no lockfile was found (looked for {}). Run `npm install`, `pnpm install`, or `yarn install` to generate one before verifying.",
+                    SUPPORTED_FILES.join(", ")
+                ),
+            });
+            return Ok(DiscoverResult {
+                deps: Vec::new(),
+                source: String::new(),
+                warnings,
+            });
+        }
         return Err(format!(
             "no npm lockfile found in {}. Looked for: {}",
             project_dir.display(),
@@ -56,7 +78,25 @@ pub fn discover(project_dir: &Path, include_dev: bool) -> Result<DiscoverResult,
     Ok(DiscoverResult {
         deps,
         source: chosen.display().to_string(),
+        warnings,
     })
+}
+
+/// Lightweight check: does this `package.json` declare any
+/// `dependencies` or `devDependencies`? Used to decide whether a
+/// missing lockfile actually matters. We tolerate parse errors
+/// silently — if the file is unreadable we just say "no deps".
+fn package_json_has_deps(path: &Path) -> Result<bool, ()> {
+    let content = std::fs::read_to_string(path).map_err(|_| ())?;
+    let parsed: serde_json::Value = serde_json::from_str(&content).map_err(|_| ())?;
+    let has = |key: &str| {
+        parsed
+            .get(key)
+            .and_then(|v| v.as_object())
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+    };
+    Ok(has("dependencies") || has("devDependencies") || has("peerDependencies") || has("optionalDependencies"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1024,5 +1064,67 @@ packages:
             .collect();
         assert!(pairs.contains(&("consumer".to_string(), "1.0.0".to_string())));
         assert!(pairs.contains(&("react".to_string(), "18.2.0".to_string())));
+    }
+
+    #[test]
+    fn discover_warns_on_package_json_without_lockfile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+              "name": "demo",
+              "version": "1.0.0",
+              "dependencies": { "lodash": "^4.0.0" }
+            }"#,
+        )
+        .unwrap();
+
+        let result = discover(dir.path(), false).expect("discover");
+        assert!(result.deps.is_empty());
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].manifest.ends_with("package.json"));
+        assert!(result.warnings[0].reason.contains("lockfile"));
+    }
+
+    #[test]
+    fn discover_no_warning_for_empty_package_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{
+              "name": "demo",
+              "version": "1.0.0"
+            }"#,
+        )
+        .unwrap();
+
+        let err = discover(dir.path(), false).err().expect("expected error");
+        assert!(err.contains("no npm lockfile"));
+    }
+
+    #[test]
+    fn discover_with_lockfile_emits_no_warnings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{ "name": "demo", "version": "1.0.0", "dependencies": { "lodash": "^4.0.0" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{
+                "name": "demo", "version": "1.0.0", "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "demo", "version": "1.0.0" },
+                    "node_modules/lodash": { "version": "4.17.21" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let result = discover(dir.path(), false).expect("discover");
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.deps.len(), 1);
+        assert_eq!(result.deps[0].name, "lodash");
     }
 }

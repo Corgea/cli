@@ -97,6 +97,11 @@ pub struct VerifyOptions {
     pub threshold: Duration,
     pub include_dev: bool,
     pub fail: bool,
+    /// When true, treat any unpinned dependency or missing-lockfile
+    /// situation (`package.json` without a lockfile, unpinned
+    /// `requirements.txt` lines, `pyproject.toml`/`Pipfile` without a
+    /// matching lockfile) as a hard failure.
+    pub fail_unpinned: bool,
     pub json: bool,
     pub path: PathBuf,
     /// Optional registry overrides (used in tests).
@@ -111,6 +116,7 @@ impl Default for VerifyOptions {
             threshold: Duration::from_secs(2 * 24 * 60 * 60),
             include_dev: false,
             fail: false,
+            fail_unpinned: false,
             json: false,
             path: PathBuf::from("."),
             npm_registry: None,
@@ -192,10 +198,12 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
 
     let mut deps: Vec<Dependency> = Vec::new();
     let mut sources: Vec<String> = Vec::new();
+    let mut unpinned_warnings: Vec<UnpinnedWarning> = Vec::new();
 
     if matches!(opts.ecosystem, Ecosystem::Npm | Ecosystem::All) {
         match npm::discover(path, opts.include_dev) {
             Ok(mut found) => {
+                unpinned_warnings.append(&mut found.warnings);
                 if !found.deps.is_empty() {
                     sources.push(found.source.clone());
                     deps.append(&mut found.deps);
@@ -220,6 +228,7 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
     if matches!(opts.ecosystem, Ecosystem::Python | Ecosystem::All) {
         match python::discover(path, opts.include_dev) {
             Ok(mut found) => {
+                unpinned_warnings.append(&mut found.warnings);
                 if !found.deps.is_empty() {
                     sources.push(found.source.clone());
                     deps.append(&mut found.deps);
@@ -241,7 +250,7 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
         }
     }
 
-    if deps.is_empty() {
+    if deps.is_empty() && unpinned_warnings.is_empty() {
         return Err(format!(
             "no supported dependency manifests found in {}. Expected one of: \
              package-lock.json, npm-shrinkwrap.json, pnpm-lock.yaml, yarn.lock, \
@@ -313,6 +322,7 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
     Ok(VerifyReport {
         sources,
         outcomes,
+        unpinned_warnings,
         threshold: opts.threshold,
         scanned_at: now,
     })
@@ -323,6 +333,7 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
 pub struct VerifyReport {
     pub sources: Vec<String>,
     pub outcomes: Vec<LookupOutcome>,
+    pub unpinned_warnings: Vec<UnpinnedWarning>,
     pub threshold: Duration,
     pub scanned_at: DateTime<Utc>,
 }
@@ -354,13 +365,42 @@ impl VerifyReport {
             .filter(|o| matches!(o, LookupOutcome::Ok { .. }))
             .count()
     }
+
+    pub fn has_unpinned(&self) -> bool {
+        !self.unpinned_warnings.is_empty()
+    }
 }
 
 /// Helper used by lockfile parsers to bundle their result.
-#[derive(Debug, Clone)]
+///
+/// `source` is empty when the discoverer could not find a lockfile;
+/// in that case `warnings` typically explains why (e.g. a manifest
+/// was found but no lockfile to resolve it against).
+#[derive(Debug, Clone, Default)]
 pub struct DiscoverResult {
     pub deps: Vec<Dependency>,
     pub source: String,
+    pub warnings: Vec<UnpinnedWarning>,
+}
+
+/// A diagnostic about a dependency we *could not* verify because it
+/// isn't pinned to an exact version. Examples:
+///
+/// * `package.json` is present but no `package-lock.json` /
+///   `pnpm-lock.yaml` / `yarn.lock` exists.
+/// * `pyproject.toml` or `Pipfile` is present without a matching
+///   lockfile.
+/// * A `requirements.txt` line is not `==`-pinned (e.g. `requests>=2.0`).
+///
+/// These are surfaced in the regular report and, with
+/// `--fail-unpinned`, cause a non-zero exit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnpinnedWarning {
+    pub ecosystem: DependencyEcosystem,
+    /// Which manifest the warning is about (relative path or filename).
+    pub manifest: String,
+    /// Human-readable description of why the dep can't be verified.
+    pub reason: String,
 }
 
 /// Read the file at `path` into a String, returning an informative error.
