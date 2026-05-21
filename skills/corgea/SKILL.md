@@ -136,6 +136,35 @@ corgea verify-deps --json                           # machine-readable output
 
 Supported lockfiles (preferred → fallback): npm: `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml` (v5/v6/v9), `yarn.lock`. Python: `poetry.lock`, `Pipfile.lock`, `uv.lock`, `requirements.txt` (only `==`-pinned lines).
 
+### Precheck — `corgea precheck <pkg-mgr> <subcommand> [args...]`
+
+Wraps an install command (`npm install`, `yarn add`, `pnpm add`, `pip install`), resolves what the package manager *would* install against the public registry, and refuses to run the install when a resolved version was published within `--threshold`. Use it as a thin replacement for the bare command in CI scripts or interactive shells.
+
+```bash
+corgea precheck npm install axios@^1.0.0 --save-dev
+corgea precheck pnpm add @types/node@latest
+corgea precheck yarn add lodash
+corgea precheck pip install requests==2.31.0
+corgea precheck pip install -r requirements.txt
+corgea precheck npm install                       # bare install — verifies the lockfile
+```
+
+| Flag | Description |
+|------|-------------|
+| `--threshold <T>` (`-t`) | Recency window (`2d`, `48h`, `30m`, `1w`). Default `2d`. |
+| `--no-fail` | Demote a recent finding from a hard block to a warning (install runs anyway). |
+| `--check-only` | Run the verification but never exec the install. |
+| `--fail-unpinned` | Also fail on unverifiable specs (URL/git/file/editable) and unpinned `requirements.txt` lines pulled in by `-r`. |
+| `--json` | Machine-readable output. |
+
+Spec resolution:
+
+* **npm / yarn / pnpm** — `pkg`, `pkg@latest`, `pkg@1.2.3`, `pkg@^1.0.0`, `pkg@>=1.0.0 <2.0.0`, `pkg@next` (any dist-tag), and scoped names (`@types/node@...`). Ranges are resolved against the registry's full version list using `semver` semantics.
+* **pip** — `pkg`, `pkg==1.2.3`, `pkg>=1,<2`, `pkg~=1.4`, `pkg[extras]==X`. Exact `==` pins are honoured precisely; other PEP 440 specifiers are resolved against PyPI's release list with a best-effort comparison.
+* **Skipped (warning, not blocked)** — `git+...`, `file:...`, `./local`, `http(s)://...`, `npm:alias@...`, `workspace:*`, `pip -e`. These are explicit out-of-band sources we can't verify against a registry.
+
+Subcommands other than `install` / `add` / `i` are forwarded straight through to the package manager unchanged, so `corgea precheck npm view ...` and similar just work.
+
 ## Common Workflows
 
 ### Scan full project
@@ -192,6 +221,15 @@ Use this together with `--fail` to gate both freshness and pinning in one CI ste
 ```bash
 corgea verify-deps --threshold 2d --fail --fail-unpinned
 ```
+
+### Pre-check an install before letting it run
+
+```bash
+corgea precheck npm install axios@^1.0.0
+corgea precheck pip install -r requirements.txt --fail-unpinned
+```
+
+`corgea precheck` resolves the actual version a package manager would install, blocks if it was published within the threshold, and otherwise transparently runs the install (preserving the package manager's exit code).
 
 ### Export results
 

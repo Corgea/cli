@@ -8,6 +8,7 @@ mod log;
 mod setup_hooks;
 mod authorize;
 mod verify_deps;
+mod precheck;
 mod scanners {
     pub mod fortify;
     pub mod blast;
@@ -208,6 +209,49 @@ enum Commands {
             help = "Path to the project to verify. Defaults to the current directory."
         )]
         path: Option<String>,
+    },
+    /// Pre-check a package install command against the registry, then run it.
+    /// Wraps `npm install`, `yarn add`, `pnpm add`, or `pip install` and refuses
+    /// to run when a resolved version was published within --threshold.
+    /// Examples:
+    ///   corgea precheck npm install axios@^1.0.0 --save-dev
+    ///   corgea precheck pip install requests
+    ///   corgea precheck pnpm add @types/node@latest
+    Precheck {
+        #[arg(
+            long,
+            short = 't',
+            default_value = "2d",
+            help = "Recency threshold. Resolved versions younger than this are flagged. Same syntax as `verify-deps --threshold`."
+        )]
+        threshold: String,
+
+        #[arg(
+            long,
+            help = "Demote a recent finding from a hard block to a printed warning. The install still runs."
+        )]
+        no_fail: bool,
+
+        #[arg(
+            long,
+            help = "Run the verification but never exec the install command."
+        )]
+        check_only: bool,
+
+        #[arg(
+            long,
+            help = "Also fail when an unpinned/unverifiable spec (URL, git, file:, editable) is in the install command."
+        )]
+        fail_unpinned: bool,
+
+        #[arg(long, help = "Output the result as JSON instead of human-readable text.")]
+        json: bool,
+
+        /// Everything after `precheck` is forwarded to the package manager.
+        /// First positional must name the package manager: npm, yarn,
+        /// pnpm, pip.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
     },
 }
 
@@ -471,6 +515,38 @@ fn main() {
                     std::process::exit(2);
                 }
             }
+        }
+        Some(Commands::Precheck { threshold, no_fail, check_only, fail_unpinned, json, cmd }) => {
+            if cmd.is_empty() {
+                eprintln!("usage: corgea precheck <pkg-manager> <subcommand> [args...]");
+                std::process::exit(2);
+            }
+            let manager = match precheck::PackageManager::parse(&cmd[0]) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(2);
+                }
+            };
+            let parsed_threshold = match verify_deps::parse_threshold(threshold) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Invalid --threshold: {}", e);
+                    std::process::exit(2);
+                }
+            };
+            let opts = precheck::PrecheckOptions {
+                manager,
+                threshold: parsed_threshold,
+                no_fail: *no_fail,
+                check_only: *check_only,
+                fail_unpinned: *fail_unpinned,
+                json: *json,
+                npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
+                pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
+            };
+            let exit_code = precheck::run(cmd, opts);
+            std::process::exit(exit_code);
         }
         None => {
             utils::terminal::show_welcome_message();
