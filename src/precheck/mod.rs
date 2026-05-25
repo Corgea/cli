@@ -7,7 +7,7 @@
 //!
 //! Verification rule: a package is rejected if the resolved version
 //! was published within `--threshold` (default `2d`). This mirrors
-//! the `verify-deps` flow but applies to the install-time set of
+//! the `deps` flow but applies to the install-time set of
 //! packages instead of the already-locked set.
 //!
 //! By default a "recent" finding makes precheck exit with status 1
@@ -322,7 +322,9 @@ fn verify_one(
     match resolved {
         Ok(resolved) => {
             let age_chrono = now.signed_duration_since(resolved.published_at);
-            let age = age_chrono.to_std().unwrap_or_else(|_| Duration::from_secs(0));
+            let age = age_chrono
+                .to_std()
+                .unwrap_or_else(|_| Duration::from_secs(0));
             if age_chrono < threshold {
                 TargetOutcome::Recent {
                     target: target.clone(),
@@ -380,7 +382,7 @@ fn verify_lockfile_or_requirements(
 
     let mut overall: i32 = 0;
     for req in requirements_files {
-        // The verify-deps machinery expects a project directory and
+        // The deps machinery expects a project directory and
         // looks for a sibling `requirements.txt`. We use the file's
         // parent dir if it has one, falling back to cwd for relative
         // paths like `-r reqs.txt`.
@@ -389,7 +391,7 @@ fn verify_lockfile_or_requirements(
             .filter(|p| !p.as_os_str().is_empty())
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        // verify-deps only looks for the literal file name
+        // deps only looks for the literal file name
         // `requirements.txt`. If the user pointed at a different
         // file (e.g. `-r dev-reqs.txt`), copy / link it temporarily
         // so the verifier can find it. We instead just parse it
@@ -400,7 +402,7 @@ fn verify_lockfile_or_requirements(
             .unwrap_or_default();
         if file_name != "requirements.txt" {
             // Parse the file ourselves and run the registry checks.
-            let code = verify_arbitrary_requirements(&req, &opts);
+            let code = verify_arbitrary_requirements(&req, opts);
             if code != 0 {
                 overall = code;
             }
@@ -429,23 +431,15 @@ fn verify_lockfile_or_requirements(
 /// the same registry verification we'd run for a project's
 /// `requirements.txt`. Used when the user passes
 /// `pip install -r dev-reqs.txt` (a non-default name).
-fn verify_arbitrary_requirements(
-    req_path: &std::path::Path,
-    opts: &PrecheckOptions,
-) -> i32 {
+fn verify_arbitrary_requirements(req_path: &std::path::Path, opts: &PrecheckOptions) -> i32 {
     let content = match std::fs::read_to_string(req_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "verify-deps: failed to read {}: {}",
-                req_path.display(),
-                e
-            );
+            eprintln!("deps: failed to read {}: {}", req_path.display(), e);
             return 2;
         }
     };
-    let (deps, unpinned) =
-        crate::verify_deps::python::parse_requirements_with_warnings(&content);
+    let (deps, unpinned) = crate::verify_deps::python::parse_requirements_with_warnings(&content);
 
     if deps.is_empty() && unpinned.is_empty() {
         return 0;
@@ -475,17 +469,16 @@ fn verify_arbitrary_requirements(
         ) {
             Ok(published_at) => {
                 let age_chrono = now.signed_duration_since(published_at);
-                let age = age_chrono.to_std().unwrap_or_else(|_| Duration::from_secs(0));
+                let age = age_chrono
+                    .to_std()
+                    .unwrap_or_else(|_| Duration::from_secs(0));
                 if age_chrono < threshold {
                     println!(
                         "  {} {}@{}  published {} ago at {} (within threshold)",
                         set_text_color("⚠", TerminalColor::Yellow),
                         dep.name,
                         dep.version,
-                        set_text_color(
-                            &verify_deps::format_duration(age),
-                            TerminalColor::Yellow,
-                        ),
+                        set_text_color(&verify_deps::format_duration(age), TerminalColor::Yellow,),
                         published_at.format("%Y-%m-%d %H:%M:%S UTC"),
                     );
                     recent_count += 1;
@@ -520,11 +513,7 @@ fn verify_arbitrary_requirements(
             )
         );
         for line in &unpinned {
-            println!(
-                "  {} {}",
-                set_text_color("?", TerminalColor::Yellow),
-                line
-            );
+            println!("  {} {}", set_text_color("?", TerminalColor::Yellow), line);
         }
     }
     if recent_count > 0 && !opts.no_fail {
@@ -558,7 +547,7 @@ fn delegate_to_verify_deps(opts: verify_deps::VerifyOptions) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("verify-deps failed: {}", e);
+            eprintln!("deps failed: {}", e);
             2
         }
     }
@@ -639,7 +628,11 @@ fn print_text(report: &PrecheckReport) {
 
     for o in &report.outcomes {
         match o {
-            TargetOutcome::Ok { target, resolved, age } => {
+            TargetOutcome::Ok {
+                target,
+                resolved,
+                age,
+            } => {
                 println!(
                     "  {} {} → {}@{}  published {} ago",
                     set_text_color("✓", TerminalColor::Green),
@@ -649,7 +642,11 @@ fn print_text(report: &PrecheckReport) {
                     verify_deps::format_duration(*age),
                 );
             }
-            TargetOutcome::Recent { target, resolved, age } => {
+            TargetOutcome::Recent {
+                target,
+                resolved,
+                age,
+            } => {
                 println!(
                     "  {} {} → {}@{}  published {} ago at {} (within threshold)",
                     set_text_color("⚠", TerminalColor::Yellow),
@@ -686,7 +683,11 @@ fn print_json(report: &PrecheckReport) {
         .outcomes
         .iter()
         .map(|o| match o {
-            TargetOutcome::Ok { target, resolved, age } => json!({
+            TargetOutcome::Ok {
+                target,
+                resolved,
+                age,
+            } => json!({
                 "status": "ok",
                 "spec": target.display,
                 "name": resolved.name,
@@ -694,7 +695,11 @@ fn print_json(report: &PrecheckReport) {
                 "published_at": resolved.published_at.to_rfc3339(),
                 "age_seconds": age.as_secs(),
             }),
-            TargetOutcome::Recent { target, resolved, age } => json!({
+            TargetOutcome::Recent {
+                target,
+                resolved,
+                age,
+            } => json!({
                 "status": "recent",
                 "spec": target.display,
                 "name": resolved.name,

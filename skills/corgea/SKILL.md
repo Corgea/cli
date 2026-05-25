@@ -109,19 +109,19 @@ corgea setup-hooks --default-config            # Default: secrets + PII, fail on
 
 Installs a pre-commit hook running `corgea scan blast --only-uncommitted`. Bypass with `git commit --no-verify`.
 
-### Verify Deps — `corgea verify-deps`
+### Deps — `corgea deps`
 
 Supply-chain tripwire: looks up every pinned dependency in the project against the public registry (npm or PyPI) and flags anything whose installed version was published within a configurable recency window. Useful for catching very-recent malicious version pushes before they get baked into a build.
 
 ```bash
-corgea verify-deps                                  # 2-day window, prod deps, both ecosystems
-corgea verify-deps --threshold 7d                   # widen the window to 7 days
-corgea verify-deps --threshold 48h --fail           # exit 1 if any recent dep is found (CI gate)
-corgea verify-deps --fail-unpinned                  # exit 1 if any dep can't be verified because it isn't pinned
-corgea verify-deps --ecosystem npm                  # only check npm deps
-corgea verify-deps --ecosystem python --include-dev # python only, include dev deps
-corgea verify-deps --path ./services/api            # check a different project
-corgea verify-deps --json                           # machine-readable output
+corgea deps                                  # 2-day window, prod deps, both ecosystems
+corgea deps --threshold 7d                   # widen the window to 7 days
+corgea deps --threshold 48h --fail           # exit 1 if any recent dep is found (CI gate)
+corgea deps --fail-unpinned                  # exit 1 if any dep can't be verified because it isn't pinned
+corgea deps --ecosystem npm                  # only check npm deps
+corgea deps --ecosystem python --include-dev # python only, include dev deps
+corgea deps --path ./services/api            # check a different project
+corgea deps --json                           # machine-readable output
 ```
 
 | Flag | Short | Description |
@@ -207,19 +207,19 @@ corgea upload report.json --project-name my-app
 ### Block builds that pull in a freshly-published dependency
 
 ```bash
-corgea verify-deps --threshold 2d --fail
+corgea deps --threshold 2d --fail
 ```
 
 ### Require pinned, lockfile-resolved dependencies
 
 ```bash
-corgea verify-deps --fail-unpinned
+corgea deps --fail-unpinned
 ```
 
 Use this together with `--fail` to gate both freshness and pinning in one CI step:
 
 ```bash
-corgea verify-deps --threshold 2d --fail --fail-unpinned
+corgea deps --threshold 2d --fail --fail-unpinned
 ```
 
 ### Pre-check an install before letting it run

@@ -18,7 +18,7 @@ const DEFAULT_PYPI_REGISTRY: &str = "https://pypi.org";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn user_agent() -> String {
-    format!("corgea-cli/{} (verify-deps)", env!("CARGO_PKG_VERSION"))
+    format!("corgea-cli/{} (deps)", env!("CARGO_PKG_VERSION"))
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, String> {
@@ -50,7 +50,9 @@ pub fn npm_publish_time(
     if name.is_empty() {
         return Err("empty package name".to_string());
     }
-    let base = registry.unwrap_or(DEFAULT_NPM_REGISTRY).trim_end_matches('/');
+    let base = registry
+        .unwrap_or(DEFAULT_NPM_REGISTRY)
+        .trim_end_matches('/');
     let path = encode_npm_name(name);
     let url = format!("{}/{}", base, path);
 
@@ -79,8 +81,12 @@ pub fn npm_publish_time(
         .text()
         .map_err(|e| format!("failed to read npm registry response: {}", e))?;
 
-    let parsed: NpmTimeResponse = serde_json::from_str(&body)
-        .map_err(|e| format!("failed to parse npm registry response for '{}': {}", name, e))?;
+    let parsed: NpmTimeResponse = serde_json::from_str(&body).map_err(|e| {
+        format!(
+            "failed to parse npm registry response for '{}': {}",
+            name, e
+        )
+    })?;
 
     let raw = parsed.time.get(version).ok_or_else(|| {
         format!(
@@ -134,7 +140,9 @@ pub fn pypi_publish_time(
     if name.is_empty() {
         return Err("empty package name".to_string());
     }
-    let base = registry.unwrap_or(DEFAULT_PYPI_REGISTRY).trim_end_matches('/');
+    let base = registry
+        .unwrap_or(DEFAULT_PYPI_REGISTRY)
+        .trim_end_matches('/');
     let url = format!(
         "{}/pypi/{}/{}/json",
         base,
@@ -176,9 +184,7 @@ pub fn pypi_publish_time(
 
     let mut earliest: Option<DateTime<Utc>> = None;
     for u in parsed.urls {
-        let raw = u
-            .upload_time_iso_8601
-            .or(u.upload_time);
+        let raw = u.upload_time_iso_8601.or(u.upload_time);
         if let Some(raw) = raw {
             if let Ok(dt) = parse_iso8601(&raw) {
                 earliest = match earliest {
@@ -258,7 +264,9 @@ pub fn npm_resolve(
     if name.is_empty() {
         return Err("empty package name".to_string());
     }
-    let base = registry.unwrap_or(DEFAULT_NPM_REGISTRY).trim_end_matches('/');
+    let base = registry
+        .unwrap_or(DEFAULT_NPM_REGISTRY)
+        .trim_end_matches('/');
     let url = format!("{}/{}", base, encode_npm_name(name));
 
     let client = http_client()?;
@@ -270,30 +278,36 @@ pub fn npm_resolve(
 
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
-        return Err(format!("package '{}' not found on npm registry ({})", name, base));
+        return Err(format!(
+            "package '{}' not found on npm registry ({})",
+            name, base
+        ));
     }
     if !status.is_success() {
-        return Err(format!("npm registry returned status {} for '{}'", status, name));
+        return Err(format!(
+            "npm registry returned status {} for '{}'",
+            status, name
+        ));
     }
 
     let body = resp
         .text()
         .map_err(|e| format!("failed to read npm registry response: {}", e))?;
 
-    let meta: NpmFullMetadata = serde_json::from_str(&body)
-        .map_err(|e| format!("failed to parse npm registry response for '{}': {}", name, e))?;
+    let meta: NpmFullMetadata = serde_json::from_str(&body).map_err(|e| {
+        format!(
+            "failed to parse npm registry response for '{}': {}",
+            name, e
+        )
+    })?;
 
     let resolved_version = match spec {
-        NpmSpec::Latest => meta
-            .dist_tags
-            .get("latest")
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "package '{}' has no 'latest' dist-tag on the npm registry",
-                    name
-                )
-            })?,
+        NpmSpec::Latest => meta.dist_tags.get("latest").cloned().ok_or_else(|| {
+            format!(
+                "package '{}' has no 'latest' dist-tag on the npm registry",
+                name
+            )
+        })?,
         NpmSpec::Tag(tag) => meta.dist_tags.get(tag).cloned().ok_or_else(|| {
             format!(
                 "package '{}' has no dist-tag named '{}' (available: {})",
@@ -315,13 +329,14 @@ pub fn npm_resolve(
             }
             v.clone()
         }
-        NpmSpec::Range(range) => npm_pick_highest_matching(&meta.versions, range)
-            .ok_or_else(|| {
+        NpmSpec::Range(range) => {
+            npm_pick_highest_matching(&meta.versions, range).ok_or_else(|| {
                 format!(
                     "no published version of '{}' satisfies range '{}'",
                     name, range
                 )
-            })?,
+            })?
+        }
     };
 
     let raw_time = meta.time.get(&resolved_version).ok_or_else(|| {
@@ -356,10 +371,7 @@ fn parse_npm_range(range: &str) -> Option<semver::VersionReq> {
     if let Ok(req) = semver::VersionReq::parse(range) {
         return Some(req);
     }
-    let normalised = range
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(",");
+    let normalised = range.split_whitespace().collect::<Vec<_>>().join(",");
     semver::VersionReq::parse(&normalised).ok()
 }
 
@@ -435,7 +447,9 @@ pub fn pypi_resolve(
     if name.is_empty() {
         return Err("empty package name".to_string());
     }
-    let base = registry.unwrap_or(DEFAULT_PYPI_REGISTRY).trim_end_matches('/');
+    let base = registry
+        .unwrap_or(DEFAULT_PYPI_REGISTRY)
+        .trim_end_matches('/');
     let url = format!("{}/pypi/{}/json", base, urlencoding::encode(name));
 
     let client = http_client()?;
@@ -476,7 +490,10 @@ pub fn pypi_resolve(
 
     let chosen = chosen.ok_or_else(|| match spec {
         PypiSpec::Exact(v) => {
-            format!("version '{}' for package '{}' was not found on PyPI", v, name)
+            format!(
+                "version '{}' for package '{}' was not found on PyPI",
+                v, name
+            )
         }
         _ => format!("no installable version found for '{}' on PyPI", name),
     })?;
@@ -501,9 +518,10 @@ fn collect_pypi_candidates(meta: &PypiInfoResponse) -> Vec<(String, DateTime<Utc
             continue;
         }
         // Skip yanked-only releases.
-        if files.iter().all(|f| {
-            f.upload_time_iso_8601.is_none() && f.upload_time.is_none()
-        }) {
+        if files
+            .iter()
+            .all(|f| f.upload_time_iso_8601.is_none() && f.upload_time.is_none())
+        {
             continue;
         }
         let mut earliest: Option<DateTime<Utc>> = None;
@@ -529,9 +547,7 @@ fn collect_pypi_candidates(meta: &PypiInfoResponse) -> Vec<(String, DateTime<Utc
 /// Pick the latest non-prerelease version using `semver` parsing as a
 /// best-effort PEP 440 ordering. Falls back to the entry with the
 /// latest upload time if no candidate parses as semver.
-fn pick_latest_stable(
-    candidates: &[(String, DateTime<Utc>)],
-) -> Option<&(String, DateTime<Utc>)> {
+fn pick_latest_stable(candidates: &[(String, DateTime<Utc>)]) -> Option<&(String, DateTime<Utc>)> {
     let mut best_semver: Option<(semver::Version, &(String, DateTime<Utc>))> = None;
     for c in candidates {
         let normalized = normalize_for_semver(&c.0);
@@ -556,7 +572,12 @@ fn pick_latest_stable(
 /// straight as semver if we pad to 3 components. Anything more exotic
 /// (`1.0a1`, `2!1.0`, etc.) is left alone and rejected by semver.
 fn normalize_for_semver(v: &str) -> String {
-    if v.contains('!') || v.contains('a') || v.contains('b') || v.contains("rc") || v.contains(".dev") {
+    if v.contains('!')
+        || v.contains('a')
+        || v.contains('b')
+        || v.contains("rc")
+        || v.contains(".dev")
+    {
         return v.to_string();
     }
     let parts: Vec<&str> = v.split('.').collect();
@@ -571,10 +592,7 @@ fn normalize_for_semver(v: &str) -> String {
 /// and return the highest match. Supported operators: `==`, `>=`, `>`,
 /// `<=`, `<`, `~=`, `!=`. Unknown operators cause us to give up and
 /// return `None` (the caller falls back to "latest stable").
-fn pypi_resolve_specifier(
-    candidates: &[(String, DateTime<Utc>)],
-    spec: &str,
-) -> Option<String> {
+fn pypi_resolve_specifier(candidates: &[(String, DateTime<Utc>)], spec: &str) -> Option<String> {
     let parts: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
     let mut requirements: Vec<(&'static str, semver::Version)> = Vec::new();
 
@@ -685,14 +703,18 @@ mod tests {
     #[test]
     #[ignore]
     fn live_npm_unknown_version() {
-        let err = npm_publish_time("left-pad", "999.999.999", None).err().unwrap();
+        let err = npm_publish_time("left-pad", "999.999.999", None)
+            .err()
+            .unwrap();
         assert!(err.contains("not found"), "got: {}", err);
     }
 
     #[test]
     #[ignore]
     fn live_pypi_unknown_version() {
-        let err = pypi_publish_time("requests", "999.999.999", None).err().unwrap();
+        let err = pypi_publish_time("requests", "999.999.999", None)
+            .err()
+            .unwrap();
         assert!(err.contains("not found"), "got: {}", err);
     }
 
@@ -726,8 +748,12 @@ mod tests {
     fn live_npm_resolve_npm_style_range() {
         // npm uses spaces, the Rust crate uses commas — we should
         // accept both.
-        let r = npm_resolve("left-pad", &NpmSpec::Range(">=1.0.0 <2.0.0".to_string()), None)
-            .expect("npm resolve space-range");
+        let r = npm_resolve(
+            "left-pad",
+            &NpmSpec::Range(">=1.0.0 <2.0.0".to_string()),
+            None,
+        )
+        .expect("npm resolve space-range");
         assert_eq!(r.version, "1.3.0");
     }
 
@@ -755,12 +781,8 @@ mod tests {
     #[test]
     #[ignore]
     fn live_pypi_resolve_exact() {
-        let r = pypi_resolve(
-            "requests",
-            &PypiSpec::Exact("2.31.0".to_string()),
-            None,
-        )
-        .expect("pypi resolve exact");
+        let r = pypi_resolve("requests", &PypiSpec::Exact("2.31.0".to_string()), None)
+            .expect("pypi resolve exact");
         assert_eq!(r.version, "2.31.0");
         assert_eq!(r.published_at.format("%Y-%m-%d").to_string(), "2023-05-22");
     }
