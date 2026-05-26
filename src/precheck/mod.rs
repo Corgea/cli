@@ -1,8 +1,7 @@
-//! `corgea precheck <pkg-mgr> <subcommand> [args...]`
+//! Install wrappers: `corgea npm`, `corgea yarn`, `corgea pnpm`, `corgea pip`, `corgea uv`.
 //!
-//! Wraps an install command from a supported package manager
-//! (`npm` / `yarn` / `pnpm` / `pip`), resolves what the package
-//! manager *would* install against the public registry, and either
+//! Wraps an install command from a supported package manager, resolves what
+//! the package manager *would* install against the public registry, and either
 //! blocks the install or runs it transparently.
 //!
 //! Verification rule: a package is rejected if the resolved version
@@ -10,7 +9,7 @@
 //! the `deps` flow but applies to the install-time set of
 //! packages instead of the already-locked set.
 //!
-//! By default a "recent" finding makes precheck exit with status 1
+//! By default a "recent" finding makes the wrapper exit with status 1
 //! *without* running the install. Use `--no-fail` to demote this to a
 //! warning (the install runs anyway), or `--check-only` to skip the
 //! install regardless of verification result.
@@ -34,28 +33,17 @@ pub enum PackageManager {
     Yarn,
     Pnpm,
     Pip,
+    Uv,
 }
 
 impl PackageManager {
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s {
-            "npm" => Ok(PackageManager::Npm),
-            "yarn" => Ok(PackageManager::Yarn),
-            "pnpm" => Ok(PackageManager::Pnpm),
-            "pip" | "pip3" => Ok(PackageManager::Pip),
-            other => Err(format!(
-                "Unsupported package manager '{}'. Supported: npm, yarn, pnpm, pip.",
-                other
-            )),
-        }
-    }
-
     pub fn binary_name(self) -> &'static str {
         match self {
             PackageManager::Npm => "npm",
             PackageManager::Yarn => "yarn",
             PackageManager::Pnpm => "pnpm",
             PackageManager::Pip => "pip",
+            PackageManager::Uv => "uv",
         }
     }
 
@@ -67,13 +55,26 @@ impl PackageManager {
             PackageManager::Yarn => matches!(sub, "add" | "install"),
             PackageManager::Pnpm => matches!(sub, "add" | "install" | "i"),
             PackageManager::Pip => matches!(sub, "install"),
+            PackageManager::Uv => false,
+        }
+    }
+
+    fn lockfile_mode(self) -> LockfileMode {
+        match self {
+            PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => LockfileMode::Npm,
+            PackageManager::Pip | PackageManager::Uv => LockfileMode::Python,
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockfileMode {
+    Npm,
+    Python,
+}
+
 #[derive(Debug, Clone)]
 pub struct PrecheckOptions {
-    pub manager: PackageManager,
     pub threshold: Duration,
     /// If true, demote a recent finding from "block" to "warn-and-run".
     pub no_fail: bool,
@@ -172,45 +173,28 @@ impl PrecheckReport {
     }
 }
 
-/// Top-level entry. `args` is the *remaining* argv after `corgea precheck`,
-/// e.g. `["npm", "install", "axios@^1.0.0", "--save-dev"]`.
+/// Canonical entry for ecosystem commands (`corgea npm install …`).
 ///
-/// Returns the exit code to use. The caller is responsible for
-/// `std::process::exit(...)`.
-pub fn run(args: &[String], opts: PrecheckOptions) -> i32 {
-    if args.is_empty() {
-        eprintln!("usage: corgea precheck <pkg-manager> <subcommand> [args...]");
-        return 2;
+/// `cmd` is everything after the ecosystem name, e.g.
+/// `["install", "axios@^1.0.0", "--save-dev"]`. An empty `cmd` execs the
+/// package manager with no arguments.
+pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOptions) -> i32 {
+    if manager == PackageManager::Uv {
+        return run_uv(cmd, opts);
     }
 
-    // We expect `args[0]` to match the configured package manager.
-    // (The CLI plumbing already accepted opts.manager from the user;
-    // this is a sanity check.)
-    let typed_manager = &args[0];
-    if PackageManager::parse(typed_manager).ok() != Some(opts.manager) {
-        eprintln!(
-            "package manager mismatch: expected '{}', got '{}'",
-            opts.manager.binary_name(),
-            typed_manager
-        );
-        return 2;
+    if cmd.is_empty() {
+        return exec_install(manager, &[], opts.check_only);
     }
 
-    if args.len() < 2 {
-        return exec_install(opts.manager, &[], opts.check_only);
+    let subcommand = &cmd[0];
+    let rest = &cmd[1..];
+
+    if !manager.is_install_subcommand(subcommand) {
+        return exec_install_with_args(manager, subcommand, rest, opts.check_only);
     }
 
-    let subcommand = &args[1];
-    let rest = &args[2..];
-
-    if !opts.manager.is_install_subcommand(subcommand) {
-        // Pass-through: not an install. We cannot verify what we
-        // don't understand, but we shouldn't get in the user's way.
-        return exec_install_with_args(opts.manager, subcommand, rest, opts.check_only);
-    }
-
-    // Parse install-command args into install targets.
-    let parsed = match parse::parse_install_args(opts.manager, rest) {
+    let parsed = match parse::parse_install_args(manager, rest) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("failed to parse install args: {}", e);
@@ -218,54 +202,109 @@ pub fn run(args: &[String], opts: PrecheckOptions) -> i32 {
         }
     };
 
+    let check_only = opts.check_only;
+    run_parsed_install(
+        manager,
+        subcommand,
+        rest,
+        parsed,
+        || exec_install_with_args(manager, subcommand, rest, check_only),
+        opts,
+        manager.lockfile_mode(),
+    )
+}
+
+fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
+    if cmd.is_empty() {
+        return exec_uv(cmd, opts.check_only);
+    }
+
+    let check_only = opts.check_only;
+    let exec = || exec_uv(cmd, check_only);
+
+    match parse::classify_uv_command(cmd) {
+        parse::UvCommand::Passthrough => exec_uv(cmd, opts.check_only),
+        parse::UvCommand::PipInstall { install_args } => {
+            let parsed = match parse::parse_pip_install_args(install_args) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("failed to parse install args: {}", e);
+                    return 2;
+                }
+            };
+            run_parsed_install(
+                PackageManager::Uv,
+                "pip install",
+                install_args,
+                parsed,
+                exec,
+                opts,
+                LockfileMode::Python,
+            )
+        }
+        parse::UvCommand::Add { add_args } => run_parsed_install(
+            PackageManager::Uv,
+            "add",
+            add_args,
+            parse::parse_pypi_positionals_args(add_args),
+            exec,
+            opts,
+            LockfileMode::Python,
+        ),
+        parse::UvCommand::Sync { sync_args } => run_parsed_install(
+            PackageManager::Uv,
+            "sync",
+            sync_args,
+            parse::parse_pypi_positionals_args(sync_args),
+            exec,
+            opts,
+            LockfileMode::Python,
+        ),
+    }
+}
+
+/// Post-parse verification shared by npm/yarn/pnpm/pip and uv install paths.
+fn run_parsed_install(
+    manager: PackageManager,
+    subcommand_label: &str,
+    rest: &[String],
+    parsed: parse::ParsedInstall,
+    exec: impl FnOnce() -> i32,
+    opts: PrecheckOptions,
+    lockfile_mode: LockfileMode,
+) -> i32 {
     if !parsed.requirements_files.is_empty() {
-        // `pip install -r reqs.txt` — load and verify the file(s).
-        // Done *before* per-target resolution so a mixed command
-        // like `pip install -r reqs.txt requests==2.31.0` checks
-        // both the file and the explicit spec.
-        let code = verify_lockfile_or_requirements(&opts, parsed.requirements_files.clone());
+        let code = verify_lockfile_or_requirements(&opts, &parsed.requirements_files);
         if code != 0 && !opts.no_fail {
             return code;
         }
     }
 
     if parsed.targets.is_empty() && !parsed.bare_install {
-        // Nothing else to verify (`-r` already handled above, or a
-        // flag-only invocation like `npm install -D`). Exec.
-        return exec_install_with_args(opts.manager, subcommand, rest, opts.check_only);
+        return exec();
     }
 
     if parsed.bare_install {
-        // `npm install` / `pip install` with no args — verify the
-        // existing lockfile in cwd, then exec.
-        let exit_from_lockfile = match opts.manager {
-            PackageManager::Pip => verify_lockfile_or_requirements(&opts, Vec::new()),
-            _ => verify_npm_lockfile(&opts),
-        };
+        let exit_from_lockfile = verify_project_lockfile(&opts, lockfile_mode);
         if exit_from_lockfile != 0 && !opts.no_fail {
             return exit_from_lockfile;
         }
-        return exec_install_with_args(opts.manager, subcommand, rest, opts.check_only);
+        return exec();
     }
 
-    let mut outcomes = Vec::with_capacity(parsed.targets.len());
     let now = Utc::now();
-    let threshold = match chrono::Duration::from_std(opts.threshold) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("invalid threshold: {}", e);
-            return 2;
-        }
-    };
+    let threshold =
+        chrono::Duration::from_std(opts.threshold).expect("threshold validated before run_install");
 
-    for target in &parsed.targets {
-        let outcome = verify_one(target, &opts, &now, threshold);
-        outcomes.push(outcome);
-    }
+    let outcomes: Vec<_> = parsed
+        .targets
+        .iter()
+        .map(|target| verify_one(target, &opts, &now, threshold))
+        .collect();
 
     let report = PrecheckReport {
-        manager: opts.manager,
-        subcommand: subcommand.clone(),
+        manager,
+        subcommand: subcommand_label.to_string(),
         original_args: rest.to_vec(),
         outcomes,
         threshold: opts.threshold,
@@ -277,10 +316,7 @@ pub fn run(args: &[String], opts: PrecheckOptions) -> i32 {
         print_text(&report);
     }
 
-    let recent = report.recent_count();
-    let errors = report.error_count();
-
-    if (recent > 0 || (errors > 0 && opts.fail_unpinned)) && !opts.no_fail {
+    if should_block_install(&report, &opts) {
         if !opts.json {
             eprintln!(
                 "{}",
@@ -293,7 +329,21 @@ pub fn run(args: &[String], opts: PrecheckOptions) -> i32 {
         return 1;
     }
 
-    exec_install_with_args(opts.manager, subcommand, rest, opts.check_only)
+    exec()
+}
+
+fn should_block_install(report: &PrecheckReport, opts: &PrecheckOptions) -> bool {
+    if opts.no_fail {
+        return false;
+    }
+    report.recent_count() > 0 || (report.error_count() > 0 && opts.fail_unpinned)
+}
+
+fn exec_uv(args: &[String], check_only: bool) -> i32 {
+    if check_only {
+        return 0;
+    }
+    exec_command("uv", args)
 }
 
 fn verify_one(
@@ -346,89 +396,69 @@ fn verify_one(
     }
 }
 
-fn verify_npm_lockfile(opts: &PrecheckOptions) -> i32 {
-    let verify_opts = verify_deps::VerifyOptions {
-        ecosystem: verify_deps::Ecosystem::Npm,
-        threshold: opts.threshold,
-        include_dev: false,
-        fail: !opts.no_fail,
-        fail_unpinned: opts.fail_unpinned,
-        json: opts.json,
-        path: std::path::PathBuf::from("."),
-        npm_registry: opts.npm_registry.clone(),
-        pypi_registry: opts.pypi_registry.clone(),
-        check_cve: false,
-        vuln_api_url: None,
-        vuln_api_token: None,
+fn verify_project_lockfile(opts: &PrecheckOptions, mode: LockfileMode) -> i32 {
+    let ecosystem = match mode {
+        LockfileMode::Npm => verify_deps::Ecosystem::Npm,
+        LockfileMode::Python => verify_deps::Ecosystem::Python,
     };
-    delegate_to_verify_deps(verify_opts)
+    delegate_to_verify_deps(install_wrap_verify_opts(
+        opts,
+        ecosystem,
+        std::path::PathBuf::from("."),
+    ))
+}
+
+fn install_wrap_verify_opts(
+    opts: &PrecheckOptions,
+    ecosystem: verify_deps::Ecosystem,
+    path: std::path::PathBuf,
+) -> verify_deps::VerifyOptions {
+    verify_deps::VerifyOptions::for_install_wrap(
+        ecosystem,
+        path,
+        opts.threshold,
+        !opts.no_fail,
+        opts.fail_unpinned,
+        opts.json,
+        opts.npm_registry.clone(),
+        opts.pypi_registry.clone(),
+    )
 }
 
 fn verify_lockfile_or_requirements(
     opts: &PrecheckOptions,
-    requirements_files: Vec<std::path::PathBuf>,
+    requirements_files: &[std::path::PathBuf],
 ) -> i32 {
     if requirements_files.is_empty() {
-        let verify_opts = verify_deps::VerifyOptions {
-            ecosystem: verify_deps::Ecosystem::Python,
-            threshold: opts.threshold,
-            include_dev: false,
-            fail: !opts.no_fail,
-            fail_unpinned: opts.fail_unpinned,
-            json: opts.json,
-            path: std::path::PathBuf::from("."),
-            npm_registry: opts.npm_registry.clone(),
-            pypi_registry: opts.pypi_registry.clone(),
-            check_cve: false,
-            vuln_api_url: None,
-            vuln_api_token: None,
-        };
-        return delegate_to_verify_deps(verify_opts);
+        return verify_project_lockfile(opts, LockfileMode::Python);
     }
 
     let mut overall: i32 = 0;
     for req in requirements_files {
-        // The deps machinery expects a project directory and
-        // looks for a sibling `requirements.txt`. We use the file's
-        // parent dir if it has one, falling back to cwd for relative
-        // paths like `-r reqs.txt`.
         let parent = req
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        // deps only looks for the literal file name
-        // `requirements.txt`. If the user pointed at a different
-        // file (e.g. `-r dev-reqs.txt`), copy / link it temporarily
-        // so the verifier can find it. We instead just parse it
-        // here directly when it isn't named requirements.txt.
+        // `deps` only discovers a file named `requirements.txt`; other
+        // `-r` paths are parsed and checked directly.
         let file_name = req
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         if file_name != "requirements.txt" {
             // Parse the file ourselves and run the registry checks.
-            let code = verify_arbitrary_requirements(&req, opts);
+            let code = verify_arbitrary_requirements(req, opts);
             if code != 0 {
                 overall = code;
             }
             continue;
         }
-        let verify_opts = verify_deps::VerifyOptions {
-            ecosystem: verify_deps::Ecosystem::Python,
-            threshold: opts.threshold,
-            include_dev: false,
-            fail: !opts.no_fail,
-            fail_unpinned: opts.fail_unpinned,
-            json: opts.json,
-            path: parent,
-            npm_registry: opts.npm_registry.clone(),
-            pypi_registry: opts.pypi_registry.clone(),
-            check_cve: false,
-            vuln_api_url: None,
-            vuln_api_token: None,
-        };
-        let code = delegate_to_verify_deps(verify_opts);
+        let code = delegate_to_verify_deps(install_wrap_verify_opts(
+            opts,
+            verify_deps::Ecosystem::Python,
+            parent,
+        ));
         if code != 0 {
             overall = code;
         }
@@ -753,16 +783,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn package_manager_parse() {
-        assert_eq!(PackageManager::parse("npm").unwrap(), PackageManager::Npm);
-        assert_eq!(PackageManager::parse("yarn").unwrap(), PackageManager::Yarn);
-        assert_eq!(PackageManager::parse("pnpm").unwrap(), PackageManager::Pnpm);
-        assert_eq!(PackageManager::parse("pip").unwrap(), PackageManager::Pip);
-        assert_eq!(PackageManager::parse("pip3").unwrap(), PackageManager::Pip);
-        assert!(PackageManager::parse("cargo").is_err());
-    }
-
-    #[test]
     fn install_subcommand_recognition() {
         assert!(PackageManager::Npm.is_install_subcommand("install"));
         assert!(PackageManager::Npm.is_install_subcommand("i"));
@@ -778,5 +798,65 @@ mod tests {
 
         assert!(PackageManager::Pip.is_install_subcommand("install"));
         assert!(!PackageManager::Pip.is_install_subcommand("freeze"));
+    }
+
+    #[test]
+    fn run_install_passthrough_non_install_subcommand() {
+        let opts = PrecheckOptions {
+            threshold: Duration::from_secs(86400),
+            no_fail: true,
+            check_only: true,
+            fail_unpinned: false,
+            json: false,
+            npm_registry: None,
+            pypi_registry: None,
+        };
+        // `view` is not an install subcommand — should return 0 in check_only mode
+        // without needing network or npm on PATH for resolution.
+        let code = run_install(
+            PackageManager::Npm,
+            &[
+                "view".to_string(),
+                "lodash".to_string(),
+                "version".to_string(),
+            ],
+            opts,
+        );
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn run_uv_passthrough_check_only() {
+        let opts = PrecheckOptions {
+            threshold: Duration::from_secs(86400),
+            no_fail: true,
+            check_only: true,
+            fail_unpinned: false,
+            json: false,
+            npm_registry: None,
+            pypi_registry: None,
+        };
+        assert_eq!(
+            run_install(
+                PackageManager::Uv,
+                &["run".to_string(), "pytest".to_string()],
+                opts
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn run_install_empty_cmd_check_only() {
+        let opts = PrecheckOptions {
+            threshold: Duration::from_secs(86400),
+            no_fail: false,
+            check_only: true,
+            fail_unpinned: false,
+            json: false,
+            npm_registry: None,
+            pypi_registry: None,
+        };
+        assert_eq!(run_install(PackageManager::Npm, &[], opts), 0);
     }
 }

@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::{env, fs, io};
 
+/// Production vuln-api host. Used when neither `CORGEA_VULN_API_URL`
+/// nor `vuln_api_url` in `~/.corgea/config.toml` is set. Self-hosted
+/// or staging deployments override via env or config.
+const DEFAULT_VULN_API_URL: &str = "https://vuln-api.corgea.app";
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub(crate) url: String,
@@ -104,14 +109,15 @@ impl Config {
         self.debug
     }
 
-    pub fn get_vuln_api_url(&self) -> Option<String> {
+    pub fn get_vuln_api_url(&self) -> String {
         let raw = crate::utils::generic::get_env_var_if_exists("CORGEA_VULN_API_URL")
-            .or_else(|| self.vuln_api_url.clone())?;
+            .or_else(|| self.vuln_api_url.clone())
+            .unwrap_or_else(|| DEFAULT_VULN_API_URL.to_string());
         let trimmed = raw.trim().trim_end_matches('/');
         if trimmed.is_empty() {
-            None
+            DEFAULT_VULN_API_URL.trim_end_matches('/').to_string()
         } else {
-            Some(trimmed.to_string())
+            trimmed.to_string()
         }
     }
 }

@@ -22,7 +22,7 @@ mod utils {
 }
 mod targets;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use config::Config;
 use scanners::fortify::parse as fortify_parse;
 use std::str::FromStr;
@@ -255,52 +255,77 @@ enum Commands {
         )]
         check_cve: bool,
     },
-    /// Pre-check a package install command against the registry, then run it.
-    /// Wraps `npm install`, `yarn add`, `pnpm add`, or `pip install` and refuses
-    /// to run when a resolved version was published within --threshold.
+    /// Wrap `npm` install/add commands: verify registry publish times, then run npm.
+    ///
     /// Examples:
-    ///   corgea precheck npm install axios@^1.0.0 --save-dev
-    ///   corgea precheck pip install requests
-    ///   corgea precheck pnpm add @types/node@latest
-    Precheck {
-        #[arg(
-            long,
-            short = 't',
-            default_value = "2d",
-            help = "Recency threshold. Resolved versions younger than this are flagged. Same syntax as `deps --threshold`."
-        )]
-        threshold: String,
+    ///   corgea npm install axios@^1.0.0 --save-dev
+    ///   corgea npm install
+    Npm(InstallWrapArgs),
+    /// Wrap `yarn` add/install commands: verify registry publish times, then run yarn.
+    ///
+    /// Examples:
+    ///   corgea yarn add lodash
+    ///   corgea yarn install
+    Yarn(InstallWrapArgs),
+    /// Wrap `pnpm` add/install commands: verify registry publish times, then run pnpm.
+    ///
+    /// Examples:
+    ///   corgea pnpm add @types/node@latest
+    ///   corgea pnpm install
+    Pnpm(InstallWrapArgs),
+    /// Wrap `pip install`: verify registry publish times, then run pip.
+    ///
+    /// Examples:
+    ///   corgea pip install requests==2.31.0
+    ///   corgea pip install -r requirements.txt
+    Pip(InstallWrapArgs),
+    /// Wrap `uv` install commands: verify registry publish times, then run uv.
+    ///
+    /// Examples:
+    ///   corgea uv add requests
+    ///   corgea uv pip install django==5.0.1
+    ///   corgea uv sync
+    Uv(InstallWrapArgs),
+}
 
-        #[arg(
-            long,
-            help = "Demote a recent finding from a hard block to a printed warning. The install still runs."
-        )]
-        no_fail: bool,
+/// Shared flags for `corgea npm` / `yarn` / `pnpm` / `pip` / `uv`.
+#[derive(Args, Debug, Clone)]
+struct InstallWrapArgs {
+    #[arg(
+        long,
+        short = 't',
+        default_value = "2d",
+        help = "Recency threshold. Resolved versions younger than this are flagged. Same syntax as `deps --threshold`."
+    )]
+    threshold: String,
 
-        #[arg(
-            long,
-            help = "Run the verification but never exec the install command."
-        )]
-        check_only: bool,
+    #[arg(
+        long,
+        help = "Demote a recent finding from a hard block to a printed warning. The install still runs."
+    )]
+    no_fail: bool,
 
-        #[arg(
-            long,
-            help = "Also fail when an unpinned/unverifiable spec (URL, git, file:, editable) is in the install command."
-        )]
-        fail_unpinned: bool,
+    #[arg(
+        long,
+        help = "Run the verification but never exec the install command."
+    )]
+    check_only: bool,
 
-        #[arg(
-            long,
-            help = "Output the result as JSON instead of human-readable text."
-        )]
-        json: bool,
+    #[arg(
+        long,
+        help = "Also fail when an unpinned/unverifiable spec (URL, git, file:, editable) is in the install command."
+    )]
+    fail_unpinned: bool,
 
-        /// Everything after `precheck` is forwarded to the package manager.
-        /// First positional must name the package manager: npm, yarn,
-        /// pnpm, pip.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        cmd: Vec<String>,
-    },
+    #[arg(
+        long,
+        help = "Output the result as JSON instead of human-readable text."
+    )]
+    json: bool,
+
+    /// Arguments forwarded to the package manager (subcommand and package specs).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    cmd: Vec<String>,
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -308,6 +333,33 @@ enum Scanner {
     Snyk,
     Semgrep,
     Blast,
+}
+
+fn parse_threshold_or_exit(threshold: &str) -> std::time::Duration {
+    match verify_deps::parse_threshold(threshold) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Invalid --threshold: {}", e);
+            std::process::exit(2);
+        }
+    }
+}
+
+fn install_wrap_options(args: &InstallWrapArgs) -> precheck::PrecheckOptions {
+    precheck::PrecheckOptions {
+        threshold: parse_threshold_or_exit(&args.threshold),
+        no_fail: args.no_fail,
+        check_only: args.check_only,
+        fail_unpinned: args.fail_unpinned,
+        json: args.json,
+        npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
+        pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
+    }
+}
+
+fn run_install_wrap_command(manager: precheck::PackageManager, args: &InstallWrapArgs) {
+    let exit_code = precheck::run_install(manager, &args.cmd, install_wrap_options(args));
+    std::process::exit(exit_code);
 }
 
 impl FromStr for Scanner {
@@ -603,25 +655,13 @@ fn main() {
                 std::path::PathBuf::from(path.clone().unwrap_or_else(|| ".".to_string()));
 
             let (vuln_api_url, vuln_api_token) = if *check_cve {
-                let configured_url = corgea_config.get_vuln_api_url();
+                let resolved_url = corgea_config.get_vuln_api_url();
                 let raw_token = corgea_config.get_token();
                 let trimmed_token = raw_token.trim().to_string();
-                let has_url = configured_url.is_some();
-                let has_token = !trimmed_token.is_empty();
-                if !has_url {
-                    eprintln!(
-                        "warning: --check-cve requires CORGEA_VULN_API_URL (or vuln_api_url in config); CVE checks will be skipped."
-                    );
-                }
-                if !has_token {
-                    eprintln!(
-                        "warning: --check-cve requires a Corgea token; CVE checks will be skipped. Run `corgea login` first."
-                    );
-                }
-                if has_url && has_token {
-                    (configured_url, Some(trimmed_token))
-                } else {
+                if trimmed_token.is_empty() {
                     (None, None)
+                } else {
+                    (Some(resolved_url), Some(trimmed_token))
                 }
             } else {
                 (None, None)
@@ -667,44 +707,20 @@ fn main() {
                 }
             }
         }
-        Some(Commands::Precheck {
-            threshold,
-            no_fail,
-            check_only,
-            fail_unpinned,
-            json,
-            cmd,
-        }) => {
-            if cmd.is_empty() {
-                eprintln!("usage: corgea precheck <pkg-manager> <subcommand> [args...]");
-                std::process::exit(2);
-            }
-            let manager = match precheck::PackageManager::parse(&cmd[0]) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(2);
-                }
-            };
-            let parsed_threshold = match verify_deps::parse_threshold(threshold) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("Invalid --threshold: {}", e);
-                    std::process::exit(2);
-                }
-            };
-            let opts = precheck::PrecheckOptions {
-                manager,
-                threshold: parsed_threshold,
-                no_fail: *no_fail,
-                check_only: *check_only,
-                fail_unpinned: *fail_unpinned,
-                json: *json,
-                npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
-                pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
-            };
-            let exit_code = precheck::run(cmd, opts);
-            std::process::exit(exit_code);
+        Some(Commands::Npm(args)) => {
+            run_install_wrap_command(precheck::PackageManager::Npm, args);
+        }
+        Some(Commands::Yarn(args)) => {
+            run_install_wrap_command(precheck::PackageManager::Yarn, args);
+        }
+        Some(Commands::Pnpm(args)) => {
+            run_install_wrap_command(precheck::PackageManager::Pnpm, args);
+        }
+        Some(Commands::Pip(args)) => {
+            run_install_wrap_command(precheck::PackageManager::Pip, args);
+        }
+        Some(Commands::Uv(args)) => {
+            run_install_wrap_command(precheck::PackageManager::Uv, args);
         }
         None => {
             utils::terminal::show_welcome_message();

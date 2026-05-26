@@ -114,11 +114,11 @@ pub struct CveFinding {
 
 /// Why CVE checks did not run when the user passed `--check-cve`.
 ///
-/// `None` means CVE checks ran (or weren't requested).
+/// `None` means CVE checks ran (or weren't requested). The vuln-api URL
+/// is always resolvable (built-in default + env/config override) so the
+/// only remaining skip reason is an unset Corgea token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CveSkipReason {
-    /// `--check-cve` was passed without a configured `vuln_api_url`.
-    MissingUrl,
     /// `--check-cve` was passed without a Corgea token.
     MissingToken,
 }
@@ -126,9 +126,6 @@ pub enum CveSkipReason {
 impl CveSkipReason {
     pub fn message(&self) -> &'static str {
         match self {
-            CveSkipReason::MissingUrl => {
-                "CORGEA_VULN_API_URL (or vuln_api_url in config) is not set"
-            }
             CveSkipReason::MissingToken => "Corgea token is not set (run `corgea login`)",
         }
     }
@@ -171,6 +168,36 @@ impl Default for VerifyOptions {
             path: PathBuf::from("."),
             npm_registry: None,
             pypi_registry: None,
+            check_cve: false,
+            vuln_api_url: None,
+            vuln_api_token: None,
+        }
+    }
+}
+
+impl VerifyOptions {
+    /// Lockfile scan used by install wrappers (`corgea npm`, `pip`, `uv`, …).
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_install_wrap(
+        ecosystem: Ecosystem,
+        path: PathBuf,
+        threshold: Duration,
+        fail: bool,
+        fail_unpinned: bool,
+        json: bool,
+        npm_registry: Option<String>,
+        pypi_registry: Option<String>,
+    ) -> Self {
+        Self {
+            ecosystem,
+            threshold,
+            include_dev: false,
+            fail,
+            fail_unpinned,
+            json,
+            path,
+            npm_registry,
+            pypi_registry,
             check_cve: false,
             vuln_api_url: None,
             vuln_api_token: None,
@@ -338,23 +365,16 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
     let mut outcomes: Vec<LookupOutcome> = Vec::with_capacity(deps.len());
     let mut cve_outcomes: Vec<CveLookupOutcome> = Vec::new();
 
-    // Resolve up-front whether CVE checks are reachable. Both URL and
-    // token must be present and non-empty after trimming; otherwise we
-    // report a skip rather than silently emitting all-zero CVE state.
+    // Resolve up-front whether CVE checks are reachable. The vuln-api
+    // URL always resolves (default + env/config override), so the only
+    // skip reason is a missing Corgea token.
     let cve_skip_reason: Option<CveSkipReason> = if opts.check_cve {
-        let url_ok = opts
-            .vuln_api_url
-            .as_deref()
-            .map(|u| !u.trim().is_empty())
-            .unwrap_or(false);
         let token_ok = opts
             .vuln_api_token
             .as_deref()
             .map(|t| !t.trim().is_empty())
             .unwrap_or(false);
-        if !url_ok {
-            Some(CveSkipReason::MissingUrl)
-        } else if !token_ok {
+        if !token_ok {
             Some(CveSkipReason::MissingToken)
         } else {
             None
@@ -827,36 +847,6 @@ mod tests {
         assert!(!report_off.check_cve);
         assert!(report_off.cve_outcomes.is_empty());
         assert!(report_off.cve_skip_reason.is_none());
-    }
-
-    #[test]
-    fn check_cve_skipped_when_url_missing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("package-lock.json"),
-            r#"{
-            "name": "demo", "version": "1.0.0", "lockfileVersion": 3,
-            "packages": {
-                "": { "name": "demo", "version": "1.0.0" },
-                "node_modules/lodash": { "version": "4.17.20" }
-            }
-        }"#,
-        )
-        .unwrap();
-
-        let opts = VerifyOptions {
-            ecosystem: Ecosystem::Npm,
-            path: dir.path().to_path_buf(),
-            check_cve: true,
-            vuln_api_url: None,
-            vuln_api_token: Some("test-token".into()),
-            npm_registry: Some("http://127.0.0.1:1".into()),
-            ..Default::default()
-        };
-        let report = run(&opts).expect("run should succeed");
-        assert!(report.check_cve);
-        assert!(report.cve_outcomes.is_empty());
-        assert_eq!(report.cve_skip_reason, Some(CveSkipReason::MissingUrl));
     }
 
     #[test]

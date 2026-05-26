@@ -1,6 +1,6 @@
 # Deps dogfood fixtures
 
-Sample apps for manually testing `corgea deps` and `corgea precheck` the way a customer would. Each subdirectory is a minimal project with pinned dependency manifests and lockfiles.
+Sample apps for manually testing `corgea deps` and install wrappers (`corgea npm`, etc.) the way a customer would. Each subdirectory is a minimal project with pinned dependency manifests and lockfiles.
 
 **Do not bump dependency versions** — pins are intentional and advisory-backed.
 
@@ -8,7 +8,7 @@ Sample apps for manually testing `corgea deps` and `corgea precheck` the way a c
 
 | Directory | Ecosystem | Lockfile | Primary test |
 |---|---|---|---|
-| `npm/` | npm | `package-lock.json` | CVE scan (`--check-cve`), precheck |
+| `npm/` | npm | `package-lock.json` | CVE scan (`--check-cve`), `corgea npm` |
 | `npm-unpinned/` | npm | *(none)* | `--fail-unpinned` |
 | `yarn/` | npm/yarn | `yarn.lock` | Yarn lockfile parser |
 | `pnpm/` | npm/pnpm | `pnpm-lock.yaml` | pnpm lockfile parser |
@@ -39,9 +39,12 @@ $BIN deps --path fixtures/deps/npm --threshold 2d --fail --fail-unpinned --check
 # JSON output
 $BIN deps --path fixtures/deps/npm --check-cve --json
 
-# Precheck (install-time tripwire)
+# Install wrapper (install-time tripwire)
 cd fixtures/deps/npm
-$BIN precheck npm install --check-only --threshold 2d
+$BIN npm install --check-only --threshold 2d
+
+cd ../python-uv
+$BIN uv sync --check-only --threshold 2d
 ```
 
 ## Automated tests

@@ -132,16 +132,42 @@ pub fn print_text(report: &VerifyReport) {
             let cve_findings = report.cve_findings();
             let cve_errors = report.cve_errors();
 
+            let checked = report.cve_outcomes.len();
             if cve_findings.is_empty() && cve_errors.is_empty() {
-                println!(
-                    "  {}",
-                    set_text_color("✓ no known vulnerabilities", TerminalColor::Green)
-                );
+                if checked == 0 {
+                    println!(
+                        "  {}",
+                        set_text_color(
+                            "⚠ no dependencies eligible for CVE check",
+                            TerminalColor::Yellow,
+                        )
+                    );
+                } else {
+                    println!(
+                        "  {}",
+                        set_text_color(
+                            &format!(
+                                "✓ no known vulnerabilities ({} dependencies checked)",
+                                checked
+                            ),
+                            TerminalColor::Green,
+                        )
+                    );
+                }
             } else {
                 for finding in &cve_findings {
                     for line in format_cve_finding(finding).lines() {
                         println!("  {}", line);
                     }
+                }
+                if !cve_findings.is_empty() {
+                    println!(
+                        "  {}",
+                        set_text_color(
+                            &format!("note: {} dependencies CVE-checked", checked),
+                            TerminalColor::Yellow,
+                        )
+                    );
                 }
             }
 

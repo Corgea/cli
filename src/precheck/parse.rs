@@ -21,34 +21,71 @@ pub struct ParsedInstall {
     pub bare_install: bool,
 }
 
+/// `uv pip install` argument list (everything after `pip install`).
+pub fn parse_pip_install_args(args: &[String]) -> Result<ParsedInstall, String> {
+    build_parsed_install(extract_pip_positionals(args)?, true)
+}
+
+/// `uv add` argument list (everything after `add`).
+pub fn parse_pypi_positionals_args(args: &[String]) -> ParsedInstall {
+    build_parsed_install(extract_node_positionals(args), false)
+        .expect("node positionals never fail")
+}
+
+fn build_parsed_install(positionals: PositionalSplit, pypi: bool) -> Result<ParsedInstall, String> {
+    let mut parsed = ParsedInstall::default();
+    for raw in &positionals.specs {
+        let target = if pypi {
+            parse_pypi_spec(raw)
+        } else {
+            parse_npm_spec(raw)
+        };
+        parsed.targets.push(target);
+    }
+    parsed.requirements_files = positionals.requirements_files;
+    if parsed.targets.is_empty() && parsed.requirements_files.is_empty() {
+        parsed.bare_install = true;
+    }
+    Ok(parsed)
+}
+
 pub fn parse_install_args(
     manager: PackageManager,
     args: &[String],
 ) -> Result<ParsedInstall, String> {
-    let positionals = match manager {
-        PackageManager::Pip => extract_pip_positionals(args)?,
-        _ => extract_node_positionals(args),
-    };
+    match manager {
+        PackageManager::Pip => parse_pip_install_args(args),
+        PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => {
+            build_parsed_install(extract_node_positionals(args), false)
+        }
+        PackageManager::Uv => unreachable!("uv uses classify_uv_command"),
+    }
+}
 
-    let mut parsed = ParsedInstall::default();
+/// Install-shaped `uv` invocations we know how to verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UvCommand<'a> {
+    Passthrough,
+    PipInstall { install_args: &'a [String] },
+    Add { add_args: &'a [String] },
+    Sync { sync_args: &'a [String] },
+}
 
-    for raw in &positionals.specs {
-        let target = match manager {
-            PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => {
-                parse_npm_spec(raw)
+pub fn classify_uv_command(cmd: &[String]) -> UvCommand<'_> {
+    match cmd.first().map(String::as_str) {
+        Some("pip") if matches!(cmd.get(1).map(String::as_str), Some("install" | "i")) => {
+            UvCommand::PipInstall {
+                install_args: &cmd[2..],
             }
-            PackageManager::Pip => parse_pypi_spec(raw),
-        };
-        parsed.targets.push(target);
+        }
+        Some("add") => UvCommand::Add {
+            add_args: &cmd[1..],
+        },
+        Some("sync") => UvCommand::Sync {
+            sync_args: &cmd[1..],
+        },
+        _ => UvCommand::Passthrough,
     }
-
-    parsed.requirements_files = positionals.requirements_files;
-
-    if parsed.targets.is_empty() && parsed.requirements_files.is_empty() {
-        parsed.bare_install = true;
-    }
-
-    Ok(parsed)
 }
 
 #[derive(Debug, Default)]
@@ -352,6 +389,8 @@ pub(crate) fn parse_pypi_spec(raw: &str) -> InstallTarget {
 
     let kind = if spec_no_marker.is_empty() {
         TargetKind::Pypi(PypiSpec::Latest)
+    } else if let Some(rest) = spec_no_marker.strip_prefix("===") {
+        TargetKind::Pypi(PypiSpec::Exact(rest.trim().to_string()))
     } else if let Some(rest) = spec_no_marker.strip_prefix("==") {
         let v = rest.trim();
         if v.is_empty() {
@@ -361,8 +400,6 @@ pub(crate) fn parse_pypi_spec(raw: &str) -> InstallTarget {
         } else {
             TargetKind::Pypi(PypiSpec::Exact(v.to_string()))
         }
-    } else if let Some(rest) = spec_no_marker.strip_prefix("===") {
-        TargetKind::Pypi(PypiSpec::Exact(rest.trim().to_string()))
     } else {
         TargetKind::Pypi(PypiSpec::Specifier(spec_no_marker.to_string()))
     };
@@ -539,6 +576,38 @@ mod tests {
                 u
             );
         }
+    }
+
+    #[test]
+    fn classify_uv_command_recognizes_install_shapes() {
+        assert!(matches!(
+            classify_uv_command(&[
+                "pip".to_string(),
+                "install".to_string(),
+                "requests".to_string(),
+            ]),
+            UvCommand::PipInstall { .. }
+        ));
+        assert!(matches!(
+            classify_uv_command(&["pip".to_string(), "i".to_string()]),
+            UvCommand::PipInstall { .. }
+        ));
+        assert!(matches!(
+            classify_uv_command(&["add".to_string(), "django".to_string()]),
+            UvCommand::Add { .. }
+        ));
+        assert!(matches!(
+            classify_uv_command(&["sync".to_string()]),
+            UvCommand::Sync { .. }
+        ));
+        assert_eq!(
+            classify_uv_command(&["run".to_string(), "pytest".to_string()]),
+            UvCommand::Passthrough
+        );
+        assert_eq!(
+            classify_uv_command(&["lock".to_string()]),
+            UvCommand::Passthrough
+        );
     }
 
     #[test]

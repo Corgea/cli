@@ -10,6 +10,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmjs.org";
@@ -21,12 +22,15 @@ fn user_agent() -> String {
     format!("corgea-cli/{} (deps)", env!("CARGO_PKG_VERSION"))
 }
 
-fn http_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .user_agent(user_agent())
-        .build()
-        .map_err(|e| format!("failed to build http client: {}", e))
+fn http_client() -> Result<&'static reqwest::blocking::Client, String> {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    Ok(CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .user_agent(user_agent())
+            .build()
+            .expect("registry http client")
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,7 +257,7 @@ struct NpmFullMetadata {
 }
 
 /// Resolve an `NpmSpec` against the npm registry and return the
-/// concrete version + publish time. Used by the precheck flow when the
+/// concrete version + publish time. Used by install wrappers when the
 /// install command says e.g. `axios@^1.0.0` and we need to know what
 /// would actually be installed before the install runs.
 pub fn npm_resolve(
@@ -405,7 +409,7 @@ fn npm_pick_highest_matching(
     best.map(|(_, raw)| raw)
 }
 
-/// PyPI version specifier used by the precheck flow. We parse a
+/// PyPI version specifier used by install wrappers. We parse a
 /// limited subset of PEP 440 specifiers — enough for the common
 /// install-command cases (`pkg`, `pkg==X`, `pkg>=X`, `pkg<X`,
 /// `pkg~=X.Y`). For anything more exotic we resolve to the latest
@@ -423,6 +427,7 @@ pub enum PypiSpec {
 
 #[derive(Debug, Deserialize)]
 struct PypiInfoResponse {
+    #[allow(dead_code)]
     info: PypiInfo,
     releases: std::collections::BTreeMap<String, Vec<PypiUrl>>,
 }
@@ -498,7 +503,16 @@ pub fn pypi_resolve(
         _ => format!("no installable version found for '{}' on PyPI", name),
     })?;
 
-    let published_at = pypi_publish_time(name, &chosen, registry)?;
+    let published_at = candidates
+        .iter()
+        .find(|(ver, _)| ver == &chosen)
+        .map(|(_, dt)| *dt)
+        .ok_or_else(|| {
+            format!(
+                "no upload timestamp for '{}' version '{}' on PyPI",
+                name, chosen
+            )
+        })?;
 
     Ok(ResolvedPackage {
         name: name.to_string(),
@@ -540,7 +554,6 @@ fn collect_pypi_candidates(meta: &PypiInfoResponse) -> Vec<(String, DateTime<Utc
             out.push((ver.clone(), dt));
         }
     }
-    let _ = &meta.info; // info.version may be useful in the future
     out
 }
 

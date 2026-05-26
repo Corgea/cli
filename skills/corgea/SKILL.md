@@ -136,17 +136,20 @@ corgea deps --json                           # machine-readable output
 
 Supported lockfiles (preferred → fallback): npm: `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml` (v5/v6/v9), `yarn.lock`. Python: `poetry.lock`, `Pipfile.lock`, `uv.lock`, `requirements.txt` (only `==`-pinned lines).
 
-### Precheck — `corgea precheck <pkg-mgr> <subcommand> [args...]`
+### Install wrappers — `corgea npm` / `yarn` / `pnpm` / `pip` / `uv`
 
-Wraps an install command (`npm install`, `yarn add`, `pnpm add`, `pip install`), resolves what the package manager *would* install against the public registry, and refuses to run the install when a resolved version was published within `--threshold`. Use it as a thin replacement for the bare command in CI scripts or interactive shells.
+Wraps install commands (`npm install`, `yarn add`, `pnpm add`, `pip install`), resolves what the package manager *would* install against the public registry, and refuses to run the install when a resolved version was published within `--threshold`. Use as a thin replacement for the bare command in CI scripts or interactive shells.
 
 ```bash
-corgea precheck npm install axios@^1.0.0 --save-dev
-corgea precheck pnpm add @types/node@latest
-corgea precheck yarn add lodash
-corgea precheck pip install requests==2.31.0
-corgea precheck pip install -r requirements.txt
-corgea precheck npm install                       # bare install — verifies the lockfile
+corgea npm install axios@^1.0.0 --save-dev
+corgea pnpm add @types/node@latest
+corgea yarn add lodash
+corgea pip install requests==2.31.0
+corgea pip install -r requirements.txt
+corgea uv add django
+corgea uv pip install requests==2.31.0
+corgea uv sync                             # verifies uv.lock / other Python lockfiles
+corgea npm install                       # bare install — verifies the lockfile
 ```
 
 | Flag | Description |
@@ -160,10 +163,10 @@ corgea precheck npm install                       # bare install — verifies th
 Spec resolution:
 
 * **npm / yarn / pnpm** — `pkg`, `pkg@latest`, `pkg@1.2.3`, `pkg@^1.0.0`, `pkg@>=1.0.0 <2.0.0`, `pkg@next` (any dist-tag), and scoped names (`@types/node@...`). Ranges are resolved against the registry's full version list using `semver` semantics.
-* **pip** — `pkg`, `pkg==1.2.3`, `pkg>=1,<2`, `pkg~=1.4`, `pkg[extras]==X`. Exact `==` pins are honoured precisely; other PEP 440 specifiers are resolved against PyPI's release list with a best-effort comparison.
+* **pip / `uv pip install` / `uv add`** — `pkg`, `pkg==1.2.3`, `pkg>=1,<2`, `pkg~=1.4`, `pkg[extras]==X`. Exact `==` pins are honoured precisely; other PEP 440 specifiers are resolved against PyPI's release list with a best-effort comparison. `uv sync` with no package args verifies the project lockfile (`uv.lock`, etc.) then runs sync.
 * **Skipped (warning, not blocked)** — `git+...`, `file:...`, `./local`, `http(s)://...`, `npm:alias@...`, `workspace:*`, `pip -e`. These are explicit out-of-band sources we can't verify against a registry.
 
-Subcommands other than `install` / `add` / `i` are forwarded straight through to the package manager unchanged, so `corgea precheck npm view ...` and similar just work.
+Subcommands other than `install` / `add` / `i` are forwarded straight through to the package manager unchanged, so `corgea npm view ...` and similar just work.
 
 ## Common Workflows
 
@@ -225,11 +228,11 @@ corgea deps --threshold 2d --fail --fail-unpinned
 ### Pre-check an install before letting it run
 
 ```bash
-corgea precheck npm install axios@^1.0.0
-corgea precheck pip install -r requirements.txt --fail-unpinned
+corgea npm install axios@^1.0.0
+corgea pip install -r requirements.txt --fail-unpinned
 ```
 
-`corgea precheck` resolves the actual version a package manager would install, blocks if it was published within the threshold, and otherwise transparently runs the install (preserving the package manager's exit code).
+Ecosystem commands resolve the actual version a package manager would install, block if it was published within the threshold, and otherwise transparently run the install (preserving the package manager's exit code).
 
 ### Export results
 
