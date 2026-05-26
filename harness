@@ -2,8 +2,8 @@
 # Project development tasks. Bash + cargo + git only.
 # Usage: ./harness <command> [--verbose] [--min=N]
 #
-# Commands: check, fix, lint, test, audit, pre-commit, ci, post-edit,
-#           setup-hooks, suppressions, install
+# Commands: check, fix, lint, test, audit, coverage, pre-commit, ci,
+#           post-edit, setup-hooks, suppressions, install
 
 set -u
 
@@ -11,8 +11,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 VERBOSE=0
+COVERAGE_MIN=40
 for arg in "$@"; do
-    [ "$arg" = "--verbose" ] && VERBOSE=1
+    case "$arg" in
+        --verbose) VERBOSE=1 ;;
+        --min=*)   COVERAGE_MIN="${arg#--min=}" ;;
+    esac
 done
 
 if [ -t 1 ]; then
@@ -173,6 +177,20 @@ _cmd_audit_inner() {
     printf "  %s⊘ Dep audit skipped (install: cargo install cargo-audit)%s\n" "$DIM" "$RESET"
 }
 
+cmd_coverage() {
+    printf "\n%s[coverage]%s min=%s%%\n\n" "$BLUE" "$RESET" "$COVERAGE_MIN"
+    if ! cargo llvm-cov --version >/dev/null 2>&1; then
+        printf "  %s✗%s Coverage (cargo-llvm-cov not installed)\n" "$RED" "$RESET"
+        printf "  %sInstall:%s cargo install cargo-llvm-cov\n" "$DIM" "$RESET"
+        exit 1
+    fi
+    run "Coverage (min ${COVERAGE_MIN}%)" 0 -- \
+        cargo llvm-cov --summary-only --fail-under-lines "$COVERAGE_MIN"
+    run "HTML report" 0 -- cargo llvm-cov report --html
+    printf "  %sHTML:%s %s/target/llvm-cov/html/index.html\n" \
+        "$DIM" "$RESET" "$ROOT"
+}
+
 cmd_post_edit() {
     local changed; changed="$(changed_rs_files)"
     [ -z "$changed" ] && return 0
@@ -224,7 +242,13 @@ cmd_ci() {
     run "Clippy (strict)" 0 -- cargo clippy -- -D warnings
     run "Format check" 0 -- cargo fmt --check
     _cmd_audit_inner 1
-    run_with_summary "Tests" 0 -- cargo test
+    if ! cargo llvm-cov --version >/dev/null 2>&1; then
+        printf "  %s✗%s Coverage (cargo-llvm-cov not installed)\n" "$RED" "$RESET"
+        printf "  %sInstall:%s cargo install cargo-llvm-cov\n" "$DIM" "$RESET"
+        exit 1
+    fi
+    run_with_summary "Tests + coverage (min ${COVERAGE_MIN}%)" 0 -- \
+        cargo llvm-cov --summary-only --fail-under-lines "$COVERAGE_MIN"
 }
 
 cmd_install() {
@@ -263,6 +287,7 @@ case "$cmd" in
     lint)         cmd_lint ;;
     test)         cmd_test ;;
     audit)        cmd_audit ;;
+    coverage)     cmd_coverage ;;
     pre-commit)   cmd_pre_commit ;;
     ci)           cmd_ci ;;
     post-edit)    cmd_post_edit ;;
@@ -270,9 +295,9 @@ case "$cmd" in
     suppressions) cmd_suppressions ;;
     install)      cmd_install ;;
     -h|--help|help)
-        printf "Usage: ./harness <command> [--verbose]\n\n"
-        printf "Commands: check, fix, lint, test, audit, pre-commit, ci,\n"
-        printf "          post-edit, setup-hooks, suppressions, install\n"
+        printf "Usage: ./harness <command> [--verbose] [--min=N]\n\n"
+        printf "Commands: check, fix, lint, test, audit, coverage, pre-commit,\n"
+        printf "          ci, post-edit, setup-hooks, suppressions, install\n"
         ;;
     *)
         printf "Unknown command: %s\n" "$cmd" >&2

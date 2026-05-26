@@ -8,8 +8,9 @@ conventions; this file covers cli-only specifics.
 
 - After edits: `./harness check` — clippy fix, format, tests, suppression report
 - Pre-commit: `./harness pre-commit` — staged Rust files only (auto via git hook)
-- CI: `./harness ci` — strict clippy (`-D warnings`), format check, dep audit, tests
+- CI: `./harness ci` — strict clippy (`-D warnings`), format check, dep audit, tests + coverage gate (min 40%)
 - Audit: `./harness audit` — `cargo audit` for known dep vulnerabilities
+- Coverage: `./harness coverage [--min=N]` — cargo-llvm-cov; HTML report under `target/llvm-cov/`; fails if line coverage < N (default 40)
 - Lint: `./harness lint` — clippy + format check, no fixes
 - Test: `./harness test` — `cargo test`
 - Fix: `./harness fix` — clippy fix + format
