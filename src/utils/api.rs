@@ -994,3 +994,80 @@ pub struct SCAIssuesResponse {
     pub total_pages: u32,
     pub total_issues: u32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn is_jwt_accepts_three_dot_separated_non_empty_parts() {
+        assert!(is_jwt("aaa.bbb.ccc"));
+        assert!(is_jwt("header.payload.signature"));
+    }
+
+    #[test]
+    fn is_jwt_rejects_wrong_part_count() {
+        assert!(!is_jwt("aaa.bbb"));
+        assert!(!is_jwt("aaa.bbb.ccc.ddd"));
+        assert!(!is_jwt("plainstring"));
+        assert!(!is_jwt(""));
+    }
+
+    #[test]
+    fn is_jwt_rejects_when_any_part_is_empty() {
+        assert!(!is_jwt("aaa..ccc"));
+        assert!(!is_jwt(".bbb.ccc"));
+        assert!(!is_jwt("aaa.bbb."));
+    }
+
+    #[test]
+    fn auth_headers_uses_bearer_for_jwt_tokens() {
+        let headers = auth_headers("aaa.bbb.ccc");
+
+        assert_eq!(
+            headers.get("Authorization").map(|v| v.to_str().unwrap()),
+            Some("Bearer aaa.bbb.ccc")
+        );
+        assert!(headers.get("CORGEA-TOKEN").is_none());
+        assert!(headers.get("CORGEA-SOURCE").is_some());
+    }
+
+    #[test]
+    fn auth_headers_uses_corgea_token_header_for_opaque_tokens() {
+        let headers = auth_headers("opaque-token-xyz");
+
+        assert_eq!(
+            headers.get("CORGEA-TOKEN").map(|v| v.to_str().unwrap()),
+            Some("opaque-token-xyz")
+        );
+        assert!(headers.get("Authorization").is_none());
+        assert!(headers.get("CORGEA-SOURCE").is_some());
+    }
+
+    #[test]
+    fn check_for_warnings_is_noop_when_no_warning_header_and_status_ok() {
+        let headers = HeaderMap::new();
+        check_for_warnings(&headers, StatusCode::OK);
+    }
+
+    #[test]
+    fn check_for_warnings_is_noop_for_non_299_codes() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "warning",
+            HeaderValue::from_static("199 - \"misc warning\""),
+        );
+        check_for_warnings(&headers, StatusCode::OK);
+    }
+
+    #[test]
+    fn check_for_warnings_tolerates_multiple_comma_separated_warnings() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "warning",
+            HeaderValue::from_static("199 host \"first\", 299 host \"deprecated\""),
+        );
+        check_for_warnings(&headers, StatusCode::OK);
+    }
+}

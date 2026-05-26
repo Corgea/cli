@@ -11,7 +11,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 VERBOSE=0
-COVERAGE_MIN=40
+COVERAGE_MIN=41
 for arg in "$@"; do
     case "$arg" in
         --verbose) VERBOSE=1 ;;
