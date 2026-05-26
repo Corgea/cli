@@ -37,29 +37,27 @@ run() {
 
     if [ "$VERBOSE" -eq 1 ]; then
         printf "  %s→ %s%s\n" "$DIM" "$*" "$RESET"
-        if "$@"; then
+        "$@"
+        LAST_RC=$?
+        LAST_OUTPUT=""
+        if [ "$LAST_RC" -eq 0 ]; then
             printf "  %s✓%s %s\n" "$GREEN" "$RESET" "$desc"
-            LAST_RC=0; LAST_OUTPUT=""
             return 0
-        else
-            LAST_RC=$?
-            printf "  %s✗%s %s\n" "$RED" "$RESET" "$desc"
-            [ "$no_exit" = "0" ] && exit "$LAST_RC"
-            return "$LAST_RC"
         fi
+        printf "  %s✗%s %s\n" "$RED" "$RESET" "$desc"
+        [ "$no_exit" = "0" ] && exit "$LAST_RC"
+        return "$LAST_RC"
     fi
 
     local tmp; tmp="$(mktemp)"
-    if "$@" >"$tmp" 2>&1; then
-        LAST_RC=0
-        LAST_OUTPUT="$(cat "$tmp")"
-        rm -f "$tmp"
-        printf "  %s✓%s %s\n" "$GREEN" "$RESET" "$desc"
-        return 0
-    fi
+    "$@" >"$tmp" 2>&1
     LAST_RC=$?
     LAST_OUTPUT="$(cat "$tmp")"
     rm -f "$tmp"
+    if [ "$LAST_RC" -eq 0 ]; then
+        printf "  %s✓%s %s\n" "$GREEN" "$RESET" "$desc"
+        return 0
+    fi
     printf "  %s✗%s %s\n" "$RED" "$RESET" "$desc"
     [ -n "$LAST_OUTPUT" ] && printf "%s\n" "$LAST_OUTPUT"
     [ "$no_exit" = "0" ] && exit "$LAST_RC"
@@ -202,6 +200,8 @@ cmd_check() {
     run "Clippy fix" 1 -- cargo clippy --fix --allow-dirty --allow-staged
     [ $? -eq 0 ] && passed=$(( passed + 1 )) || failed=$(( failed + 1 ))
     run "Format" 1 -- cargo fmt
+    [ $? -eq 0 ] && passed=$(( passed + 1 )) || failed=$(( failed + 1 ))
+    run "Clippy (strict)" 1 -- cargo clippy -- -D warnings
     [ $? -eq 0 ] && passed=$(( passed + 1 )) || failed=$(( failed + 1 ))
     run_with_summary "Tests" 1 -- cargo test
     [ $? -eq 0 ] && passed=$(( passed + 1 )) || failed=$(( failed + 1 ))
