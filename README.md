@@ -26,6 +26,23 @@ Once the binary is installed, login with your token from the Corgea app.
 corgea login <token>
 ```
 
+## Dependency Security
+
+`corgea deps` is a supply-chain tripwire for pinned npm and Python dependencies. It supports two independent modes: **freshness** (flag recently published versions) and **CVE detection** (query known advisories).
+
+Freshness gate — block builds that pull in a recently published dependency:
+
+```bash
+corgea deps --threshold 2d --fail
+```
+
+CVE gate — requires `corgea login` (or `CORGEA_TOKEN`):
+
+```bash
+corgea deps --check-cve --fail-cve
+```
+
+See [Dependency Scanning (CLI)](https://docs.corgea.app/cli/deps) for flags, exit codes, CI integration, and self-hosted vuln-api setup.
 
 ## Development Setup
 

@@ -133,6 +133,53 @@ corgea deps --json                           # machine-readable output
 | `--fail-unpinned` | | Exit non-zero if any dep is unpinned (manifest with no lockfile, or unpinned `requirements.txt` line) |
 | `--json` | | JSON output instead of human text |
 | `--path` | `-p` | Project directory (default: `.`) |
+| `--check-cve` | | Query Corgea vulnerability database for known CVEs/advisories (requires login) |
+| `--fail-cve` | | Exit non-zero if any known CVE is found (requires `--check-cve`) |
+
+### CVE detection
+
+Pass `--check-cve` to query the Corgea vulnerability database for known CVEs and advisories on every pinned dependency. Requires `corgea login` first (or `CORGEA_TOKEN` set). Without a token, the command refuses to start and exits **2** with no report printed.
+
+```bash
+# Local: see what would fail
+corgea deps --check-cve
+
+# CI: fail the build on any known CVE
+corgea deps --check-cve --fail-cve
+```
+
+Example finding:
+
+```text
+✗ npm lodash@4.17.20: GHSA-xxxx-yyyy-zzzz [TOP-FIX] (severity: high)
+  → upgrade to 4.17.21
+  https://corgea.app/advisories/GHSA-xxxx-yyyy-zzzz
+```
+
+With `--json`, each dependency in `results[]` includes a `cves[]` array and `cve_status` label. Top-level `cve_summary` reports counts (`checked`, `vulnerable`, `clean`, `errors`, `unpinned_not_checked`). CVE fields are omitted when `--check-cve` is not passed.
+
+| Override | Where | Default |
+|----------|-------|---------|
+| Token | `corgea login` or `CORGEA_TOKEN` env | (required) |
+| Vuln-api URL | `CORGEA_VULN_API_URL` env, or `vuln_api_url` in `~/.corgea/config.toml` | `https://vuln-api.corgea.app` |
+
+**Exit codes — CVE CI gating:**
+
+| Exit | Condition |
+|------|-----------|
+| 0 | No vulnerable deps found, or `--check-cve` not passed, or findings present but no `--fail-cve` |
+| 1 | Known CVE found **and** `--fail-cve` passed |
+| 2 | `--check-cve` without token; `--fail-cve` without `--check-cve`; parse/validation errors |
+
+**All deps gates (independent flags):**
+
+| Flag | Exit 1 when |
+|------|-------------|
+| `--fail` | Recent publish, registry error, CVE finding, **or CVE lookup error** |
+| `--fail-unpinned` | Unpinned dep detected |
+| `--fail-cve` | CVE finding only (lookup errors do **not** trigger) |
+
+Full reference: https://docs.corgea.app/cli/deps
 
 Supported lockfiles (preferred → fallback): npm: `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml` (v5/v6/v9), `yarn.lock`. Python: `poetry.lock`, `Pipfile.lock`, `uv.lock`, `requirements.txt` (only `==`-pinned lines).
 
@@ -224,6 +271,17 @@ Use this together with `--fail` to gate both freshness and pinning in one CI ste
 ```bash
 corgea deps --threshold 2d --fail --fail-unpinned
 ```
+
+### Block CI on known CVEs
+
+```yaml
+- name: Check dependencies for known CVEs
+  env:
+    CORGEA_TOKEN: ${{ secrets.CORGEA_TOKEN }}
+  run: corgea deps --check-cve --fail-cve
+```
+
+Local dry-run first: `corgea deps --check-cve` (no `--fail-cve`) to inspect findings without failing.
 
 ### Pre-check an install before letting it run
 

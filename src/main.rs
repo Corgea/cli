@@ -200,6 +200,7 @@ enum Commands {
     /// Verify installed dependencies against the registry to flag recently published versions.
     /// Useful as a supply-chain tripwire: any dep whose installed version was published within
     /// the configured threshold will be reported. Currently supports npm and Python.
+    /// Pass --check-cve to query the Corgea vulnerability database for known advisories (requires login).
     Deps {
         #[arg(
             long,
@@ -251,14 +252,14 @@ enum Commands {
 
         #[arg(
             long,
-            help = "Check each dependency against the Corgea vulnerability database for known CVEs/advisories."
+            help = "Check each dependency against the Corgea vulnerability database for known CVEs/advisories. Requires corgea login (or CORGEA_TOKEN). See https://docs.corgea.app/cli/deps#check-cve."
         )]
         check_cve: bool,
 
         #[arg(
             long,
             requires = "check_cve",
-            help = "Exit with a non-zero status code if any known CVE is found. Requires --check-cve. Independent of --fail and --fail-unpinned."
+            help = "Exit with a non-zero status code if any known CVE is found. Requires --check-cve. Independent of --fail and --fail-unpinned. See https://docs.corgea.app/cli/deps#check-cve."
         )]
         fail_cve: bool,
     },
