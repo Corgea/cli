@@ -357,6 +357,8 @@ fn verify_npm_lockfile(opts: &PrecheckOptions) -> i32 {
         path: std::path::PathBuf::from("."),
         npm_registry: opts.npm_registry.clone(),
         pypi_registry: opts.pypi_registry.clone(),
+        check_cve: false,
+        vuln_api_url: None,
     };
     delegate_to_verify_deps(verify_opts)
 }
@@ -376,6 +378,8 @@ fn verify_lockfile_or_requirements(
             path: std::path::PathBuf::from("."),
             npm_registry: opts.npm_registry.clone(),
             pypi_registry: opts.pypi_registry.clone(),
+            check_cve: false,
+            vuln_api_url: None,
         };
         return delegate_to_verify_deps(verify_opts);
     }
@@ -418,6 +422,8 @@ fn verify_lockfile_or_requirements(
             path: parent,
             npm_registry: opts.npm_registry.clone(),
             pypi_registry: opts.pypi_registry.clone(),
+            check_cve: false,
+            vuln_api_url: None,
         };
         let code = delegate_to_verify_deps(verify_opts);
         if code != 0 {

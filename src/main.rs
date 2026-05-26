@@ -8,6 +8,7 @@ mod precheck;
 mod scan;
 mod setup_hooks;
 mod verify_deps;
+mod vuln_api;
 mod wait;
 mod scanners {
     pub mod blast;
@@ -247,6 +248,12 @@ enum Commands {
             help = "Path to the project to verify. Defaults to the current directory."
         )]
         path: Option<String>,
+
+        #[arg(
+            long,
+            help = "Check each dependency against the Corgea vulnerability database for known CVEs/advisories."
+        )]
+        check_cve: bool,
     },
     /// Pre-check a package install command against the registry, then run it.
     /// Wraps `npm install`, `yarn add`, `pnpm add`, or `pip install` and refuses
@@ -576,6 +583,7 @@ fn main() {
             fail_unpinned,
             json,
             path,
+            check_cve,
         }) => {
             let parsed_ecosystem = match verify_deps::Ecosystem::parse(ecosystem) {
                 Ok(e) => e,
@@ -593,6 +601,32 @@ fn main() {
             };
             let project_path =
                 std::path::PathBuf::from(path.clone().unwrap_or_else(|| ".".to_string()));
+
+            let configured_vuln_api_url = corgea_config.get_vuln_api_url();
+            let vuln_api_url = if *check_cve {
+                let token = corgea_config.get_token();
+                let has_token = !token.trim().is_empty();
+                if !has_token {
+                    eprintln!(
+                        "warning: --check-cve requires a Corgea token; CVE checks will be skipped. Run `corgea login` first."
+                    );
+                } else {
+                    utils::api::set_auth_token(&token);
+                }
+                if configured_vuln_api_url.is_none() {
+                    eprintln!(
+                        "warning: --check-cve requires CORGEA_VULN_API_URL (or vuln_api_url in config); CVE checks will be skipped."
+                    );
+                }
+                if has_token {
+                    configured_vuln_api_url
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let opts = verify_deps::VerifyOptions {
                 ecosystem: parsed_ecosystem,
                 threshold: parsed_threshold,
@@ -603,6 +637,8 @@ fn main() {
                 path: project_path,
                 npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
                 pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
+                check_cve: *check_cve,
+                vuln_api_url,
             };
 
             match verify_deps::run(&opts) {

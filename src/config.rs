@@ -1,22 +1,20 @@
-use dirs;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::{env, fs, io};
-use toml;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub(crate) url: String,
     pub(crate) debug: i8,
     pub(crate) token: String,
+    #[serde(default)]
+    pub(crate) vuln_api_url: Option<String>,
 }
 
 impl Config {
     fn config_path() -> io::Result<PathBuf> {
-        let mut dir_path = dirs::home_dir().ok_or(io::Error::new(
-            io::ErrorKind::Other,
-            "Unable to get home directory",
-        ))?;
+        let mut dir_path =
+            dirs::home_dir().ok_or(io::Error::other("Unable to get home directory"))?;
 
         dir_path.push(".corgea");
 
@@ -38,6 +36,7 @@ impl Config {
                 url: "https://www.corgea.app".to_string(),
                 debug: 0,
                 token: "".to_string(),
+                vuln_api_url: None,
             };
 
             let toml = toml::to_string(&config).expect("Failed to serialize config");
@@ -95,13 +94,24 @@ impl Config {
             return corgea_token;
         }
 
-        return self.token.clone();
+        self.token.clone()
     }
     pub fn get_debug(&self) -> i8 {
         if let Ok(corgea_debug) = env::var("CORGEA_DEBUG") {
             return corgea_debug.parse::<i8>().unwrap_or(0);
         }
 
-        return self.debug;
+        self.debug
+    }
+
+    pub fn get_vuln_api_url(&self) -> Option<String> {
+        let url = crate::utils::generic::get_env_var_if_exists("CORGEA_VULN_API_URL")
+            .or_else(|| self.vuln_api_url.clone())?;
+
+        if url.ends_with('/') {
+            Some(url.trim_end_matches('/').to_string())
+        } else {
+            Some(url)
+        }
     }
 }

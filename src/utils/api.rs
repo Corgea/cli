@@ -144,7 +144,7 @@ pub fn http_client() -> HttpClient {
     HttpClient { inner: SHARED_CLIENT.clone() }
 }
 
-fn check_for_warnings(headers: &HeaderMap, status: StatusCode) {
+pub(crate) fn check_for_warnings(headers: &HeaderMap, status: StatusCode) {
     if let Some(warning) = headers.get("warning") {
         let warnings = warning.to_str().unwrap().split(',');
         for warning in warnings {
