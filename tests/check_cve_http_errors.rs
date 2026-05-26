@@ -1,25 +1,13 @@
 mod common;
 
 use common::vuln_api_stub::spawn_with_statuses;
+use common::{corgea_cmd, stub_env};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Command;
 
 fn npm_fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/deps/npm")
-}
-
-fn corgea_cmd() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_corgea"))
-}
-
-fn stub_env(stub_url: &str) -> [(&'static str, String); 3] {
-    [
-        ("CORGEA_VULN_API_URL", stub_url.to_string()),
-        ("CORGEA_TOKEN", "test-token".to_string()),
-        ("CORGEA_NPM_REGISTRY", "http://127.0.0.1:1".to_string()),
-    ]
 }
 
 #[test]
@@ -37,6 +25,8 @@ fn check_cve_404_is_clean_in_json() {
         .args([
             "deps",
             "--check-cve",
+            "--cve-concurrency",
+            "1",
             "--json",
             "-e",
             "npm",
@@ -92,6 +82,8 @@ fn check_cve_http_errors_render_actionable_messages() {
         .args([
             "deps",
             "--check-cve",
+            "--cve-concurrency",
+            "1",
             "-e",
             "npm",
             "-p",
@@ -124,6 +116,8 @@ fn check_cve_500_renders_unavailable_message() {
         .args([
             "deps",
             "--check-cve",
+            "--cve-concurrency",
+            "1",
             "-e",
             "npm",
             "-p",

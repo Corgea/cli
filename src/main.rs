@@ -258,6 +258,15 @@ enum Commands {
 
         #[arg(
             long,
+            env = "CORGEA_CVE_CONCURRENCY",
+            default_value = "8",
+            value_parser = clap::value_parser!(u8).range(1..=32),
+            help = "Max in-flight vuln-api requests when --check-cve is set (1..32). Tune down for slow networks or vuln-api rate limits."
+        )]
+        cve_concurrency: u8,
+
+        #[arg(
+            long,
             requires = "check_cve",
             help = "Exit with a non-zero status code if any known CVE is found. Requires --check-cve. Independent of --fail and --fail-unpinned. See https://docs.corgea.app/cli/deps#check-cve."
         )]
@@ -645,6 +654,7 @@ fn main() {
             path,
             check_cve,
             fail_cve,
+            cve_concurrency,
         }) => {
             let parsed_ecosystem = match verify_deps::Ecosystem::parse(ecosystem) {
                 Ok(e) => e,
@@ -691,6 +701,7 @@ fn main() {
                 check_cve: *check_cve,
                 vuln_api_url,
                 vuln_api_token,
+                cve_concurrency: *cve_concurrency as usize,
             };
 
             match verify_deps::run(&opts) {

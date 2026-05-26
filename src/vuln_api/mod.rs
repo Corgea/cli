@@ -74,7 +74,7 @@ fn user_agent() -> String {
     format!("corgea-cli/{} (vuln-api)", env!("CARGO_PKG_VERSION"))
 }
 
-fn http_client() -> Result<reqwest::blocking::Client, String> {
+pub(crate) fn http_client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent(user_agent())
@@ -107,7 +107,54 @@ fn encode_package_name(ecosystem: &str, name: &str) -> String {
     }
 }
 
+fn build_package_check_request<'a>(
+    client: &'a reqwest::blocking::Client,
+    url: &'a str,
+    token: &'a str,
+) -> reqwest::blocking::RequestBuilder {
+    let mut req = client
+        .get(url)
+        .header("Accept", "application/json")
+        .header("CORGEA-SOURCE", "cli");
+    if is_jwt(token) {
+        req = req.header("Authorization", format!("Bearer {}", token));
+    } else {
+        req = req.header("CORGEA-TOKEN", token);
+    }
+    req
+}
+
+fn retry_after_seconds(response: &reqwest::blocking::Response) -> u64 {
+    response
+        .headers()
+        .get("Retry-After")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|s| s.clamp(1, 10))
+        .unwrap_or(1)
+}
+
+fn send_package_check_with_429_retry(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    token: &str,
+) -> Result<reqwest::blocking::Response, Box<dyn std::error::Error>> {
+    let response = build_package_check_request(client, url, token)
+        .send()
+        .map_err(|e| format!("Failed to send vuln-api request: {}", e))?;
+
+    if response.status().as_u16() == 429 {
+        let wait = retry_after_seconds(&response);
+        std::thread::sleep(Duration::from_secs(wait));
+        return build_package_check_request(client, url, token)
+            .send()
+            .map_err(|e| format!("Failed to send vuln-api request: {}", e).into());
+    }
+    Ok(response)
+}
+
 pub fn check_package_version(
+    client: &reqwest::blocking::Client,
     base_url: &str,
     token: &str,
     ecosystem: &str,
@@ -128,22 +175,9 @@ pub fn check_package_version(
         base, ecosystem, encoded_name, encoded_version
     );
 
-    let client = http_client()?;
     debug(&format!("Sending vuln-api request to URL: {}", url));
 
-    let mut req = client
-        .get(&url)
-        .header("Accept", "application/json")
-        .header("CORGEA-SOURCE", "cli");
-    if is_jwt(token) {
-        req = req.header("Authorization", format!("Bearer {}", token));
-    } else {
-        req = req.header("CORGEA-TOKEN", token);
-    }
-
-    let response = req
-        .send()
-        .map_err(|e| format!("Failed to send vuln-api request: {}", e))?;
+    let response = send_package_check_with_429_retry(client, &url, token)?;
 
     let status = response.status();
     match status.as_u16() {
@@ -223,6 +257,7 @@ pub fn check_package_version(
 }
 
 pub fn get_advisory(
+    client: &reqwest::blocking::Client,
     base_url: &str,
     token: &str,
     advisory_id: &str,
@@ -237,7 +272,6 @@ pub fn get_advisory(
     let encoded_id = urlencoding::encode(advisory_id);
     let url = format!("{}/v1/advisories/{}", base, encoded_id);
 
-    let client = http_client()?;
     debug(&format!(
         "Sending vuln-api advisory request to URL: {}",
         url
@@ -307,18 +341,22 @@ mod tests {
         _handle: thread::JoinHandle<()>,
     }
 
-    /// Bind 127.0.0.1:0 and serve one response per connection for
-    /// GET /v1/packages/{eco}/{name}/versions/{ver}/check.
-    fn spawn_package_check_stub(
+    /// Keys in `retry_after_keys`: first hit → 429 + Retry-After: 1, second hit →
+    /// response from `responses` (or clean 200 fallback).
+    fn spawn_package_check_stub_with_retry_keys(
         responses: HashMap<(String, String, String), (u16, String)>,
+        retry_after_keys: HashMap<(String, String, String), (u16, String)>,
     ) -> PackageCheckStub {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
         let port = listener.local_addr().unwrap().port();
         let base_url = format!("http://127.0.0.1:{}", port);
         let responses = Arc::new(Mutex::new(responses));
+        let retry_after_keys = Arc::new(Mutex::new(retry_after_keys));
+        let hit_counts: Arc<Mutex<HashMap<(String, String, String), u32>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         let handle = thread::spawn(move || {
-            for stream in listener.incoming().take(16) {
+            for stream in listener.incoming().take(32) {
                 let Ok(mut stream) = stream else {
                     continue;
                 };
@@ -335,7 +373,7 @@ mod tests {
                 }
                 let req = String::from_utf8_lossy(&buf);
 
-                let (status_code, status_text, body) = if let Some(path) =
+                let (status_code, status_text, body, extra_headers) = if let Some(path) =
                     req.lines().next().and_then(|l| l.split_whitespace().nth(1))
                 {
                     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -352,31 +390,57 @@ mod tests {
                         let ver = urlencoding::decode(parts[5])
                             .unwrap_or_default()
                             .into_owned();
-                        let (code, body) = responses
-                            .lock()
-                            .unwrap()
-                            .get(&(eco, name, ver))
-                            .cloned()
-                            .unwrap_or((200, r#"{"is_vulnerable":false,"matches":[]}"#.into()));
-                        let text = match code {
-                            401 => "Unauthorized",
-                            403 => "Forbidden",
-                            404 => "Not Found",
-                            429 => "Too Many Requests",
-                            500..=599 => "Internal Server Error",
-                            _ => "Error",
+                        let key = (eco.clone(), name.clone(), ver.clone());
+                        let hits = {
+                            let mut counts = hit_counts.lock().unwrap();
+                            let entry = counts.entry(key.clone()).or_insert(0);
+                            *entry += 1;
+                            *entry
                         };
-                        (code, text, body)
+
+                        let retry_body = retry_after_keys.lock().unwrap().get(&key).cloned();
+                        if retry_body.is_some() && hits == 1 {
+                            let (code, body) = (429, r#"{"error":"rate limited"}"#.to_string());
+                            let text = "Too Many Requests";
+                            (code, text, body, "Retry-After: 1\r\n".to_string())
+                        } else {
+                            let (code, body) = responses
+                                .lock()
+                                .unwrap()
+                                .get(&key)
+                                .cloned()
+                                .or_else(|| retry_body)
+                                .unwrap_or((200, r#"{"is_vulnerable":false,"matches":[]}"#.into()));
+                            let text = match code {
+                                401 => "Unauthorized",
+                                403 => "Forbidden",
+                                404 => "Not Found",
+                                429 => "Too Many Requests",
+                                500..=599 => "Internal Server Error",
+                                _ => "Error",
+                            };
+                            (code, text, body, String::new())
+                        }
                     } else {
-                        (404, "Not Found", r#"{"error":"not found"}"#.into())
+                        (
+                            404,
+                            "Not Found",
+                            r#"{"error":"not found"}"#.into(),
+                            String::new(),
+                        )
                     }
                 } else {
-                    (400, "Bad Request", r#"{"error":"bad request"}"#.into())
+                    (
+                        400,
+                        "Bad Request",
+                        r#"{"error":"bad request"}"#.into(),
+                        String::new(),
+                    )
                 };
 
                 let response = format!(
-                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                    status_code, status_text, body.len(), body
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\n\r\n{}",
+                    status_code, status_text, extra_headers, body.len(), body
                 );
                 let _ = stream.write_all(response.as_bytes());
             }
@@ -393,13 +457,21 @@ mod tests {
         status_code: u16,
         body: &str,
     ) -> Result<VulnCheckResponse, Box<dyn std::error::Error>> {
+        let client = http_client().expect("test client");
         let mut responses = HashMap::new();
         responses.insert(
             ("npm".into(), "lodash".into(), "4.17.20".into()),
             (status_code, body.to_string()),
         );
-        let stub = spawn_package_check_stub(responses);
-        check_package_version(&stub.base_url, "test-token", "npm", "lodash", "4.17.20")
+        let stub = spawn_package_check_stub_with_retry_keys(responses, HashMap::new());
+        check_package_version(
+            &client,
+            &stub.base_url,
+            "test-token",
+            "npm",
+            "lodash",
+            "4.17.20",
+        )
     }
 
     #[test]
@@ -427,10 +499,44 @@ mod tests {
     }
 
     #[test]
-    fn check_package_version_429_returns_actionable_error() {
+    fn check_package_version_persistent_429_returns_actionable_error() {
         let err = check_with_stub_status(429, r#"{"error":"rate limited"}"#)
             .expect_err("429 should fail");
         assert!(err.to_string().contains("rate-limited"));
+    }
+
+    #[test]
+    fn check_package_version_429_retries_then_succeeds() {
+        let client = http_client().unwrap();
+        let vulnerable_body = r#"{
+            "ecosystem": "npm",
+            "package_name": "lodash",
+            "version": "4.17.20",
+            "is_vulnerable": true,
+            "matches": [{
+                "advisory_id": "GHSA-retry-test",
+                "severity_level": "high",
+                "tier": 1,
+                "vulnerable_version_range": "<4.17.21",
+                "fixed_version": "4.17.21"
+            }]
+        }"#;
+        let mut retry_after_keys = HashMap::new();
+        retry_after_keys.insert(
+            ("npm".into(), "lodash".into(), "4.17.20".into()),
+            (200, vulnerable_body.to_string()),
+        );
+        let stub = spawn_package_check_stub_with_retry_keys(HashMap::new(), retry_after_keys);
+        let resp = check_package_version(
+            &client,
+            &stub.base_url,
+            "test-token",
+            "npm",
+            "lodash",
+            "4.17.20",
+        )
+        .expect("retry should succeed");
+        assert!(resp.is_vulnerable);
     }
 
     #[test]

@@ -12,7 +12,10 @@ pub mod python;
 pub mod registry;
 pub mod report;
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -147,6 +150,9 @@ pub struct VerifyOptions {
     /// `check_cve = true`. Preflight in `main.rs` guarantees this before
     /// `run()` is called.
     pub vuln_api_token: Option<String>,
+    /// Max in-flight vuln-api package-check requests when `check_cve` is true.
+    /// Ignored when `check_cve` is false. Default 8, clamped 1..32 by clap.
+    pub cve_concurrency: usize,
 }
 
 impl Default for VerifyOptions {
@@ -165,6 +171,7 @@ impl Default for VerifyOptions {
             check_cve: false,
             vuln_api_url: None,
             vuln_api_token: None,
+            cve_concurrency: 8,
         }
     }
 }
@@ -196,6 +203,7 @@ impl VerifyOptions {
             check_cve: false,
             vuln_api_url: None,
             vuln_api_token: None,
+            cve_concurrency: 8,
         }
     }
 }
@@ -359,10 +367,6 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
 
     let mut outcomes: Vec<LookupOutcome> = Vec::with_capacity(deps.len());
     let mut cve_outcomes: Vec<CveLookupOutcome> = Vec::new();
-    let mut advisory_cache: std::collections::HashMap<
-        String,
-        Result<vuln_api::AdvisoryResponse, ()>,
-    > = std::collections::HashMap::new();
 
     let cve_base_url = opts
         .vuln_api_url
@@ -375,9 +379,7 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
         .map(str::trim)
         .unwrap_or_default();
 
-    for dep in deps {
-        let dep_for_cve = opts.check_cve.then(|| dep.clone());
-
+    for dep in &deps {
         let published = match dep.ecosystem {
             DependencyEcosystem::Npm => {
                 registry::npm_publish_time(&dep.name, &dep.version, opts.npm_registry.as_deref())
@@ -395,13 +397,13 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
                     .unwrap_or_else(|_| Duration::from_secs(0));
                 if age_chrono < threshold {
                     outcomes.push(LookupOutcome::Recent(Finding {
-                        dep,
+                        dep: dep.clone(),
                         published_at,
                         age,
                     }));
                 } else {
                     outcomes.push(LookupOutcome::Ok {
-                        dep,
+                        dep: dep.clone(),
                         published_at,
                         age,
                     });
@@ -409,44 +411,16 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
             }
             Err(e) => {
                 outcomes.push(LookupOutcome::Error {
-                    dep,
+                    dep: dep.clone(),
                     error: e.to_string(),
                 });
             }
         }
+    }
 
-        if let Some(dep_for_cve) = dep_for_cve {
-            match crate::vuln_api::check_package_version(
-                cve_base_url,
-                cve_token,
-                dep_for_cve.ecosystem.vuln_api_ecosystem(),
-                &dep_for_cve.name,
-                &dep_for_cve.version,
-            ) {
-                Ok(response) if response.is_vulnerable => {
-                    let advisory_details = collect_advisory_details(
-                        &mut advisory_cache,
-                        cve_base_url,
-                        cve_token,
-                        &response.matches,
-                    );
-                    cve_outcomes.push(CveLookupOutcome::Vulnerable(CveFinding {
-                        dep: dep_for_cve,
-                        matches: response.matches,
-                        advisory_details,
-                    }));
-                }
-                Ok(_) => {
-                    cve_outcomes.push(CveLookupOutcome::Clean { dep: dep_for_cve });
-                }
-                Err(e) => {
-                    cve_outcomes.push(CveLookupOutcome::Error {
-                        dep: dep_for_cve,
-                        error: e.to_string(),
-                    });
-                }
-            }
-        }
+    if opts.check_cve {
+        let client = crate::vuln_api::http_client()?;
+        cve_outcomes = run_cve_pass(&client, opts, &deps, cve_base_url, cve_token);
     }
 
     Ok(VerifyReport {
@@ -596,6 +570,7 @@ pub(super) fn pick_highest_fixed(
 /// or a previously-recorded failure). If either `base_url` or `token`
 /// is empty, returns all-`None` without making any HTTP calls.
 fn collect_advisory_details(
+    client: &reqwest::blocking::Client,
     cache: &mut std::collections::HashMap<String, Result<vuln_api::AdvisoryResponse, ()>>,
     base_url: &str,
     token: &str,
@@ -611,14 +586,116 @@ fn collect_advisory_details(
             if let Some(entry) = cache.get(&id) {
                 return entry.as_ref().ok().cloned();
             }
-            let entry = match vuln_api::get_advisory(base_url, token, &id) {
-                Ok(resp) => Ok(resp),
-                Err(_) => Err(()),
-            };
+            let entry = vuln_api::get_advisory(client, base_url, token, &id).map_err(|_| ());
             let result = entry.as_ref().ok().cloned();
             cache.insert(id, entry);
             result
         })
+        .collect()
+}
+
+fn report_cve_progress(done: usize, total: usize, json: bool, last_milestone: &AtomicU8) {
+    if json || total < 20 {
+        return;
+    }
+    if std::io::stderr().is_terminal() {
+        eprint!("\r[CVE check] {}/{}", done, total);
+    } else {
+        let pct = ((done as u64 * 100) / total as u64) as u8;
+        for threshold in [25u8, 50, 75, 100] {
+            if pct >= threshold {
+                let prev = last_milestone.load(Ordering::Relaxed);
+                if prev < threshold
+                    && last_milestone
+                        .compare_exchange(prev, threshold, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    eprintln!("[CVE check] {}/{}", done, total);
+                }
+            }
+        }
+    }
+}
+
+// Advisory GETs from vulnerable deps may briefly exceed `cve_concurrency`
+// in-flight package-check slots; volume is ≪ package checks (accepted).
+fn run_cve_pass(
+    client: &reqwest::blocking::Client,
+    opts: &VerifyOptions,
+    deps: &[Dependency],
+    cve_base_url: &str,
+    cve_token: &str,
+) -> Vec<CveLookupOutcome> {
+    if deps.is_empty() {
+        return Vec::new();
+    }
+
+    let concurrency = opts.cve_concurrency.max(1);
+    let total = deps.len();
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<CveLookupOutcome>>> =
+        Mutex::new((0..total).map(|_| None).collect());
+    let advisory_cache: Mutex<
+        std::collections::HashMap<String, Result<vuln_api::AdvisoryResponse, ()>>,
+    > = Mutex::new(std::collections::HashMap::new());
+    let progress = AtomicUsize::new(0);
+    let last_milestone = AtomicU8::new(0);
+
+    std::thread::scope(|s| {
+        for _ in 0..concurrency {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= total {
+                    break;
+                }
+                let dep = &deps[i];
+                let outcome = match crate::vuln_api::check_package_version(
+                    client,
+                    cve_base_url,
+                    cve_token,
+                    dep.ecosystem.vuln_api_ecosystem(),
+                    &dep.name,
+                    &dep.version,
+                ) {
+                    Ok(response) if response.is_vulnerable => {
+                        let advisory_details = {
+                            let mut cache = advisory_cache.lock().unwrap();
+                            collect_advisory_details(
+                                client,
+                                &mut cache,
+                                cve_base_url,
+                                cve_token,
+                                &response.matches,
+                            )
+                        };
+                        CveLookupOutcome::Vulnerable(CveFinding {
+                            dep: dep.clone(),
+                            matches: response.matches,
+                            advisory_details,
+                        })
+                    }
+                    Ok(_) => CveLookupOutcome::Clean { dep: dep.clone() },
+                    Err(e) => CveLookupOutcome::Error {
+                        dep: dep.clone(),
+                        error: e.to_string(),
+                    },
+                };
+                results.lock().unwrap()[i] = Some(outcome);
+                let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                report_cve_progress(done, total, opts.json, &last_milestone);
+            });
+        }
+    });
+
+    if !opts.json && total >= 20 && std::io::stderr().is_terminal() {
+        eprintln!();
+    }
+
+    results
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|o| o.expect("every dep index assigned exactly once"))
         .collect()
 }
 
@@ -639,19 +716,6 @@ mod tests {
         _handle: thread::JoinHandle<()>,
     }
 
-    fn spawn_vuln_api_stub(
-        fixtures: HashMap<(String, String, String), crate::vuln_api::VulnCheckResponse>,
-    ) -> VulnApiStub {
-        spawn_vuln_api_stub_with_advisories(fixtures, HashMap::new())
-    }
-
-    /// Advisory fixture in the real server's wire shape.
-    ///
-    /// Tests build this as a raw `serde_json::Value` so the CLI's
-    /// deserialization path (with `#[serde(rename = "id" / "source_url")]`)
-    /// is actually exercised. Serializing `AdvisoryResponse` directly
-    /// would round-trip through the same Rust struct and hide a future
-    /// server-side rename.
     fn spawn_vuln_api_stub_with_advisories(
         fixtures: HashMap<(String, String, String), crate::vuln_api::VulnCheckResponse>,
         advisory_fixtures: HashMap<String, serde_json::Value>,
@@ -819,8 +883,9 @@ mod tests {
         );
         let stub = spawn_vuln_api_stub_with_advisories(HashMap::new(), advisory_fixtures);
 
-        let resp =
-            crate::vuln_api::get_advisory(&stub.base_url, "test-token", "GHSA-foo").expect("ok");
+        let client = crate::vuln_api::http_client().unwrap();
+        let resp = crate::vuln_api::get_advisory(&client, &stub.base_url, "test-token", "GHSA-foo")
+            .expect("ok");
         assert_eq!(resp.advisory_id, "GHSA-foo");
         assert_eq!(
             resp.url.as_deref(),
@@ -834,13 +899,16 @@ mod tests {
     #[test]
     fn vuln_api_stub_returns_404_for_missing_advisory() {
         let stub = spawn_vuln_api_stub_with_advisories(HashMap::new(), HashMap::new());
-        let err = crate::vuln_api::get_advisory(&stub.base_url, "test-token", "GHSA-missing")
-            .unwrap_err();
+        let client = crate::vuln_api::http_client().unwrap();
+        let err =
+            crate::vuln_api::get_advisory(&client, &stub.base_url, "test-token", "GHSA-missing")
+                .unwrap_err();
         let msg = format!("{}", err);
         assert!(msg.contains("404"), "expected 404 in error, got: {}", msg);
 
         // The /check route still works against the same stub.
         let resp = crate::vuln_api::check_package_version(
+            &client,
             &stub.base_url,
             "test-token",
             "npm",
@@ -959,7 +1027,7 @@ mod tests {
             },
         );
 
-        let stub = spawn_vuln_api_stub(fixtures);
+        let stub = spawn_vuln_api_stub_with_advisories(fixtures, HashMap::new());
 
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
@@ -1160,6 +1228,7 @@ mod tests {
             ecosystem: Ecosystem::Npm,
             path: dir.path().to_path_buf(),
             check_cve: true,
+            cve_concurrency: 1,
             vuln_api_url: Some(stub.base_url.clone()),
             vuln_api_token: Some("test-token".into()),
             npm_registry: Some("http://127.0.0.1:1".into()),
@@ -1330,6 +1399,91 @@ mod tests {
             entry.get("remediation").is_none(),
             "remediation should not appear in CVE JSON output"
         );
+    }
+
+    #[test]
+    fn cve_outcomes_order_stable_across_concurrency() {
+        let mut fixtures = HashMap::new();
+        let mk = |name: &str| crate::vuln_api::VulnCheckResponse {
+            ecosystem: "npm".into(),
+            package_name: name.into(),
+            version: "1.0.0".into(),
+            is_vulnerable: true,
+            matches: vec![crate::vuln_api::VulnMatch {
+                advisory_id: "GHSA-shared".into(),
+                severity_level: "high".into(),
+                tier: 1,
+                vulnerable_version_range: Some("<2.0.0".into()),
+                fixed_version: Some("2.0.0".into()),
+            }],
+        };
+        fixtures.insert(("npm".into(), "alpha".into(), "1.0.0".into()), mk("alpha"));
+        fixtures.insert(("npm".into(), "beta".into(), "1.0.0".into()), mk("beta"));
+
+        let mut advisories = HashMap::new();
+        advisories.insert(
+            "GHSA-shared".to_string(),
+            serde_json::json!({
+                "id": "GHSA-shared",
+                "severity_level": "high",
+                "tier": 1,
+                "source_url": "https://github.com/advisories/GHSA-shared",
+            }),
+        );
+        let stub = spawn_vuln_api_stub_with_advisories(fixtures, advisories);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{
+                "name": "demo", "version": "1.0.0", "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "demo", "version": "1.0.0" },
+                    "node_modules/alpha": { "version": "1.0.0" },
+                    "node_modules/beta":  { "version": "1.0.0" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let base_opts = VerifyOptions {
+            ecosystem: Ecosystem::Npm,
+            path: dir.path().to_path_buf(),
+            check_cve: true,
+            vuln_api_url: Some(stub.base_url.clone()),
+            vuln_api_token: Some("test-token".into()),
+            npm_registry: Some("http://127.0.0.1:1".into()),
+            ..Default::default()
+        };
+
+        let mut opts1 = base_opts.clone();
+        opts1.cve_concurrency = 1;
+        let mut opts16 = base_opts;
+        opts16.cve_concurrency = 16;
+
+        let report1 = run(&opts1).expect("run ok");
+        let report16 = run(&opts16).expect("run ok");
+
+        fn cve_snapshot(report: &VerifyReport) -> Vec<(String, String, String, String)> {
+            report
+                .cve_outcomes
+                .iter()
+                .map(|o| {
+                    let (dep, tag) = match o {
+                        CveLookupOutcome::Clean { dep } => (dep, "clean"),
+                        CveLookupOutcome::Error { dep, .. } => (dep, "error"),
+                        CveLookupOutcome::Vulnerable(f) => (&f.dep, "vulnerable"),
+                    };
+                    (
+                        dep.ecosystem.label().to_string(),
+                        dep.name.clone(),
+                        dep.version.clone(),
+                        tag.to_string(),
+                    )
+                })
+                .collect()
+        }
+        assert_eq!(cve_snapshot(&report1), cve_snapshot(&report16));
     }
 
     fn fixture_deps_dir(name: &str) -> PathBuf {
