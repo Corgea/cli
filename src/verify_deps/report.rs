@@ -25,8 +25,8 @@ pub fn format_cve_finding(finding: &CveFinding) -> String {
         .filter_map(|m| m.fixed_version.clone())
         .collect();
     let best_fixed = super::pick_highest_fixed(dep.ecosystem, &fixed_candidates);
-    let fix_seg = match &best_fixed {
-        Some(v) => format!(", fix: upgrade to {}", v),
+    let fix_line = match &best_fixed {
+        Some(v) => format!("\n  → upgrade to {}", v),
         None => String::new(),
     };
     finding
@@ -44,21 +44,22 @@ pub fn format_cve_finding(finding: &CveFinding) -> String {
             } else {
                 TerminalColor::Yellow
             };
-            let url_seg = match detail.as_ref().and_then(|d| d.url.as_deref()) {
-                Some(u) => format!(", {}", set_text_color(u, TerminalColor::Blue)),
+            let badge = if m.tier == 1 { " [TOP-FIX]" } else { "" };
+            let url_line = match detail.as_ref().and_then(|d| d.url.as_deref()) {
+                Some(u) => format!("\n  {}", set_text_color(u, TerminalColor::Blue)),
                 None => String::new(),
             };
             set_text_color(
                 &format!(
-                    "✗ {} {}@{}: {} (severity: {}, tier: {}{}{})",
+                    "✗ {} {}@{}: {}{} (severity: {}){}{}",
                     dep.ecosystem.label(),
                     dep.name,
                     dep.version,
                     m.advisory_id,
+                    badge,
                     m.severity_level,
-                    m.tier,
-                    fix_seg,
-                    url_seg,
+                    fix_line,
+                    url_line,
                 ),
                 color,
             )
@@ -475,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn format_cve_finding_includes_fix_version() {
+    fn format_cve_finding_includes_fix_line_and_badge_for_tier_one() {
         let finding = CveFinding {
             dep: Dependency {
                 name: "lodash".into(),
@@ -495,8 +496,47 @@ mod tests {
         };
         let line = format_cve_finding(&finding);
         assert!(
-            line.contains("fix: upgrade to 4.17.21"),
-            "expected 'fix: upgrade to 4.17.21' in: {}",
+            line.contains("→ upgrade to 4.17.21"),
+            "expected '→ upgrade to 4.17.21' in: {}",
+            line
+        );
+        assert!(
+            line.contains("[TOP-FIX]"),
+            "expected '[TOP-FIX]' badge in: {}",
+            line
+        );
+        assert!(!line.contains("tier: "), "tier: substring leaked: {}", line);
+    }
+
+    #[test]
+    fn format_cve_finding_hides_badge_for_tier_two() {
+        let finding = CveFinding {
+            dep: Dependency {
+                name: "lodash".into(),
+                version: "4.17.20".into(),
+                ecosystem: DependencyEcosystem::Npm,
+                source: "package-lock.json".into(),
+                dev: false,
+            },
+            matches: vec![VulnMatch {
+                advisory_id: "GHSA-tier-two".into(),
+                severity_level: "low".into(),
+                tier: 2,
+                vulnerable_version_range: None,
+                fixed_version: Some("4.17.21".into()),
+            }],
+            advisory_details: vec![None],
+        };
+        let line = format_cve_finding(&finding);
+        assert!(
+            !line.contains("[TOP-FIX]"),
+            "tier-2 should not render badge: {}",
+            line
+        );
+        assert!(!line.contains("tier: "), "tier: substring leaked: {}", line);
+        assert!(
+            line.contains("→ upgrade to 4.17.21"),
+            "fix line missing: {}",
             line
         );
     }
@@ -527,7 +567,7 @@ mod tests {
             advisory_details: vec![None, None, None],
         };
         let line = format_cve_finding(&finding);
-        assert!(line.contains("fix: upgrade to 1.2.0"), "got: {}", line);
-        assert!(!line.contains("fix: upgrade to 1.0.0"), "got: {}", line);
+        assert!(line.contains("→ upgrade to 1.2.0"), "got: {}", line);
+        assert!(!line.contains("→ upgrade to 1.0.0"), "got: {}", line);
     }
 }

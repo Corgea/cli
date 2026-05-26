@@ -993,8 +993,18 @@ mod tests {
         let text_line = format_cve_finding(report.cve_findings()[0]);
         assert!(text_line.contains("GHSA-integration-test"));
         assert!(
-            text_line.contains("fix: upgrade to 4.17.21"),
-            "expected fix-version substring, got: {}",
+            text_line.contains("→ upgrade to 4.17.21"),
+            "expected fix continuation line, got: {}",
+            text_line
+        );
+        assert!(
+            text_line.contains("[TOP-FIX]"),
+            "expected [TOP-FIX] badge on tier-1 line, got: {}",
+            text_line
+        );
+        assert!(
+            !text_line.contains("tier: "),
+            "tier: substring leaked into text output: {}",
             text_line
         );
 
@@ -1084,7 +1094,13 @@ mod tests {
         assert!(finding.advisory_details[0].is_some());
 
         let line = format_cve_finding(finding);
-        assert!(line.contains("fix: upgrade to 4.17.21"), "got: {}", line);
+        assert!(line.contains("→ upgrade to 4.17.21"), "got: {}", line);
+        assert!(
+            line.contains("[TOP-FIX]"),
+            "expected tier-1 badge: {}",
+            line
+        );
+        assert!(!line.contains("tier: "), "tier: substring leaked: {}", line);
         assert!(
             line.contains("https://github.com/advisories/GHSA-integration-test"),
             "got: {}",
@@ -1225,7 +1241,13 @@ mod tests {
 
         let line = format_cve_finding(f);
         assert!(line.contains("GHSA-no-detail"), "got: {}", line);
-        assert!(line.contains("fix: upgrade to 4.17.21"), "got: {}", line);
+        assert!(line.contains("→ upgrade to 4.17.21"), "got: {}", line);
+        assert!(
+            line.contains("[TOP-FIX]"),
+            "expected tier-1 badge: {}",
+            line
+        );
+        assert!(!line.contains("tier: "), "tier: substring leaked: {}", line);
         assert!(
             !line.contains("https://"),
             "should not render URL: {}",
