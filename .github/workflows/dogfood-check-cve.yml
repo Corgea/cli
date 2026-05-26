@@ -10,16 +10,23 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/dogfood-check-cve.yml'
 
+env:
+  CORGEA_TOKEN: ci-stub-token
+  CORGEA_NPM_REGISTRY: http://127.0.0.1:1
+
 jobs:
   vulnerable-fixture-blocks-build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
+      - run: cargo build --release --bin corgea --bin vuln-api-stub
+      - name: Start vuln-api stub
+        run: |
+          ./target/release/vuln-api-stub --fixtures fixtures/deps/vuln-api-stub.json --print-url > stub.url &
+          echo "CORGEA_VULN_API_URL=$(cat stub.url)" >> "$GITHUB_ENV"
+          sleep 1
       - name: Run against vulnerable fixture; expect exit 1
-        env:
-          CORGEA_TOKEN: ${{ secrets.CORGEA_CI_TOKEN }}
         run: |
           set +e
           ./target/release/corgea deps --check-cve --fail-cve --path fixtures/deps/npm
@@ -34,8 +41,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
+      - run: cargo build --release --bin corgea --bin vuln-api-stub
+      - name: Start vuln-api stub
+        run: |
+          ./target/release/vuln-api-stub --fixtures fixtures/deps/vuln-api-stub.json --print-url > stub.url &
+          echo "CORGEA_VULN_API_URL=$(cat stub.url)" >> "$GITHUB_ENV"
+          sleep 1
       - name: Run against clean fixture; expect exit 0
-        env:
-          CORGEA_TOKEN: ${{ secrets.CORGEA_CI_TOKEN }}
         run: ./target/release/corgea deps --check-cve --fail-cve --path fixtures/deps/npm-clean

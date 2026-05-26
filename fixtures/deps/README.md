@@ -17,6 +17,23 @@ Sample apps for manually testing `corgea deps` and install wrappers (`corgea npm
 | `python-poetry/` | Python | `poetry.lock` | Poetry lock discovery |
 | `python-uv/` | Python | `uv.lock` | uv lock discovery |
 
+## vuln-api e2e stub
+
+Offline dogfood and GitHub Actions use [`vuln-api-stub.json`](vuln-api-stub.json) with the `vuln-api-stub` binary:
+
+```bash
+cargo build --release --bin vuln-api-stub --bin corgea
+./target/release/vuln-api-stub --fixtures fixtures/deps/vuln-api-stub.json --print-url &
+export CORGEA_VULN_API_URL=http://127.0.0.1:<port>
+export CORGEA_TOKEN=ci-stub-token
+export CORGEA_NPM_REGISTRY=http://127.0.0.1:1
+
+./target/release/corgea deps --check-cve --fail-cve --path fixtures/deps/npm      # expect exit 1
+./target/release/corgea deps --check-cve --fail-cve --path fixtures/deps/npm-clean # expect exit 0
+```
+
+Unlisted `(ecosystem, name, version)` keys in the fixture file default to **clean** responses.
+
 ## Manual dogfood
 
 ```bash

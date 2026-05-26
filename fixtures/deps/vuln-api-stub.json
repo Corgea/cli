@@ -1,0 +1,25 @@
+{
+  "package_checks": {
+    "npm/lodash/4.17.20": {
+      "ecosystem": "npm",
+      "package_name": "lodash",
+      "version": "4.17.20",
+      "is_vulnerable": true,
+      "matches": [
+        {
+          "advisory_id": "CVE-2019-10744",
+          "severity_level": "high",
+          "tier": 1,
+          "vulnerable_version_range": "< 4.17.21",
+          "fixed_version": "4.17.21"
+        }
+      ]
+    }
+  },
+  "advisories": {
+    "CVE-2019-10744": {
+      "id": "CVE-2019-10744",
+      "source_url": "https://corgea.app/advisories/CVE-2019-10744"
+    }
+  }
+}
