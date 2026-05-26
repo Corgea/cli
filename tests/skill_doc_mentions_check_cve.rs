@@ -27,6 +27,14 @@ fn deps_help_mentions_login_and_docs() {
         stdout.contains("--check-cve"),
         "expected --check-cve flag in deps --help, got: {stdout}"
     );
+    assert!(
+        stdout.contains("--severity"),
+        "expected --severity flag in deps --help, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("docs.corgea.app/cli/deps#severity"),
+        "expected severity docs URL in deps --help, got: {stdout}"
+    );
 }
 
 #[test]
@@ -68,6 +76,10 @@ fn skill_md_mentions_check_cve() {
         "SKILL.md missing --fail-cve"
     );
     assert!(
+        content.contains("--severity"),
+        "SKILL.md missing --severity"
+    );
+    assert!(
         content.contains("docs.corgea.app/cli/deps") || content.contains("vuln-api.corgea.app"),
         "SKILL.md missing docs or vuln-api reference"
     );
@@ -86,6 +98,10 @@ fn readme_mentions_deps_cve() {
     assert!(
         content.contains("--check-cve"),
         "README.md missing --check-cve"
+    );
+    assert!(
+        content.contains("--severity"),
+        "README.md missing --severity"
     );
     assert!(
         content.contains("docs.corgea.app/cli/deps"),

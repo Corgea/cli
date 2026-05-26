@@ -11,6 +11,9 @@ pub mod npm;
 pub mod python;
 pub mod registry;
 pub mod report;
+pub mod severity;
+
+pub use severity::{parse_severity_floor_arg, SeverityFloor, SeverityLevel};
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -153,6 +156,10 @@ pub struct VerifyOptions {
     /// Max in-flight vuln-api package-check requests when `check_cve` is true.
     /// Ignored when `check_cve` is false. Default 8, clamped 1..32 by clap.
     pub cve_concurrency: usize,
+    /// Minimum severity required to trip `--fail-cve`. Defaults to
+    /// `SeverityFloor::Any` (chunk-02 behavior: fail on any finding).
+    /// Ignored when `check_cve` is false.
+    pub severity_floor: SeverityFloor,
 }
 
 impl Default for VerifyOptions {
@@ -172,6 +179,7 @@ impl Default for VerifyOptions {
             vuln_api_url: None,
             vuln_api_token: None,
             cve_concurrency: 8,
+            severity_floor: SeverityFloor::Any,
         }
     }
 }
@@ -204,6 +212,7 @@ impl VerifyOptions {
             vuln_api_url: None,
             vuln_api_token: None,
             cve_concurrency: 8,
+            severity_floor: SeverityFloor::Any,
         }
     }
 }
@@ -431,6 +440,7 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
         scanned_at: now,
         check_cve: opts.check_cve,
         cve_outcomes,
+        severity_floor: opts.severity_floor.clone(),
     })
 }
 
@@ -444,6 +454,9 @@ pub struct VerifyReport {
     pub scanned_at: DateTime<Utc>,
     pub check_cve: bool,
     pub cve_outcomes: Vec<CveLookupOutcome>,
+    /// Copy of `VerifyOptions::severity_floor` so renderers can produce
+    /// the floor-aware summary without `main.rs` having to thread it in.
+    pub severity_floor: SeverityFloor,
 }
 
 impl VerifyReport {
@@ -496,6 +509,50 @@ impl VerifyReport {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Findings whose worst-severity match meets `self.severity_floor`.
+    /// Uses `SeverityLevel::parse_lossy` so unknown server strings collapse
+    /// to `Info` and remain catchable by `Any` / low floors.
+    pub fn cve_findings_above_floor(&self) -> Vec<&CveFinding> {
+        self.cve_findings()
+            .into_iter()
+            .filter(|f| {
+                f.matches.iter().any(|m| {
+                    self.severity_floor
+                        .includes(SeverityLevel::parse_lossy(&m.severity_level))
+                })
+            })
+            .collect()
+    }
+
+    /// Count of findings filtered out by the floor (i.e. `cve_findings -
+    /// cve_findings_above_floor`). A finding is counted iff none of its
+    /// matches meet the floor. Pinned by tests for downstream tooling; the
+    /// text/JSON rendering uses match-level granularity via
+    /// [`Self::cve_below_floor_matches_count`].
+    #[allow(dead_code)]
+    pub fn cve_findings_below_floor_count(&self) -> usize {
+        self.cve_findings().len() - self.cve_findings_above_floor().len()
+    }
+
+    /// Count of individual advisory matches whose severity is below the
+    /// floor. Counts across all findings — so a single finding with a
+    /// critical match + a high match contributes 1 to this count when
+    /// the floor is `AtLeast(Critical)`. Used by `print_text` /
+    /// `print_json` to surface the "N findings below --severity floor"
+    /// note (granularity is matches, since the user sees one rendered
+    /// line per match).
+    pub fn cve_below_floor_matches_count(&self) -> usize {
+        self.cve_findings()
+            .iter()
+            .flat_map(|f| f.matches.iter())
+            .filter(|m| {
+                !self
+                    .severity_floor
+                    .includes(SeverityLevel::parse_lossy(&m.severity_level))
+            })
+            .count()
     }
 }
 
@@ -1620,5 +1677,157 @@ mod tests {
         let names: Vec<_> = result.deps.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"django"));
         assert!(names.contains(&"urllib3"));
+    }
+
+    mod severity_floor_accessors {
+        use super::super::{
+            CveFinding, CveLookupOutcome, Dependency, DependencyEcosystem, SeverityFloor,
+            SeverityLevel, VerifyReport,
+        };
+        use crate::vuln_api::VulnMatch;
+        use chrono::Utc;
+        use std::collections::BTreeSet;
+        use std::time::Duration;
+
+        fn dep(name: &str) -> Dependency {
+            Dependency {
+                name: name.into(),
+                version: "1.0.0".into(),
+                ecosystem: DependencyEcosystem::Npm,
+                source: "package-lock.json".into(),
+                dev: false,
+            }
+        }
+
+        fn vuln_match(advisory: &str, severity: &str) -> VulnMatch {
+            VulnMatch {
+                advisory_id: advisory.into(),
+                severity_level: severity.into(),
+                tier: 2,
+                vulnerable_version_range: None,
+                fixed_version: None,
+            }
+        }
+
+        fn finding(name: &str, matches: Vec<VulnMatch>) -> CveFinding {
+            let advisory_details = vec![None; matches.len()];
+            CveFinding {
+                dep: dep(name),
+                matches,
+                advisory_details,
+            }
+        }
+
+        fn report_with_findings(findings: Vec<CveFinding>, floor: SeverityFloor) -> VerifyReport {
+            let cve_outcomes: Vec<CveLookupOutcome> = findings
+                .into_iter()
+                .map(CveLookupOutcome::Vulnerable)
+                .collect();
+            VerifyReport {
+                sources: vec![],
+                outcomes: vec![],
+                unpinned_warnings: vec![],
+                threshold: Duration::from_secs(0),
+                scanned_at: Utc::now(),
+                check_cve: true,
+                cve_outcomes,
+                severity_floor: floor,
+            }
+        }
+
+        #[test]
+        fn above_floor_returns_all_findings_for_any() {
+            let report = report_with_findings(
+                vec![
+                    finding("critical-pkg", vec![vuln_match("a", "critical")]),
+                    finding("high-pkg", vec![vuln_match("b", "high")]),
+                    finding("low-pkg", vec![vuln_match("c", "low")]),
+                ],
+                SeverityFloor::Any,
+            );
+            assert_eq!(report.cve_findings_above_floor().len(), 3);
+            assert_eq!(report.cve_findings_below_floor_count(), 0);
+        }
+
+        #[test]
+        fn above_floor_at_least_critical_only_matches_critical() {
+            let report = report_with_findings(
+                vec![
+                    finding("critical-pkg", vec![vuln_match("a", "critical")]),
+                    finding("high-pkg", vec![vuln_match("b", "high")]),
+                ],
+                SeverityFloor::AtLeast(SeverityLevel::Critical),
+            );
+            assert_eq!(report.cve_findings_above_floor().len(), 1);
+            assert_eq!(report.cve_findings_below_floor_count(), 1);
+            assert_eq!(
+                report.cve_findings_above_floor()[0].dep.name,
+                "critical-pkg"
+            );
+        }
+
+        #[test]
+        fn above_floor_at_least_low_matches_low_through_critical() {
+            let report = report_with_findings(
+                vec![
+                    finding("critical-pkg", vec![vuln_match("a", "critical")]),
+                    finding("high-pkg", vec![vuln_match("b", "high")]),
+                    finding("low-pkg", vec![vuln_match("c", "low")]),
+                ],
+                SeverityFloor::AtLeast(SeverityLevel::Low),
+            );
+            assert_eq!(report.cve_findings_above_floor().len(), 3);
+            assert_eq!(report.cve_findings_below_floor_count(), 0);
+        }
+
+        #[test]
+        fn above_floor_one_of_matches_exact_set() {
+            let mut set = BTreeSet::new();
+            set.insert(SeverityLevel::Critical);
+            set.insert(SeverityLevel::High);
+            let report = report_with_findings(
+                vec![
+                    finding("critical-pkg", vec![vuln_match("a", "critical")]),
+                    finding("medium-pkg", vec![vuln_match("b", "medium")]),
+                    finding("high-pkg", vec![vuln_match("c", "high")]),
+                ],
+                SeverityFloor::OneOf(set),
+            );
+            assert_eq!(report.cve_findings_above_floor().len(), 2);
+            assert_eq!(report.cve_findings_below_floor_count(), 1);
+        }
+
+        #[test]
+        fn above_floor_uses_any_match_semantics_for_multi_match_finding() {
+            // A single finding with one critical and one low match should
+            // count as above-floor for AtLeast(Critical).
+            let report = report_with_findings(
+                vec![finding(
+                    "mixed-pkg",
+                    vec![vuln_match("a", "low"), vuln_match("b", "critical")],
+                )],
+                SeverityFloor::AtLeast(SeverityLevel::Critical),
+            );
+            assert_eq!(report.cve_findings_above_floor().len(), 1);
+            assert_eq!(report.cve_findings_below_floor_count(), 0);
+        }
+
+        #[test]
+        fn above_floor_unknown_severity_treated_as_info() {
+            // Server emits "unknown" — must not silently drop from Any / low
+            // floors. Critical floor must filter it out.
+            let report_any = report_with_findings(
+                vec![finding("weird-pkg", vec![vuln_match("a", "unknown")])],
+                SeverityFloor::Any,
+            );
+            assert_eq!(report_any.cve_findings_above_floor().len(), 1);
+
+            let report_critical = report_with_findings(
+                vec![finding("weird-pkg", vec![vuln_match("a", "unknown")])],
+                SeverityFloor::AtLeast(SeverityLevel::Critical),
+            );
+            assert_eq!(report_critical.cve_findings_above_floor().len(), 0);
+            assert_eq!(report_critical.cve_findings_below_floor_count(), 1);
+        }
     }
 }

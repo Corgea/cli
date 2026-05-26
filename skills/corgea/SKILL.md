@@ -135,6 +135,7 @@ corgea deps --json                           # machine-readable output
 | `--path` | `-p` | Project directory (default: `.`) |
 | `--check-cve` | | Query Corgea vulnerability database for known CVEs/advisories (requires login) |
 | `--fail-cve` | | Exit non-zero if any known CVE is found (requires `--check-cve`) |
+| `--severity` | | Minimum severity to trip `--fail-cve` (`critical|high|medium|low|info`, comma list for exact set, or `any` for default). Requires `--fail-cve`. |
 
 ### CVE detection
 
@@ -146,6 +147,9 @@ corgea deps --check-cve
 
 # CI: fail the build on any known CVE
 corgea deps --check-cve --fail-cve
+
+# CI: fail only on critical CVEs (high/medium/low still render).
+corgea deps --check-cve --fail-cve --severity critical
 ```
 
 Example finding:
@@ -157,6 +161,8 @@ Example finding:
 ```
 
 With `--json`, each dependency in `results[]` includes a `cves[]` array and `cve_status` label. Top-level `cve_summary` reports counts (`checked`, `vulnerable`, `clean`, `errors`, `unpinned_not_checked`). CVE fields are omitted when `--check-cve` is not passed.
+
+`cve_summary` also carries `severity_floor` (the rendered `--severity` value, default `"any"`) and `vulnerable_above_floor` (count of findings that meet the floor; equals `vulnerable` when floor is `any`).
 
 | Override | Where | Default |
 |----------|-------|---------|

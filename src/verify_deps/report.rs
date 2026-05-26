@@ -6,7 +6,7 @@ use serde_json::json;
 
 use crate::utils::terminal::{set_text_color, TerminalColor};
 
-use super::{format_duration, CveFinding, Dependency, LookupOutcome, VerifyReport};
+use super::{format_duration, CveFinding, Dependency, LookupOutcome, SeverityFloor, VerifyReport};
 
 fn dep_key(dep: &Dependency) -> (String, String, String) {
     (
@@ -147,8 +147,18 @@ pub fn print_text(report: &VerifyReport) {
         let cve_errors = report.cve_errors();
 
         let checked = report.cve_outcomes.len();
-        if cve_findings.is_empty() && cve_errors.is_empty() {
-            if checked == 0 {
+        if cve_findings.is_empty() {
+            if !cve_errors.is_empty() {
+                // Findings empty but errors present — without this line the
+                // "Known vulnerabilities:" section looks half-rendered.
+                println!(
+                    "  {}",
+                    set_text_color(
+                        "✗ CVE check did not complete — see errors below",
+                        TerminalColor::Red,
+                    )
+                );
+            } else if checked == 0 {
                 println!(
                     "  {}",
                     set_text_color(
@@ -174,14 +184,31 @@ pub fn print_text(report: &VerifyReport) {
                     println!("  {}", line);
                 }
             }
-            if !cve_findings.is_empty() {
-                println!(
-                    "  {}",
-                    set_text_color(
-                        &format!("note: {} dependencies CVE-checked", checked),
-                        TerminalColor::Yellow,
-                    )
-                );
+            println!(
+                "  {}",
+                set_text_color(
+                    &format!("note: {} dependencies CVE-checked", checked),
+                    TerminalColor::Yellow,
+                )
+            );
+            let below_floor = report.cve_below_floor_matches_count();
+            if below_floor > 0 {
+                let note = match &report.severity_floor {
+                    SeverityFloor::Any => None,
+                    SeverityFloor::AtLeast(_) => Some(format!(
+                        "note: {} advisory matches below --severity floor ({}) — informational only",
+                        below_floor,
+                        report.severity_floor.label()
+                    )),
+                    SeverityFloor::OneOf(_) => Some(format!(
+                        "note: {} advisory matches outside --severity set ({}) — informational only",
+                        below_floor,
+                        report.severity_floor.label()
+                    )),
+                };
+                if let Some(note) = note {
+                    println!("  {}", set_text_color(&note, TerminalColor::Yellow));
+                }
             }
         }
 
@@ -242,7 +269,7 @@ pub fn print_text(report: &VerifyReport) {
         println!(
             "{}",
             set_text_color(
-                "All dependencies are older than the threshold.",
+                "All dependencies are older than the freshness threshold.",
                 TerminalColor::Green,
             )
         );
@@ -286,7 +313,14 @@ impl CveStatus {
 /// (e.g. 404 on `/v1/advisories/:id`).
 ///
 /// Top-level `cve_summary` is present when `--check-cve` was passed:
-/// `{ checked, vulnerable, clean, errors, unpinned_not_checked }`.
+/// `{ checked, vulnerable, clean, errors, unpinned_not_checked,
+/// severity_floor, vulnerable_above_floor }`.
+///
+/// `severity_floor` is the rendered `--severity` value (`"any"` |
+/// `"critical"` | ... | `"critical,high"` — comma-joined descending for
+/// `OneOf`). `vulnerable_above_floor` is the count of findings whose
+/// worst-severity match meets the floor; equals `vulnerable` when the
+/// floor is `"any"`. Both keys are always present in `cve_summary`.
 /// It is omitted when CVE checking was not requested.
 pub fn print_json(report: &VerifyReport) {
     let mut cve_by_dep: HashMap<(String, String, String), CveStatus> = HashMap::new();
@@ -424,6 +458,7 @@ pub fn print_json(report: &VerifyReport) {
 
     if report.check_cve {
         let vulnerable = report.cve_findings().len();
+        let vulnerable_above_floor = report.cve_findings_above_floor().len();
         let errors = report.cve_errors().len();
         let clean = report
             .cve_outcomes
@@ -436,6 +471,8 @@ pub fn print_json(report: &VerifyReport) {
             "clean": clean,
             "errors": errors,
             "unpinned_not_checked": report.unpinned_warnings.len(),
+            "severity_floor": report.severity_floor.label(),
+            "vulnerable_above_floor": vulnerable_above_floor,
         });
         body.as_object_mut()
             .expect("top-level JSON is an object")

@@ -43,6 +43,11 @@ CVE gate — requires `corgea login` (or `CORGEA_TOKEN`):
 
 ```bash
 corgea deps --check-cve --fail-cve
+
+# Fail only on critical (or critical+high) CVEs; lower-severity
+# findings still render but do not block.
+corgea deps --check-cve --fail-cve --severity critical
+corgea deps --check-cve --fail-cve --severity critical,high
 ```
 
 See [Dependency Scanning (CLI)](https://docs.corgea.app/cli/deps) for flags, exit codes, CI integration, and self-hosted vuln-api setup.

@@ -211,6 +211,19 @@ fn check_cve_json_includes_cves_and_cve_summary() {
         summary.get("skipped").is_none(),
         "skipped key removed from cve_summary"
     );
+    // Severity-floor schema lock (chunk 08): both keys always present
+    // when cve_summary is emitted; default floor is "any" and
+    // vulnerable_above_floor == vulnerable.
+    assert_eq!(
+        summary.get("severity_floor").and_then(Value::as_str),
+        Some("any")
+    );
+    assert_eq!(
+        summary
+            .get("vulnerable_above_floor")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
 
     let results = body
         .get("results")
@@ -278,6 +291,22 @@ fn json_clean_deps_have_empty_cves_array() {
         Some(0)
     );
     assert!(semver.get("cve_error").is_none());
+
+    // Severity-floor schema lock (chunk 08): floor defaults to "any" and
+    // vulnerable_above_floor is 0 when there are no findings.
+    let summary = body
+        .get("cve_summary")
+        .expect("cve_summary should be present with --check-cve");
+    assert_eq!(
+        summary.get("severity_floor").and_then(Value::as_str),
+        Some("any")
+    );
+    assert_eq!(
+        summary
+            .get("vulnerable_above_floor")
+            .and_then(Value::as_u64),
+        Some(0)
+    );
 }
 
 #[test]
@@ -305,6 +334,34 @@ fn json_omits_cve_fields_without_check_cve() {
         assert!(dep.get("cves").is_none());
         assert!(dep.get("cve_status").is_none());
     }
+}
+
+#[test]
+fn cve_check_total_failure_renders_explicit_message() {
+    let fixture = npm_fixture_dir();
+    let env = [
+        ("CORGEA_VULN_API_URL", "http://127.0.0.1:1".to_string()),
+        ("CORGEA_TOKEN", "test-token".to_string()),
+        ("CORGEA_NPM_REGISTRY", "http://127.0.0.1:1".to_string()),
+    ];
+
+    let output = run_deps(
+        &[
+            "deps",
+            "--check-cve",
+            "-e",
+            "npm",
+            "-p",
+            fixture.to_str().unwrap(),
+        ],
+        &env,
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("✗ CVE check did not complete"),
+        "expected explicit failure message under 'Known vulnerabilities:'; stdout:\n{}",
+        stdout
+    );
 }
 
 #[test]

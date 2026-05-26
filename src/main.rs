@@ -271,6 +271,14 @@ enum Commands {
             help = "Exit with a non-zero status code if any known CVE is found. Requires --check-cve. Independent of --fail and --fail-unpinned. See https://docs.corgea.app/cli/deps#check-cve."
         )]
         fail_cve: bool,
+
+        #[arg(
+            long,
+            default_value = "any",
+            value_parser = verify_deps::parse_severity_floor_arg,
+            help = "Minimum severity required to trip --fail-cve. Single value (critical|high|medium|low|info) matches that level and above; comma-separated list (e.g. critical,high) matches exactly those levels; 'any' (default) matches everything. Requires --fail-cve when set to a non-'any' value. See https://docs.corgea.app/cli/deps#severity."
+        )]
+        severity: verify_deps::SeverityFloor,
     },
     /// Wrap `npm` install/add commands: verify registry publish times, then run npm.
     ///
@@ -655,7 +663,18 @@ fn main() {
             check_cve,
             fail_cve,
             cve_concurrency,
+            severity,
         }) => {
+            // Runtime validation: a non-`Any` --severity is meaningful only
+            // when --fail-cve is set (it gates the exit code). Explicit
+            // `--severity any` is a no-op and is accepted without
+            // --fail-cve so CI matrices can pass the flag unconditionally.
+            if !matches!(severity, verify_deps::SeverityFloor::Any) && !*fail_cve {
+                eprintln!("error: --severity requires --fail-cve.");
+                eprintln!("       See https://docs.corgea.app/cli/deps#severity");
+                std::process::exit(2);
+            }
+
             let parsed_ecosystem = match verify_deps::Ecosystem::parse(ecosystem) {
                 Ok(e) => e,
                 Err(e) => {
@@ -702,6 +721,7 @@ fn main() {
                 vuln_api_url,
                 vuln_api_token,
                 cve_concurrency: *cve_concurrency as usize,
+                severity_floor: severity.clone(),
             };
 
             match verify_deps::run(&opts) {
@@ -714,15 +734,16 @@ fn main() {
                     let recent = !report.recent().is_empty();
                     let errors = !report.errors().is_empty();
                     let unpinned = report.has_unpinned();
-                    let cve_vulnerable = !report.cve_findings().is_empty();
+                    let cve_vulnerable_any = !report.cve_findings().is_empty();
+                    let cve_vulnerable_above_floor = !report.cve_findings_above_floor().is_empty();
                     let cve_errored = !report.cve_errors().is_empty();
-                    if (recent || errors || cve_vulnerable || cve_errored) && opts.fail {
+                    if (recent || errors || cve_vulnerable_any || cve_errored) && opts.fail {
                         std::process::exit(1);
                     }
                     if unpinned && opts.fail_unpinned {
                         std::process::exit(1);
                     }
-                    if cve_vulnerable && opts.fail_cve {
+                    if cve_vulnerable_above_floor && opts.fail_cve {
                         std::process::exit(1);
                     }
                 }
