@@ -602,29 +602,29 @@ fn main() {
             let project_path =
                 std::path::PathBuf::from(path.clone().unwrap_or_else(|| ".".to_string()));
 
-            let configured_vuln_api_url = corgea_config.get_vuln_api_url();
-            let vuln_api_url = if *check_cve {
-                let token = corgea_config.get_token();
-                let has_token = !token.trim().is_empty();
-                if !has_token {
-                    eprintln!(
-                        "warning: --check-cve requires a Corgea token; CVE checks will be skipped. Run `corgea login` first."
-                    );
-                } else {
-                    utils::api::set_auth_token(&token);
-                }
-                if configured_vuln_api_url.is_none() {
+            let (vuln_api_url, vuln_api_token) = if *check_cve {
+                let configured_url = corgea_config.get_vuln_api_url();
+                let raw_token = corgea_config.get_token();
+                let trimmed_token = raw_token.trim().to_string();
+                let has_url = configured_url.is_some();
+                let has_token = !trimmed_token.is_empty();
+                if !has_url {
                     eprintln!(
                         "warning: --check-cve requires CORGEA_VULN_API_URL (or vuln_api_url in config); CVE checks will be skipped."
                     );
                 }
-                if has_token {
-                    configured_vuln_api_url
+                if !has_token {
+                    eprintln!(
+                        "warning: --check-cve requires a Corgea token; CVE checks will be skipped. Run `corgea login` first."
+                    );
+                }
+                if has_url && has_token {
+                    (configured_url, Some(trimmed_token))
                 } else {
-                    None
+                    (None, None)
                 }
             } else {
-                None
+                (None, None)
             };
 
             let opts = verify_deps::VerifyOptions {
@@ -639,6 +639,7 @@ fn main() {
                 pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
                 check_cve: *check_cve,
                 vuln_api_url,
+                vuln_api_token,
             };
 
             match verify_deps::run(&opts) {
@@ -651,7 +652,9 @@ fn main() {
                     let recent = !report.recent().is_empty();
                     let errors = !report.errors().is_empty();
                     let unpinned = report.has_unpinned();
-                    if (recent || errors) && opts.fail {
+                    let cve_vulnerable = !report.cve_findings().is_empty();
+                    let cve_errored = !report.cve_errors().is_empty();
+                    if (recent || errors || cve_vulnerable || cve_errored) && opts.fail {
                         std::process::exit(1);
                     }
                     if unpinned && opts.fail_unpinned {

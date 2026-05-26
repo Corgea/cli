@@ -112,6 +112,28 @@ pub struct CveFinding {
     pub matches: Vec<crate::vuln_api::VulnMatch>,
 }
 
+/// Why CVE checks did not run when the user passed `--check-cve`.
+///
+/// `None` means CVE checks ran (or weren't requested).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CveSkipReason {
+    /// `--check-cve` was passed without a configured `vuln_api_url`.
+    MissingUrl,
+    /// `--check-cve` was passed without a Corgea token.
+    MissingToken,
+}
+
+impl CveSkipReason {
+    pub fn message(&self) -> &'static str {
+        match self {
+            CveSkipReason::MissingUrl => {
+                "CORGEA_VULN_API_URL (or vuln_api_url in config) is not set"
+            }
+            CveSkipReason::MissingToken => "Corgea token is not set (run `corgea login`)",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VerifyOptions {
     pub ecosystem: Ecosystem,
@@ -132,6 +154,9 @@ pub struct VerifyOptions {
     pub check_cve: bool,
     /// Base URL for vuln-api (resolved from env/config in main.rs).
     pub vuln_api_url: Option<String>,
+    /// Token sent to vuln-api as `Authorization: Bearer …` (JWT) or
+    /// `CORGEA-TOKEN: …` (legacy). Resolved from config in main.rs.
+    pub vuln_api_token: Option<String>,
 }
 
 impl Default for VerifyOptions {
@@ -148,6 +173,7 @@ impl Default for VerifyOptions {
             pypi_registry: None,
             check_cve: false,
             vuln_api_url: None,
+            vuln_api_token: None,
         }
     }
 }
@@ -312,6 +338,42 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
     let mut outcomes: Vec<LookupOutcome> = Vec::with_capacity(deps.len());
     let mut cve_outcomes: Vec<CveLookupOutcome> = Vec::new();
 
+    // Resolve up-front whether CVE checks are reachable. Both URL and
+    // token must be present and non-empty after trimming; otherwise we
+    // report a skip rather than silently emitting all-zero CVE state.
+    let cve_skip_reason: Option<CveSkipReason> = if opts.check_cve {
+        let url_ok = opts
+            .vuln_api_url
+            .as_deref()
+            .map(|u| !u.trim().is_empty())
+            .unwrap_or(false);
+        let token_ok = opts
+            .vuln_api_token
+            .as_deref()
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false);
+        if !url_ok {
+            Some(CveSkipReason::MissingUrl)
+        } else if !token_ok {
+            Some(CveSkipReason::MissingToken)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let cve_active = opts.check_cve && cve_skip_reason.is_none();
+    let cve_base_url = opts
+        .vuln_api_url
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    let cve_token = opts
+        .vuln_api_token
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+
     for dep in deps {
         let dep_for_cve = dep.clone();
 
@@ -352,29 +414,28 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
             }
         }
 
-        if opts.check_cve {
-            if let Some(base_url) = opts.vuln_api_url.as_deref() {
-                match crate::vuln_api::check_package_version(
-                    base_url,
-                    dep_for_cve.ecosystem.vuln_api_ecosystem(),
-                    &dep_for_cve.name,
-                    &dep_for_cve.version,
-                ) {
-                    Ok(response) if response.is_vulnerable && !response.matches.is_empty() => {
-                        cve_outcomes.push(CveLookupOutcome::Vulnerable(CveFinding {
-                            dep: dep_for_cve,
-                            matches: response.matches,
-                        }));
-                    }
-                    Ok(_) => {
-                        cve_outcomes.push(CveLookupOutcome::Clean { dep: dep_for_cve });
-                    }
-                    Err(e) => {
-                        cve_outcomes.push(CveLookupOutcome::Error {
-                            dep: dep_for_cve,
-                            error: e.to_string(),
-                        });
-                    }
+        if cve_active {
+            match crate::vuln_api::check_package_version(
+                cve_base_url,
+                cve_token,
+                dep_for_cve.ecosystem.vuln_api_ecosystem(),
+                &dep_for_cve.name,
+                &dep_for_cve.version,
+            ) {
+                Ok(response) if response.is_vulnerable => {
+                    cve_outcomes.push(CveLookupOutcome::Vulnerable(CveFinding {
+                        dep: dep_for_cve,
+                        matches: response.matches,
+                    }));
+                }
+                Ok(_) => {
+                    cve_outcomes.push(CveLookupOutcome::Clean { dep: dep_for_cve });
+                }
+                Err(e) => {
+                    cve_outcomes.push(CveLookupOutcome::Error {
+                        dep: dep_for_cve,
+                        error: e.to_string(),
+                    });
                 }
             }
         }
@@ -388,6 +449,7 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
         scanned_at: now,
         check_cve: opts.check_cve,
         cve_outcomes,
+        cve_skip_reason,
     })
 }
 
@@ -401,6 +463,10 @@ pub struct VerifyReport {
     pub scanned_at: DateTime<Utc>,
     pub check_cve: bool,
     pub cve_outcomes: Vec<CveLookupOutcome>,
+    /// Set when `--check-cve` was requested but no lookups ran. Lets
+    /// the report distinguish "0 vulnerabilities found" from "0 checks
+    /// performed".
+    pub cve_skip_reason: Option<CveSkipReason>,
 }
 
 impl VerifyReport {
@@ -505,6 +571,7 @@ mod tests {
 
     struct VulnApiStub {
         base_url: String,
+        seen_auth: Arc<Mutex<Vec<String>>>,
         _handle: thread::JoinHandle<()>,
     }
 
@@ -515,15 +582,33 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let base_url = format!("http://127.0.0.1:{}", port);
         let fixtures = Arc::new(Mutex::new(fixtures));
+        let seen_auth: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_auth_thread = seen_auth.clone();
 
         let handle = thread::spawn(move || {
             for stream in listener.incoming().take(32) {
                 let Ok(mut stream) = stream else {
                     continue;
                 };
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]);
+                let mut buf = Vec::with_capacity(4096);
+                let mut chunk = [0u8; 1024];
+                while let Ok(n) = stream.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf);
+
+                for line in req.lines() {
+                    let lower = line.to_ascii_lowercase();
+                    if lower.starts_with("authorization:") || lower.starts_with("corgea-token:") {
+                        seen_auth_thread.lock().unwrap().push(line.to_string());
+                    }
+                }
 
                 let response_body = if let Some(path) =
                     req.lines().next().and_then(|l| l.split_whitespace().nth(1))
@@ -539,14 +624,23 @@ mod tests {
                         let name = urlencoding::decode(parts[3])
                             .unwrap_or_default()
                             .into_owned();
-                        let ver = parts[5].to_string();
+                        let ver = urlencoding::decode(parts[5])
+                            .unwrap_or_default()
+                            .into_owned();
                         fixtures
                             .lock()
                             .unwrap()
-                            .get(&(eco, name, ver))
+                            .get(&(eco.clone(), name.clone(), ver.clone()))
                             .map(|r| serde_json::to_string(r).unwrap())
                             .unwrap_or_else(|| {
-                                r#"{"is_vulnerable":false,"matches":[]}"#.to_string()
+                                serde_json::to_string(&crate::vuln_api::VulnCheckResponse {
+                                    ecosystem: eco,
+                                    package_name: name,
+                                    version: ver,
+                                    is_vulnerable: false,
+                                    matches: vec![],
+                                })
+                                .unwrap()
                             })
                     } else {
                         r#"{"error":"not found"}"#.to_string()
@@ -568,6 +662,7 @@ mod tests {
 
         VulnApiStub {
             base_url,
+            seen_auth,
             _handle: handle,
         }
     }
@@ -654,7 +749,6 @@ mod tests {
 
     #[test]
     fn check_cve_reports_vulnerabilities_from_stub() {
-        use crate::utils::api::set_auth_token;
         use crate::verify_deps::report::format_cve_finding;
 
         let mut fixtures = HashMap::new();
@@ -676,7 +770,6 @@ mod tests {
         );
 
         let stub = spawn_vuln_api_stub(fixtures);
-        set_auth_token("test-token");
 
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
@@ -696,6 +789,7 @@ mod tests {
             path: dir.path().to_path_buf(),
             check_cve: true,
             vuln_api_url: Some(stub.base_url.clone()),
+            vuln_api_token: Some("test-token".into()),
             npm_registry: Some("http://127.0.0.1:1".into()),
             ..Default::default()
         };
@@ -706,20 +800,92 @@ mod tests {
             report.cve_findings()[0].matches[0].advisory_id,
             "GHSA-integration-test"
         );
+        assert!(report.cve_skip_reason.is_none());
 
         let text_line = format_cve_finding(report.cve_findings()[0]);
         assert!(text_line.contains("GHSA-integration-test"));
+
+        // Auth header must have been attached.
+        let auth = stub.seen_auth.lock().unwrap().clone();
+        assert!(
+            auth.iter()
+                .any(|h| h.to_ascii_lowercase().contains("corgea-token: test-token")),
+            "expected CORGEA-TOKEN header, got: {:?}",
+            auth
+        );
 
         let opts_off = VerifyOptions {
             ecosystem: Ecosystem::Npm,
             path: dir.path().to_path_buf(),
             check_cve: false,
             vuln_api_url: None,
+            vuln_api_token: None,
             npm_registry: Some("http://127.0.0.1:1".into()),
             ..Default::default()
         };
         let report_off = run(&opts_off).expect("run should succeed");
         assert!(!report_off.check_cve);
         assert!(report_off.cve_outcomes.is_empty());
+        assert!(report_off.cve_skip_reason.is_none());
+    }
+
+    #[test]
+    fn check_cve_skipped_when_url_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{
+            "name": "demo", "version": "1.0.0", "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "demo", "version": "1.0.0" },
+                "node_modules/lodash": { "version": "4.17.20" }
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let opts = VerifyOptions {
+            ecosystem: Ecosystem::Npm,
+            path: dir.path().to_path_buf(),
+            check_cve: true,
+            vuln_api_url: None,
+            vuln_api_token: Some("test-token".into()),
+            npm_registry: Some("http://127.0.0.1:1".into()),
+            ..Default::default()
+        };
+        let report = run(&opts).expect("run should succeed");
+        assert!(report.check_cve);
+        assert!(report.cve_outcomes.is_empty());
+        assert_eq!(report.cve_skip_reason, Some(CveSkipReason::MissingUrl));
+    }
+
+    #[test]
+    fn check_cve_skipped_when_token_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{
+            "name": "demo", "version": "1.0.0", "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "demo", "version": "1.0.0" },
+                "node_modules/lodash": { "version": "4.17.20" }
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let opts = VerifyOptions {
+            ecosystem: Ecosystem::Npm,
+            path: dir.path().to_path_buf(),
+            check_cve: true,
+            vuln_api_url: Some("http://example.invalid".into()),
+            vuln_api_token: None,
+            npm_registry: Some("http://127.0.0.1:1".into()),
+            ..Default::default()
+        };
+        let report = run(&opts).expect("run should succeed");
+        assert!(report.check_cve);
+        assert!(report.cve_outcomes.is_empty());
+        assert_eq!(report.cve_skip_reason, Some(CveSkipReason::MissingToken));
     }
 }

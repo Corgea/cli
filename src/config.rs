@@ -105,13 +105,13 @@ impl Config {
     }
 
     pub fn get_vuln_api_url(&self) -> Option<String> {
-        let url = crate::utils::generic::get_env_var_if_exists("CORGEA_VULN_API_URL")
+        let raw = crate::utils::generic::get_env_var_if_exists("CORGEA_VULN_API_URL")
             .or_else(|| self.vuln_api_url.clone())?;
-
-        if url.ends_with('/') {
-            Some(url.trim_end_matches('/').to_string())
+        let trimmed = raw.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            None
         } else {
-            Some(url)
+            Some(trimmed.to_string())
         }
     }
 }

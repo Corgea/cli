@@ -114,42 +114,65 @@ pub fn print_text(report: &VerifyReport) {
     }
 
     if report.check_cve {
-        let cve_findings = report.cve_findings();
-        let cve_errors = report.cve_errors();
-
         println!();
         println!(
             "{}",
             set_text_color("Known vulnerabilities:", TerminalColor::Yellow)
         );
 
-        if cve_findings.is_empty() && cve_errors.is_empty() {
+        if let Some(reason) = &report.cve_skip_reason {
             println!(
                 "  {}",
-                set_text_color("✓ no known vulnerabilities", TerminalColor::Green)
+                set_text_color(
+                    &format!("⚠ CVE checks skipped — {}", reason.message()),
+                    TerminalColor::Yellow,
+                )
             );
         } else {
-            for finding in &cve_findings {
-                for line in format_cve_finding(finding).lines() {
-                    println!("  {}", line);
+            let cve_findings = report.cve_findings();
+            let cve_errors = report.cve_errors();
+
+            if cve_findings.is_empty() && cve_errors.is_empty() {
+                println!(
+                    "  {}",
+                    set_text_color("✓ no known vulnerabilities", TerminalColor::Green)
+                );
+            } else {
+                for finding in &cve_findings {
+                    for line in format_cve_finding(finding).lines() {
+                        println!("  {}", line);
+                    }
                 }
             }
-        }
 
-        if !cve_errors.is_empty() {
-            println!();
-            println!(
-                "{}",
-                set_text_color("CVE lookup errors:", TerminalColor::Red)
-            );
-            for (dep, err) in &cve_errors {
+            if !cve_errors.is_empty() {
+                println!();
                 println!(
-                    "  {} {}@{} ({}): {}",
-                    set_text_color("✗", TerminalColor::Red),
-                    dep.name,
-                    dep.version,
-                    dep.ecosystem.label(),
-                    err,
+                    "{}",
+                    set_text_color("CVE lookup errors:", TerminalColor::Red)
+                );
+                for (dep, err) in &cve_errors {
+                    println!(
+                        "  {} {}@{} ({}): {}",
+                        set_text_color("✗", TerminalColor::Red),
+                        dep.name,
+                        dep.version,
+                        dep.ecosystem.label(),
+                        err,
+                    );
+                }
+            }
+
+            if !report.unpinned_warnings.is_empty() {
+                println!(
+                    "  {}",
+                    set_text_color(
+                        &format!(
+                            "note: {} unpinned dependency manifest(s) were not CVE-checked",
+                            report.unpinned_warnings.len()
+                        ),
+                        TerminalColor::Yellow,
+                    )
                 );
             }
         }
@@ -187,14 +210,34 @@ pub fn print_text(report: &VerifyReport) {
     }
 }
 
+/// Per-dep CVE status, kept distinct so downstream automation can
+/// tell apart "checked clean", "checked and failed", "lookup errored",
+/// and "never checked because the run was skipped".
+enum CveStatus {
+    Clean,
+    Vulnerable(Vec<serde_json::Value>),
+    Error(String),
+    NotChecked,
+}
+
+impl CveStatus {
+    fn label(&self) -> &'static str {
+        match self {
+            CveStatus::Clean => "clean",
+            CveStatus::Vulnerable(_) => "vulnerable",
+            CveStatus::Error(_) => "error",
+            CveStatus::NotChecked => "not_checked",
+        }
+    }
+}
+
 /// Render the report as a single JSON object on stdout.
 pub fn print_json(report: &VerifyReport) {
-    let mut cve_by_dep: HashMap<(String, String, String), Vec<serde_json::Value>> = HashMap::new();
-    if report.check_cve {
+    let mut cve_by_dep: HashMap<(String, String, String), CveStatus> = HashMap::new();
+    if report.check_cve && report.cve_skip_reason.is_none() {
         for outcome in &report.cve_outcomes {
             match outcome {
                 super::CveLookupOutcome::Vulnerable(f) => {
-                    let key = dep_key(&f.dep);
                     let entries: Vec<_> = f
                         .matches
                         .iter()
@@ -208,12 +251,14 @@ pub fn print_json(report: &VerifyReport) {
                             })
                         })
                         .collect();
-                    cve_by_dep.insert(key, entries);
+                    cve_by_dep.insert(dep_key(&f.dep), CveStatus::Vulnerable(entries));
                 }
                 super::CveLookupOutcome::Clean { dep } => {
-                    cve_by_dep.entry(dep_key(dep)).or_default();
+                    cve_by_dep.entry(dep_key(dep)).or_insert(CveStatus::Clean);
                 }
-                super::CveLookupOutcome::Error { .. } => {}
+                super::CveLookupOutcome::Error { dep, error } => {
+                    cve_by_dep.insert(dep_key(dep), CveStatus::Error(error.clone()));
+                }
             }
         }
     }
@@ -258,21 +303,40 @@ pub fn print_json(report: &VerifyReport) {
                 }),
             };
 
-            if report.check_cve {
-                let dep = match o {
-                    LookupOutcome::Ok { dep, .. } => dep,
-                    LookupOutcome::Recent(f) => &f.dep,
-                    LookupOutcome::Error { dep, .. } => dep,
-                };
-                let mut obj = obj;
-                let cves = cve_by_dep.get(&dep_key(dep)).cloned().unwrap_or_default();
-                obj.as_object_mut()
-                    .unwrap()
-                    .insert("cves".to_string(), json!(cves));
-                obj
-            } else {
-                obj
+            if !report.check_cve {
+                return obj;
             }
+
+            let dep = match o {
+                LookupOutcome::Ok { dep, .. } => dep,
+                LookupOutcome::Recent(f) => &f.dep,
+                LookupOutcome::Error { dep, .. } => dep,
+            };
+            let status = if report.cve_skip_reason.is_some() {
+                CveStatus::NotChecked
+            } else {
+                cve_by_dep
+                    .remove(&dep_key(dep))
+                    .unwrap_or(CveStatus::NotChecked)
+            };
+            let mut obj = obj;
+            let map = obj
+                .as_object_mut()
+                .expect("LookupOutcome JSON serializes as an object");
+            map.insert("cve_status".to_string(), json!(status.label()));
+            match status {
+                CveStatus::Vulnerable(cves) => {
+                    map.insert("cves".to_string(), json!(cves));
+                }
+                CveStatus::Clean => {
+                    map.insert("cves".to_string(), json!([]));
+                }
+                CveStatus::Error(err) => {
+                    map.insert("cve_error".to_string(), json!(err));
+                }
+                CveStatus::NotChecked => {}
+            }
+            obj
         })
         .collect();
 
@@ -304,22 +368,36 @@ pub fn print_json(report: &VerifyReport) {
     });
 
     if report.check_cve {
-        let vulnerable = report.cve_findings().len();
-        let errors = report.cve_errors().len();
-        let clean = report
-            .cve_outcomes
-            .iter()
-            .filter(|o| matches!(o, super::CveLookupOutcome::Clean { .. }))
-            .count();
-        body.as_object_mut().unwrap().insert(
-            "cve_summary".to_string(),
+        let summary = if let Some(reason) = &report.cve_skip_reason {
             json!({
+                "skipped": true,
+                "skipped_reason": reason.message(),
+                "checked": 0,
+                "vulnerable": 0,
+                "clean": 0,
+                "errors": 0,
+                "unpinned_not_checked": report.unpinned_warnings.len(),
+            })
+        } else {
+            let vulnerable = report.cve_findings().len();
+            let errors = report.cve_errors().len();
+            let clean = report
+                .cve_outcomes
+                .iter()
+                .filter(|o| matches!(o, super::CveLookupOutcome::Clean { .. }))
+                .count();
+            json!({
+                "skipped": false,
                 "checked": report.cve_outcomes.len(),
                 "vulnerable": vulnerable,
                 "clean": clean,
                 "errors": errors,
-            }),
-        );
+                "unpinned_not_checked": report.unpinned_warnings.len(),
+            })
+        };
+        body.as_object_mut()
+            .expect("top-level JSON is an object")
+            .insert("cve_summary".to_string(), summary);
     }
 
     println!("{}", serde_json::to_string_pretty(&body).unwrap());

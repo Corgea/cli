@@ -359,6 +359,7 @@ fn verify_npm_lockfile(opts: &PrecheckOptions) -> i32 {
         pypi_registry: opts.pypi_registry.clone(),
         check_cve: false,
         vuln_api_url: None,
+        vuln_api_token: None,
     };
     delegate_to_verify_deps(verify_opts)
 }
@@ -380,6 +381,7 @@ fn verify_lockfile_or_requirements(
             pypi_registry: opts.pypi_registry.clone(),
             check_cve: false,
             vuln_api_url: None,
+            vuln_api_token: None,
         };
         return delegate_to_verify_deps(verify_opts);
     }
@@ -424,6 +426,7 @@ fn verify_lockfile_or_requirements(
             pypi_registry: opts.pypi_registry.clone(),
             check_cve: false,
             vuln_api_url: None,
+            vuln_api_token: None,
         };
         let code = delegate_to_verify_deps(verify_opts);
         if code != 0 {
