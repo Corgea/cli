@@ -17,13 +17,17 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-
-      - name: Run unit tests
-        run: cargo test
-
-      - name: Deps dogfood fixture tests
-        run: cargo test deps_dogfood
+      - name: CI gate
+        run: ./harness ci
