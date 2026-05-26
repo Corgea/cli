@@ -584,7 +584,7 @@ fn pick_latest_stable(candidates: &[(String, DateTime<Utc>)]) -> Option<&(String
 /// `X.Y` or `X.Y.Z.postN` — the dotted-number form usually parses
 /// straight as semver if we pad to 3 components. Anything more exotic
 /// (`1.0a1`, `2!1.0`, etc.) is left alone and rejected by semver.
-fn normalize_for_semver(v: &str) -> String {
+pub(super) fn normalize_for_semver(v: &str) -> String {
     if v.contains('!')
         || v.contains('a')
         || v.contains('b')

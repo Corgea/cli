@@ -19,24 +19,46 @@ fn dep_key(dep: &Dependency) -> (String, String, String) {
 /// Format a single CVE finding line for text output. Public for integration tests.
 pub fn format_cve_finding(finding: &CveFinding) -> String {
     let dep = &finding.dep;
+    let fixed_candidates: Vec<String> = finding
+        .matches
+        .iter()
+        .filter_map(|m| m.fixed_version.clone())
+        .collect();
+    let best_fixed = super::pick_highest_fixed(dep.ecosystem, &fixed_candidates);
+    let fix_seg = match &best_fixed {
+        Some(v) => format!(", fix: upgrade to {}", v),
+        None => String::new(),
+    };
     finding
         .matches
         .iter()
-        .map(|m| {
+        .zip(
+            finding
+                .advisory_details
+                .iter()
+                .chain(std::iter::repeat(&None)),
+        )
+        .map(|(m, detail)| {
             let color = if m.tier == 1 {
                 TerminalColor::Red
             } else {
                 TerminalColor::Yellow
             };
+            let url_seg = match detail.as_ref().and_then(|d| d.url.as_deref()) {
+                Some(u) => format!(", {}", set_text_color(u, TerminalColor::Blue)),
+                None => String::new(),
+            };
             set_text_color(
                 &format!(
-                    "✗ {} {}@{}: {} (severity: {}, tier: {})",
+                    "✗ {} {}@{}: {} (severity: {}, tier: {}{}{})",
                     dep.ecosystem.label(),
                     dep.name,
                     dep.version,
                     m.advisory_id,
                     m.severity_level,
                     m.tier,
+                    fix_seg,
+                    url_seg,
                 ),
                 color,
             )
@@ -266,6 +288,12 @@ impl CveStatus {
 /// Lookup failures add `cve_error` instead of `cves`. When `--check-cve` was
 /// not passed, per-dep CVE fields are omitted entirely.
 ///
+/// Each entry of `cves` carries `advisory_id`, `severity_level`, `tier`,
+/// `vulnerable_version_range`, `fixed_version`, and `advisory_url`.
+/// The last two may be `null` when the server did not return a fix
+/// version or the advisory-detail lookup did not produce a URL
+/// (e.g. 404 on `/v1/advisories/:id`).
+///
 /// Top-level `cve_summary` is present when `--check-cve` was passed:
 /// `{ checked, vulnerable, clean, errors, skipped, skipped_reason?, unpinned_not_checked }`.
 /// It is omitted when CVE checking was not requested.
@@ -278,13 +306,16 @@ pub fn print_json(report: &VerifyReport) {
                     let entries: Vec<_> = f
                         .matches
                         .iter()
-                        .map(|m| {
+                        .zip(f.advisory_details.iter().chain(std::iter::repeat(&None)))
+                        .map(|(m, detail)| {
+                            let advisory_url = detail.as_ref().and_then(|d| d.url.clone());
                             json!({
                                 "advisory_id": m.advisory_id,
                                 "severity_level": m.severity_level,
                                 "tier": m.tier,
                                 "vulnerable_version_range": m.vulnerable_version_range,
                                 "fixed_version": m.fixed_version,
+                                "advisory_url": advisory_url,
                             })
                         })
                         .collect();
@@ -463,9 +494,67 @@ mod tests {
                 vulnerable_version_range: None,
                 fixed_version: None,
             }],
+            advisory_details: vec![None],
         };
         let line = format_cve_finding(&finding);
         assert!(line.contains("GHSA-test-advisory"));
         assert!(line.contains("lodash@4.17.20"));
+    }
+
+    #[test]
+    fn format_cve_finding_includes_fix_version() {
+        let finding = CveFinding {
+            dep: Dependency {
+                name: "lodash".into(),
+                version: "4.17.20".into(),
+                ecosystem: DependencyEcosystem::Npm,
+                source: "package-lock.json".into(),
+                dev: false,
+            },
+            matches: vec![VulnMatch {
+                advisory_id: "GHSA-test-advisory".into(),
+                severity_level: "high".into(),
+                tier: 1,
+                vulnerable_version_range: None,
+                fixed_version: Some("4.17.21".into()),
+            }],
+            advisory_details: vec![None],
+        };
+        let line = format_cve_finding(&finding);
+        assert!(
+            line.contains("fix: upgrade to 4.17.21"),
+            "expected 'fix: upgrade to 4.17.21' in: {}",
+            line
+        );
+    }
+
+    #[test]
+    fn format_cve_finding_picks_highest_fix_across_matches() {
+        let dep = Dependency {
+            name: "left-pad".into(),
+            version: "1.0.0".into(),
+            ecosystem: DependencyEcosystem::Npm,
+            source: "package-lock.json".into(),
+            dev: false,
+        };
+        let mk = |id: &str, fv: &str| VulnMatch {
+            advisory_id: id.into(),
+            severity_level: "low".into(),
+            tier: 2,
+            vulnerable_version_range: None,
+            fixed_version: Some(fv.into()),
+        };
+        let finding = CveFinding {
+            dep,
+            matches: vec![
+                mk("GHSA-a", "1.0.0"),
+                mk("GHSA-b", "1.2.0"),
+                mk("GHSA-c", "1.1.0"),
+            ],
+            advisory_details: vec![None, None, None],
+        };
+        let line = format_cve_finding(&finding);
+        assert!(line.contains("fix: upgrade to 1.2.0"), "got: {}", line);
+        assert!(!line.contains("fix: upgrade to 1.0.0"), "got: {}", line);
     }
 }

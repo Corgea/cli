@@ -18,6 +18,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use crate::utils::terminal::{set_text_color, TerminalColor};
+use crate::vuln_api;
 
 /// Which ecosystem(s) to scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +111,12 @@ pub enum CveLookupOutcome {
 pub struct CveFinding {
     pub dep: Dependency,
     pub matches: Vec<crate::vuln_api::VulnMatch>,
+    /// Best-effort enrichment from `/v1/advisories/:id`. Index-aligned
+    /// with `matches`; `None` for entries whose detail lookup failed
+    /// (404, network, parse, or the cache previously recorded a
+    /// failure). The CVE line still renders without the advisory URL
+    /// when this is `None`.
+    pub advisory_details: Vec<Option<crate::vuln_api::AdvisoryResponse>>,
 }
 
 /// Why CVE checks did not run when the user passed `--check-cve`.
@@ -369,6 +376,10 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
 
     let mut outcomes: Vec<LookupOutcome> = Vec::with_capacity(deps.len());
     let mut cve_outcomes: Vec<CveLookupOutcome> = Vec::new();
+    let mut advisory_cache: std::collections::HashMap<
+        String,
+        Result<vuln_api::AdvisoryResponse, ()>,
+    > = std::collections::HashMap::new();
 
     // Resolve up-front whether CVE checks are reachable. The vuln-api
     // URL always resolves (default + env/config override), so the only
@@ -448,9 +459,16 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
                 &dep_for_cve.version,
             ) {
                 Ok(response) if response.is_vulnerable => {
+                    let advisory_details = collect_advisory_details(
+                        &mut advisory_cache,
+                        cve_base_url,
+                        cve_token,
+                        &response.matches,
+                    );
                     cve_outcomes.push(CveLookupOutcome::Vulnerable(CveFinding {
                         dep: dep_for_cve,
                         matches: response.matches,
+                        advisory_details,
                     }));
                 }
                 Ok(_) => {
@@ -584,6 +602,66 @@ pub(crate) fn read_to_string(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("failed to read {}: {}", path.display(), e))
 }
 
+/// Pick the highest `fixed_version` candidate (lexically as semver) from
+/// the matches that returned one. Python `fixed_version` strings are
+/// piped through `registry::normalize_for_semver` first (PEP 440 →
+/// semver). Falls back to the first candidate string if none parse —
+/// preserves chunk-01 behaviour for exotic version strings.
+pub(super) fn pick_highest_fixed(
+    eco: DependencyEcosystem,
+    candidates: &[String],
+) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut best: Option<(semver::Version, String)> = None;
+    for raw in candidates {
+        let normalised = match eco {
+            DependencyEcosystem::Npm => raw.clone(),
+            DependencyEcosystem::Python => registry::normalize_for_semver(raw),
+        };
+        if let Ok(v) = semver::Version::parse(&normalised) {
+            if best.as_ref().map(|(b, _)| v > *b).unwrap_or(true) {
+                best = Some((v, raw.clone()));
+            }
+        }
+    }
+    best.map(|(_, raw)| raw)
+        .or_else(|| candidates.first().cloned())
+}
+
+/// Best-effort fetch of advisory detail for every match in `matches`,
+/// memoised in `cache`. Returns a `Vec<Option<AdvisoryResponse>>`
+/// index-aligned with the input; `None` for misses (404, network, parse,
+/// or a previously-recorded failure). If either `base_url` or `token`
+/// is empty, returns all-`None` without making any HTTP calls.
+fn collect_advisory_details(
+    cache: &mut std::collections::HashMap<String, Result<vuln_api::AdvisoryResponse, ()>>,
+    base_url: &str,
+    token: &str,
+    matches: &[vuln_api::VulnMatch],
+) -> Vec<Option<vuln_api::AdvisoryResponse>> {
+    if base_url.is_empty() || token.is_empty() {
+        return vec![None; matches.len()];
+    }
+    matches
+        .iter()
+        .map(|m| {
+            let id = m.advisory_id.clone();
+            if let Some(entry) = cache.get(&id) {
+                return entry.as_ref().ok().cloned();
+            }
+            let entry = match vuln_api::get_advisory(base_url, token, &id) {
+                Ok(resp) => Ok(resp),
+                Err(_) => Err(()),
+            };
+            let result = entry.as_ref().ok().cloned();
+            cache.insert(id, entry);
+            result
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,18 +675,37 @@ mod tests {
     struct VulnApiStub {
         base_url: String,
         seen_auth: Arc<Mutex<Vec<String>>>,
+        advisory_hits: Arc<Mutex<HashMap<String, usize>>>,
         _handle: thread::JoinHandle<()>,
     }
 
     fn spawn_vuln_api_stub(
         fixtures: HashMap<(String, String, String), crate::vuln_api::VulnCheckResponse>,
     ) -> VulnApiStub {
+        spawn_vuln_api_stub_with_advisories(fixtures, HashMap::new())
+    }
+
+    /// Advisory fixture in the real server's wire shape.
+    ///
+    /// Tests build this as a raw `serde_json::Value` so the CLI's
+    /// deserialization path (with `#[serde(rename = "id" / "source_url")]`)
+    /// is actually exercised. Serializing `AdvisoryResponse` directly
+    /// would round-trip through the same Rust struct and hide a future
+    /// server-side rename.
+    fn spawn_vuln_api_stub_with_advisories(
+        fixtures: HashMap<(String, String, String), crate::vuln_api::VulnCheckResponse>,
+        advisory_fixtures: HashMap<String, serde_json::Value>,
+    ) -> VulnApiStub {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
         let port = listener.local_addr().unwrap().port();
         let base_url = format!("http://127.0.0.1:{}", port);
         let fixtures = Arc::new(Mutex::new(fixtures));
+        let advisory_fixtures = Arc::new(Mutex::new(advisory_fixtures));
         let seen_auth: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let advisory_hits: Arc<Mutex<HashMap<String, usize>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let seen_auth_thread = seen_auth.clone();
+        let advisory_hits_thread = advisory_hits.clone();
 
         let handle = thread::spawn(move || {
             for stream in listener.incoming().take(32) {
@@ -635,7 +732,9 @@ mod tests {
                     }
                 }
 
-                let response_body = if let Some(path) =
+                let (status_code, status_text, response_body): (u16, &str, String) = if let Some(
+                    path,
+                ) =
                     req.lines().next().and_then(|l| l.split_whitespace().nth(1))
                 {
                     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -652,7 +751,7 @@ mod tests {
                         let ver = urlencoding::decode(parts[5])
                             .unwrap_or_default()
                             .into_owned();
-                        fixtures
+                        let body = fixtures
                             .lock()
                             .unwrap()
                             .get(&(eco.clone(), name.clone(), ver.clone()))
@@ -666,16 +765,32 @@ mod tests {
                                     matches: vec![],
                                 })
                                 .unwrap()
-                            })
+                            });
+                        (200, "OK", body)
+                    } else if parts.len() >= 3 && parts[0] == "v1" && parts[1] == "advisories" {
+                        let id = urlencoding::decode(parts[2])
+                            .unwrap_or_default()
+                            .into_owned();
+                        *advisory_hits_thread
+                            .lock()
+                            .unwrap()
+                            .entry(id.clone())
+                            .or_insert(0) += 1;
+                        match advisory_fixtures.lock().unwrap().get(&id) {
+                            Some(r) => (200, "OK", serde_json::to_string(r).unwrap()),
+                            None => (404, "Not Found", r#"{"error":"not found"}"#.to_string()),
+                        }
                     } else {
-                        r#"{"error":"not found"}"#.to_string()
+                        (200, "OK", r#"{"error":"not found"}"#.to_string())
                     }
                 } else {
-                    r#"{"error":"bad request"}"#.to_string()
+                    (200, "OK", r#"{"error":"bad request"}"#.to_string())
                 };
 
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    status_code,
+                    status_text,
                     response_body.len(),
                     response_body
                 );
@@ -688,8 +803,92 @@ mod tests {
         VulnApiStub {
             base_url,
             seen_auth,
+            advisory_hits,
             _handle: handle,
         }
+    }
+
+    #[test]
+    fn pick_highest_fixed_npm_picks_highest() {
+        let got = pick_highest_fixed(
+            DependencyEcosystem::Npm,
+            &["1.0.0".into(), "1.2.0".into(), "1.1.0".into()],
+        );
+        assert_eq!(got, Some("1.2.0".into()));
+    }
+
+    #[test]
+    fn pick_highest_fixed_python_via_normalize() {
+        // "1.0" normalises to "1.0.0", "1.0.1" stays as-is.
+        let got = pick_highest_fixed(DependencyEcosystem::Python, &["1.0".into(), "1.0.1".into()]);
+        assert_eq!(got, Some("1.0.1".into()));
+    }
+
+    #[test]
+    fn pick_highest_fixed_unparseable_falls_back_to_first() {
+        // Both PEP 440 prerelease — normalize_for_semver leaves them alone,
+        // semver parsing fails, helper falls back to candidates.first().
+        let got = pick_highest_fixed(
+            DependencyEcosystem::Python,
+            &["1.0a1".into(), "1.0rc1".into()],
+        );
+        assert_eq!(got, Some("1.0a1".into()));
+    }
+
+    #[test]
+    fn pick_highest_fixed_empty_returns_none() {
+        let got = pick_highest_fixed(DependencyEcosystem::Npm, &[]);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn vuln_api_stub_serves_advisory_fixture() {
+        // Wire-shape fixture: `id`, `source_url`, no `remediation`.
+        // Exercises the rename mapping in `AdvisoryResponse`.
+        let mut advisory_fixtures = HashMap::new();
+        advisory_fixtures.insert(
+            "GHSA-foo".to_string(),
+            serde_json::json!({
+                "id": "GHSA-foo",
+                "aliases": ["CVE-2026-0001"],
+                "title": "test advisory",
+                "severity_level": "high",
+                "tier": 1,
+                "source_url": "https://github.com/advisories/GHSA-foo",
+            }),
+        );
+        let stub = spawn_vuln_api_stub_with_advisories(HashMap::new(), advisory_fixtures);
+
+        let resp =
+            crate::vuln_api::get_advisory(&stub.base_url, "test-token", "GHSA-foo").expect("ok");
+        assert_eq!(resp.advisory_id, "GHSA-foo");
+        assert_eq!(
+            resp.url.as_deref(),
+            Some("https://github.com/advisories/GHSA-foo")
+        );
+
+        let hits = stub.advisory_hits.lock().unwrap().clone();
+        assert_eq!(hits.get("GHSA-foo").copied(), Some(1));
+    }
+
+    #[test]
+    fn vuln_api_stub_returns_404_for_missing_advisory() {
+        let stub = spawn_vuln_api_stub_with_advisories(HashMap::new(), HashMap::new());
+        let err = crate::vuln_api::get_advisory(&stub.base_url, "test-token", "GHSA-missing")
+            .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("404"), "expected 404 in error, got: {}", msg);
+
+        // The /check route still works against the same stub.
+        let resp = crate::vuln_api::check_package_version(
+            &stub.base_url,
+            "test-token",
+            "npm",
+            "lodash",
+            "4.17.20",
+        )
+        .expect("clean fallback");
+        assert!(!resp.is_vulnerable);
     }
 
     #[test]
@@ -835,6 +1034,11 @@ mod tests {
 
         let text_line = format_cve_finding(report.cve_findings()[0]);
         assert!(text_line.contains("GHSA-integration-test"));
+        assert!(
+            text_line.contains("fix: upgrade to 4.17.21"),
+            "expected fix-version substring, got: {}",
+            text_line
+        );
 
         // Auth header must have been attached.
         let auth = stub.seen_auth.lock().unwrap().clone();
@@ -858,6 +1062,295 @@ mod tests {
         assert!(!report_off.check_cve);
         assert!(report_off.cve_outcomes.is_empty());
         assert!(report_off.cve_skip_reason.is_none());
+    }
+
+    #[test]
+    fn check_cve_renders_advisory_url_and_fix_version() {
+        use crate::verify_deps::report::format_cve_finding;
+
+        let mut fixtures = HashMap::new();
+        fixtures.insert(
+            ("npm".into(), "lodash".into(), "4.17.20".into()),
+            crate::vuln_api::VulnCheckResponse {
+                ecosystem: "npm".into(),
+                package_name: "lodash".into(),
+                version: "4.17.20".into(),
+                is_vulnerable: true,
+                matches: vec![crate::vuln_api::VulnMatch {
+                    advisory_id: "GHSA-integration-test".into(),
+                    severity_level: "high".into(),
+                    tier: 1,
+                    vulnerable_version_range: Some("<4.17.21".into()),
+                    fixed_version: Some("4.17.21".into()),
+                }],
+            },
+        );
+        let mut advisories = HashMap::new();
+        advisories.insert(
+            "GHSA-integration-test".to_string(),
+            serde_json::json!({
+                "id": "GHSA-integration-test",
+                "severity_level": "high",
+                "tier": 1,
+                "source_url": "https://github.com/advisories/GHSA-integration-test",
+            }),
+        );
+        let stub = spawn_vuln_api_stub_with_advisories(fixtures, advisories);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{
+                "name": "demo", "version": "1.0.0", "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "demo", "version": "1.0.0" },
+                    "node_modules/lodash": { "version": "4.17.20" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let opts = VerifyOptions {
+            ecosystem: Ecosystem::Npm,
+            path: dir.path().to_path_buf(),
+            check_cve: true,
+            vuln_api_url: Some(stub.base_url.clone()),
+            vuln_api_token: Some("test-token".into()),
+            npm_registry: Some("http://127.0.0.1:1".into()),
+            ..Default::default()
+        };
+
+        let report = run(&opts).expect("run ok");
+        assert_eq!(report.cve_findings().len(), 1);
+        let finding = report.cve_findings()[0];
+        assert_eq!(finding.advisory_details.len(), finding.matches.len());
+        assert!(finding.advisory_details[0].is_some());
+
+        let line = format_cve_finding(finding);
+        assert!(line.contains("fix: upgrade to 4.17.21"), "got: {}", line);
+        assert!(
+            line.contains("https://github.com/advisories/GHSA-integration-test"),
+            "got: {}",
+            line
+        );
+
+        let hits = stub.advisory_hits.lock().unwrap().clone();
+        assert_eq!(hits.get("GHSA-integration-test").copied(), Some(1));
+    }
+
+    #[test]
+    fn check_cve_dedupes_shared_advisory_lookups() {
+        let mut fixtures = HashMap::new();
+        let mk = |name: &str| crate::vuln_api::VulnCheckResponse {
+            ecosystem: "npm".into(),
+            package_name: name.into(),
+            version: "1.0.0".into(),
+            is_vulnerable: true,
+            matches: vec![crate::vuln_api::VulnMatch {
+                advisory_id: "GHSA-shared".into(),
+                severity_level: "high".into(),
+                tier: 1,
+                vulnerable_version_range: Some("<2.0.0".into()),
+                fixed_version: Some("2.0.0".into()),
+            }],
+        };
+        fixtures.insert(("npm".into(), "alpha".into(), "1.0.0".into()), mk("alpha"));
+        fixtures.insert(("npm".into(), "beta".into(), "1.0.0".into()), mk("beta"));
+
+        let mut advisories = HashMap::new();
+        advisories.insert(
+            "GHSA-shared".to_string(),
+            serde_json::json!({
+                "id": "GHSA-shared",
+                "severity_level": "high",
+                "tier": 1,
+                "source_url": "https://github.com/advisories/GHSA-shared",
+            }),
+        );
+        let stub = spawn_vuln_api_stub_with_advisories(fixtures, advisories);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{
+                "name": "demo", "version": "1.0.0", "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "demo", "version": "1.0.0" },
+                    "node_modules/alpha": { "version": "1.0.0" },
+                    "node_modules/beta":  { "version": "1.0.0" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let opts = VerifyOptions {
+            ecosystem: Ecosystem::Npm,
+            path: dir.path().to_path_buf(),
+            check_cve: true,
+            vuln_api_url: Some(stub.base_url.clone()),
+            vuln_api_token: Some("test-token".into()),
+            npm_registry: Some("http://127.0.0.1:1".into()),
+            ..Default::default()
+        };
+        let report = run(&opts).expect("run ok");
+        assert_eq!(report.cve_findings().len(), 2);
+
+        let hits = stub.advisory_hits.lock().unwrap().clone();
+        assert_eq!(
+            hits.get("GHSA-shared").copied(),
+            Some(1),
+            "hits = {:?}",
+            hits
+        );
+
+        // Both findings carry the same URL via the cache.
+        for f in report.cve_findings() {
+            let detail = f.advisory_details[0].as_ref().expect("detail present");
+            assert_eq!(
+                detail.url.as_deref(),
+                Some("https://github.com/advisories/GHSA-shared")
+            );
+        }
+    }
+
+    #[test]
+    fn check_cve_handles_advisory_lookup_failure() {
+        use crate::verify_deps::report::format_cve_finding;
+
+        let mut fixtures = HashMap::new();
+        fixtures.insert(
+            ("npm".into(), "lodash".into(), "4.17.20".into()),
+            crate::vuln_api::VulnCheckResponse {
+                ecosystem: "npm".into(),
+                package_name: "lodash".into(),
+                version: "4.17.20".into(),
+                is_vulnerable: true,
+                matches: vec![crate::vuln_api::VulnMatch {
+                    advisory_id: "GHSA-no-detail".into(),
+                    severity_level: "high".into(),
+                    tier: 1,
+                    vulnerable_version_range: Some("<4.17.21".into()),
+                    fixed_version: Some("4.17.21".into()),
+                }],
+            },
+        );
+        // Note: no advisory fixture for GHSA-no-detail — stub returns 404.
+        let stub = spawn_vuln_api_stub_with_advisories(fixtures, HashMap::new());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{
+                "name": "demo", "version": "1.0.0", "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "demo", "version": "1.0.0" },
+                    "node_modules/lodash": { "version": "4.17.20" }
+                }
+            }"#,
+        )
+        .unwrap();
+        let opts = VerifyOptions {
+            ecosystem: Ecosystem::Npm,
+            path: dir.path().to_path_buf(),
+            check_cve: true,
+            vuln_api_url: Some(stub.base_url.clone()),
+            vuln_api_token: Some("test-token".into()),
+            npm_registry: Some("http://127.0.0.1:1".into()),
+            ..Default::default()
+        };
+        let report = run(&opts).expect("run ok");
+        assert_eq!(report.cve_findings().len(), 1);
+        let f = report.cve_findings()[0];
+        assert!(
+            f.advisory_details[0].is_none(),
+            "expected detail to be None on 404"
+        );
+
+        let line = format_cve_finding(f);
+        assert!(line.contains("GHSA-no-detail"), "got: {}", line);
+        assert!(line.contains("fix: upgrade to 4.17.21"), "got: {}", line);
+        assert!(
+            !line.contains("https://"),
+            "should not render URL: {}",
+            line
+        );
+    }
+
+    #[test]
+    fn check_cve_json_includes_advisory_url() {
+        let mut fixtures = HashMap::new();
+        fixtures.insert(
+            ("npm".into(), "lodash".into(), "4.17.20".into()),
+            crate::vuln_api::VulnCheckResponse {
+                ecosystem: "npm".into(),
+                package_name: "lodash".into(),
+                version: "4.17.20".into(),
+                is_vulnerable: true,
+                matches: vec![crate::vuln_api::VulnMatch {
+                    advisory_id: "GHSA-json".into(),
+                    severity_level: "high".into(),
+                    tier: 1,
+                    vulnerable_version_range: Some("<4.17.21".into()),
+                    fixed_version: Some("4.17.21".into()),
+                }],
+            },
+        );
+        let mut advisories = HashMap::new();
+        advisories.insert(
+            "GHSA-json".to_string(),
+            serde_json::json!({
+                "id": "GHSA-json",
+                "severity_level": "high",
+                "tier": 1,
+                "source_url": "https://github.com/advisories/GHSA-json",
+            }),
+        );
+        let stub = spawn_vuln_api_stub_with_advisories(fixtures, advisories);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{
+                "name": "demo", "version": "1.0.0", "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "demo", "version": "1.0.0" },
+                    "node_modules/lodash": { "version": "4.17.20" }
+                }
+            }"#,
+        )
+        .unwrap();
+        let opts = VerifyOptions {
+            ecosystem: Ecosystem::Npm,
+            path: dir.path().to_path_buf(),
+            check_cve: true,
+            vuln_api_url: Some(stub.base_url.clone()),
+            vuln_api_token: Some("test-token".into()),
+            npm_registry: Some("http://127.0.0.1:1".into()),
+            ..Default::default()
+        };
+        let report = run(&opts).expect("run ok");
+        let finding = report.cve_findings()[0];
+
+        // Re-serialise the per-match JSON entry inline (mirrors print_json).
+        let detail = finding.advisory_details[0].as_ref();
+        let m = &finding.matches[0];
+        let entry = serde_json::json!({
+            "advisory_id": m.advisory_id,
+            "severity_level": m.severity_level,
+            "tier": m.tier,
+            "vulnerable_version_range": m.vulnerable_version_range,
+            "fixed_version": m.fixed_version,
+            "advisory_url": detail.and_then(|d| d.url.clone()),
+        });
+        assert_eq!(
+            entry["advisory_url"].as_str(),
+            Some("https://github.com/advisories/GHSA-json")
+        );
+        assert_eq!(entry["fixed_version"].as_str(), Some("4.17.21"));
+        assert!(
+            entry.get("remediation").is_none(),
+            "remediation should not appear in CVE JSON output"
+        );
     }
 
     #[test]
@@ -944,7 +1437,17 @@ mod tests {
                 }],
             },
         );
-        let stub = spawn_vuln_api_stub(fixtures);
+        let mut advisories = HashMap::new();
+        advisories.insert(
+            "GHSA-dogfood-fixture".to_string(),
+            serde_json::json!({
+                "id": "GHSA-dogfood-fixture",
+                "severity_level": "high",
+                "tier": 1,
+                "source_url": "https://github.com/advisories/GHSA-dogfood-fixture",
+            }),
+        );
+        let stub = spawn_vuln_api_stub_with_advisories(fixtures, advisories);
 
         let opts = VerifyOptions {
             ecosystem: Ecosystem::Npm,
