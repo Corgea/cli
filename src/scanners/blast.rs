@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use uuid::Uuid;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     config: &Config,
     fail_on: Option<String>,

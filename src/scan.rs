@@ -156,11 +156,10 @@ pub fn upload_scan(
     let run_id = Uuid::new_v4().to_string();
     let base_url = config.get_url();
     let api_base = "/api/v1";
-    let project;
 
-    if in_ci {
+    let project = if in_ci {
         debug("Running in CI");
-        project = format!(
+        format!(
             "{}-{}",
             github_env_vars
                 .get("GITHUB_REPOSITORY")
@@ -170,8 +169,8 @@ pub fn upload_scan(
                 .expect("Failed to get GITHUB_REPOSITORY")
         )
     } else {
-        project = utils::generic::determine_project_name(project_name.as_deref());
-    }
+        utils::generic::determine_project_name(project_name.as_deref())
+    };
     let repo_data = std::env::var("REPO_DATA").unwrap_or_else(|_| "".to_string());
 
     let scan_upload_url = if repo_data.is_empty() {

@@ -358,8 +358,8 @@ fn yarn_key_name(key: &str) -> Option<String> {
     if key.is_empty() {
         return None;
     }
-    let (name_part, _) = if key.starts_with('@') {
-        let after_scope = key[1..].find('@')?;
+    let (name_part, _) = if let Some(rest) = key.strip_prefix('@') {
+        let after_scope = rest.find('@')?;
         let split_at = after_scope + 1;
         (&key[..split_at], &key[split_at + 1..])
     } else {
@@ -373,11 +373,11 @@ fn yarn_key_name(key: &str) -> Option<String> {
 /// 7.x and 9.x — the format and key conventions vary across versions:
 ///
 /// * v5/v6 keys in `packages:` use `/` separators:
-///     `/lodash/4.17.21:` or `/@types/node/20.10.5:`
+///   `/lodash/4.17.21:` or `/@types/node/20.10.5:`
 /// * v6+ keys may use `@` for the version separator:
-///     `/lodash@4.17.21:` or `/@types/node@20.10.5:`
+///   `/lodash@4.17.21:` or `/@types/node@20.10.5:`
 /// * v9 keys drop the leading `/` entirely:
-///     `lodash@4.17.21:` or `'@types/node@20.10.5':`
+///   `lodash@4.17.21:` or `'@types/node@20.10.5':`
 ///
 /// Versions can carry a peer-deps suffix that is *not* part of the
 /// resolved version — `(react@18.0.0)` in v9, `_react@18.0.0` in v6.

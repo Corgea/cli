@@ -245,7 +245,7 @@ pub fn run(
                 issue.location.line_number.to_string(),
             ];
             if render_blocking_rules {
-                row.push(blocking_rules.get(&issue.id).is_some().to_string());
+                row.push(blocking_rules.contains_key(&issue.id).to_string());
                 row.push(
                     blocking_rules
                         .get(&issue.id)

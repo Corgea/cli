@@ -438,7 +438,7 @@ struct PypiInfo {
 
 /// Resolve a `PypiSpec` against PyPI and return the concrete version
 /// + publish time. The latest non-prerelease, non-yanked release is
-/// preferred.
+///   preferred.
 pub fn pypi_resolve(
     name: &str,
     spec: &PypiSpec,
