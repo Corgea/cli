@@ -22,6 +22,25 @@ fn stub_env(stub_url: &str) -> [(&'static str, String); 3] {
     ]
 }
 
+fn run_deps(args: &[&str], extra_env: &[(&str, String)]) -> std::process::Output {
+    let mut cmd = corgea_cmd();
+    cmd.args(args);
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    cmd.output().expect("spawn corgea")
+}
+
+fn run_deps_json(args: &[&str], extra_env: &[(&str, String)]) -> Value {
+    let output = run_deps(args, extra_env);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("stdout should be valid JSON")
+}
+
 #[test]
 fn fail_cve_exits_one_when_vulnerable() {
     let mut fixtures = HashMap::new();
@@ -32,8 +51,8 @@ fn fail_cve_exits_one_when_vulnerable() {
     let stub = spawn(fixtures);
     let fixture = npm_fixture_dir();
 
-    let output = corgea_cmd()
-        .args([
+    let output = run_deps(
+        &[
             "deps",
             "--check-cve",
             "--fail-cve",
@@ -41,14 +60,146 @@ fn fail_cve_exits_one_when_vulnerable() {
             "npm",
             "-p",
             fixture.to_str().unwrap(),
-        ])
-        .envs(stub_env(&stub.base_url))
-        .output()
-        .expect("spawn corgea");
+        ],
+        &stub_env(&stub.base_url),
+    );
 
     assert_eq!(
         output.status.code(),
         Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn fail_cve_exits_zero_when_all_clean() {
+    let stub = spawn(HashMap::new());
+    let fixture = npm_fixture_dir();
+
+    let output = run_deps(
+        &[
+            "deps",
+            "--check-cve",
+            "--fail-cve",
+            "-e",
+            "npm",
+            "-p",
+            fixture.to_str().unwrap(),
+        ],
+        &stub_env(&stub.base_url),
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn fail_cve_and_fail_flags_are_independent() {
+    let mut fixtures = HashMap::new();
+    fixtures.insert(
+        ("npm".into(), "lodash".into(), "4.17.20".into()),
+        lodash_vulnerable_response(),
+    );
+    let stub = spawn(fixtures);
+    let fixture = npm_fixture_dir();
+    let env = stub_env(&stub.base_url);
+    let path = fixture.to_str().unwrap();
+
+    // CVE present, neither gate flag → success.
+    let neither = run_deps(&["deps", "--check-cve", "-e", "npm", "-p", path], &env);
+    assert_eq!(neither.status.code(), Some(0));
+
+    // --fail-cve alone gates on CVEs.
+    let fail_cve_only = run_deps(
+        &["deps", "--check-cve", "--fail-cve", "-e", "npm", "-p", path],
+        &env,
+    );
+    assert_eq!(fail_cve_only.status.code(), Some(1));
+
+    // --fail alone also gates on CVE findings (legacy behavior).
+    let fail_only = run_deps(
+        &["deps", "--check-cve", "--fail", "-e", "npm", "-p", path],
+        &env,
+    );
+    assert_eq!(fail_only.status.code(), Some(1));
+}
+
+#[test]
+fn fail_cve_not_triggered_by_cve_lookup_errors() {
+    let fixture = npm_fixture_dir();
+    let env = [
+        ("CORGEA_VULN_API_URL", "http://127.0.0.1:1".to_string()),
+        ("CORGEA_TOKEN", "test-token".to_string()),
+        ("CORGEA_NPM_REGISTRY", "http://127.0.0.1:1".to_string()),
+    ];
+
+    let fail_cve = run_deps(
+        &[
+            "deps",
+            "--check-cve",
+            "--fail-cve",
+            "-e",
+            "npm",
+            "-p",
+            fixture.to_str().unwrap(),
+        ],
+        &env,
+    );
+    assert_eq!(
+        fail_cve.status.code(),
+        Some(0),
+        "--fail-cve should not trip on lookup errors alone; stderr: {}",
+        String::from_utf8_lossy(&fail_cve.stderr)
+    );
+
+    let fail = run_deps(
+        &[
+            "deps",
+            "--check-cve",
+            "--fail",
+            "-e",
+            "npm",
+            "-p",
+            fixture.to_str().unwrap(),
+        ],
+        &env,
+    );
+    assert_eq!(
+        fail.status.code(),
+        Some(1),
+        "--fail should still trip on CVE lookup errors; stderr: {}",
+        String::from_utf8_lossy(&fail.stderr)
+    );
+}
+
+#[test]
+fn fail_cve_exits_zero_when_cve_check_skipped() {
+    let fixture = npm_fixture_dir();
+
+    let output = run_deps(
+        &[
+            "deps",
+            "--check-cve",
+            "--fail-cve",
+            "-e",
+            "npm",
+            "-p",
+            fixture.to_str().unwrap(),
+        ],
+        &[
+            ("CORGEA_NPM_REGISTRY", "http://127.0.0.1:1".to_string()),
+            ("CORGEA_TOKEN", String::new()),
+        ],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -64,8 +215,8 @@ fn check_cve_json_includes_cves_and_cve_summary() {
     let stub = spawn(fixtures);
     let fixture = npm_fixture_dir();
 
-    let output = corgea_cmd()
-        .args([
+    let body = run_deps_json(
+        &[
             "deps",
             "--check-cve",
             "--json",
@@ -73,27 +224,18 @@ fn check_cve_json_includes_cves_and_cve_summary() {
             "npm",
             "-p",
             fixture.to_str().unwrap(),
-        ])
-        .envs(stub_env(&stub.base_url))
-        .output()
-        .expect("spawn corgea");
-
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        ],
+        &stub_env(&stub.base_url),
     );
-
-    let body: Value = serde_json::from_slice(&output.stdout).expect("stdout should be valid JSON");
 
     let summary = body
         .get("cve_summary")
         .expect("cve_summary should be present with --check-cve");
     assert_eq!(summary.get("skipped").and_then(Value::as_bool), Some(false));
+    assert_eq!(summary.get("vulnerable").and_then(Value::as_u64), Some(1));
+    assert_eq!(summary.get("clean").and_then(Value::as_u64), Some(2));
+    assert_eq!(summary.get("errors").and_then(Value::as_u64), Some(0));
     assert!(summary.get("checked").and_then(Value::as_u64).is_some());
-    assert!(summary.get("vulnerable").and_then(Value::as_u64).is_some());
-    assert!(summary.get("clean").and_then(Value::as_u64).is_some());
-    assert!(summary.get("errors").and_then(Value::as_u64).is_some());
 
     let results = body
         .get("results")
@@ -103,6 +245,10 @@ fn check_cve_json_includes_cves_and_cve_summary() {
         .iter()
         .find(|r| r.get("name").and_then(Value::as_str) == Some("lodash"))
         .expect("lodash result");
+    assert_eq!(
+        lodash.get("cve_status").and_then(Value::as_str),
+        Some("vulnerable")
+    );
     let cves = lodash
         .get("cves")
         .and_then(Value::as_array)
@@ -123,29 +269,57 @@ fn check_cve_json_includes_cves_and_cve_summary() {
 }
 
 #[test]
+fn json_clean_deps_have_empty_cves_array() {
+    let stub = spawn(HashMap::new());
+    let fixture = npm_fixture_dir();
+
+    let body = run_deps_json(
+        &[
+            "deps",
+            "--check-cve",
+            "--json",
+            "-e",
+            "npm",
+            "-p",
+            fixture.to_str().unwrap(),
+        ],
+        &stub_env(&stub.base_url),
+    );
+
+    let results = body
+        .get("results")
+        .and_then(Value::as_array)
+        .expect("results array");
+    let semver = results
+        .iter()
+        .find(|r| r.get("name").and_then(Value::as_str) == Some("semver"))
+        .expect("semver result");
+    assert_eq!(
+        semver.get("cve_status").and_then(Value::as_str),
+        Some("clean")
+    );
+    assert_eq!(
+        semver.get("cves").and_then(Value::as_array).map(Vec::len),
+        Some(0)
+    );
+    assert!(semver.get("cve_error").is_none());
+}
+
+#[test]
 fn json_omits_cve_fields_without_check_cve() {
     let fixture = npm_fixture_dir();
 
-    let output = corgea_cmd()
-        .args([
+    let body = run_deps_json(
+        &[
             "deps",
             "--json",
             "-e",
             "npm",
             "-p",
             fixture.to_str().unwrap(),
-        ])
-        .env("CORGEA_NPM_REGISTRY", "http://127.0.0.1:1")
-        .output()
-        .expect("spawn corgea");
-
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        ],
+        &[("CORGEA_NPM_REGISTRY", "http://127.0.0.1:1".to_string())],
     );
-
-    let body: Value = serde_json::from_slice(&output.stdout).expect("stdout should be valid JSON");
     assert!(body.get("cve_summary").is_none());
     let results = body
         .get("results")
@@ -155,6 +329,49 @@ fn json_omits_cve_fields_without_check_cve() {
     for dep in results {
         assert!(dep.get("cves").is_none());
         assert!(dep.get("cve_status").is_none());
+    }
+}
+
+#[test]
+fn json_cve_summary_skipped_when_token_missing() {
+    let fixture = npm_fixture_dir();
+
+    let body = run_deps_json(
+        &[
+            "deps",
+            "--check-cve",
+            "--json",
+            "-e",
+            "npm",
+            "-p",
+            fixture.to_str().unwrap(),
+        ],
+        &[
+            ("CORGEA_NPM_REGISTRY", "http://127.0.0.1:1".to_string()),
+            ("CORGEA_TOKEN", String::new()),
+        ],
+    );
+
+    let summary = body
+        .get("cve_summary")
+        .expect("cve_summary present even when skipped");
+    assert_eq!(summary.get("skipped").and_then(Value::as_bool), Some(true));
+    assert_eq!(summary.get("checked").and_then(Value::as_u64), Some(0));
+    assert!(summary
+        .get("skipped_reason")
+        .and_then(Value::as_str)
+        .is_some());
+
+    let results = body
+        .get("results")
+        .and_then(Value::as_array)
+        .expect("results array");
+    for dep in results {
+        assert_eq!(
+            dep.get("cve_status").and_then(Value::as_str),
+            Some("not_checked")
+        );
+        assert!(dep.get("cves").is_none());
     }
 }
 

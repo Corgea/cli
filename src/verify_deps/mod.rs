@@ -745,6 +745,12 @@ mod tests {
     }
 
     #[test]
+    fn verify_options_default_fail_cve_is_false() {
+        let opts = VerifyOptions::default();
+        assert!(!opts.fail_cve);
+    }
+
+    #[test]
     fn run_without_check_cve_has_empty_cve_outcomes() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
