@@ -146,12 +146,34 @@ pub fn check_package_version(
         .map_err(|e| format!("Failed to send vuln-api request: {}", e))?;
 
     let status = response.status();
-    if !status.is_success() {
-        return Err(format!(
-            "Error: Unable to check package version. Status code: {}",
-            status
-        )
-        .into());
+    match status.as_u16() {
+        401 => {
+            return Err(
+                "vuln-api rejected the Corgea token (run `corgea login` to refresh)".into(),
+            );
+        }
+        403 => {
+            return Err("vuln-api access denied (check your Corgea plan/permissions)".into());
+        }
+        404 => {
+            return Ok(VulnCheckResponse {
+                ecosystem: ecosystem.to_string(),
+                package_name: name.to_string(),
+                version: version.to_string(),
+                is_vulnerable: false,
+                matches: vec![],
+            });
+        }
+        429 => {
+            return Err("vuln-api rate-limited this request (retry later)".into());
+        }
+        500..=599 => {
+            return Err(format!("vuln-api unavailable (HTTP {})", status.as_u16()).into());
+        }
+        code if !status.is_success() => {
+            return Err(format!("vuln-api returned unexpected HTTP {}", code).into());
+        }
+        _ => {}
     }
 
     let response_text = response.text()?;
@@ -273,6 +295,157 @@ pub fn get_advisory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    struct PackageCheckStub {
+        base_url: String,
+        _handle: thread::JoinHandle<()>,
+    }
+
+    /// Bind 127.0.0.1:0 and serve one response per connection for
+    /// GET /v1/packages/{eco}/{name}/versions/{ver}/check.
+    fn spawn_package_check_stub(
+        responses: HashMap<(String, String, String), (u16, String)>,
+    ) -> PackageCheckStub {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{}", port);
+        let responses = Arc::new(Mutex::new(responses));
+
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming().take(16) {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let mut buf = Vec::with_capacity(4096);
+                let mut chunk = [0u8; 1024];
+                while let Ok(n) = stream.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf);
+
+                let (status_code, status_text, body) = if let Some(path) =
+                    req.lines().next().and_then(|l| l.split_whitespace().nth(1))
+                {
+                    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+                    if parts.len() >= 7
+                        && parts[0] == "v1"
+                        && parts[1] == "packages"
+                        && parts[4] == "versions"
+                        && parts[6] == "check"
+                    {
+                        let eco = parts[2].to_string();
+                        let name = urlencoding::decode(parts[3])
+                            .unwrap_or_default()
+                            .into_owned();
+                        let ver = urlencoding::decode(parts[5])
+                            .unwrap_or_default()
+                            .into_owned();
+                        let (code, body) = responses
+                            .lock()
+                            .unwrap()
+                            .get(&(eco, name, ver))
+                            .cloned()
+                            .unwrap_or((200, r#"{"is_vulnerable":false,"matches":[]}"#.into()));
+                        let text = match code {
+                            401 => "Unauthorized",
+                            403 => "Forbidden",
+                            404 => "Not Found",
+                            429 => "Too Many Requests",
+                            500..=599 => "Internal Server Error",
+                            _ => "Error",
+                        };
+                        (code, text, body)
+                    } else {
+                        (404, "Not Found", r#"{"error":"not found"}"#.into())
+                    }
+                } else {
+                    (400, "Bad Request", r#"{"error":"bad request"}"#.into())
+                };
+
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    status_code, status_text, body.len(), body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        PackageCheckStub {
+            base_url,
+            _handle: handle,
+        }
+    }
+
+    fn check_with_stub_status(
+        status_code: u16,
+        body: &str,
+    ) -> Result<VulnCheckResponse, Box<dyn std::error::Error>> {
+        let mut responses = HashMap::new();
+        responses.insert(
+            ("npm".into(), "lodash".into(), "4.17.20".into()),
+            (status_code, body.to_string()),
+        );
+        let stub = spawn_package_check_stub(responses);
+        check_package_version(&stub.base_url, "test-token", "npm", "lodash", "4.17.20")
+    }
+
+    #[test]
+    fn check_package_version_401_returns_actionable_error() {
+        let err = check_with_stub_status(401, r#"{"error":"unauthorized"}"#)
+            .expect_err("401 should fail");
+        assert!(err.to_string().contains("rejected the Corgea token"));
+    }
+
+    #[test]
+    fn check_package_version_403_returns_actionable_error() {
+        let err =
+            check_with_stub_status(403, r#"{"error":"forbidden"}"#).expect_err("403 should fail");
+        assert!(err.to_string().contains("access denied"));
+    }
+
+    #[test]
+    fn check_package_version_404_returns_clean() {
+        let resp =
+            check_with_stub_status(404, r#"{"error":"not found"}"#).expect("404 should be clean");
+        assert!(!resp.is_vulnerable);
+        assert!(resp.matches.is_empty());
+        assert_eq!(resp.package_name, "lodash");
+        assert_eq!(resp.version, "4.17.20");
+    }
+
+    #[test]
+    fn check_package_version_429_returns_actionable_error() {
+        let err = check_with_stub_status(429, r#"{"error":"rate limited"}"#)
+            .expect_err("429 should fail");
+        assert!(err.to_string().contains("rate-limited"));
+    }
+
+    #[test]
+    fn check_package_version_500_returns_unavailable() {
+        let err =
+            check_with_stub_status(500, r#"{"error":"internal"}"#).expect_err("500 should fail");
+        assert!(err.to_string().contains("unavailable (HTTP 500)"));
+    }
+
+    #[test]
+    fn check_package_version_unexpected_status_returns_generic_error() {
+        let err =
+            check_with_stub_status(418, r#"{"error":"teapot"}"#).expect_err("418 should fail");
+        assert!(err.to_string().contains("unexpected HTTP 418"));
+    }
 
     #[test]
     fn encode_package_name_scoped_npm() {

@@ -12,10 +12,18 @@ pub struct VulnApiStub {
 
 /// Minimal TCP vuln-api stub for CLI integration tests.
 pub fn spawn(fixtures: HashMap<(String, String, String), String>) -> VulnApiStub {
+    spawn_with_statuses(fixtures, HashMap::new())
+}
+
+pub fn spawn_with_statuses(
+    fixtures: HashMap<(String, String, String), String>,
+    status_overrides: HashMap<(String, String, String), u16>,
+) -> VulnApiStub {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
     let port = listener.local_addr().unwrap().port();
     let base_url = format!("http://127.0.0.1:{}", port);
     let fixtures = Arc::new(Mutex::new(fixtures));
+    let status_overrides = Arc::new(Mutex::new(status_overrides));
 
     let handle = thread::spawn(move || {
         for stream in listener.incoming().take(64) {
@@ -35,42 +43,73 @@ pub fn spawn(fixtures: HashMap<(String, String, String), String>) -> VulnApiStub
             }
             let req = String::from_utf8_lossy(&buf);
 
-            let response_body = if let Some(path) =
-                req.lines().next().and_then(|l| l.split_whitespace().nth(1))
-            {
-                let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-                if parts.len() >= 7
-                    && parts[0] == "v1"
-                    && parts[1] == "packages"
-                    && parts[4] == "versions"
-                    && parts[6] == "check"
-                {
-                    let eco = parts[2].to_string();
-                    let name = urlencoding::decode(parts[3])
-                        .unwrap_or_default()
-                        .into_owned();
-                    let ver = urlencoding::decode(parts[5])
-                        .unwrap_or_default()
-                        .into_owned();
-                    fixtures
+            let package_check = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|path| {
+                    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+                    if parts.len() >= 7
+                        && parts[0] == "v1"
+                        && parts[1] == "packages"
+                        && parts[4] == "versions"
+                        && parts[6] == "check"
+                    {
+                        Some((
+                            parts[2].to_string(),
+                            urlencoding::decode(parts[3])
+                                .unwrap_or_default()
+                                .into_owned(),
+                            urlencoding::decode(parts[5])
+                                .unwrap_or_default()
+                                .into_owned(),
+                        ))
+                    } else {
+                        None
+                    }
+                });
+
+            let (status_code, response_body) = match package_check {
+                Some((eco, name, ver)) => {
+                    let key = (eco.clone(), name.clone(), ver.clone());
+                    let body = fixtures
                         .lock()
                         .unwrap()
-                        .get(&(eco.clone(), name.clone(), ver.clone()))
+                        .get(&key)
                         .cloned()
                         .unwrap_or_else(|| {
                             format!(
                                 r#"{{"ecosystem":"{eco}","package_name":"{name}","version":"{ver}","is_vulnerable":false,"matches":[]}}"#
                             )
-                        })
-                } else {
-                    r#"{"error":"not found"}"#.to_string()
+                        });
+                    let status = status_overrides
+                        .lock()
+                        .unwrap()
+                        .get(&key)
+                        .copied()
+                        .unwrap_or(200);
+                    (status, body)
                 }
-            } else {
-                r#"{"error":"bad request"}"#.to_string()
+                None if req.lines().next().is_some() => {
+                    (404, r#"{"error":"not found"}"#.to_string())
+                }
+                None => (400, r#"{"error":"bad request"}"#.to_string()),
+            };
+
+            let status_text = match status_code {
+                404 => "Not Found",
+                401 => "Unauthorized",
+                403 => "Forbidden",
+                429 => "Too Many Requests",
+                500..=599 => "Internal Server Error",
+                _ if status_code >= 400 => "Error",
+                _ => "OK",
             };
 
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                status_code,
+                status_text,
                 response_body.len(),
                 response_body
             );

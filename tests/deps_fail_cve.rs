@@ -178,34 +178,6 @@ fn fail_cve_not_triggered_by_cve_lookup_errors() {
 }
 
 #[test]
-fn fail_cve_exits_zero_when_cve_check_skipped() {
-    let fixture = npm_fixture_dir();
-
-    let output = run_deps(
-        &[
-            "deps",
-            "--check-cve",
-            "--fail-cve",
-            "-e",
-            "npm",
-            "-p",
-            fixture.to_str().unwrap(),
-        ],
-        &[
-            ("CORGEA_NPM_REGISTRY", "http://127.0.0.1:1".to_string()),
-            ("CORGEA_TOKEN", String::new()),
-        ],
-    );
-
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
 fn check_cve_json_includes_cves_and_cve_summary() {
     let mut fixtures = HashMap::new();
     fixtures.insert(
@@ -231,11 +203,14 @@ fn check_cve_json_includes_cves_and_cve_summary() {
     let summary = body
         .get("cve_summary")
         .expect("cve_summary should be present with --check-cve");
-    assert_eq!(summary.get("skipped").and_then(Value::as_bool), Some(false));
     assert_eq!(summary.get("vulnerable").and_then(Value::as_u64), Some(1));
     assert_eq!(summary.get("clean").and_then(Value::as_u64), Some(2));
     assert_eq!(summary.get("errors").and_then(Value::as_u64), Some(0));
     assert!(summary.get("checked").and_then(Value::as_u64).is_some());
+    assert!(
+        summary.get("skipped").is_none(),
+        "skipped key removed from cve_summary"
+    );
 
     let results = body
         .get("results")
@@ -329,49 +304,6 @@ fn json_omits_cve_fields_without_check_cve() {
     for dep in results {
         assert!(dep.get("cves").is_none());
         assert!(dep.get("cve_status").is_none());
-    }
-}
-
-#[test]
-fn json_cve_summary_skipped_when_token_missing() {
-    let fixture = npm_fixture_dir();
-
-    let body = run_deps_json(
-        &[
-            "deps",
-            "--check-cve",
-            "--json",
-            "-e",
-            "npm",
-            "-p",
-            fixture.to_str().unwrap(),
-        ],
-        &[
-            ("CORGEA_NPM_REGISTRY", "http://127.0.0.1:1".to_string()),
-            ("CORGEA_TOKEN", String::new()),
-        ],
-    );
-
-    let summary = body
-        .get("cve_summary")
-        .expect("cve_summary present even when skipped");
-    assert_eq!(summary.get("skipped").and_then(Value::as_bool), Some(true));
-    assert_eq!(summary.get("checked").and_then(Value::as_u64), Some(0));
-    assert!(summary
-        .get("skipped_reason")
-        .and_then(Value::as_str)
-        .is_some());
-
-    let results = body
-        .get("results")
-        .and_then(Value::as_array)
-        .expect("results array");
-    for dep in results {
-        assert_eq!(
-            dep.get("cve_status").and_then(Value::as_str),
-            Some("not_checked")
-        );
-        assert!(dep.get("cves").is_none());
     }
 }
 

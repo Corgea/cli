@@ -142,87 +142,77 @@ pub fn print_text(report: &VerifyReport) {
             set_text_color("Known vulnerabilities:", TerminalColor::Yellow)
         );
 
-        if let Some(reason) = &report.cve_skip_reason {
-            println!(
-                "  {}",
-                set_text_color(
-                    &format!("⚠ CVE checks skipped — {}", reason.message()),
-                    TerminalColor::Yellow,
-                )
-            );
-        } else {
-            let cve_findings = report.cve_findings();
-            let cve_errors = report.cve_errors();
+        let cve_findings = report.cve_findings();
+        let cve_errors = report.cve_errors();
 
-            let checked = report.cve_outcomes.len();
-            if cve_findings.is_empty() && cve_errors.is_empty() {
-                if checked == 0 {
-                    println!(
-                        "  {}",
-                        set_text_color(
-                            "⚠ no dependencies eligible for CVE check",
-                            TerminalColor::Yellow,
-                        )
-                    );
-                } else {
-                    println!(
-                        "  {}",
-                        set_text_color(
-                            &format!(
-                                "✓ no known vulnerabilities ({} dependencies checked)",
-                                checked
-                            ),
-                            TerminalColor::Green,
-                        )
-                    );
-                }
-            } else {
-                for finding in &cve_findings {
-                    for line in format_cve_finding(finding).lines() {
-                        println!("  {}", line);
-                    }
-                }
-                if !cve_findings.is_empty() {
-                    println!(
-                        "  {}",
-                        set_text_color(
-                            &format!("note: {} dependencies CVE-checked", checked),
-                            TerminalColor::Yellow,
-                        )
-                    );
-                }
-            }
-
-            if !cve_errors.is_empty() {
-                println!();
+        let checked = report.cve_outcomes.len();
+        if cve_findings.is_empty() && cve_errors.is_empty() {
+            if checked == 0 {
                 println!(
-                    "{}",
-                    set_text_color("CVE lookup errors:", TerminalColor::Red)
+                    "  {}",
+                    set_text_color(
+                        "⚠ no dependencies eligible for CVE check",
+                        TerminalColor::Yellow,
+                    )
                 );
-                for (dep, err) in &cve_errors {
-                    println!(
-                        "  {} {}@{} ({}): {}",
-                        set_text_color("✗", TerminalColor::Red),
-                        dep.name,
-                        dep.version,
-                        dep.ecosystem.label(),
-                        err,
-                    );
-                }
-            }
-
-            if !report.unpinned_warnings.is_empty() {
+            } else {
                 println!(
                     "  {}",
                     set_text_color(
                         &format!(
-                            "note: {} unpinned dependency manifest(s) were not CVE-checked",
-                            report.unpinned_warnings.len()
+                            "✓ no known vulnerabilities ({} dependencies checked)",
+                            checked
                         ),
+                        TerminalColor::Green,
+                    )
+                );
+            }
+        } else {
+            for finding in &cve_findings {
+                for line in format_cve_finding(finding).lines() {
+                    println!("  {}", line);
+                }
+            }
+            if !cve_findings.is_empty() {
+                println!(
+                    "  {}",
+                    set_text_color(
+                        &format!("note: {} dependencies CVE-checked", checked),
                         TerminalColor::Yellow,
                     )
                 );
             }
+        }
+
+        if !cve_errors.is_empty() {
+            println!();
+            println!(
+                "{}",
+                set_text_color("CVE lookup errors:", TerminalColor::Red)
+            );
+            for (dep, err) in &cve_errors {
+                println!(
+                    "  {} {}@{} ({}): {}",
+                    set_text_color("✗", TerminalColor::Red),
+                    dep.name,
+                    dep.version,
+                    dep.ecosystem.label(),
+                    err,
+                );
+            }
+        }
+
+        if !report.unpinned_warnings.is_empty() {
+            println!(
+                "  {}",
+                set_text_color(
+                    &format!(
+                        "note: {} unpinned dependency manifest(s) were not CVE-checked",
+                        report.unpinned_warnings.len()
+                    ),
+                    TerminalColor::Yellow,
+                )
+            );
         }
     }
 
@@ -260,7 +250,7 @@ pub fn print_text(report: &VerifyReport) {
 
 /// Per-dep CVE status, kept distinct so downstream automation can
 /// tell apart "checked clean", "checked and failed", "lookup errored",
-/// and "never checked because the run was skipped".
+/// and "never checked" (e.g. unpinned manifests).
 enum CveStatus {
     Clean,
     Vulnerable(Vec<serde_json::Value>),
@@ -295,11 +285,11 @@ impl CveStatus {
 /// (e.g. 404 on `/v1/advisories/:id`).
 ///
 /// Top-level `cve_summary` is present when `--check-cve` was passed:
-/// `{ checked, vulnerable, clean, errors, skipped, skipped_reason?, unpinned_not_checked }`.
+/// `{ checked, vulnerable, clean, errors, unpinned_not_checked }`.
 /// It is omitted when CVE checking was not requested.
 pub fn print_json(report: &VerifyReport) {
     let mut cve_by_dep: HashMap<(String, String, String), CveStatus> = HashMap::new();
-    if report.check_cve && report.cve_skip_reason.is_none() {
+    if report.check_cve {
         for outcome in &report.cve_outcomes {
             match outcome {
                 super::CveLookupOutcome::Vulnerable(f) => {
@@ -380,13 +370,9 @@ pub fn print_json(report: &VerifyReport) {
                 LookupOutcome::Recent(f) => &f.dep,
                 LookupOutcome::Error { dep, .. } => dep,
             };
-            let status = if report.cve_skip_reason.is_some() {
-                CveStatus::NotChecked
-            } else {
-                cve_by_dep
-                    .remove(&dep_key(dep))
-                    .unwrap_or(CveStatus::NotChecked)
-            };
+            let status = cve_by_dep
+                .remove(&dep_key(dep))
+                .unwrap_or(CveStatus::NotChecked);
             let mut obj = obj;
             let map = obj
                 .as_object_mut()
@@ -436,33 +422,20 @@ pub fn print_json(report: &VerifyReport) {
     });
 
     if report.check_cve {
-        let summary = if let Some(reason) = &report.cve_skip_reason {
-            json!({
-                "skipped": true,
-                "skipped_reason": reason.message(),
-                "checked": 0,
-                "vulnerable": 0,
-                "clean": 0,
-                "errors": 0,
-                "unpinned_not_checked": report.unpinned_warnings.len(),
-            })
-        } else {
-            let vulnerable = report.cve_findings().len();
-            let errors = report.cve_errors().len();
-            let clean = report
-                .cve_outcomes
-                .iter()
-                .filter(|o| matches!(o, super::CveLookupOutcome::Clean { .. }))
-                .count();
-            json!({
-                "skipped": false,
-                "checked": report.cve_outcomes.len(),
-                "vulnerable": vulnerable,
-                "clean": clean,
-                "errors": errors,
-                "unpinned_not_checked": report.unpinned_warnings.len(),
-            })
-        };
+        let vulnerable = report.cve_findings().len();
+        let errors = report.cve_errors().len();
+        let clean = report
+            .cve_outcomes
+            .iter()
+            .filter(|o| matches!(o, super::CveLookupOutcome::Clean { .. }))
+            .count();
+        let summary = json!({
+            "checked": report.cve_outcomes.len(),
+            "vulnerable": vulnerable,
+            "clean": clean,
+            "errors": errors,
+            "unpinned_not_checked": report.unpinned_warnings.len(),
+        });
         body.as_object_mut()
             .expect("top-level JSON is an object")
             .insert("cve_summary".to_string(), summary);

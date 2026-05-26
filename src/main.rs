@@ -659,18 +659,19 @@ fn main() {
                     std::process::exit(2);
                 }
             };
+
             let project_path =
                 std::path::PathBuf::from(path.clone().unwrap_or_else(|| ".".to_string()));
 
             let (vuln_api_url, vuln_api_token) = if *check_cve {
-                let resolved_url = corgea_config.get_vuln_api_url();
-                let raw_token = corgea_config.get_token();
-                let trimmed_token = raw_token.trim().to_string();
+                let trimmed_token = corgea_config.get_token().trim().to_string();
                 if trimmed_token.is_empty() {
-                    (None, None)
-                } else {
-                    (Some(resolved_url), Some(trimmed_token))
+                    eprintln!("error: --check-cve requires a Corgea token.");
+                    eprintln!("       Run `corgea login` or set CORGEA_TOKEN.");
+                    eprintln!("       See https://docs.corgea.app/cli/deps#check-cve");
+                    std::process::exit(2);
                 }
+                (Some(corgea_config.get_vuln_api_url()), Some(trimmed_token))
             } else {
                 (None, None)
             };
@@ -709,8 +710,7 @@ fn main() {
                     if unpinned && opts.fail_unpinned {
                         std::process::exit(1);
                     }
-                    let has_cves = !report.cve_findings().is_empty();
-                    if has_cves && opts.fail_cve {
+                    if cve_vulnerable && opts.fail_cve {
                         std::process::exit(1);
                     }
                 }

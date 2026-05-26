@@ -119,25 +119,6 @@ pub struct CveFinding {
     pub advisory_details: Vec<Option<crate::vuln_api::AdvisoryResponse>>,
 }
 
-/// Why CVE checks did not run when the user passed `--check-cve`.
-///
-/// `None` means CVE checks ran (or weren't requested). The vuln-api URL
-/// is always resolvable (built-in default + env/config override) so the
-/// only remaining skip reason is an unset Corgea token.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CveSkipReason {
-    /// `--check-cve` was passed without a Corgea token.
-    MissingToken,
-}
-
-impl CveSkipReason {
-    pub fn message(&self) -> &'static str {
-        match self {
-            CveSkipReason::MissingToken => "Corgea token is not set (run `corgea login`)",
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct VerifyOptions {
     pub ecosystem: Ecosystem,
@@ -162,7 +143,9 @@ pub struct VerifyOptions {
     /// Base URL for vuln-api (resolved from env/config in main.rs).
     pub vuln_api_url: Option<String>,
     /// Token sent to vuln-api as `Authorization: Bearer …` (JWT) or
-    /// `CORGEA-TOKEN: …` (legacy). Resolved from config in main.rs.
+    /// `CORGEA-TOKEN: …` (legacy). Required and non-empty when
+    /// `check_cve = true`. Preflight in `main.rs` guarantees this before
+    /// `run()` is called.
     pub vuln_api_token: Option<String>,
 }
 
@@ -381,24 +364,6 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
         Result<vuln_api::AdvisoryResponse, ()>,
     > = std::collections::HashMap::new();
 
-    // Resolve up-front whether CVE checks are reachable. The vuln-api
-    // URL always resolves (default + env/config override), so the only
-    // skip reason is a missing Corgea token.
-    let cve_skip_reason: Option<CveSkipReason> = if opts.check_cve {
-        let token_ok = opts
-            .vuln_api_token
-            .as_deref()
-            .map(|t| !t.trim().is_empty())
-            .unwrap_or(false);
-        if !token_ok {
-            Some(CveSkipReason::MissingToken)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let cve_active = opts.check_cve && cve_skip_reason.is_none();
     let cve_base_url = opts
         .vuln_api_url
         .as_deref()
@@ -411,7 +376,7 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
         .unwrap_or_default();
 
     for dep in deps {
-        let dep_for_cve = dep.clone();
+        let dep_for_cve = opts.check_cve.then(|| dep.clone());
 
         let published = match dep.ecosystem {
             DependencyEcosystem::Npm => {
@@ -450,7 +415,7 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
             }
         }
 
-        if cve_active {
+        if let Some(dep_for_cve) = dep_for_cve {
             match crate::vuln_api::check_package_version(
                 cve_base_url,
                 cve_token,
@@ -492,7 +457,6 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport, String> {
         scanned_at: now,
         check_cve: opts.check_cve,
         cve_outcomes,
-        cve_skip_reason,
     })
 }
 
@@ -506,10 +470,6 @@ pub struct VerifyReport {
     pub scanned_at: DateTime<Utc>,
     pub check_cve: bool,
     pub cve_outcomes: Vec<CveLookupOutcome>,
-    /// Set when `--check-cve` was requested but no lookups ran. Lets
-    /// the report distinguish "0 vulnerabilities found" from "0 checks
-    /// performed".
-    pub cve_skip_reason: Option<CveSkipReason>,
 }
 
 impl VerifyReport {
@@ -1030,8 +990,6 @@ mod tests {
             report.cve_findings()[0].matches[0].advisory_id,
             "GHSA-integration-test"
         );
-        assert!(report.cve_skip_reason.is_none());
-
         let text_line = format_cve_finding(report.cve_findings()[0]);
         assert!(text_line.contains("GHSA-integration-test"));
         assert!(
@@ -1061,7 +1019,6 @@ mod tests {
         let report_off = run(&opts_off).expect("run should succeed");
         assert!(!report_off.check_cve);
         assert!(report_off.cve_outcomes.is_empty());
-        assert!(report_off.cve_skip_reason.is_none());
     }
 
     #[test]
@@ -1351,36 +1308,6 @@ mod tests {
             entry.get("remediation").is_none(),
             "remediation should not appear in CVE JSON output"
         );
-    }
-
-    #[test]
-    fn check_cve_skipped_when_token_missing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("package-lock.json"),
-            r#"{
-            "name": "demo", "version": "1.0.0", "lockfileVersion": 3,
-            "packages": {
-                "": { "name": "demo", "version": "1.0.0" },
-                "node_modules/lodash": { "version": "4.17.20" }
-            }
-        }"#,
-        )
-        .unwrap();
-
-        let opts = VerifyOptions {
-            ecosystem: Ecosystem::Npm,
-            path: dir.path().to_path_buf(),
-            check_cve: true,
-            vuln_api_url: Some("http://example.invalid".into()),
-            vuln_api_token: None,
-            npm_registry: Some("http://127.0.0.1:1".into()),
-            ..Default::default()
-        };
-        let report = run(&opts).expect("run should succeed");
-        assert!(report.check_cve);
-        assert!(report.cve_outcomes.is_empty());
-        assert_eq!(report.cve_skip_reason, Some(CveSkipReason::MissingToken));
     }
 
     fn fixture_deps_dir(name: &str) -> PathBuf {
