@@ -258,6 +258,17 @@ impl CveStatus {
 }
 
 /// Render the report as a single JSON object on stdout.
+///
+/// ## CVE fields (when `--check-cve` was passed)
+///
+/// Each entry in `results` includes a `cves` array (empty when clean) and a
+/// `cve_status` label (`clean`, `vulnerable`, `error`, or `not_checked`).
+/// Lookup failures add `cve_error` instead of `cves`. When `--check-cve` was
+/// not passed, per-dep CVE fields are omitted entirely.
+///
+/// Top-level `cve_summary` is present when `--check-cve` was passed:
+/// `{ checked, vulnerable, clean, errors, skipped, skipped_reason?, unpinned_not_checked }`.
+/// It is omitted when CVE checking was not requested.
 pub fn print_json(report: &VerifyReport) {
     let mut cve_by_dep: HashMap<(String, String, String), CveStatus> = HashMap::new();
     if report.check_cve && report.cve_skip_reason.is_none() {

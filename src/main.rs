@@ -254,6 +254,13 @@ enum Commands {
             help = "Check each dependency against the Corgea vulnerability database for known CVEs/advisories."
         )]
         check_cve: bool,
+
+        #[arg(
+            long,
+            requires = "check_cve",
+            help = "Exit with a non-zero status code if any known CVE is found. Requires --check-cve. Independent of --fail and --fail-unpinned."
+        )]
+        fail_cve: bool,
     },
     /// Wrap `npm` install/add commands: verify registry publish times, then run npm.
     ///
@@ -636,6 +643,7 @@ fn main() {
             json,
             path,
             check_cve,
+            fail_cve,
         }) => {
             let parsed_ecosystem = match verify_deps::Ecosystem::parse(ecosystem) {
                 Ok(e) => e,
@@ -673,6 +681,7 @@ fn main() {
                 include_dev: *include_dev,
                 fail: *fail,
                 fail_unpinned: *fail_unpinned,
+                fail_cve: *fail_cve,
                 json: *json,
                 path: project_path,
                 npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
@@ -698,6 +707,10 @@ fn main() {
                         std::process::exit(1);
                     }
                     if unpinned && opts.fail_unpinned {
+                        std::process::exit(1);
+                    }
+                    let has_cves = !report.cve_findings().is_empty();
+                    if has_cves && opts.fail_cve {
                         std::process::exit(1);
                     }
                 }

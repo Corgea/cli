@@ -142,6 +142,9 @@ pub struct VerifyOptions {
     /// `requirements.txt` lines, `pyproject.toml`/`Pipfile` without a
     /// matching lockfile) as a hard failure.
     pub fail_unpinned: bool,
+    /// When true, exit non-zero if any dependency has known CVEs.
+    /// Requires `check_cve`. Independent of `fail` and `fail_unpinned`.
+    pub fail_cve: bool,
     pub json: bool,
     pub path: PathBuf,
     /// Optional registry overrides (used in tests).
@@ -164,6 +167,7 @@ impl Default for VerifyOptions {
             include_dev: false,
             fail: false,
             fail_unpinned: false,
+            fail_cve: false,
             json: false,
             path: PathBuf::from("."),
             npm_registry: None,
@@ -194,6 +198,7 @@ impl VerifyOptions {
             include_dev: false,
             fail,
             fail_unpinned,
+            fail_cve: false,
             json,
             path,
             npm_registry,
