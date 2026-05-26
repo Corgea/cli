@@ -23,17 +23,13 @@ impl ScanParser for CoverityParser {
                     let is_merged_defect = e.name().as_ref() == b"cov:mergedDefect"
                         || e.name().as_ref() == b"mergedDefect";
                     if is_merged_defect {
-                        for attr in e.attributes() {
-                            if let Ok(attr) = attr {
-                                if attr.key.as_ref() == b"file" {
-                                    if let Ok(file_path) = std::str::from_utf8(attr.value.as_ref())
-                                    {
-                                        let clean_path = file_path
-                                            .trim_start_matches('/')
-                                            .trim_start_matches('\\');
-                                        if !clean_path.is_empty() {
-                                            paths.push(clean_path.to_string());
-                                        }
+                        for attr in e.attributes().flatten() {
+                            if attr.key.as_ref() == b"file" {
+                                if let Ok(file_path) = std::str::from_utf8(attr.value.as_ref()) {
+                                    let clean_path =
+                                        file_path.trim_start_matches('/').trim_start_matches('\\');
+                                    if !clean_path.is_empty() {
+                                        paths.push(clean_path.to_string());
                                     }
                                 }
                             }

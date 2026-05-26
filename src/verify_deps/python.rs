@@ -15,12 +15,7 @@ use serde::Deserialize;
 
 use super::{Dependency, DependencyEcosystem, DiscoverResult};
 
-const SUPPORTED_FILES: &[&str] = &[
-    "poetry.lock",
-    "Pipfile.lock",
-    "uv.lock",
-    "requirements.txt",
-];
+const SUPPORTED_FILES: &[&str] = &["poetry.lock", "Pipfile.lock", "uv.lock", "requirements.txt"];
 
 pub fn discover(project_dir: &Path, include_dev: bool) -> Result<DiscoverResult, String> {
     let candidates: Vec<_> = SUPPORTED_FILES
@@ -63,15 +58,14 @@ pub fn discover(project_dir: &Path, include_dev: bool) -> Result<DiscoverResult,
         && !poetry_lock.exists()
         && !uv_lock.exists()
         && !pipfile_lock.exists()
+        && pyproject_has_deps(&pyproject).unwrap_or(false)
     {
-        if pyproject_has_deps(&pyproject).unwrap_or(false) {
-            warnings.push(super::UnpinnedWarning {
+        warnings.push(super::UnpinnedWarning {
                 ecosystem: DependencyEcosystem::Python,
                 manifest: pyproject.display().to_string(),
                 reason: "pyproject.toml declares dependencies but no lockfile was found (looked for poetry.lock, uv.lock, Pipfile.lock). Run `poetry lock`, `uv lock`, or generate a pinned requirements.txt before verifying."
                     .to_string(),
             });
-        }
     }
 
     if candidates.is_empty() {
@@ -111,10 +105,7 @@ pub fn discover(project_dir: &Path, include_dev: bool) -> Result<DiscoverResult,
                 warnings.push(super::UnpinnedWarning {
                     ecosystem: DependencyEcosystem::Python,
                     manifest: chosen.display().to_string(),
-                    reason: format!(
-                        "requirements.txt line is not `==`-pinned: `{}`",
-                        line
-                    ),
+                    reason: format!("requirements.txt line is not `==`-pinned: `{}`", line),
                 });
             }
             pinned
@@ -148,7 +139,10 @@ fn pyproject_has_deps(path: &Path) -> Result<bool, ()> {
         .get("project")
         .and_then(|p| p.get("optional-dependencies"))
         .and_then(|v| v.as_table())
-        .map(|t| t.values().any(|v| v.as_array().map(|a| !a.is_empty()).unwrap_or(false)))
+        .map(|t| {
+            t.values()
+                .any(|v| v.as_array().map(|a| !a.is_empty()).unwrap_or(false))
+        })
         .unwrap_or(false);
     let poetry_main = parsed
         .get("tool")
@@ -200,7 +194,10 @@ struct PoetrySource {
     source_type: Option<String>,
 }
 
-pub(crate) fn parse_poetry_lock(content: &str, include_dev: bool) -> Result<Vec<Dependency>, String> {
+pub(crate) fn parse_poetry_lock(
+    content: &str,
+    include_dev: bool,
+) -> Result<Vec<Dependency>, String> {
     let root: PoetryLockRoot =
         toml::from_str(content).map_err(|e| format!("failed to parse poetry.lock: {}", e))?;
 
@@ -233,14 +230,12 @@ pub(crate) fn parse_poetry_lock(content: &str, include_dev: bool) -> Result<Vec<
 
 fn is_poetry_dev(pkg: &PoetryPackage) -> bool {
     if let Some(cat) = &pkg.category {
-        if !cat.is_empty() && cat.to_ascii_lowercase() != "main" {
+        if !cat.is_empty() && !cat.eq_ignore_ascii_case("main") {
             return true;
         }
     }
     if let Some(groups) = &pkg.groups {
-        if !groups.is_empty()
-            && !groups.iter().any(|g| g.eq_ignore_ascii_case("main"))
-        {
+        if !groups.is_empty() && !groups.iter().any(|g| g.eq_ignore_ascii_case("main")) {
             return true;
         }
     }
@@ -264,9 +259,12 @@ struct PipfileLockEntry {
     path: Option<String>,
 }
 
-pub(crate) fn parse_pipfile_lock(content: &str, include_dev: bool) -> Result<Vec<Dependency>, String> {
-    let root: PipfileLockRoot =
-        serde_json::from_str(content).map_err(|e| format!("failed to parse Pipfile.lock: {}", e))?;
+pub(crate) fn parse_pipfile_lock(
+    content: &str,
+    include_dev: bool,
+) -> Result<Vec<Dependency>, String> {
+    let root: PipfileLockRoot = serde_json::from_str(content)
+        .map_err(|e| format!("failed to parse Pipfile.lock: {}", e))?;
     let mut out = Vec::new();
     extend_pipfile(&root.default, false, &mut out);
     if include_dev {
@@ -378,9 +376,7 @@ pub(crate) fn parse_uv_lock(content: &str) -> Result<Vec<Dependency>, String> {
 ///   we *could not* resolve to a pinned version (range specifiers,
 ///   bare names, git URLs, editables, etc.). Surfaced as warnings so
 ///   `--fail-unpinned` can fail on them.
-pub(crate) fn parse_requirements_with_warnings(
-    content: &str,
-) -> (Vec<Dependency>, Vec<String>) {
+pub(crate) fn parse_requirements_with_warnings(content: &str) -> (Vec<Dependency>, Vec<String>) {
     let mut deps = Vec::new();
     let mut unpinned = Vec::new();
     let mut continued = String::new();
@@ -432,10 +428,7 @@ pub(crate) fn parse_requirements_with_warnings(
         let unverifiable_prefixes = [
             "git+", "hg+", "svn+", "bzr+", "http://", "https://", "file:",
         ];
-        if unverifiable_prefixes
-            .iter()
-            .any(|p| lowered.starts_with(p))
-        {
+        if unverifiable_prefixes.iter().any(|p| lowered.starts_with(p)) {
             continue;
         }
 
@@ -501,7 +494,10 @@ mod tests {
         assert_eq!(normalize_python_name("Flask"), "flask");
         assert_eq!(normalize_python_name("pytest_mock"), "pytest-mock");
         assert_eq!(normalize_python_name("ruamel.yaml"), "ruamel-yaml");
-        assert_eq!(normalize_python_name("Some__Weird--Name.."), "some-weird-name");
+        assert_eq!(
+            normalize_python_name("Some__Weird--Name.."),
+            "some-weird-name"
+        );
     }
 
     #[test]
@@ -516,7 +512,10 @@ git+https://github.com/x/y.git
 django[bcrypt]==4.2.0
         "#;
         let deps = parse_requirements(req);
-        let pairs: Vec<_> = deps.iter().map(|d| (d.name.clone(), d.version.clone())).collect();
+        let pairs: Vec<_> = deps
+            .iter()
+            .map(|d| (d.name.clone(), d.version.clone()))
+            .collect();
         assert!(pairs.contains(&("requests".to_string(), "2.31.0".to_string())));
         assert!(pairs.contains(&("flask".to_string(), "2.3.2".to_string())));
         assert!(pairs.contains(&("django".to_string(), "4.2.0".to_string())));
@@ -579,7 +578,10 @@ type = "directory"
 url = "../local"
 "#;
         let prod = parse_poetry_lock(lock, false).unwrap();
-        let pairs: Vec<_> = prod.iter().map(|d| (d.name.clone(), d.version.clone())).collect();
+        let pairs: Vec<_> = prod
+            .iter()
+            .map(|d| (d.name.clone(), d.version.clone()))
+            .collect();
         assert_eq!(pairs, vec![("requests".to_string(), "2.31.0".to_string())]);
 
         let all = parse_poetry_lock(lock, true).unwrap();
@@ -634,7 +636,10 @@ version = "0.0.0"
 git = "https://example.com/x.git"
 "#;
         let deps = parse_uv_lock(lock).unwrap();
-        let pairs: Vec<_> = deps.iter().map(|d| (d.name.clone(), d.version.clone())).collect();
+        let pairs: Vec<_> = deps
+            .iter()
+            .map(|d| (d.name.clone(), d.version.clone()))
+            .collect();
         assert_eq!(pairs, vec![("requests".to_string(), "2.31.0".to_string())]);
     }
 
@@ -677,11 +682,7 @@ version = "0.1.0"
     #[test]
     fn discover_warns_on_pipfile_without_lock() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("Pipfile"),
-            "[packages]\nrequests = \"*\"\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("Pipfile"), "[packages]\nrequests = \"*\"\n").unwrap();
 
         let result = discover(dir.path(), false).expect("discover");
         assert!(result.deps.is_empty());
@@ -733,8 +734,12 @@ flask
         // When requirements.in is paired with a pyproject.toml that
         // *does* declare deps, we end up returning a warning.
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("requirements.in"), "requests
-").unwrap();
+        std::fs::write(
+            dir.path().join("requirements.in"),
+            "requests
+",
+        )
+        .unwrap();
         std::fs::write(
             dir.path().join("pyproject.toml"),
             r#"[project]

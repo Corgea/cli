@@ -1,5 +1,3 @@
-
-
 #[derive(Debug)]
 pub struct ParseResult {
     pub paths: Vec<String>,
@@ -53,7 +51,7 @@ impl ScanParserFactory {
     }
 }
 
-pub mod semgrep;
-pub mod sarif;
 pub mod checkmarx;
 pub mod coverity;
+pub mod sarif;
+pub mod semgrep;

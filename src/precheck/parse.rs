@@ -133,9 +133,9 @@ fn extract_pip_positionals(args: &[String]) -> Result<PositionalSplit, String> {
         }
         match a.as_str() {
             "-r" | "--requirement" => {
-                let path = args.get(i + 1).ok_or_else(|| {
-                    "`-r` / `--requirement` requires a file path".to_string()
-                })?;
+                let path = args
+                    .get(i + 1)
+                    .ok_or_else(|| "`-r` / `--requirement` requires a file path".to_string())?;
                 out.requirements_files.push(PathBuf::from(path));
                 i += 2;
                 continue;
@@ -268,7 +268,11 @@ pub(crate) fn parse_npm_spec(raw: &str) -> InstallTarget {
         }
     };
 
-    InstallTarget { name, display, kind }
+    InstallTarget {
+        name,
+        display,
+        kind,
+    }
 }
 
 /// Loose check: does this spec look like an npm version range?
@@ -280,7 +284,11 @@ fn looks_like_npm_range(s: &str) -> bool {
     matches!(
         s.chars().next(),
         Some('^') | Some('~') | Some('>') | Some('<') | Some('=') | Some('*')
-    ) || s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+    ) || s
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
 }
 
 /// A dist-tag is a non-empty alphanumeric string (e.g. `latest`,
@@ -290,7 +298,10 @@ fn is_npm_dist_tag(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-        && s.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+        && s.chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false)
 }
 
 /// Parse a single pip-style positional, e.g. `requests`, `requests==2.31.0`,
@@ -417,7 +428,10 @@ mod tests {
             ("axios@1.0.0", NpmSpec::Exact("1.0.0".to_string())),
             ("axios@^1.0.0", NpmSpec::Range("^1.0.0".to_string())),
             ("axios@~1.0.0", NpmSpec::Range("~1.0.0".to_string())),
-            ("axios@>=1.0.0 <2.0.0", NpmSpec::Range(">=1.0.0 <2.0.0".to_string())),
+            (
+                "axios@>=1.0.0 <2.0.0",
+                NpmSpec::Range(">=1.0.0 <2.0.0".to_string()),
+            ),
             ("axios@next", NpmSpec::Tag("next".to_string())),
             ("axios@beta", NpmSpec::Tag("beta".to_string())),
             ("@types/node", NpmSpec::Latest),
@@ -459,7 +473,11 @@ mod tests {
         ];
         for u in unverifiable {
             let t = parse_npm_spec(u);
-            assert!(matches!(t.kind, TargetKind::Unverifiable { .. }), "for '{}'", u);
+            assert!(
+                matches!(t.kind, TargetKind::Unverifiable { .. }),
+                "for '{}'",
+                u
+            );
         }
     }
 
@@ -472,7 +490,10 @@ mod tests {
             ("requests~=2.0", PypiSpec::Specifier("~=2.0".to_string())),
             ("requests<3,>=2", PypiSpec::Specifier("<3,>=2".to_string())),
             ("requests[security]", PypiSpec::Latest),
-            ("requests[security]==2.31.0", PypiSpec::Exact("2.31.0".to_string())),
+            (
+                "requests[security]==2.31.0",
+                PypiSpec::Exact("2.31.0".to_string()),
+            ),
         ];
         for (input, expected) in cases {
             let t = parse_pypi_spec(input);
@@ -487,7 +508,10 @@ mod tests {
 
     #[test]
     fn parse_pypi_spec_strips_extras_and_markers() {
-        assert_eq!(parse_pypi_spec("requests[security]==2.31.0").name, "requests");
+        assert_eq!(
+            parse_pypi_spec("requests[security]==2.31.0").name,
+            "requests"
+        );
         assert_eq!(
             parse_pypi_spec("requests==2.31.0; python_version >= \"3.7\"").name,
             "requests"
@@ -509,7 +533,11 @@ mod tests {
         ];
         for u in unverifiable {
             let t = parse_pypi_spec(u);
-            assert!(matches!(t.kind, TargetKind::Unverifiable { .. }), "for '{}'", u);
+            assert!(
+                matches!(t.kind, TargetKind::Unverifiable { .. }),
+                "for '{}'",
+                u
+            );
         }
     }
 

@@ -96,7 +96,10 @@ fn package_json_has_deps(path: &Path) -> Result<bool, ()> {
             .map(|m| !m.is_empty())
             .unwrap_or(false)
     };
-    Ok(has("dependencies") || has("devDependencies") || has("peerDependencies") || has("optionalDependencies"))
+    Ok(has("dependencies")
+        || has("devDependencies")
+        || has("peerDependencies")
+        || has("optionalDependencies"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,10 +135,7 @@ struct NpmLockV2Entry {
     link: bool,
 }
 
-pub(crate) fn parse_npm_lock(
-    content: &str,
-    include_dev: bool,
-) -> Result<Vec<Dependency>, String> {
+pub(crate) fn parse_npm_lock(content: &str, include_dev: bool) -> Result<Vec<Dependency>, String> {
     let root: NpmLockRoot = serde_json::from_str(content)
         .map_err(|e| format!("failed to parse npm lockfile: {}", e))?;
 
@@ -237,7 +237,16 @@ fn is_registry_version(version: &str) -> bool {
     }
     let lower = v.to_ascii_lowercase();
     let bad_prefixes = [
-        "git+", "git:", "git://", "ssh://", "http://", "https://", "file:", "link:", "workspace:", "npm:",
+        "git+",
+        "git:",
+        "git://",
+        "ssh://",
+        "http://",
+        "https://",
+        "file:",
+        "link:",
+        "workspace:",
+        "npm:",
     ];
     if bad_prefixes.iter().any(|p| lower.starts_with(p)) {
         return false;
@@ -267,13 +276,10 @@ pub(crate) fn parse_yarn_lock(content: &str) -> Result<Vec<Dependency>, String> 
     let mut current_version: Option<String> = None;
 
     let flush =
-        |keys: &mut Vec<String>,
-         version: &mut Option<String>,
-         out: &mut Vec<Dependency>| {
-            if let (Some(name), Some(ver)) = (
-                keys.first().and_then(|k| yarn_key_name(k)),
-                version.clone(),
-            ) {
+        |keys: &mut Vec<String>, version: &mut Option<String>, out: &mut Vec<Dependency>| {
+            if let (Some(name), Some(ver)) =
+                (keys.first().and_then(|k| yarn_key_name(k)), version.clone())
+            {
                 if is_registry_version(&ver) {
                     out.push(Dependency {
                         name,
@@ -388,10 +394,7 @@ fn yarn_key_name(key: &str) -> Option<String> {
 ///   non-dev, because resolving the full graph from a lockfile is out
 ///   of scope here. Including those in production scans is the safer
 ///   default for a supply-chain tripwire.
-pub(crate) fn parse_pnpm_lock(
-    content: &str,
-    include_dev: bool,
-) -> Result<Vec<Dependency>, String> {
+pub(crate) fn parse_pnpm_lock(content: &str, include_dev: bool) -> Result<Vec<Dependency>, String> {
     let importers = parse_pnpm_importers(content);
     let entries = parse_pnpm_packages(content)?;
 
@@ -453,7 +456,12 @@ fn parse_pnpm_packages(content: &str) -> Result<Vec<PnpmPackageEntry>, String> {
         let body = &raw_line[indent..];
 
         if indent == 0 {
-            commit_pnpm_entry(&mut out, &mut current_name, &mut current_version, &mut current_dev);
+            commit_pnpm_entry(
+                &mut out,
+                &mut current_name,
+                &mut current_version,
+                &mut current_dev,
+            );
             state = if body.trim_end_matches(' ') == "packages:" {
                 PackagesState::Inside
             } else {
@@ -471,7 +479,12 @@ fn parse_pnpm_packages(content: &str) -> Result<Vec<PnpmPackageEntry>, String> {
         }
 
         if indent == entry_indent && body.ends_with(':') {
-            commit_pnpm_entry(&mut out, &mut current_name, &mut current_version, &mut current_dev);
+            commit_pnpm_entry(
+                &mut out,
+                &mut current_name,
+                &mut current_version,
+                &mut current_dev,
+            );
 
             let key = body.trim_end_matches(':').trim();
             if let Some((name, version)) = extract_pnpm_pkg_key(key) {
@@ -494,7 +507,12 @@ fn parse_pnpm_packages(content: &str) -> Result<Vec<PnpmPackageEntry>, String> {
             }
         }
     }
-    commit_pnpm_entry(&mut out, &mut current_name, &mut current_version, &mut current_dev);
+    commit_pnpm_entry(
+        &mut out,
+        &mut current_name,
+        &mut current_version,
+        &mut current_dev,
+    );
     Ok(out)
 }
 
@@ -607,7 +625,8 @@ fn parse_pnpm_importers(content: &str) -> PnpmImporters {
         if indent != expected_entry_indent {
             if let Some((ref pkg, _)) = pending_name {
                 if key == "version" && !value.is_empty() {
-                    let version = strip_pnpm_peer_suffix(value.trim_matches('\'').trim_matches('"'));
+                    let version =
+                        strip_pnpm_peer_suffix(value.trim_matches('\'').trim_matches('"'));
                     let pair = (pkg.clone(), version);
                     match active_bucket {
                         Bucket::Prod => {
@@ -738,7 +757,10 @@ mod tests {
             }
         }"#;
         let prod = parse_npm_lock(lock, false).unwrap();
-        let names: Vec<_> = prod.iter().map(|d| (d.name.as_str(), d.version.as_str())).collect();
+        let names: Vec<_> = prod
+            .iter()
+            .map(|d| (d.name.as_str(), d.version.as_str()))
+            .collect();
         assert_eq!(names, vec![("left-pad", "1.3.0")]);
 
         let all = parse_npm_lock(lock, true).unwrap();
@@ -775,11 +797,17 @@ mod tests {
         }"#;
 
         let prod = parse_npm_lock(lock, false).unwrap();
-        let names: Vec<_> = prod.iter().map(|d| (d.name.as_str(), d.version.as_str())).collect();
+        let names: Vec<_> = prod
+            .iter()
+            .map(|d| (d.name.as_str(), d.version.as_str()))
+            .collect();
         assert_eq!(names, vec![("left-pad", "1.3.0")]);
 
         let all = parse_npm_lock(lock, true).unwrap();
-        let mut got: Vec<_> = all.iter().map(|d| (d.name.clone(), d.version.clone())).collect();
+        let mut got: Vec<_> = all
+            .iter()
+            .map(|d| (d.name.clone(), d.version.clone()))
+            .collect();
         got.sort();
         assert_eq!(
             got,
@@ -805,7 +833,10 @@ mod tests {
 "#;
         let deps = parse_yarn_lock(lock).unwrap();
         assert_eq!(deps.len(), 2);
-        let names: Vec<_> = deps.iter().map(|d| (d.name.clone(), d.version.clone())).collect();
+        let names: Vec<_> = deps
+            .iter()
+            .map(|d| (d.name.clone(), d.version.clone()))
+            .collect();
         assert!(names.contains(&("left-pad".to_string(), "1.3.0".to_string())));
         assert!(names.contains(&("@types/node".to_string(), "20.10.5".to_string())));
     }
@@ -823,7 +854,10 @@ mod tests {
 
     #[test]
     fn extracts_packages_key_name() {
-        assert_eq!(extract_name_from_packages_key("node_modules/foo").as_deref(), Some("foo"));
+        assert_eq!(
+            extract_name_from_packages_key("node_modules/foo").as_deref(),
+            Some("foo")
+        );
         assert_eq!(
             extract_name_from_packages_key("node_modules/@scope/bar").as_deref(),
             Some("@scope/bar")
@@ -1000,10 +1034,7 @@ packages:
             .iter()
             .map(|d| (d.name.clone(), d.version.clone()))
             .collect();
-        assert_eq!(
-            pairs,
-            vec![("lodash".to_string(), "4.17.21".to_string())]
-        );
+        assert_eq!(pairs, vec![("lodash".to_string(), "4.17.21".to_string())]);
 
         let all = parse_pnpm_lock(lock, true).unwrap();
         assert_eq!(all.len(), 3);
@@ -1034,10 +1065,7 @@ packages:
             .iter()
             .map(|d| (d.name.clone(), d.version.clone()))
             .collect();
-        assert_eq!(
-            pairs,
-            vec![("lodash".to_string(), "4.17.21".to_string())]
-        );
+        assert_eq!(pairs, vec![("lodash".to_string(), "4.17.21".to_string())]);
     }
 
     #[test]
