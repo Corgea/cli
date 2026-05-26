@@ -1,0 +1,18 @@
+version = 1
+requires-python = ">=3.8"
+
+[[package]]
+name = "django"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "urllib3"
+version = "1.25.8"
+source = { registry = "https://pypi.org/simple" }
+
+[package.metadata]
+requires-dist = [
+    { name = "django", specifier = "==2.2.0" },
+    { name = "urllib3", specifier = "==1.25.8" },
+]

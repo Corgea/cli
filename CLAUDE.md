@@ -14,6 +14,7 @@ conventions; this file covers cli-only commands.
 - Test: `./harness test` — `cargo test`
 - Fix: `./harness fix` — clippy fix + format
 - Setup: `./harness setup-hooks` — install `.git/hooks/pre-commit`
+- Install: `./harness install` — `cargo install --path .` to `~/.cargo/bin/corgea`
 - Auto-format: `./harness post-edit` runs via Claude Code Stop hook
 
 Add `--verbose` to stream raw command output instead of the quiet summary.

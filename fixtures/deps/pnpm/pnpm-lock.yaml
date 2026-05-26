@@ -1,0 +1,31 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+  .:
+    dependencies:
+      json5:
+        specifier: 2.2.1
+        version: 2.2.1
+      lodash:
+        specifier: 4.17.20
+        version: 4.17.20
+      semver:
+        specifier: 5.4.1
+        version: 5.4.1
+
+packages:
+  json5@2.2.1:
+    resolution: {integrity: sha512-x}
+    engines: {node: '>=6'}
+
+  lodash@4.17.20:
+    resolution: {integrity: sha512-y}
+    engines: {node: '>=4'}
+
+  semver@5.4.1:
+    resolution: {integrity: sha512-z}
+    engines: {node: '*'}

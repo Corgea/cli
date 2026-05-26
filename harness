@@ -3,7 +3,7 @@
 # Usage: ./harness <command> [--verbose] [--min=N]
 #
 # Commands: check, fix, lint, test, audit, pre-commit, ci, post-edit,
-#           setup-hooks, suppressions
+#           setup-hooks, suppressions, install
 
 set -u
 
@@ -227,6 +227,21 @@ cmd_ci() {
     run_with_summary "Tests" 0 -- cargo test
 }
 
+cmd_install() {
+    printf "\n%s[install]%s Building and installing corgea to ~/.cargo/bin\n\n" "$BLUE" "$RESET"
+    run "cargo install" 0 -- cargo install --path . --force
+    local bin="$HOME/.cargo/bin/corgea"
+    if [ -x "$bin" ]; then
+        local ver; ver="$("$bin" --version 2>/dev/null || echo unknown)"
+        printf "\n%sInstalled%s %s %s(%s)%s\n" "$GREEN" "$RESET" "$bin" "$DIM" "$ver" "$RESET"
+        local resolved; resolved="$(command -v corgea 2>/dev/null || true)"
+        if [ -n "$resolved" ] && [ "$resolved" != "$bin" ]; then
+            printf "%sNote:%s 'corgea' on PATH resolves to %s — re-order PATH to prefer ~/.cargo/bin\n" \
+                "$DIM" "$RESET" "$resolved"
+        fi
+    fi
+}
+
 cmd_setup_hooks() {
     local hook_dir="$ROOT/.git/hooks"
     local hook="$hook_dir/pre-commit"
@@ -253,10 +268,11 @@ case "$cmd" in
     post-edit)    cmd_post_edit ;;
     setup-hooks)  cmd_setup_hooks ;;
     suppressions) cmd_suppressions ;;
+    install)      cmd_install ;;
     -h|--help|help)
         printf "Usage: ./harness <command> [--verbose]\n\n"
         printf "Commands: check, fix, lint, test, audit, pre-commit, ci,\n"
-        printf "          post-edit, setup-hooks, suppressions\n"
+        printf "          post-edit, setup-hooks, suppressions, install\n"
         ;;
     *)
         printf "Unknown command: %s\n" "$cmd" >&2

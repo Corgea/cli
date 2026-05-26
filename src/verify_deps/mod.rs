@@ -888,4 +888,130 @@ mod tests {
         assert!(report.cve_outcomes.is_empty());
         assert_eq!(report.cve_skip_reason, Some(CveSkipReason::MissingToken));
     }
+
+    fn fixture_deps_dir(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/deps")
+            .join(name)
+    }
+
+    #[test]
+    fn deps_dogfood_npm_discovers_pins() {
+        let result = npm::discover(&fixture_deps_dir("npm"), false).expect("discover npm");
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.deps.len(), 3);
+        let names: Vec<_> = result.deps.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"lodash"));
+        assert!(names.contains(&"semver"));
+        assert!(names.contains(&"json5"));
+    }
+
+    #[test]
+    fn deps_dogfood_npm_unpinned() {
+        let result =
+            npm::discover(&fixture_deps_dir("npm-unpinned"), false).expect("discover npm-unpinned");
+        assert!(result.deps.is_empty());
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].manifest.ends_with("package.json"));
+
+        let opts = VerifyOptions {
+            ecosystem: Ecosystem::Npm,
+            path: fixture_deps_dir("npm-unpinned"),
+            npm_registry: Some("http://127.0.0.1:1".into()),
+            ..Default::default()
+        };
+        let report = run(&opts).expect("run should succeed");
+        assert!(report.has_unpinned());
+    }
+
+    #[test]
+    fn deps_dogfood_npm_cve_with_stub() {
+        let mut fixtures = HashMap::new();
+        fixtures.insert(
+            ("npm".into(), "lodash".into(), "4.17.20".into()),
+            crate::vuln_api::VulnCheckResponse {
+                ecosystem: "npm".into(),
+                package_name: "lodash".into(),
+                version: "4.17.20".into(),
+                is_vulnerable: true,
+                matches: vec![crate::vuln_api::VulnMatch {
+                    advisory_id: "GHSA-dogfood-fixture".into(),
+                    severity_level: "high".into(),
+                    tier: 1,
+                    vulnerable_version_range: Some("<4.17.21".into()),
+                    fixed_version: Some("4.17.21".into()),
+                }],
+            },
+        );
+        let stub = spawn_vuln_api_stub(fixtures);
+
+        let opts = VerifyOptions {
+            ecosystem: Ecosystem::Npm,
+            path: fixture_deps_dir("npm"),
+            check_cve: true,
+            vuln_api_url: Some(stub.base_url),
+            vuln_api_token: Some("test-token".into()),
+            npm_registry: Some("http://127.0.0.1:1".into()),
+            ..Default::default()
+        };
+
+        let report = run(&opts).expect("run should succeed");
+        assert_eq!(report.cve_findings().len(), 1);
+        assert_eq!(report.cve_findings()[0].dep.name, "lodash");
+        assert_eq!(
+            report.cve_findings()[0].matches[0].advisory_id,
+            "GHSA-dogfood-fixture"
+        );
+    }
+
+    #[test]
+    fn deps_dogfood_yarn_lock_parses() {
+        let result = npm::discover(&fixture_deps_dir("yarn"), false).expect("discover yarn");
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.deps.len(), 3);
+        assert!(result.source.ends_with("yarn.lock"));
+    }
+
+    #[test]
+    fn deps_dogfood_pnpm_lock_parses() {
+        let result = npm::discover(&fixture_deps_dir("pnpm"), false).expect("discover pnpm");
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.deps.len(), 3);
+        assert!(result.source.ends_with("pnpm-lock.yaml"));
+    }
+
+    #[test]
+    fn deps_dogfood_python_requirements_discovers() {
+        let result = python::discover(&fixture_deps_dir("python-requirements"), false)
+            .expect("discover python-requirements");
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.deps.len(), 4);
+        let names: Vec<_> = result.deps.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"django"));
+        assert!(names.contains(&"pyyaml"));
+        assert!(names.contains(&"urllib3"));
+        assert!(names.contains(&"pillow"));
+    }
+
+    #[test]
+    fn deps_dogfood_python_poetry_discovers() {
+        let result = python::discover(&fixture_deps_dir("python-poetry"), false)
+            .expect("discover python-poetry");
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.deps.len(), 2);
+        let names: Vec<_> = result.deps.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"django"));
+        assert!(names.contains(&"pyyaml"));
+    }
+
+    #[test]
+    fn deps_dogfood_python_uv_discovers() {
+        let result =
+            python::discover(&fixture_deps_dir("python-uv"), false).expect("discover python-uv");
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.deps.len(), 2);
+        let names: Vec<_> = result.deps.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"django"));
+        assert!(names.contains(&"urllib3"));
+    }
 }

@@ -1,0 +1,11 @@
+{
+  "name": "deps-fixture-pnpm",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sample app for corgea deps pnpm-lock.yaml dogfood. Intentional old pins — do not bump.",
+  "dependencies": {
+    "json5": "2.2.1",
+    "lodash": "4.17.20",
+    "semver": "5.4.1"
+  }
+}

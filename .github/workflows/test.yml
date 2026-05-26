@@ -24,3 +24,6 @@ jobs:
 
       - name: Run unit tests
         run: cargo test
+
+      - name: Deps dogfood fixture tests
+        run: cargo test deps_dogfood
