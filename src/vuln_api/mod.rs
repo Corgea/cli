@@ -18,6 +18,12 @@ use crate::log::debug;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Cap on how much of an error response body we splice into the
+/// user-facing error message. Fits a CLI line, captures
+/// `{"error":"…"}`-class messages comfortably, and truncates
+/// Cloudflare HTML before it gets ugly.
+const ERROR_BODY_SNIPPET_LEN: usize = 300;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VulnCheckResponse {
     pub ecosystem: String,
@@ -124,6 +130,24 @@ fn build_package_check_request<'a>(
     req
 }
 
+/// Collapse whitespace and truncate at `max_chars` so a server error
+/// body can be spliced into a single-line CLI error message without
+/// dragging in HTML newlines or runaway length. Returns empty string
+/// when the body is empty so the caller can format conditionally.
+/// Char-boundary safe — operates on `chars()`, never byte slices.
+fn body_snippet(body: &str, max_chars: usize) -> String {
+    let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return String::new();
+    }
+    let truncated: String = collapsed.chars().take(max_chars).collect();
+    if collapsed.chars().count() > max_chars {
+        format!("{}…", truncated)
+    } else {
+        truncated
+    }
+}
+
 fn retry_after_seconds(response: &reqwest::blocking::Response) -> u64 {
     response
         .headers()
@@ -205,7 +229,14 @@ pub fn check_package_version(
             return Err(format!("vuln-api unavailable (HTTP {})", status.as_u16()).into());
         }
         code if !status.is_success() => {
-            return Err(format!("vuln-api returned unexpected HTTP {}", code).into());
+            let body = response.text().unwrap_or_default();
+            let snippet = body_snippet(&body, ERROR_BODY_SNIPPET_LEN);
+            let suffix = if snippet.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", snippet)
+            };
+            return Err(format!("vuln-api returned unexpected HTTP {}{}", code, suffix).into());
         }
         _ => {}
     }
@@ -293,7 +324,19 @@ pub fn get_advisory(
 
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("Error: Unable to fetch advisory. Status code: {}", status).into());
+        let body = response.text().unwrap_or_default();
+        let snippet = body_snippet(&body, ERROR_BODY_SNIPPET_LEN);
+        let suffix = if snippet.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", snippet)
+        };
+        return Err(format!(
+            "vuln-api advisory lookup failed: HTTP {}{}",
+            status.as_u16(),
+            suffix
+        )
+        .into());
     }
 
     let response_text = response.text()?;
@@ -343,15 +386,19 @@ mod tests {
 
     /// Keys in `retry_after_keys`: first hit → 429 + Retry-After: 1, second hit →
     /// response from `responses` (or clean 200 fallback).
+    /// `advisory_responses` keys advisory id → (status, body) for the
+    /// `/v1/advisories/:id` route. Empty map = route returns 404.
     fn spawn_package_check_stub_with_retry_keys(
         responses: HashMap<(String, String, String), (u16, String)>,
         retry_after_keys: HashMap<(String, String, String), (u16, String)>,
+        advisory_responses: HashMap<String, (u16, String)>,
     ) -> PackageCheckStub {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
         let port = listener.local_addr().unwrap().port();
         let base_url = format!("http://127.0.0.1:{}", port);
         let responses = Arc::new(Mutex::new(responses));
         let retry_after_keys = Arc::new(Mutex::new(retry_after_keys));
+        let advisory_responses = Arc::new(Mutex::new(advisory_responses));
         let hit_counts: Arc<Mutex<HashMap<(String, String, String), u32>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
@@ -421,6 +468,25 @@ mod tests {
                             };
                             (code, text, body, String::new())
                         }
+                    } else if parts.len() >= 3 && parts[0] == "v1" && parts[1] == "advisories" {
+                        let id = urlencoding::decode(parts[2])
+                            .unwrap_or_default()
+                            .into_owned();
+                        let (code, body) = advisory_responses
+                            .lock()
+                            .unwrap()
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or((404, r#"{"error":"not found"}"#.into()));
+                        let text = match code {
+                            401 => "Unauthorized",
+                            403 => "Forbidden",
+                            404 => "Not Found",
+                            429 => "Too Many Requests",
+                            500..=599 => "Internal Server Error",
+                            _ => "Error",
+                        };
+                        (code, text, body, String::new())
                     } else {
                         (
                             404,
@@ -463,7 +529,8 @@ mod tests {
             ("npm".into(), "lodash".into(), "4.17.20".into()),
             (status_code, body.to_string()),
         );
-        let stub = spawn_package_check_stub_with_retry_keys(responses, HashMap::new());
+        let stub =
+            spawn_package_check_stub_with_retry_keys(responses, HashMap::new(), HashMap::new());
         check_package_version(
             &client,
             &stub.base_url,
@@ -526,7 +593,11 @@ mod tests {
             ("npm".into(), "lodash".into(), "4.17.20".into()),
             (200, vulnerable_body.to_string()),
         );
-        let stub = spawn_package_check_stub_with_retry_keys(HashMap::new(), retry_after_keys);
+        let stub = spawn_package_check_stub_with_retry_keys(
+            HashMap::new(),
+            retry_after_keys,
+            HashMap::new(),
+        );
         let resp = check_package_version(
             &client,
             &stub.base_url,
@@ -547,10 +618,76 @@ mod tests {
     }
 
     #[test]
-    fn check_package_version_unexpected_status_returns_generic_error() {
+    fn check_package_version_unexpected_status_includes_body_snippet() {
         let err =
             check_with_stub_status(418, r#"{"error":"teapot"}"#).expect_err("418 should fail");
-        assert!(err.to_string().contains("unexpected HTTP 418"));
+        let msg = err.to_string();
+        assert!(msg.contains("unexpected HTTP 418"), "got: {}", msg);
+        assert!(
+            msg.contains("teapot"),
+            "expected body in error; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn check_package_version_unexpected_status_omits_body_when_empty() {
+        let err = check_with_stub_status(418, "").expect_err("418 should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("unexpected HTTP 418"), "got: {}", msg);
+        // Body is empty → message must end at the status, no dangling ":" or whitespace.
+        assert!(
+            msg.trim_end().ends_with("418"),
+            "expected message to end at status code; got: {:?}",
+            msg
+        );
+    }
+
+    #[test]
+    fn get_advisory_non_success_includes_body_snippet() {
+        let client = http_client().expect("test client");
+        let mut advisories = HashMap::new();
+        advisories.insert(
+            "GHSA-deploy-gap".to_string(),
+            (400, r#"{"error":"Invalid url"}"#.to_string()),
+        );
+        let stub =
+            spawn_package_check_stub_with_retry_keys(HashMap::new(), HashMap::new(), advisories);
+        let err = get_advisory(&client, &stub.base_url, "test-token", "GHSA-deploy-gap")
+            .expect_err("400 should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("advisory lookup failed: HTTP 400"),
+            "got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Invalid url"),
+            "expected body snippet in advisory error; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn body_snippet_truncates_at_char_boundary() {
+        // Multi-byte char ("é" is 2 bytes UTF-8). Naïve byte-slicing would
+        // panic; we must operate on chars().
+        let input = "é".repeat(500);
+        let out = body_snippet(&input, ERROR_BODY_SNIPPET_LEN);
+        assert!(out.ends_with('…'), "expected ellipsis; got: {:?}", out);
+        // 300 "é" chars + the ellipsis.
+        assert_eq!(out.chars().count(), ERROR_BODY_SNIPPET_LEN + 1);
+    }
+
+    #[test]
+    fn body_snippet_collapses_whitespace() {
+        assert_eq!(body_snippet("foo\n  bar\t\tbaz", 100), "foo bar baz");
+    }
+
+    #[test]
+    fn body_snippet_empty_returns_empty() {
+        assert_eq!(body_snippet("", 100), "");
+        assert_eq!(body_snippet("   \n\t  ", 100), "");
     }
 
     #[test]
