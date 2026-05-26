@@ -1,0 +1,41 @@
+name: Dogfood — corgea deps --check-cve
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'fixtures/deps/**'
+      - 'Cargo.lock'
+      - '.github/workflows/dogfood-check-cve.yml'
+
+jobs:
+  vulnerable-fixture-blocks-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: Run against vulnerable fixture; expect exit 1
+        env:
+          CORGEA_TOKEN: ${{ secrets.CORGEA_CI_TOKEN }}
+        run: |
+          set +e
+          ./target/release/corgea deps --check-cve --fail-cve --path fixtures/deps/npm
+          rc=$?
+          if [ "$rc" -ne 1 ]; then
+            echo "expected exit 1, got $rc"
+            exit 1
+          fi
+
+  clean-fixture-passes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: Run against clean fixture; expect exit 0
+        env:
+          CORGEA_TOKEN: ${{ secrets.CORGEA_CI_TOKEN }}
+        run: ./target/release/corgea deps --check-cve --fail-cve --path fixtures/deps/npm-clean

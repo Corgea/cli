@@ -1,0 +1,9 @@
+{
+  "name": "deps-fixture-npm-clean",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Clean CVE control fixture — lodash@4.17.21 (patched). Do not bump.",
+  "dependencies": {
+    "lodash": "4.17.21"
+  }
+}

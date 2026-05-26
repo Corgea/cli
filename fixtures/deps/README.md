@@ -9,6 +9,7 @@ Sample apps for manually testing `corgea deps` and install wrappers (`corgea npm
 | Directory | Ecosystem | Lockfile | Primary test |
 |---|---|---|---|
 | `npm/` | npm | `package-lock.json` | CVE scan (`--check-cve`), `corgea npm` |
+| `npm-clean/` | npm | `package-lock.json` | CVE clean control (`lodash@4.17.21`, patched) |
 | `npm-unpinned/` | npm | *(none)* | `--fail-unpinned` |
 | `yarn/` | npm/yarn | `yarn.lock` | Yarn lockfile parser |
 | `pnpm/` | npm/pnpm | `pnpm-lock.yaml` | pnpm lockfile parser |

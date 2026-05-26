@@ -179,6 +179,32 @@ With `--json`, each dependency in `results[]` includes a `cves[]` array and `cve
 | `--fail-unpinned` | Unpinned dep detected |
 | `--fail-cve` | CVE finding only (lookup errors do **not** trigger) |
 
+#### GitHub Actions
+
+```yaml
+name: Dependency security
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  corgea-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install -g @corgea/cli
+      - name: Check dependencies for known CVEs
+        env:
+          CORGEA_TOKEN: ${{ secrets.CORGEA_TOKEN }}
+        run: corgea deps --check-cve --fail-cve
+```
+
+Python install, self-hosted vuln-api, and strict-mode variants: https://docs.corgea.app/cli/deps#ci-integration
+
 Full reference: https://docs.corgea.app/cli/deps
 
 Supported lockfiles (preferred → fallback): npm: `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml` (v5/v6/v9), `yarn.lock`. Python: `poetry.lock`, `Pipfile.lock`, `uv.lock`, `requirements.txt` (only `==`-pinned lines).
@@ -274,14 +300,7 @@ corgea deps --threshold 2d --fail --fail-unpinned
 
 ### Block CI on known CVEs
 
-```yaml
-- name: Check dependencies for known CVEs
-  env:
-    CORGEA_TOKEN: ${{ secrets.CORGEA_TOKEN }}
-  run: corgea deps --check-cve --fail-cve
-```
-
-Local dry-run first: `corgea deps --check-cve` (no `--fail-cve`) to inspect findings without failing.
+See [GitHub Actions](#github-actions) under CVE detection for the full workflow. Local dry-run first: `corgea deps --check-cve` (no `--fail-cve`) to inspect findings without failing.
 
 ### Pre-check an install before letting it run
 
