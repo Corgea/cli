@@ -1,14 +1,14 @@
+use crate::cicd::*;
+use crate::log::debug;
+use crate::scanners::parsers::ScanParserFactory;
+use crate::{utils, Config};
+use reqwest::header;
+use serde_json::Value;
 use std::collections::HashSet;
 use std::io::{self, Read};
-use crate::{utils, Config};
-use uuid::Uuid;
 use std::path::Path;
 use std::process::Command;
-use crate::cicd::{*};
-use crate::log::debug;
-use reqwest::header;
-use crate::scanners::parsers::ScanParserFactory;
-use serde_json::Value;
+use uuid::Uuid;
 
 pub fn run_command(base_cmd: &String, mut command: Command) -> String {
     match which::which(base_cmd) {
@@ -30,7 +30,7 @@ pub fn run_command(base_cmd: &String, mut command: Command) -> String {
                     std::process::exit(1);
                 }
 
-                return stdout;
+                stdout
             } else {
                 let stderr = String::from_utf8(output.stderr).expect("Failed to parse stderr");
                 let stdout = String::from_utf8(output.stdout).expect("Failed to parse stdout");
@@ -55,7 +55,11 @@ pub fn run_semgrep(config: &Config, project_name: Option<String>) {
     println!("Scanning with semgrep...");
     let base_command = "semgrep";
     let mut command = std::process::Command::new(base_command);
-    command.arg("scan").arg("--config").arg("auto").arg("--json");
+    command
+        .arg("scan")
+        .arg("--config")
+        .arg("auto")
+        .arg("--json");
 
     println!("Running \"semgrep scan --config auto --json\"");
 
@@ -100,7 +104,12 @@ pub fn read_file_report(config: &Config, file_path: &str, project_name: Option<S
     let _ = parse_scan(config, input, false, project_name);
 }
 
-pub fn parse_scan(config: &Config, input: String, save_to_file: bool, project_name: Option<String>) -> Option<ScanUploadResult> {
+pub fn parse_scan(
+    config: &Config,
+    input: String,
+    save_to_file: bool,
+    project_name: Option<String>,
+) -> Option<ScanUploadResult> {
     debug("Parsing the scan report");
 
     // Remove BOM (Byte Order Mark) if present
@@ -115,7 +124,14 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool, project_na
                 std::process::exit(0);
             }
 
-            return upload_scan(config, parse_result.paths, parse_result.scanner, cleaned_input.to_string(), save_to_file, project_name);
+            upload_scan(
+                config,
+                parse_result.paths,
+                parse_result.scanner,
+                cleaned_input.to_string(),
+                save_to_file,
+                project_name,
+            )
         }
 
         Err(error_message) => {
@@ -125,7 +141,14 @@ pub fn parse_scan(config: &Config, input: String, save_to_file: bool, project_na
     }
 }
 
-pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: String, save_to_file: bool, project_name: Option<String>) -> Option<ScanUploadResult> {
+pub fn upload_scan(
+    config: &Config,
+    paths: Vec<String>,
+    scanner: String,
+    input: String,
+    save_to_file: bool,
+    project_name: Option<String>,
+) -> Option<ScanUploadResult> {
     let in_ci = running_in_ci();
     let ci_platform = which_ci();
     let github_env_vars = get_github_env_vars();
@@ -133,30 +156,38 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
     let run_id = Uuid::new_v4().to_string();
     let base_url = config.get_url();
     let api_base = "/api/v1";
-    let project;
 
-    if in_ci {
+    let project = if in_ci {
         debug("Running in CI");
-        project = format!("{}-{}",
-                          github_env_vars.get("GITHUB_REPOSITORY").expect("Failed to get GITHUB_REPOSITORY").to_string(),
-                          github_env_vars.get("GITHUB_PR").expect("Failed to get GITHUB_REPOSITORY").to_string())
+        format!(
+            "{}-{}",
+            github_env_vars
+                .get("GITHUB_REPOSITORY")
+                .expect("Failed to get GITHUB_REPOSITORY"),
+            github_env_vars
+                .get("GITHUB_PR")
+                .expect("Failed to get GITHUB_REPOSITORY")
+        )
     } else {
-        project = utils::generic::determine_project_name(project_name.as_deref());
-    }
+        utils::generic::determine_project_name(project_name.as_deref())
+    };
     let repo_data = std::env::var("REPO_DATA").unwrap_or_else(|_| "".to_string());
 
     let scan_upload_url = if repo_data.is_empty() {
         format!(
-            "{}{}/scan-upload?engine={}&run_id={}&project={}&ci={}&ci_platform={}", base_url, api_base, scanner, run_id, project, in_ci, ci_platform
+            "{}{}/scan-upload?engine={}&run_id={}&project={}&ci={}&ci_platform={}",
+            base_url, api_base, scanner, run_id, project, in_ci, ci_platform
         )
     } else {
         format!(
-            "{}{}/scan-upload?engine={}&run_id={}&project={}&ci={}&ci_platform={}&repo_data={}", base_url, api_base, scanner, run_id, project, in_ci, ci_platform, repo_data
+            "{}{}/scan-upload?engine={}&run_id={}&project={}&ci={}&ci_platform={}&repo_data={}",
+            base_url, api_base, scanner, run_id, project, in_ci, ci_platform, repo_data
         )
     };
 
     let git_config_upload_url = format!(
-        "{}{}/git-config-upload?run_id={}", base_url, api_base, run_id
+        "{}{}/git-config-upload?run_id={}",
+        base_url, api_base, run_id
     );
     let client = utils::api::http_client();
 
@@ -168,7 +199,10 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
 
     for path in &paths {
         if !Path::new(&path).exists() {
-            eprintln!("Required file {} not found which is required for the scan, exiting.", path);
+            eprintln!(
+                "Required file {} not found which is required for the scan, exiting.",
+                path
+            );
             std::process::exit(1);
         }
 
@@ -177,7 +211,8 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
         }
 
         let src_upload_url = format!(
-            "{}{}/code-upload?run_id={}&path={}", base_url, api_base, run_id, path
+            "{}{}/code-upload?run_id={}&path={}",
+            base_url, api_base, run_id, path
         );
         debug(&format!("Uploading file: {}", path));
         let fp = Path::new(&path);
@@ -191,16 +226,19 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
                 .expect("Failed to read file");
 
             debug(&format!("POST: {}", src_upload_url));
-            let res = client.post(&src_upload_url)
-                .multipart(form)
-                .send();
+            let res = client.post(&src_upload_url).multipart(form).send();
 
             match res {
                 Ok(response) => {
                     if !response.status().is_success() {
                         let status = response.status();
-                        let body = response.text().unwrap_or_else(|_| "Unable to read response body".to_string());
-                        debug(&format!("Code upload failed with status: {}. Response body: {}", status, body));
+                        let body = response
+                            .text()
+                            .unwrap_or_else(|_| "Unable to read response body".to_string());
+                        debug(&format!(
+                            "Code upload failed with status: {}. Response body: {}",
+                            status, body
+                        ));
                         eprintln!("Failed to upload file {} {}... retrying", status, path);
                         std::thread::sleep(std::time::Duration::from_secs(1));
                         attempts += 1;
@@ -219,7 +257,10 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
 
         if attempts == 3 && !success {
             upload_error_count += 1;
-            eprintln!("Failed to upload file: {} after 3 attempts. skipping...", path);
+            eprintln!(
+                "Failed to upload file: {} after 3 attempts. skipping...",
+                path
+            );
         }
     }
 
@@ -235,30 +276,34 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
     let input_size = input_bytes.len();
     let max_upload_size = 50 * 1024 * 1024; // 50mb
     let chunk_size = match std::env::var("DEBUG_CORGEA_OVERRIDE_REPORT_CHUNK_SIZE") {
-        Ok(val) => {
-            match val.parse::<usize>() {
-                Ok(mb) if mb > 0 => {
-                    debug(&format!("Overriding report chunk size to {} MB", mb));
-                    mb * 1024 * 1024
-                }
-                _ => {
-                    eprintln!("Invalid DEBUG_CORGEA_OVERRIDE_REPORT_CHUNK_SIZE value '{}', using default 1 MB", val);
-                    1024 * 1024
-                }
+        Ok(val) => match val.parse::<usize>() {
+            Ok(mb) if mb > 0 => {
+                debug(&format!("Overriding report chunk size to {} MB", mb));
+                mb * 1024 * 1024
             }
-        }
+            _ => {
+                eprintln!("Invalid DEBUG_CORGEA_OVERRIDE_REPORT_CHUNK_SIZE value '{}', using default 1 MB", val);
+                1024 * 1024
+            }
+        },
         Err(_) => 1024 * 1024, // default 1mb
     };
     let is_chunked = input_size > max_upload_size;
     let res = if is_chunked {
-        let total_chunks = (input_size + chunk_size - 1) / chunk_size;
+        let total_chunks = input_size.div_ceil(chunk_size);
         debug(&format!("Uploading scan in {} chunks", total_chunks));
         let mut offset = 0usize;
         let mut last_response = None;
 
         for (index, chunk) in input_bytes.chunks(chunk_size).enumerate() {
-            debug(&format!("POST: {} (chunk {}/{})", scan_upload_url, index + 1, total_chunks));
-            let response = client.post(&scan_upload_url)
+            debug(&format!(
+                "POST: {} (chunk {}/{})",
+                scan_upload_url,
+                index + 1,
+                total_chunks
+            ));
+            let response = client
+                .post(&scan_upload_url)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("Upload-Offset", offset.to_string())
                 .header("Upload-Length", input_size.to_string())
@@ -295,7 +340,7 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
                             false
                         }
                     }
-                },
+                }
                 Err(_) => true,
             };
             last_response = Some(response);
@@ -308,7 +353,8 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
         last_response.expect("Failed to upload scan.")
     } else {
         debug(&format!("POST: {}", scan_upload_url));
-        client.post(&scan_upload_url)
+        client
+            .post(&scan_upload_url)
             .header(header::CONTENT_TYPE, "application/json")
             .body(input.clone())
             .send()
@@ -365,8 +411,13 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
             } else {
                 upload_failed = true;
                 let status = response.status();
-                let body = response.text().unwrap_or_else(|_| "Unable to read response body".to_string());
-                debug(&format!("Scan upload failed with status: {}. Response body: {}", status, body));
+                let body = response
+                    .text()
+                    .unwrap_or_else(|_| "Unable to read response body".to_string());
+                debug(&format!(
+                    "Scan upload failed with status: {}. Response body: {}",
+                    status, body
+                ));
                 eprintln!("Failed to upload scan: {}", status);
             }
         }
@@ -375,7 +426,6 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
             upload_failed = true;
         }
     }
-
 
     let git_config_path = Path::new(".git/config");
 
@@ -386,9 +436,7 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
             .expect("Failed to read file");
 
         debug(&format!("POST: {}", git_config_upload_url));
-        let res = client.post(&git_config_upload_url)
-            .multipart(form)
-            .send();
+        let res = client.post(&git_config_upload_url).multipart(form).send();
 
         match res {
             Ok(response) => {
@@ -404,7 +452,8 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
 
     if in_ci {
         let ci_data_upload_url = format!(
-            "{}{}/ci-data-upload?run_id={}&platform={}", base_url, api_base, run_id, ci_platform
+            "{}{}/ci-data-upload?run_id={}&platform={}",
+            base_url, api_base, run_id, ci_platform
         );
 
         let mut github_env_vars_json = serde_json::Map::new();
@@ -421,7 +470,8 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
         };
 
         debug(&format!("POST: {}", ci_data_upload_url));
-        let _res = client.post(ci_data_upload_url)
+        let _res = client
+            .post(ci_data_upload_url)
             .header(header::CONTENT_TYPE, "application/json")
             .body(github_env_vars_json_string)
             .send();
@@ -433,7 +483,7 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
 
         match std::fs::write(&file_path, input.clone()) {
             Ok(_) => println!("Successfully saved scan to {}", file_path.display()),
-            Err(e) => eprintln!("Failed to save scan to {}: {}", file_path.display(), e)
+            Err(e) => eprintln!("Failed to save scan to {}: {}", file_path.display(), e),
         }
     }
 
@@ -441,13 +491,22 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
         std::process::exit(1);
     }
 
-    println!("Successfully scanned using {} and uploaded to Corgea.", scanner);
+    println!(
+        "Successfully scanned using {} and uploaded to Corgea.",
+        scanner
+    );
 
     if upload_error_count > 0 {
-        println!("Failed to upload {} files, you may not see all fixes in Corgea.", upload_error_count);
+        println!(
+            "Failed to upload {} files, you may not see all fixes in Corgea.",
+            upload_error_count
+        );
     }
 
     println!("Go to {base_url} to see results.");
 
-    sast_scan_id.map(|scan_id| ScanUploadResult { scan_id, project_id })
+    sast_scan_id.map(|scan_id| ScanUploadResult {
+        scan_id,
+        project_id,
+    })
 }

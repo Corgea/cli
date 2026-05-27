@@ -1,16 +1,18 @@
-use crate::{config::Config, utils::{terminal, api}};
+use crate::{
+    config::Config,
+    utils::{api, terminal},
+};
+use http_body_util::Full;
+use hyper::body::Bytes;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use http_body_util::Full;
-use hyper::body::Bytes;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tokio::net::TcpListener;
-
 
 const DEFAULT_PORT: u16 = 9876;
 
@@ -24,60 +26,62 @@ pub fn run(scope: Option<String>, url: Option<String>) -> Result<(), Box<dyn std
         // Default fallback
         _ => "https://www.corgea.app".to_string(),
     };
-    
+
     // Find available port starting from default
     let port = find_available_port(DEFAULT_PORT)?;
     let callback_url = format!("http://localhost:{}", port);
-    let auth_url = format!("{}/authorize?callback={}", base_domain, 
-                          urlencoding::encode(&callback_url));
-    
+    let auth_url = format!(
+        "{}/authorize?callback={}",
+        base_domain,
+        urlencoding::encode(&callback_url)
+    );
+
     println!("Opening browser to authorize Corgea CLI...");
     println!("Authorization URL: {}", auth_url);
-    
+
     // Open browser
     if let Err(e) = open::that(&auth_url) {
         eprintln!("Failed to open browser automatically: {}", e);
         println!("Please manually open the following URL in your browser:");
         println!("{}", auth_url);
     }
-    
+
     // Set up shared state for the authorization code
     let auth_code = Arc::new(Mutex::new(None::<String>));
     let auth_code_clone = auth_code.clone();
-    
+
     // Set up loading message
     let stop_signal = Arc::new(Mutex::new(false));
     let stop_signal_clone = stop_signal.clone();
-    
+
     // Start loading spinner in a separate thread
     let loading_handle = thread::spawn(move || {
         terminal::show_loading_message("Waiting for authorization...", stop_signal_clone);
     });
-    
+
     // Start the HTTP server to listen for the callback
     let rt = tokio::runtime::Runtime::new()?;
-    let result = rt.block_on(async {
-        start_callback_server(port, auth_code_clone).await
-    });
-    
+    let result = rt.block_on(async { start_callback_server(port, auth_code_clone).await });
+
     // Stop the loading spinner
     *stop_signal.lock().unwrap() = true;
     loading_handle.join().unwrap();
-    
+
     match result {
         Ok(code) => {
-            
             // Exchange the code for a user token
             let user_token = api::exchange_code_for_token(&base_domain, &code)?;
-            
+
             // Save the user token to config
             let mut config = Config::load().expect("Failed to load config");
-            config.set_token(user_token).expect("Failed to save user token");
+            config
+                .set_token(user_token)
+                .expect("Failed to save user token");
             config.set_url(base_domain).expect("Failed to save URL");
-            
+
             println!("\r🎉 Successfully authenticated to Corgea!");
             println!("You can now use other Corgea CLI commands.");
-            
+
             Ok(())
         }
         Err(e) => {
@@ -95,7 +99,7 @@ fn find_available_port(start_port: u16) -> Result<u16, Box<dyn std::error::Error
         (8000, 8100),
         (7000, 7100),
     ];
-    
+
     for (range_start, range_end) in search_ranges {
         for port in range_start..range_end {
             if port_is_available(port) {
@@ -103,7 +107,7 @@ fn find_available_port(start_port: u16) -> Result<u16, Box<dyn std::error::Error
             }
         }
     }
-    
+
     Err("No available ports found after checking multiple ranges".into())
 }
 
@@ -128,14 +132,12 @@ async fn start_callback_server(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let addr = format!("127.0.0.1:{}", port);
     let listener = match TcpListener::bind(&addr).await {
-        Ok(listener) => {
-            listener
-        }
+        Ok(listener) => listener,
         Err(e) => {
             return Err(format!("Failed to bind to {}: {}", addr, e).into());
         }
     };
-    
+
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
@@ -175,17 +177,17 @@ async fn handle_callback(
     auth_code: Arc<Mutex<Option<String>>>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let uri = req.uri();
-    
+
     // Parse query parameters
     if let Some(query) = uri.query() {
         let params = parse_query_params(query);
-        
+
         if let Some(code) = params.get("code") {
             // Store the authorization code
             if let Ok(mut code_guard) = auth_code.lock() {
                 *code_guard = Some(code.clone());
             }
-            
+
             // Return success page
             let success_html = r#"
 <!DOCTYPE html>
@@ -357,20 +359,20 @@ async fn handle_callback(
 </body>
 </html>
             "#;
-            
+
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "text/html")
                 .body(Full::new(Bytes::from(success_html)))
                 .unwrap());
         }
-        
+
         if let Some(error) = params.get("error") {
             let default_error = "Unknown error occurred".to_string();
-            let error_description = params.get("error_description")
-                .unwrap_or(&default_error);
-            
-            let error_html = format!(r#"
+            let error_description = params.get("error_description").unwrap_or(&default_error);
+
+            let error_html = format!(
+                r#"
 <!DOCTYPE html>
 <html>
 <head>
@@ -432,8 +434,10 @@ async fn handle_callback(
     </div>
 </body>
 </html>
-            "#, error, error_description);
-            
+            "#,
+                error, error_description
+            );
+
             return Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .header("Content-Type", "text/html")
@@ -441,7 +445,7 @@ async fn handle_callback(
                 .unwrap());
         }
     }
-    
+
     // Default response for other requests
     let response_html = r#"
 <!DOCTYPE html>
@@ -500,7 +504,7 @@ async fn handle_callback(
 </body>
 </html>
     "#;
-    
+
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "text/html")
@@ -514,19 +518,15 @@ fn parse_query_params(query: &str) -> HashMap<String, String> {
         .filter_map(|param| {
             let mut parts = param.splitn(2, '=');
             match (parts.next(), parts.next()) {
-                (Some(key), Some(value)) => {
-                    Some((
-                        urlencoding::decode(key).ok()?.into_owned(),
-                        urlencoding::decode(value).ok()?.into_owned(),
-                    ))
-                }
+                (Some(key), Some(value)) => Some((
+                    urlencoding::decode(key).ok()?.into_owned(),
+                    urlencoding::decode(value).ok()?.into_owned(),
+                )),
                 _ => None,
             }
         })
         .collect()
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -541,7 +541,10 @@ mod tests {
 
     fn reserve_ephemeral_port() -> u16 {
         let listener = StdTcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
-        listener.local_addr().expect("failed to get local addr").port()
+        listener
+            .local_addr()
+            .expect("failed to get local addr")
+            .port()
     }
 
     fn spawn_callback_server(
@@ -604,7 +607,10 @@ mod tests {
         let params = parse_query_params("code=a%20b&error_description=needs%2Blogin");
 
         assert_eq!(params.get("code"), Some(&"a b".to_string()));
-        assert_eq!(params.get("error_description"), Some(&"needs+login".to_string()));
+        assert_eq!(
+            params.get("error_description"),
+            Some(&"needs+login".to_string())
+        );
     }
 
     #[test]
