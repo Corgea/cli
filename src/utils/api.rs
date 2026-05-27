@@ -173,15 +173,22 @@ pub fn http_client() -> HttpClient {
     }
 }
 
+/// Returns true when the `warning` header carries an RFC 7234 code `299`,
+/// which Corgea uses to signal a deprecated CLI version.
+fn should_warn_deprecated(headers: &HeaderMap) -> bool {
+    headers
+        .get("warning")
+        .and_then(|v| v.to_str().ok())
+        .map(|text| {
+            text.split(',')
+                .any(|w| w.trim().split(' ').next() == Some("299"))
+        })
+        .unwrap_or(false)
+}
+
 fn check_for_warnings(headers: &HeaderMap, status: StatusCode) {
-    if let Some(warning) = headers.get("warning") {
-        let warnings = warning.to_str().unwrap().split(',');
-        for warning in warnings {
-            let code = warning.trim().split(' ').next().unwrap();
-            if code == "299" {
-                eprintln!("This version of the Corgea plugin is deprecated. Please upgrade to the latest version to ensure continued support and better performance.");
-            }
-        }
+    if should_warn_deprecated(headers) {
+        eprintln!("This version of the Corgea plugin is deprecated. Please upgrade to the latest version to ensure continued support and better performance.");
     }
     if status == StatusCode::GONE {
         eprintln!("Support for this extension version has dropped. Please upgrade Corgea extension immediately to continue using it.");
@@ -1046,28 +1053,38 @@ mod tests {
     }
 
     #[test]
-    fn check_for_warnings_is_noop_when_no_warning_header_and_status_ok() {
+    fn should_warn_deprecated_false_when_no_warning_header() {
         let headers = HeaderMap::new();
-        check_for_warnings(&headers, StatusCode::OK);
+        assert!(!should_warn_deprecated(&headers));
     }
 
     #[test]
-    fn check_for_warnings_is_noop_for_non_299_codes() {
+    fn should_warn_deprecated_false_for_non_299_codes() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "warning",
             HeaderValue::from_static("199 - \"misc warning\""),
         );
-        check_for_warnings(&headers, StatusCode::OK);
+        assert!(!should_warn_deprecated(&headers));
     }
 
     #[test]
-    fn check_for_warnings_tolerates_multiple_comma_separated_warnings() {
+    fn should_warn_deprecated_true_for_single_299() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "warning",
+            HeaderValue::from_static("299 host \"deprecated\""),
+        );
+        assert!(should_warn_deprecated(&headers));
+    }
+
+    #[test]
+    fn should_warn_deprecated_true_when_299_in_comma_separated_list() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "warning",
             HeaderValue::from_static("199 host \"first\", 299 host \"deprecated\""),
         );
-        check_for_warnings(&headers, StatusCode::OK);
+        assert!(should_warn_deprecated(&headers));
     }
 }

@@ -3,7 +3,7 @@
 # Usage: ./harness <command> [--verbose] [--min=N]
 #
 # Commands: check, fix, lint, test, audit, coverage, pre-commit, ci,
-#           post-edit, setup-hooks, suppressions, install
+#           post-edit, setup-hooks, suppressions
 
 set -u
 
@@ -206,7 +206,10 @@ cmd_pre_commit() {
         return 0
     fi
     printf "\n%s[pre-commit]%s\n\n" "$BLUE" "$RESET"
-    cmd_fix
+    # Check-only: never rewrite the working tree behind the commit.
+    # Mirrors the CI gate so anything that passes here passes there.
+    run "Clippy (strict)" 0 -- cargo clippy -- -D warnings
+    run "Format check" 0 -- cargo fmt --check
     cmd_test
 }
 
@@ -281,7 +284,7 @@ case "$cmd" in
     -h|--help|help)
         printf "Usage: ./harness <command> [--verbose] [--min=N]\n\n"
         printf "Commands: check, fix, lint, test, audit, coverage, pre-commit,\n"
-        printf "          ci, post-edit, setup-hooks, suppressions, install\n"
+        printf "          ci, post-edit, setup-hooks, suppressions\n"
         ;;
     *)
         printf "Unknown command: %s\n" "$cmd" >&2
