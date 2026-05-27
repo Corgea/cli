@@ -1,0 +1,5 @@
+# Intentional old pins for corgea deps dogfood — do not bump.
+django==2.2.0
+pyyaml==5.1
+urllib3==1.25.8
+pillow==8.1.0

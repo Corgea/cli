@@ -109,6 +109,164 @@ corgea setup-hooks --default-config            # Default: secrets + PII, fail on
 
 Installs a pre-commit hook running `corgea scan blast --only-uncommitted`. Bypass with `git commit --no-verify`.
 
+### Deps — `corgea deps` (inventory / policy)
+
+Offline manifest + lockfile scan. **Requires a subcommand** — `corgea deps scan`, not bare `corgea deps`.
+
+```bash
+corgea deps scan                             # scan cwd, table output
+corgea deps scan --path ./services/api       # scan another project
+corgea deps scan --fail-on high              # exit 1 on high+ policy findings (CI)
+corgea deps scan --out-format json           # JSON inventory + findings
+corgea deps explain qs                       # why a package is present + dependency path
+corgea deps graph                            # print resolved graph
+corgea deps diff --base origin/main          # graph diff vs git ref
+corgea deps sbom --format cyclonedx --out sbom.json
+corgea deps policy init                      # write starter .corgea/deps.yml
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `scan` | Detect files, build graph, emit policy findings |
+| `graph` | List resolved packages |
+| `explain <pkg>` | Direct/transitive paths to a package |
+| `diff --base <ref>` | Added/removed/changed deps vs base |
+| `sbom` | CycloneDX SBOM from graph |
+| `policy init` | Create default `.corgea/deps.yml` |
+
+Supported ecosystems: npm, Python (Poetry/requirements), Java (Maven/Gradle). Finding codes include DEP001 (missing lockfile), DEP002 (stale lock), DEP003/004 (ranges/wildcards), DEP005/006 (mutable git/URL), DEP008 (missing integrity), DEP014 (duplicate versions), DEP021 (SNAPSHOT). No token or network required.
+
+### Verify — `corgea deps verify` (freshness / CVE)
+
+Registry recency tripwire and optional CVE check for **pinned** npm and Python lockfiles.
+
+```bash
+corgea deps verify                            # 2-day window, prod deps, both ecosystems
+corgea deps verify --threshold 7d             # widen the window to 7 days
+corgea deps verify --threshold 48h --fail     # exit 1 if any recent dep is found (CI gate)
+corgea deps verify --fail-unpinned            # exit 1 if any dep can't be verified because it isn't pinned
+corgea deps verify --ecosystem npm            # only check npm deps
+corgea deps verify --ecosystem python --include-dev
+corgea deps verify --path ./services/api
+corgea deps verify --json
+```
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--ecosystem` | `-e` | `npm`, `python`, or `all` (default) |
+| `--threshold` | `-t` | Recency window: `2d`, `48h`, `30m`, `1w`, etc. (default `2d`) |
+| `--include-dev` | | Include development dependencies |
+| `--fail` | `-f` | Exit non-zero if any recent dep is detected |
+| `--fail-unpinned` | | Exit non-zero if any dep is unpinned |
+| `--json` | | JSON output instead of human text |
+| `--path` | `-p` | Project directory (default: `.`) |
+| `--check-cve` | | Query Corgea vulnerability database (requires login) |
+| `--fail-cve` | | Exit non-zero if any known CVE is found (requires `--check-cve`) |
+| `--severity` | | Minimum severity to trip `--fail-cve` |
+
+#### CVE detection
+
+```bash
+corgea deps verify --check-cve
+corgea deps verify --check-cve --fail-cve
+corgea deps verify --check-cve --fail-cve --severity critical
+```
+
+Example finding:
+
+```text
+✗ npm lodash@4.17.20: GHSA-xxxx-yyyy-zzzz [TOP-FIX] (severity: high)
+  → upgrade to 4.17.21
+  https://corgea.app/advisories/GHSA-xxxx-yyyy-zzzz
+```
+
+With `--json`, each dependency in `results[]` includes a `cves[]` array and `cve_status` label. Top-level `cve_summary` reports counts (`checked`, `vulnerable`, `clean`, `errors`, `unpinned_not_checked`). CVE fields are omitted when `--check-cve` is not passed.
+
+`cve_summary` also carries `severity_floor` (the rendered `--severity` value, default `"any"`) and `vulnerable_above_floor` (count of findings that meet the floor; equals `vulnerable` when floor is `any`).
+
+| Override | Where | Default |
+|----------|-------|---------|
+| Token | `corgea login` or `CORGEA_TOKEN` env | (required) |
+| Vuln-api URL | `CORGEA_VULN_API_URL` env, or `vuln_api_url` in `~/.corgea/config.toml` | `https://vuln-api.corgea.app` |
+
+**Exit codes — CVE CI gating:**
+
+| Exit | Condition |
+|------|-----------|
+| 0 | No vulnerable deps found, or `--check-cve` not passed, or findings present but no `--fail-cve` |
+| 1 | Known CVE found **and** `--fail-cve` passed |
+| 2 | `--check-cve` without token; `--fail-cve` without `--check-cve`; parse/validation errors |
+
+**All deps gates (independent flags):**
+
+| Flag | Exit 1 when |
+|------|-------------|
+| `--fail` | Recent publish, registry error, CVE finding, **or CVE lookup error** |
+| `--fail-unpinned` | Unpinned dep detected |
+| `--fail-cve` | CVE finding only (lookup errors do **not** trigger) |
+
+#### GitHub Actions
+
+```yaml
+name: Dependency security
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  corgea-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install -g @corgea/cli
+      - name: Check dependencies for known CVEs
+        env:
+          CORGEA_TOKEN: ${{ secrets.CORGEA_TOKEN }}
+        run: corgea deps verify --check-cve --fail-cve
+```
+
+Python install, self-hosted vuln-api, and strict-mode variants: https://docs.corgea.app/cli/deps#ci-integration
+
+Full reference: https://docs.corgea.app/cli/deps
+
+Supported lockfiles (preferred → fallback): npm: `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml` (v5/v6/v9), `yarn.lock`. Python: `poetry.lock`, `Pipfile.lock`, `uv.lock`, `requirements.txt` (only `==`-pinned lines).
+
+### Install wrappers — `corgea npm` / `yarn` / `pnpm` / `pip` / `uv`
+
+Wraps install commands (`npm install`, `yarn add`, `pnpm add`, `pip install`), resolves what the package manager *would* install against the public registry, and refuses to run the install when a resolved version was published within `--threshold`. Use as a thin replacement for the bare command in CI scripts or interactive shells.
+
+```bash
+corgea npm install axios@^1.0.0 --save-dev
+corgea pnpm add @types/node@latest
+corgea yarn add lodash
+corgea pip install requests==2.31.0
+corgea pip install -r requirements.txt
+corgea uv add django
+corgea uv pip install requests==2.31.0
+corgea uv sync                             # verifies uv.lock / other Python lockfiles
+corgea npm install                       # bare install — verifies the lockfile
+```
+
+| Flag | Description |
+|------|-------------|
+| `--threshold <T>` (`-t`) | Recency window (`2d`, `48h`, `30m`, `1w`). Default `2d`. |
+| `--no-fail` | Demote a recent finding from a hard block to a warning (install runs anyway). |
+| `--check-only` | Run the verification but never exec the install. |
+| `--fail-unpinned` | Also fail on unverifiable specs (URL/git/file/editable) and unpinned `requirements.txt` lines pulled in by `-r`. |
+| `--json` | Machine-readable output. |
+
+Spec resolution:
+
+* **npm / yarn / pnpm** — `pkg`, `pkg@latest`, `pkg@1.2.3`, `pkg@^1.0.0`, `pkg@>=1.0.0 <2.0.0`, `pkg@next` (any dist-tag), and scoped names (`@types/node@...`). Ranges are resolved against the registry's full version list using `semver` semantics.
+* **pip / `uv pip install` / `uv add`** — `pkg`, `pkg==1.2.3`, `pkg>=1,<2`, `pkg~=1.4`, `pkg[extras]==X`. Exact `==` pins are honoured precisely; other PEP 440 specifiers are resolved against PyPI's release list with a best-effort comparison. `uv sync` with no package args verifies the project lockfile (`uv.lock`, etc.) then runs sync.
+* **Skipped (warning, not blocked)** — `git+...`, `file:...`, `./local`, `http(s)://...`, `npm:alias@...`, `workspace:*`, `pip -e`. These are explicit out-of-band sources we can't verify against a registry.
+
+Subcommands other than `install` / `add` / `i` are forwarded straight through to the package manager unchanged, so `corgea npm view ...` and similar just work.
+
 ## Common Workflows
 
 ### Scan full project
@@ -147,6 +305,37 @@ corgea scan --fail-on CR --out-format sarif --out-file results.sarif
 ```bash
 corgea upload report.json --project-name my-app
 ```
+
+### Block builds that pull in a freshly-published dependency
+
+```bash
+corgea deps verify --threshold 2d --fail
+```
+
+### Require pinned, lockfile-resolved dependencies
+
+```bash
+corgea deps verify --fail-unpinned
+```
+
+Use this together with `--fail` to gate both freshness and pinning in one CI step:
+
+```bash
+corgea deps verify --threshold 2d --fail --fail-unpinned
+```
+
+### Block CI on known CVEs
+
+See [GitHub Actions](#github-actions) under CVE detection for the full workflow. Local dry-run first: `corgea deps verify --check-cve` (no `--fail-cve`) to inspect findings without failing.
+
+### Pre-check an install before letting it run
+
+```bash
+corgea npm install axios@^1.0.0
+corgea pip install -r requirements.txt --fail-unpinned
+```
+
+Ecosystem commands resolve the actual version a package manager would install, block if it was published within the threshold, and otherwise transparently run the install (preserving the package manager's exit code).
 
 ### Export results
 

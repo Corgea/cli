@@ -1,4 +1,7 @@
 # Corgea CLI
+
+[![Dependency security](https://github.com/Corgea/cli/actions/workflows/dogfood-check-cve.yml/badge.svg)](https://github.com/Corgea/cli/actions/workflows/dogfood-check-cve.yml)
+
 Corgea CLI is a powerful developer tool that helps you find and fix security vulnerabilities in your code. Using our AI-powered scanner (blast) and our platform, Corgea identifies complex security issues like business logic flaws, authentication vulnerabilities, and other hard-to-find bugs. The CLI provides commands to scan your codebase, inspect findings, interact with fixes, and much more - all designed with a great developer experience in mind.
 
 
@@ -26,6 +29,30 @@ Once the binary is installed, login with your token from the Corgea app.
 corgea login <token>
 ```
 
+## Dependency Security
+
+**Inventory / policy (offline):** `corgea deps scan` and related subcommands — see [Dependency Scanning (CLI)](https://docs.corgea.app/cli/deps).
+
+**Freshness / CVE:** `corgea deps verify` is a supply-chain tripwire for pinned npm and Python dependencies.
+
+Freshness gate — block builds that pull in a recently published dependency:
+
+```bash
+corgea deps verify --threshold 2d --fail
+```
+
+CVE gate — requires `corgea login` (or `CORGEA_TOKEN`):
+
+```bash
+corgea deps verify --check-cve --fail-cve
+
+# Fail only on critical (or critical+high) CVEs; lower-severity
+# findings still render but do not block.
+corgea deps verify --check-cve --fail-cve --severity critical
+corgea deps verify --check-cve --fail-cve --severity critical,high
+```
+
+See [Dependency Scanning (CLI)](https://docs.corgea.app/cli/deps) for flags, exit codes, CI integration, and self-hosted vuln-api setup.
 
 ## Development Setup
 

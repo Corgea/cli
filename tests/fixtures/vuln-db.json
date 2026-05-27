@@ -1,0 +1,11 @@
+{
+  "advisories": [
+    {
+      "name": "qs",
+      "vulnerable_versions": ["6.11.0"],
+      "id": "GHSA-FIXTURE-qs-0001",
+      "severity": "high",
+      "summary": "Fixture advisory for qs (test data — not a live CVE mapping)."
+    }
+  ]
+}

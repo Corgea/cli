@@ -5,8 +5,20 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+name = "corgea"
+path = "src/lib.rs"
+
+[[bin]]
+name = "corgea"
+path = "src/main.rs"
+
+[[bin]]
+name = "vuln-api-stub"
+path = "src/bin/vuln-api-stub.rs"
+
 [dependencies]
-clap = { version = "4.4.13", features = ["derive"] }
+clap = { version = "4.4.13", features = ["derive", "env"] }
 dirs = "5.0.1"
 reqwest = { version = "0.12.23", default-features = false, features = [
     "blocking",
@@ -39,6 +51,8 @@ http-body-util = "0.1"
 url = "2.5"
 open = "5.0"
 urlencoding = "2.1"
+semver = "1"
+serde_yaml_ng = "0.10"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }

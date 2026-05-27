@@ -1,5 +1,3 @@
-
-
 #[derive(Debug)]
 pub struct ParseResult {
     pub paths: Vec<String>,
@@ -34,8 +32,11 @@ impl ScanParserFactory {
     }
 
     #[allow(dead_code)]
-    pub fn find_parser(&self, input: &str) -> Option<&Box<dyn ScanParser>> {
-        self.parsers.iter().find(|parser| parser.detect(input))
+    pub fn find_parser(&self, input: &str) -> Option<&dyn ScanParser> {
+        self.parsers
+            .iter()
+            .find(|parser| parser.detect(input))
+            .map(|b| b.as_ref())
     }
 
     pub fn parse_scan_data(&self, input: &str) -> Result<ParseResult, String> {
@@ -53,7 +54,7 @@ impl ScanParserFactory {
     }
 }
 
-pub mod semgrep;
-pub mod sarif;
 pub mod checkmarx;
 pub mod coverity;
+pub mod sarif;
+pub mod semgrep;

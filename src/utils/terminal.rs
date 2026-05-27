@@ -1,11 +1,11 @@
-use std::io::{self, Write};
-use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
-use std::{thread, time};
-use std::sync::{Arc, Mutex};
 use crate::utils;
 use regex::Regex;
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
+use std::{thread, time};
+use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
-pub fn show_progress_bar(progress: f32) -> () {
+pub fn show_progress_bar(progress: f32) {
     let total_bar_length = 50;
     if progress == -1.0 {
         print!("\r{}", " ".repeat(50));
@@ -27,17 +27,28 @@ pub fn show_progress_bar(progress: f32) -> () {
 }
 
 pub fn show_loading_message(message: &str, stop_signal: Arc<Mutex<bool>>) {
-    let spinner = vec!["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
-    let spinner_colors = vec![Color::Cyan, Color::Magenta, Color::Yellow, Color::Green];
+    let spinner = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+    let spinner_colors = [Color::Cyan, Color::Magenta, Color::Yellow, Color::Green];
     let start_time = time::Instant::now();
     let mut i = 0;
     let mut stdout = StandardStream::stdout(ColorChoice::Always);
     print!("{} ", message);
     io::stdout().flush().unwrap();
     loop {
-        stdout.set_color(ColorSpec::new().set_fg(Some(spinner_colors[i % spinner_colors.len()])).set_bg(Some(Color::Black))).unwrap();
+        stdout
+            .set_color(
+                ColorSpec::new()
+                    .set_fg(Some(spinner_colors[i % spinner_colors.len()]))
+                    .set_bg(Some(Color::Black)),
+            )
+            .unwrap();
         let message = message.replace("[T]", &format!("{:.0}", start_time.elapsed().as_secs()));
-        print!("\r[{}] {}{}", spinner[i % spinner.len()], message, set_text_color("", TerminalColor::Reset));
+        print!(
+            "\r[{}] {}{}",
+            spinner[i % spinner.len()],
+            message,
+            set_text_color("", TerminalColor::Reset)
+        );
         io::stdout().flush().unwrap();
         // Sleep for a bit before updating the spinner
         thread::sleep(time::Duration::from_millis(100));
@@ -53,8 +64,6 @@ pub fn show_loading_message(message: &str, stop_signal: Arc<Mutex<bool>>) {
     stdout.reset().unwrap();
 }
 
-
-
 pub fn set_text_color(txt: &str, color: TerminalColor) -> String {
     let color_code = match color {
         TerminalColor::Red => "\x1b[31m",
@@ -63,7 +72,7 @@ pub fn set_text_color(txt: &str, color: TerminalColor) -> String {
         TerminalColor::Yellow => "\x1b[33m",
         TerminalColor::Reset => "\x1b[0m",
     };
-    return format!("{}{}{}", color_code, txt, "\x1b[0m");
+    format!("{}{}{}", color_code, txt, "\x1b[0m")
 }
 
 pub fn show_welcome_message() {
@@ -79,7 +88,7 @@ pub fn show_welcome_message() {
    
    "#;
     println!("{}", set_text_color(dog_art, TerminalColor::Green));
-} 
+}
 
 pub fn format_code(code: &str) -> String {
     let mut formatted_code = String::new();
@@ -89,7 +98,13 @@ pub fn format_code(code: &str) -> String {
     for capture in regex.captures_iter(code) {
         if let Some(matched) = capture.get(1) {
             formatted_code.push_str(&code[last_end..capture.get(0).unwrap().start()]);
-            formatted_code.push_str(&format!("`{}`", utils::terminal::set_text_color(matched.as_str(), utils::terminal::TerminalColor::Green)));
+            formatted_code.push_str(&format!(
+                "`{}`",
+                utils::terminal::set_text_color(
+                    matched.as_str(),
+                    utils::terminal::TerminalColor::Green
+                )
+            ));
             last_end = capture.get(0).unwrap().end();
         }
     }
@@ -113,9 +128,9 @@ pub fn format_diff(diff: &str) -> String {
             format!("{}\n", set_text_color(line, TerminalColor::Green))
         } else if line.starts_with("@@") {
             let formatted_text = regex.replace_all(line, |caps: &regex::Captures| {
-                set_text_color(&caps[0], TerminalColor::Blue) 
+                set_text_color(&caps[0], TerminalColor::Blue)
             });
-            format!("{}\n", formatted_text) 
+            format!("{}\n", formatted_text)
         } else if line.starts_with("-") {
             format!("{}\n", set_text_color(line, TerminalColor::Red))
         } else if line.starts_with("+") {
@@ -135,7 +150,11 @@ pub fn clear_line(length: usize) {
 }
 
 pub fn clear_previous_line() {
-    print!("\r{}{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset), " ".repeat(100));
+    print!(
+        "\r{}{}",
+        utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset),
+        " ".repeat(100)
+    );
 }
 
 pub fn print_with_pagination(str: &str) {
@@ -143,7 +162,7 @@ pub fn print_with_pagination(str: &str) {
     let mut lines = str.lines();
     let mut buffer = String::new();
     let stdin = io::stdin();
-    let message ="-- More -- (Press Enter to continue, Ctrl+C to exit)";
+    let message = "-- More -- (Press Enter to continue, Ctrl+C to exit)";
 
     loop {
         clear_line(message.len());
@@ -154,7 +173,6 @@ pub fn print_with_pagination(str: &str) {
                 clear_line(message.len());
                 return;
             }
-
         }
 
         print!("{}", message);
@@ -162,7 +180,6 @@ pub fn print_with_pagination(str: &str) {
 
         buffer.clear();
         stdin.read_line(&mut buffer).unwrap();
-
 
         print!("\x1B[2K\x1B[1A");
         stdout.flush().unwrap();
@@ -182,30 +199,44 @@ pub fn ask_yes_no(question: &str, should_default: bool) -> bool {
     loop {
         print!("{} (y/n): ", question);
         io::stdout().flush().unwrap();
-        
+
         let mut input = String::new();
         io::stdin().read_line(&mut input).unwrap();
-        
+
         match input.trim().to_lowercase().as_str() {
             "y" | "yes" => return true,
             "n" | "no" => return false,
-            _ => if should_default {
-                return true;
-            } else {
-                println!("Please answer with yes/y or no/n");
+            _ => {
+                if should_default {
+                    return true;
+                } else {
+                    println!("Please answer with yes/y or no/n");
+                }
             }
         }
     }
 }
 
 pub fn print_table(table: Vec<Vec<String>>, page: Option<u32>, total_pages: Option<u32>) {
-    let columns = table.iter().enumerate().fold(vec![vec![]; table[0].len()], |mut acc, (_i, row)| {
-        for (j, cell) in row.iter().enumerate() {
-            acc[j].push(cell.clone());
-        }
-        acc
-    });
-    let column_lengths = columns.iter().map(|col| col.iter().map(|cell| cell.len()).max_by(|a, b| a.cmp(b)).unwrap_or(0)).collect::<Vec<_>>();
+    let columns =
+        table
+            .iter()
+            .enumerate()
+            .fold(vec![vec![]; table[0].len()], |mut acc, (_i, row)| {
+                for (j, cell) in row.iter().enumerate() {
+                    acc[j].push(cell.clone());
+                }
+                acc
+            });
+    let column_lengths = columns
+        .iter()
+        .map(|col| {
+            col.iter()
+                .map(|cell| cell.len())
+                .max_by(|a, b| a.cmp(b))
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
     for (j, row) in table.iter().enumerate() {
         for (i, cell) in row.iter().enumerate() {
             print!("{:<width$}   ", cell, width = column_lengths[i]);
@@ -219,7 +250,6 @@ pub fn print_table(table: Vec<Vec<String>>, page: Option<u32>, total_pages: Opti
         println!("\nPage {} of {}", page, total_pages);
     }
 }
-
 
 pub enum TerminalColor {
     Reset,

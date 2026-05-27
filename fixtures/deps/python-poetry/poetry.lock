@@ -1,0 +1,22 @@
+# Intentional old pins for corgea deps dogfood — do not bump.
+
+[[package]]
+name = "django"
+version = "2.2.0"
+description = ""
+category = "main"
+optional = false
+python-versions = "*"
+
+[[package]]
+name = "pyyaml"
+version = "5.1"
+description = ""
+category = "main"
+optional = false
+python-versions = "*"
+
+[metadata]
+lock-version = "2.0"
+python-versions = "^3.8"
+content-hash = "fixture"

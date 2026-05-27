@@ -29,11 +29,14 @@ pub fn setup_pre_commit_hook(include_default_scan_types: bool) {
     });
 
     // Check if pre-commit hook already exists
-    if std::path::Path::new(&pre_commit_path).exists() {
-        if !terminal::ask_yes_no("Pre-commit hook already exists. Do you want to overwrite it?", false) {
-            println!("Skipping pre-commit hook setup.");
-            return;
-        }
+    if std::path::Path::new(&pre_commit_path).exists()
+        && !terminal::ask_yes_no(
+            "Pre-commit hook already exists. Do you want to overwrite it?",
+            false,
+        )
+    {
+        println!("Skipping pre-commit hook setup.");
+        return;
     }
 
     // Determine scan types to include
@@ -62,10 +65,13 @@ pub fn setup_pre_commit_hook(include_default_scan_types: bool) {
     // Determine fail-on severity levels to include
 
     // Create pre-commit hook content
-    let hook_content = format!(r#"#!/bin/sh
+    let hook_content = format!(
+        r#"#!/bin/sh
 # Corgea pre-commit hook
 corgea scan blast --only-uncommitted --fail-on LO --scan-type {}
-"#, scan_types.join(","));
+"#,
+        scan_types.join(",")
+    );
 
     // Write pre-commit hook
     std::fs::write(&pre_commit_path, hook_content).unwrap_or_else(|e| {
@@ -74,11 +80,14 @@ corgea scan blast --only-uncommitted --fail-on LO --scan-type {}
     });
 
     #[cfg(unix)]
-    std::fs::set_permissions(&pre_commit_path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to set pre-commit hook permissions: {}", e);
-            std::process::exit(1);
-        });
+    std::fs::set_permissions(
+        &pre_commit_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to set pre-commit hook permissions: {}", e);
+        std::process::exit(1);
+    });
 
     println!("Successfully installed pre-commit hook!");
 }

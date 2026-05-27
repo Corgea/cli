@@ -1,0 +1,70 @@
+name: Dogfood — corgea deps verify --check-cve
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'fixtures/deps/**'
+      - 'Cargo.lock'
+      - '.github/workflows/dogfood-check-cve.yml'
+
+env:
+  CORGEA_TOKEN: ci-stub-token
+  CORGEA_NPM_REGISTRY: http://127.0.0.1:1
+  STUB_PORT: "9876"
+
+jobs:
+  vulnerable-fixture-blocks-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --bin corgea --bin vuln-api-stub
+      - name: Start vuln-api stub
+        run: |
+          ./target/release/vuln-api-stub \
+            --fixtures fixtures/deps/vuln-api-stub.json \
+            --port "$STUB_PORT" &
+          echo "CORGEA_VULN_API_URL=http://127.0.0.1:${STUB_PORT}" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            if (echo > /dev/tcp/127.0.0.1/"$STUB_PORT") 2>/dev/null; then
+              exit 0
+            fi
+            sleep 0.1
+          done
+          echo "vuln-api stub did not start on port $STUB_PORT"
+          exit 1
+      - name: Run against vulnerable fixture; expect exit 1
+        run: |
+          set +e
+          ./target/release/corgea deps verify --check-cve --fail-cve --path fixtures/deps/npm
+          rc=$?
+          if [ "$rc" -ne 1 ]; then
+            echo "expected exit 1, got $rc"
+            exit 1
+          fi
+
+  clean-fixture-passes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --bin corgea --bin vuln-api-stub
+      - name: Start vuln-api stub
+        run: |
+          ./target/release/vuln-api-stub \
+            --fixtures fixtures/deps/vuln-api-stub.json \
+            --port "$STUB_PORT" &
+          echo "CORGEA_VULN_API_URL=http://127.0.0.1:${STUB_PORT}" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            if (echo > /dev/tcp/127.0.0.1/"$STUB_PORT") 2>/dev/null; then
+              exit 0
+            fi
+            sleep 0.1
+          done
+          echo "vuln-api stub did not start on port $STUB_PORT"
+          exit 1
+      - name: Run against clean fixture; expect exit 0
+        run: ./target/release/corgea deps verify --check-cve --fail-cve --path fixtures/deps/npm-clean
