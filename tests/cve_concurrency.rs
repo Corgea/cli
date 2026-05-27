@@ -1,18 +1,9 @@
 mod common;
 
 use common::concurrency_stub::{ConcurrencyStub, StubConfig};
-use common::{corgea_cmd, stub_env};
+use common::{corgea_cmd, cve_integration_lock, stub_env};
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-
-static CVE_INTEGRATION_LOCK: Mutex<()> = Mutex::new(());
-
-fn integration_lock() -> MutexGuard<'static, ()> {
-    CVE_INTEGRATION_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 fn write_n_dep_lockfile(dir: &Path, n: usize) {
     let mut entries = String::new();
@@ -30,10 +21,10 @@ fn write_n_dep_lockfile(dir: &Path, n: usize) {
 
 #[test]
 fn invalid_cve_concurrency_exits_2() {
-    let _lock = integration_lock();
+    let _lock = cve_integration_lock();
     for bad in ["0", "100"] {
         let output = corgea_cmd()
-            .args(["deps", "--check-cve", "--cve-concurrency", bad])
+            .args(["deps", "verify", "--check-cve", "--cve-concurrency", bad])
             .output()
             .expect("spawn");
         assert_eq!(output.status.code(), Some(2), "bad={bad}");
@@ -51,7 +42,7 @@ fn invalid_cve_concurrency_exits_2() {
 
 #[test]
 fn peak_concurrency_capped_at_default() {
-    let _lock = integration_lock();
+    let _lock = cve_integration_lock();
     let dir = tempfile::tempdir().unwrap();
     write_n_dep_lockfile(dir.path(), 50);
 
@@ -65,6 +56,7 @@ fn peak_concurrency_capped_at_default() {
     let output = corgea_cmd()
         .args([
             "deps",
+            "verify",
             "--check-cve",
             "--cve-concurrency",
             "8",
@@ -100,7 +92,7 @@ fn peak_concurrency_capped_at_default() {
 
 #[test]
 fn retry_after_429_produces_finding() {
-    let _lock = integration_lock();
+    let _lock = cve_integration_lock();
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("package-lock.json"),
@@ -123,6 +115,7 @@ fn retry_after_429_produces_finding() {
     let output = corgea_cmd()
         .args([
             "deps",
+            "verify",
             "--check-cve",
             "-e",
             "npm",

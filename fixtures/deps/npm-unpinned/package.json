@@ -2,7 +2,7 @@
   "name": "deps-fixture-npm-unpinned",
   "version": "1.0.0",
   "private": true,
-  "description": "Sample app for corgea deps --fail-unpinned testing. No lockfile on purpose.",
+  "description": "Sample app for corgea deps verify --fail-unpinned testing. No lockfile on purpose.",
   "dependencies": {
     "json5": "2.2.1",
     "lodash": "4.17.20",

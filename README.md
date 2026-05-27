@@ -31,23 +31,25 @@ corgea login <token>
 
 ## Dependency Security
 
-`corgea deps` is a supply-chain tripwire for pinned npm and Python dependencies. It supports two independent modes: **freshness** (flag recently published versions) and **CVE detection** (query known advisories).
+**Inventory / policy (offline):** `corgea deps scan` and related subcommands — see [Dependency Scanning (CLI)](https://docs.corgea.app/cli/deps).
+
+**Freshness / CVE:** `corgea deps verify` is a supply-chain tripwire for pinned npm and Python dependencies.
 
 Freshness gate — block builds that pull in a recently published dependency:
 
 ```bash
-corgea deps --threshold 2d --fail
+corgea deps verify --threshold 2d --fail
 ```
 
 CVE gate — requires `corgea login` (or `CORGEA_TOKEN`):
 
 ```bash
-corgea deps --check-cve --fail-cve
+corgea deps verify --check-cve --fail-cve
 
 # Fail only on critical (or critical+high) CVEs; lower-severity
 # findings still render but do not block.
-corgea deps --check-cve --fail-cve --severity critical
-corgea deps --check-cve --fail-cve --severity critical,high
+corgea deps verify --check-cve --fail-cve --severity critical
+corgea deps verify --check-cve --fail-cve --severity critical,high
 ```
 
 See [Dependency Scanning (CLI)](https://docs.corgea.app/cli/deps) for flags, exit codes, CI integration, and self-hosted vuln-api setup.

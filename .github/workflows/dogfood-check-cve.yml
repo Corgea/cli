@@ -1,4 +1,4 @@
-name: Dogfood — corgea deps --check-cve
+name: Dogfood — corgea deps verify --check-cve
 
 on:
   push:
@@ -39,7 +39,7 @@ jobs:
       - name: Run against vulnerable fixture; expect exit 1
         run: |
           set +e
-          ./target/release/corgea deps --check-cve --fail-cve --path fixtures/deps/npm
+          ./target/release/corgea deps verify --check-cve --fail-cve --path fixtures/deps/npm
           rc=$?
           if [ "$rc" -ne 1 ]; then
             echo "expected exit 1, got $rc"
@@ -67,4 +67,4 @@ jobs:
           echo "vuln-api stub did not start on port $STUB_PORT"
           exit 1
       - name: Run against clean fixture; expect exit 0
-        run: ./target/release/corgea deps --check-cve --fail-cve --path fixtures/deps/npm-clean
+        run: ./target/release/corgea deps verify --check-cve --fail-cve --path fixtures/deps/npm-clean

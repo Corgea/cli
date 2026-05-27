@@ -1,6 +1,6 @@
 # Deps dogfood fixtures
 
-Sample apps for manually testing `corgea deps` and install wrappers (`corgea npm`, etc.) the way a customer would. Each subdirectory is a minimal project with pinned dependency manifests and lockfiles.
+Sample apps for manually testing `corgea deps verify` and install wrappers (`corgea npm`, etc.) the way a customer would. Each subdirectory is a minimal project with pinned dependency manifests and lockfiles.
 
 **Do not bump dependency versions** — pins are intentional and advisory-backed.
 
@@ -28,8 +28,8 @@ export CORGEA_VULN_API_URL=http://127.0.0.1:<port>
 export CORGEA_TOKEN=ci-stub-token
 export CORGEA_NPM_REGISTRY=http://127.0.0.1:1
 
-./target/release/corgea deps --check-cve --fail-cve --path fixtures/deps/npm      # expect exit 1
-./target/release/corgea deps --check-cve --fail-cve --path fixtures/deps/npm-clean # expect exit 0
+./target/release/corgea deps verify --check-cve --fail-cve --path fixtures/deps/npm      # expect exit 1
+./target/release/corgea deps verify --check-cve --fail-cve --path fixtures/deps/npm-clean # expect exit 0
 ```
 
 Unlisted `(ecosystem, name, version)` keys in the fixture file default to **clean** responses.
@@ -42,20 +42,20 @@ cargo build --release
 BIN=./target/release/corgea
 
 # Baseline freshness scan
-$BIN deps --path fixtures/deps/npm --threshold 2d
+$BIN deps verify --path fixtures/deps/npm --threshold 2d
 
 # Pinning enforcement (expect exit 1)
-$BIN deps --path fixtures/deps/npm-unpinned --fail-unpinned
+$BIN deps verify --path fixtures/deps/npm-unpinned --fail-unpinned
 
 # CVE scan (needs CORGEA_VULN_API_URL + Corgea token)
-$BIN deps --path fixtures/deps/npm --check-cve
-$BIN deps --path fixtures/deps/python-requirements --ecosystem python --check-cve
+$BIN deps verify --path fixtures/deps/npm --check-cve
+$BIN deps verify --path fixtures/deps/python-requirements --ecosystem python --check-cve
 
 # CI-gate shape
-$BIN deps --path fixtures/deps/npm --threshold 2d --fail --fail-unpinned --check-cve
+$BIN deps verify --path fixtures/deps/npm --threshold 2d --fail --fail-unpinned --check-cve
 
 # JSON output
-$BIN deps --path fixtures/deps/npm --check-cve --json
+$BIN deps verify --path fixtures/deps/npm --check-cve --json
 
 # Install wrapper (install-time tripwire)
 cd fixtures/deps/npm

@@ -1,7 +1,6 @@
 mod common;
 
-use common::vuln_api_stub::spawn_with_statuses;
-use common::{corgea_cmd, stub_env};
+use common::{corgea_cmd, cve_integration_lock, stub_env, vuln_api_stub::spawn_with_statuses};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,6 +11,7 @@ fn npm_fixture_dir() -> PathBuf {
 
 #[test]
 fn check_cve_404_is_clean_in_json() {
+    let _lock = cve_integration_lock();
     let mut fixtures = HashMap::new();
     fixtures.insert(
         ("npm".into(), "semver".into(), "5.4.1".into()),
@@ -24,6 +24,7 @@ fn check_cve_404_is_clean_in_json() {
     let output = corgea_cmd()
         .args([
             "deps",
+            "verify",
             "--check-cve",
             "--cve-concurrency",
             "1",
@@ -65,6 +66,7 @@ fn check_cve_404_is_clean_in_json() {
 
 #[test]
 fn check_cve_http_errors_render_actionable_messages() {
+    let _lock = cve_integration_lock();
     let mut fixtures = HashMap::new();
     let mut statuses = HashMap::new();
 
@@ -81,6 +83,7 @@ fn check_cve_http_errors_render_actionable_messages() {
     let output = corgea_cmd()
         .args([
             "deps",
+            "verify",
             "--check-cve",
             "--cve-concurrency",
             "1",
@@ -103,6 +106,7 @@ fn check_cve_http_errors_render_actionable_messages() {
 
 #[test]
 fn check_cve_500_renders_unavailable_message() {
+    let _lock = cve_integration_lock();
     let mut fixtures = HashMap::new();
     fixtures.insert(
         ("npm".into(), "lodash".into(), "4.17.20".into()),
@@ -115,6 +119,7 @@ fn check_cve_500_renders_unavailable_message() {
     let output = corgea_cmd()
         .args([
             "deps",
+            "verify",
             "--check-cve",
             "--cve-concurrency",
             "1",

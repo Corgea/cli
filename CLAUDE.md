@@ -29,7 +29,8 @@ CLI entry is `src/main.rs` — clap-derived `Commands` enum dispatches to one mo
 | `authorize.rs` / `cicd.rs` | OAuth device flow + CI/CD token detection for `login` |
 | `scanners/{blast,fortify,parsers}` | `scan` subcommand — blast (default), semgrep, snyk, Fortify FPR parsing |
 | `scan.rs` / `wait.rs` / `list.rs` / `inspect.rs` | Upload, poll, list, inspect scans and issues against Corgea API |
-| `verify_deps/` | `deps` subcommand — registry freshness + optional CVE check (npm + Python) |
+| `verify_deps/` | Internal freshness/CVE engine (binary crate); powers `corgea deps verify` |
+| `deps/` | `deps` subcommands — offline inventory, policy, graph, SBOM; `verify` args only in lib |
 | `precheck/` | `npm` / `yarn` / `pnpm` / `pip` / `uv` install wrappers |
 | `vuln_api/` | Client for `vuln-api.corgea.app` (advisories); opt-in via `--check-cve` |
 | `utils/{api,generic,terminal}` | HTTP, env helpers, TTY/color output |

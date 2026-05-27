@@ -15,6 +15,7 @@ fn npm_fixture_dir() -> PathBuf {
 }
 
 fn run_deps(args: &[&str], extra_env: &[(&'static str, String)]) -> std::process::Output {
+    let _lock = common::cve_integration_lock();
     let mut cmd = corgea_cmd();
     cmd.args(args);
     // Serialize requests against the in-process stub so parallel test
@@ -49,6 +50,7 @@ fn severity_critical_blocks_only_critical_findings() {
     let output = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--fail-cve",
             "--severity",
@@ -76,6 +78,7 @@ fn severity_critical_exits_zero_when_only_high_finding() {
     let output = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--fail-cve",
             "--severity",
@@ -102,6 +105,7 @@ fn severity_low_blocks_everything_at_or_above_low() {
     let output = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--fail-cve",
             "--severity",
@@ -128,6 +132,7 @@ fn severity_any_preserves_chunk_02_behavior() {
     let output = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--fail-cve",
             "--severity",
@@ -154,6 +159,7 @@ fn severity_oneof_matches_exact_set() {
     let output = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--fail-cve",
             "--severity",
@@ -178,7 +184,7 @@ fn severity_without_fail_cve_errors() {
     // Pre-flight (no stub) — non-Any --severity without --fail-cve must
     // exit 2 at the runtime guard before any work is done.
     let output = corgea_cmd()
-        .args(["deps", "--check-cve", "--severity", "critical"])
+        .args(["deps", "verify", "--check-cve", "--severity", "critical"])
         .output()
         .expect("spawn corgea");
     assert_eq!(
@@ -204,6 +210,7 @@ fn explicit_severity_any_without_fail_cve_succeeds() {
     let output = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--severity",
             "any",
@@ -225,7 +232,14 @@ fn explicit_severity_any_without_fail_cve_succeeds() {
 #[test]
 fn severity_invalid_value_exits_two() {
     let output = corgea_cmd()
-        .args(["deps", "--check-cve", "--fail-cve", "--severity", "bogus"])
+        .args([
+            "deps",
+            "verify",
+            "--check-cve",
+            "--fail-cve",
+            "--severity",
+            "bogus",
+        ])
         .output()
         .expect("spawn corgea");
     assert_eq!(output.status.code(), Some(2));
@@ -249,6 +263,7 @@ fn severity_unknown_server_string_treated_as_info() {
     let output_any = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--fail-cve",
             "--severity",
@@ -272,6 +287,7 @@ fn severity_unknown_server_string_treated_as_info() {
     let output_critical = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--fail-cve",
             "--severity",
@@ -301,6 +317,7 @@ fn severity_does_not_widen_fail_broad_gate() {
     let output = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--fail",
             "--fail-cve",
@@ -328,6 +345,7 @@ fn severity_critical_below_floor_note_appears_in_text_output() {
     let output = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--fail-cve",
             "--severity",
@@ -365,6 +383,7 @@ fn severity_oneof_outside_set_note_appears_in_text_output() {
     let output = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--fail-cve",
             "--severity",
@@ -391,6 +410,7 @@ fn severity_any_does_not_emit_below_floor_note() {
     let output = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--fail-cve",
             "--severity",
@@ -422,6 +442,7 @@ fn severity_floor_emitted_in_cve_summary_json() {
     let output = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--fail-cve",
             "--severity",
@@ -462,6 +483,7 @@ fn severity_any_emits_floor_as_any_in_json() {
     let output = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--json",
             "-e",
@@ -496,6 +518,7 @@ fn severity_oneof_emits_descending_label_in_json() {
     let output = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--fail-cve",
             "--severity",

@@ -23,8 +23,10 @@ fn stub_env(stub_url: &str) -> [(&'static str, String); 3] {
 }
 
 fn run_deps(args: &[&str], extra_env: &[(&str, String)]) -> std::process::Output {
+    let _lock = common::cve_integration_lock();
     let mut cmd = corgea_cmd();
     cmd.args(args);
+    cmd.args(["--cve-concurrency", "1"]);
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -54,6 +56,7 @@ fn fail_cve_exits_one_when_vulnerable() {
     let output = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--fail-cve",
             "-e",
@@ -80,6 +83,7 @@ fn fail_cve_exits_zero_when_all_clean() {
     let output = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--fail-cve",
             "-e",
@@ -111,19 +115,40 @@ fn fail_cve_and_fail_flags_are_independent() {
     let path = fixture.to_str().unwrap();
 
     // CVE present, neither gate flag → success.
-    let neither = run_deps(&["deps", "--check-cve", "-e", "npm", "-p", path], &env);
+    let neither = run_deps(
+        &["deps", "verify", "--check-cve", "-e", "npm", "-p", path],
+        &env,
+    );
     assert_eq!(neither.status.code(), Some(0));
 
     // --fail-cve alone gates on CVEs.
     let fail_cve_only = run_deps(
-        &["deps", "--check-cve", "--fail-cve", "-e", "npm", "-p", path],
+        &[
+            "deps",
+            "verify",
+            "--check-cve",
+            "--fail-cve",
+            "-e",
+            "npm",
+            "-p",
+            path,
+        ],
         &env,
     );
     assert_eq!(fail_cve_only.status.code(), Some(1));
 
     // --fail alone also gates on CVE findings (legacy behavior).
     let fail_only = run_deps(
-        &["deps", "--check-cve", "--fail", "-e", "npm", "-p", path],
+        &[
+            "deps",
+            "verify",
+            "--check-cve",
+            "--fail",
+            "-e",
+            "npm",
+            "-p",
+            path,
+        ],
         &env,
     );
     assert_eq!(fail_only.status.code(), Some(1));
@@ -141,6 +166,7 @@ fn fail_cve_not_triggered_by_cve_lookup_errors() {
     let fail_cve = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--fail-cve",
             "-e",
@@ -160,6 +186,7 @@ fn fail_cve_not_triggered_by_cve_lookup_errors() {
     let fail = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--fail",
             "-e",
@@ -177,6 +204,12 @@ fn fail_cve_not_triggered_by_cve_lookup_errors() {
     );
 }
 
+fn clean_npm_package_response(name: &str, version: &str) -> String {
+    format!(
+        r#"{{"ecosystem":"npm","package_name":"{name}","version":"{version}","is_vulnerable":false,"matches":[]}}"#
+    )
+}
+
 #[test]
 fn check_cve_json_includes_cves_and_cve_summary() {
     let mut fixtures = HashMap::new();
@@ -184,12 +217,21 @@ fn check_cve_json_includes_cves_and_cve_summary() {
         ("npm".into(), "lodash".into(), "4.17.20".into()),
         lodash_vulnerable_response(),
     );
+    fixtures.insert(
+        ("npm".into(), "json5".into(), "2.2.1".into()),
+        clean_npm_package_response("json5", "2.2.1"),
+    );
+    fixtures.insert(
+        ("npm".into(), "semver".into(), "5.4.1".into()),
+        clean_npm_package_response("semver", "5.4.1"),
+    );
     let stub = spawn(fixtures);
     let fixture = npm_fixture_dir();
 
     let body = run_deps_json(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--json",
             "-e",
@@ -264,6 +306,7 @@ fn json_clean_deps_have_empty_cves_array() {
     let body = run_deps_json(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "--json",
             "-e",
@@ -316,6 +359,7 @@ fn json_omits_cve_fields_without_check_cve() {
     let body = run_deps_json(
         &[
             "deps",
+            "verify",
             "--json",
             "-e",
             "npm",
@@ -348,6 +392,7 @@ fn cve_check_total_failure_renders_explicit_message() {
     let output = run_deps(
         &[
             "deps",
+            "verify",
             "--check-cve",
             "-e",
             "npm",
@@ -367,7 +412,7 @@ fn cve_check_total_failure_renders_explicit_message() {
 #[test]
 fn fail_cve_without_check_cve_errors() {
     let output = corgea_cmd()
-        .args(["deps", "--fail-cve"])
+        .args(["deps", "verify", "--fail-cve"])
         .output()
         .expect("spawn corgea");
 

@@ -197,88 +197,10 @@ enum Commands {
         )]
         default_config: bool,
     },
-    /// Verify installed dependencies against the registry to flag recently published versions.
-    /// Useful as a supply-chain tripwire: any dep whose installed version was published within
-    /// the configured threshold will be reported. Currently supports npm and Python.
-    /// Pass --check-cve to query the Corgea vulnerability database for known advisories (requires login).
+    /// Dependency inventory, policy, and registry verification.
     Deps {
-        #[arg(
-            long,
-            short = 'e',
-            default_value = "all",
-            help = "Which ecosystem(s) to verify. Valid options are 'npm', 'python', or 'all' (default)."
-        )]
-        ecosystem: String,
-
-        #[arg(
-            long,
-            short = 't',
-            default_value = "2d",
-            help = "Recency threshold. Any dependency published within this window is flagged. Examples: '2d' (default), '48h', '30m', '1w'. Bare numbers are interpreted as days."
-        )]
-        threshold: String,
-
-        #[arg(
-            long,
-            help = "Include development dependencies (default: production only)."
-        )]
-        include_dev: bool,
-
-        #[arg(
-            long,
-            short = 'f',
-            help = "Exit with a non-zero status code if any recently published dependency is found."
-        )]
-        fail: bool,
-
-        #[arg(
-            long,
-            help = "Exit with a non-zero status code if any dependency is unpinned (e.g. package.json without a lockfile, pyproject.toml/Pipfile without a matching lockfile, or unpinned `requirements.txt` lines). Independent of --fail."
-        )]
-        fail_unpinned: bool,
-
-        #[arg(
-            long,
-            help = "Output the result as JSON instead of human-readable text."
-        )]
-        json: bool,
-
-        #[arg(
-            long,
-            short = 'p',
-            help = "Path to the project to verify. Defaults to the current directory."
-        )]
-        path: Option<String>,
-
-        #[arg(
-            long,
-            help = "Check each dependency against the Corgea vulnerability database for known CVEs/advisories. Requires corgea login (or CORGEA_TOKEN). See https://docs.corgea.app/cli/deps#check-cve."
-        )]
-        check_cve: bool,
-
-        #[arg(
-            long,
-            env = "CORGEA_CVE_CONCURRENCY",
-            default_value = "8",
-            value_parser = clap::value_parser!(u8).range(1..=32),
-            help = "Max in-flight vuln-api requests when --check-cve is set (1..32). Tune down for slow networks or vuln-api rate limits."
-        )]
-        cve_concurrency: u8,
-
-        #[arg(
-            long,
-            requires = "check_cve",
-            help = "Exit with a non-zero status code if any known CVE is found. Requires --check-cve. Independent of --fail and --fail-unpinned. See https://docs.corgea.app/cli/deps#check-cve."
-        )]
-        fail_cve: bool,
-
-        #[arg(
-            long,
-            default_value = "any",
-            value_parser = verify_deps::parse_severity_floor_arg,
-            help = "Minimum severity required to trip --fail-cve. Single value (critical|high|medium|low|info) matches that level and above; comma-separated list (e.g. critical,high) matches exactly those levels; 'any' (default) matches everything. Requires --fail-cve when set to a non-'any' value. See https://docs.corgea.app/cli/deps#severity."
-        )]
-        severity: verify_deps::SeverityFloor,
+        #[command(subcommand)]
+        command: corgea::deps::run::DepsSubcommand,
     },
     /// Wrap `npm` install/add commands: verify registry publish times, then run npm.
     ///
@@ -320,7 +242,7 @@ struct InstallWrapArgs {
         long,
         short = 't',
         default_value = "2d",
-        help = "Recency threshold. Resolved versions younger than this are flagged. Same syntax as `deps --threshold`."
+        help = "Recency threshold. Resolved versions younger than this are flagged. Same syntax as `deps verify --threshold`."
     )]
     threshold: String,
 
@@ -385,6 +307,109 @@ fn install_wrap_options(args: &InstallWrapArgs) -> precheck::PrecheckOptions {
 fn run_install_wrap_command(manager: precheck::PackageManager, args: &InstallWrapArgs) {
     let exit_code = precheck::run_install(manager, &args.cmd, install_wrap_options(args));
     std::process::exit(exit_code);
+}
+
+fn run_verify_deps(corgea_config: &Config, verify: &corgea::deps::verify::VerifyArgs) -> ! {
+    let ecosystem = verify.ecosystem.clone();
+    let threshold = verify.threshold.clone();
+    let include_dev = verify.include_dev;
+    let fail = verify.fail;
+    let fail_unpinned = verify.fail_unpinned;
+    let json = verify.json;
+    let path = verify.path.clone();
+    let check_cve = verify.check_cve;
+    let fail_cve = verify.fail_cve;
+    let cve_concurrency = verify.cve_concurrency;
+    let severity = match verify_deps::parse_severity_floor_arg(&verify.severity) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Invalid --severity: {e}");
+            std::process::exit(2);
+        }
+    };
+    if !matches!(severity, verify_deps::SeverityFloor::Any) && !fail_cve {
+        eprintln!("error: --severity requires --fail-cve.");
+        eprintln!("       See https://docs.corgea.app/cli/deps#severity");
+        std::process::exit(2);
+    }
+
+    let parsed_ecosystem = match verify_deps::Ecosystem::parse(&ecosystem) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(2);
+        }
+    };
+    let parsed_threshold = match verify_deps::parse_threshold(&threshold) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Invalid --threshold: {}", e);
+            std::process::exit(2);
+        }
+    };
+
+    let project_path = std::path::PathBuf::from(path.as_deref().unwrap_or("."));
+
+    let (vuln_api_url, vuln_api_token) = if check_cve {
+        let trimmed_token = corgea_config.get_token().trim().to_string();
+        if trimmed_token.is_empty() {
+            eprintln!("error: --check-cve requires a Corgea token.");
+            eprintln!("       Run `corgea login` or set CORGEA_TOKEN.");
+            eprintln!("       See https://docs.corgea.app/cli/deps#check-cve");
+            std::process::exit(2);
+        }
+        (Some(corgea_config.get_vuln_api_url()), Some(trimmed_token))
+    } else {
+        (None, None)
+    };
+
+    let opts = verify_deps::VerifyOptions {
+        ecosystem: parsed_ecosystem,
+        threshold: parsed_threshold,
+        include_dev,
+        fail,
+        fail_unpinned,
+        fail_cve,
+        json,
+        path: project_path,
+        npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
+        pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
+        check_cve,
+        vuln_api_url,
+        vuln_api_token,
+        cve_concurrency: cve_concurrency as usize,
+        severity_floor: severity,
+    };
+
+    match verify_deps::run(&opts) {
+        Ok(report) => {
+            if opts.json {
+                verify_deps::report::print_json(&report);
+            } else {
+                verify_deps::report::print_text(&report);
+            }
+            let recent = !report.recent().is_empty();
+            let errors = !report.errors().is_empty();
+            let unpinned = report.has_unpinned();
+            let cve_vulnerable_any = !report.cve_findings().is_empty();
+            let cve_vulnerable_above_floor = !report.cve_findings_above_floor().is_empty();
+            let cve_errored = !report.cve_errors().is_empty();
+            if (recent || errors || cve_vulnerable_any || cve_errored) && opts.fail {
+                std::process::exit(1);
+            }
+            if unpinned && opts.fail_unpinned {
+                std::process::exit(1);
+            }
+            if cve_vulnerable_above_floor && opts.fail_cve {
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("deps verify failed: {}", e);
+            std::process::exit(2);
+        }
+    }
 }
 
 impl FromStr for Scanner {
@@ -652,107 +677,12 @@ fn main() {
         Some(Commands::SetupHooks { default_config }) => {
             setup_hooks::setup_pre_commit_hook(*default_config);
         }
-        Some(Commands::Deps {
-            ecosystem,
-            threshold,
-            include_dev,
-            fail,
-            fail_unpinned,
-            json,
-            path,
-            check_cve,
-            fail_cve,
-            cve_concurrency,
-            severity,
-        }) => {
-            // Runtime validation: a non-`Any` --severity is meaningful only
-            // when --fail-cve is set (it gates the exit code). Explicit
-            // `--severity any` is a no-op and is accepted without
-            // --fail-cve so CI matrices can pass the flag unconditionally.
-            if !matches!(severity, verify_deps::SeverityFloor::Any) && !*fail_cve {
-                eprintln!("error: --severity requires --fail-cve.");
-                eprintln!("       See https://docs.corgea.app/cli/deps#severity");
-                std::process::exit(2);
+        Some(Commands::Deps { command }) => match command.clone() {
+            corgea::deps::run::DepsSubcommand::Verify { args } => {
+                run_verify_deps(&corgea_config, &args)
             }
-
-            let parsed_ecosystem = match verify_deps::Ecosystem::parse(ecosystem) {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("{}", e);
-                    std::process::exit(2);
-                }
-            };
-            let parsed_threshold = match verify_deps::parse_threshold(threshold) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("Invalid --threshold: {}", e);
-                    std::process::exit(2);
-                }
-            };
-
-            let project_path =
-                std::path::PathBuf::from(path.clone().unwrap_or_else(|| ".".to_string()));
-
-            let (vuln_api_url, vuln_api_token) = if *check_cve {
-                let trimmed_token = corgea_config.get_token().trim().to_string();
-                if trimmed_token.is_empty() {
-                    eprintln!("error: --check-cve requires a Corgea token.");
-                    eprintln!("       Run `corgea login` or set CORGEA_TOKEN.");
-                    eprintln!("       See https://docs.corgea.app/cli/deps#check-cve");
-                    std::process::exit(2);
-                }
-                (Some(corgea_config.get_vuln_api_url()), Some(trimmed_token))
-            } else {
-                (None, None)
-            };
-
-            let opts = verify_deps::VerifyOptions {
-                ecosystem: parsed_ecosystem,
-                threshold: parsed_threshold,
-                include_dev: *include_dev,
-                fail: *fail,
-                fail_unpinned: *fail_unpinned,
-                fail_cve: *fail_cve,
-                json: *json,
-                path: project_path,
-                npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
-                pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
-                check_cve: *check_cve,
-                vuln_api_url,
-                vuln_api_token,
-                cve_concurrency: *cve_concurrency as usize,
-                severity_floor: severity.clone(),
-            };
-
-            match verify_deps::run(&opts) {
-                Ok(report) => {
-                    if opts.json {
-                        verify_deps::report::print_json(&report);
-                    } else {
-                        verify_deps::report::print_text(&report);
-                    }
-                    let recent = !report.recent().is_empty();
-                    let errors = !report.errors().is_empty();
-                    let unpinned = report.has_unpinned();
-                    let cve_vulnerable_any = !report.cve_findings().is_empty();
-                    let cve_vulnerable_above_floor = !report.cve_findings_above_floor().is_empty();
-                    let cve_errored = !report.cve_errors().is_empty();
-                    if (recent || errors || cve_vulnerable_any || cve_errored) && opts.fail {
-                        std::process::exit(1);
-                    }
-                    if unpinned && opts.fail_unpinned {
-                        std::process::exit(1);
-                    }
-                    if cve_vulnerable_above_floor && opts.fail_cve {
-                        std::process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("deps failed: {}", e);
-                    std::process::exit(2);
-                }
-            }
-        }
+            other => std::process::exit(i32::from(corgea::deps::run::run(other))),
+        },
         Some(Commands::Npm(args)) => {
             run_install_wrap_command(precheck::PackageManager::Npm, args);
         }

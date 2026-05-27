@@ -1,3 +1,6 @@
+mod common;
+
+use common::cve_integration_lock;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -7,9 +10,11 @@ fn npm_fixture_dir() -> PathBuf {
 
 #[test]
 fn check_cve_preflight_exits_two_without_token() {
+    let _lock = cve_integration_lock();
     let output = Command::new(env!("CARGO_BIN_EXE_corgea"))
         .args([
             "deps",
+            "verify",
             "--check-cve",
             "-e",
             "npm",
@@ -42,9 +47,11 @@ fn check_cve_preflight_exits_two_without_token() {
 
 #[test]
 fn check_cve_preflight_exits_two_with_whitespace_token() {
+    let _lock = cve_integration_lock();
     let output = Command::new(env!("CARGO_BIN_EXE_corgea"))
         .args([
             "deps",
+            "verify",
             "--check-cve",
             "-e",
             "npm",

@@ -52,6 +52,7 @@ url = "2.5"
 open = "5.0"
 urlencoding = "2.1"
 semver = "1"
+serde_yaml_ng = "0.10"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }

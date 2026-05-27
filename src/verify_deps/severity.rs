@@ -1,4 +1,4 @@
-//! Severity ladder + floor filter for `corgea deps --check-cve --fail-cve`.
+//! Severity ladder + floor filter for `corgea deps verify --check-cve --fail-cve`.
 //!
 //! The vuln-api emits categorical `severity_level` strings
 //! (`critical | high | medium | low | none | unknown`, lowercased on the
