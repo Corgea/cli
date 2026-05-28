@@ -1,0 +1,4 @@
+flask==2.3.3
+requests
+urllib3>=1.26
+internal-lib @ git+https://github.com/acme/internal-lib.git@main
