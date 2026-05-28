@@ -1,0 +1,11 @@
+[tool.poetry]
+name = "python-poetry-app"
+version = "0.1.0"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+requests = "^2.31.0"
+flask = "2.3.3"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"

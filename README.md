@@ -26,6 +26,23 @@ Once the binary is installed, login with your token from the Corgea app.
 corgea login <token>
 ```
 
+## Dependency Inventory (offline)
+
+`corgea deps` builds a dependency inventory from npm, Python, and Java manifests
+and lockfiles, then evaluates a pinning policy (DEP rules). Runs fully offline —
+no token or network required.
+
+```bash
+corgea deps scan                       # table report for the current directory
+corgea deps scan --fail-on high        # exit 1 if any finding is >= high
+corgea deps scan --out-format json     # machine-readable (json or sarif)
+corgea deps graph                      # print the resolved dependency graph
+corgea deps explain <package>          # show why a package is present
+corgea deps sbom --format cyclonedx    # emit a CycloneDX SBOM
+corgea deps policy init                # write a starter .corgea/deps.yml
+```
+
+See [Dependency Scanning (CLI)](https://docs.corgea.app/cli/deps) for the full flag and exit-code reference.
 
 ## Development Setup
 
