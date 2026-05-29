@@ -144,6 +144,34 @@ pub fn http_client() -> HttpClient {
     HttpClient { inner: SHARED_CLIENT.clone() }
 }
 
+#[cfg(not(test))]
+const RETRY_BACKOFF_SECS: &[u64] = &[1, 2, 4, 8, 16, 32];
+
+#[cfg(test)]
+const RETRY_BACKOFF_SECS: &[u64] = &[0, 0, 0, 0, 0, 0];
+
+pub fn retry_on_network_error<F, T>(operation: &str, mut make_request: F) -> reqwest::Result<T>
+where
+    F: FnMut() -> reqwest::Result<T>,
+{
+    let mut attempt = 0usize;
+    loop {
+        match make_request() {
+            Ok(result) => return Ok(result),
+            Err(e) if (e.is_connect() || e.is_timeout()) && attempt < RETRY_BACKOFF_SECS.len() => {
+                let delay = RETRY_BACKOFF_SECS[attempt];
+                eprintln!(
+                    "Network error during {}: {}. Retrying in {}s... ({}/{})",
+                    operation, e, delay, attempt + 1, RETRY_BACKOFF_SECS.len()
+                );
+                std::thread::sleep(std::time::Duration::from_secs(delay));
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn check_for_warnings(headers: &HeaderMap, status: StatusCode) {
     if let Some(warning) = headers.get("warning") {
         let warnings = warning.to_str().unwrap().split(',');
@@ -912,4 +940,134 @@ pub struct SCAIssuesResponse {
     pub page: u32,
     pub total_pages: u32,
     pub total_issues: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    fn connection_refused_error() -> reqwest::Error {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
+        let port = listener.local_addr().expect("failed to get listener addr").port();
+        drop(listener);
+
+        reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(1))
+            .build()
+            .expect("failed to build client")
+            .get(format!("http://127.0.0.1:{port}"))
+            .send()
+            .expect_err("expected connection error")
+    }
+
+    fn timeout_error() -> reqwest::Error {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
+        let port = listener.local_addr().expect("failed to get listener addr").port();
+
+        thread::spawn(move || {
+            if let Ok((_, _)) = listener.accept() {
+                thread::sleep(Duration::from_secs(30));
+            }
+        });
+
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .expect("failed to build client")
+            .get(format!("http://127.0.0.1:{port}"))
+            .send()
+            .expect_err("expected timeout error")
+    }
+
+    fn non_retryable_error() -> reqwest::Error {
+        let err = reqwest::blocking::Client::new()
+            .get("http://[::1:bad")
+            .send()
+            .expect_err("expected request error");
+
+        assert!(
+            !err.is_connect() && !err.is_timeout(),
+            "expected a non-retryable reqwest error, got: {err}"
+        );
+        err
+    }
+
+    #[test]
+    fn retry_on_network_error_returns_ok_on_first_success() {
+        let attempts = Cell::new(0);
+
+        let result = retry_on_network_error("test operation", || {
+            attempts.set(attempts.get() + 1);
+            Ok("success")
+        });
+
+        assert_eq!(result.unwrap(), "success");
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn retry_on_network_error_retries_connect_errors_then_succeeds() {
+        let attempts = Cell::new(0);
+
+        let result = retry_on_network_error("test operation", || {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            if attempt < 3 {
+                Err(connection_refused_error())
+            } else {
+                Ok(42)
+            }
+        });
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn retry_on_network_error_retries_timeout_errors() {
+        let attempts = Cell::new(0);
+
+        let result = retry_on_network_error("test operation", || {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            if attempt == 1 {
+                Err(timeout_error())
+            } else {
+                Ok("recovered")
+            }
+        });
+
+        assert_eq!(result.unwrap(), "recovered");
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn retry_on_network_error_does_not_retry_non_network_errors() {
+        let attempts = Cell::new(0);
+
+        let result: reqwest::Result<()> = retry_on_network_error("test operation", || {
+            attempts.set(attempts.get() + 1);
+            Err(non_retryable_error())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn retry_on_network_error_gives_up_after_max_retries() {
+        let attempts = Cell::new(0);
+
+        let result: reqwest::Result<()> = retry_on_network_error("test operation", || {
+            attempts.set(attempts.get() + 1);
+            Err(connection_refused_error())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), RETRY_BACKOFF_SECS.len() + 1);
+    }
 }
