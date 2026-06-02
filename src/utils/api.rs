@@ -1,16 +1,19 @@
+use crate::log::debug;
 use crate::utils;
-use serde_json::json;
-use std::collections::HashMap;
 use reqwest::header::HeaderMap;
-use serde::{Deserialize, Serialize};
 use reqwest::StatusCode;
-use std::fs::File;
+use reqwest::{
+    blocking::multipart,
+    blocking::multipart::{Form, Part},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use serde_json::Value;
+use std::collections::HashMap;
 use std::error::Error;
+use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use reqwest::{blocking::multipart, blocking::multipart::{Form, Part}};
-use serde_json::Value;
-use crate::log::debug;
 
 const CHUNK_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 const API_BASE: &str = "/api/v1";
@@ -77,15 +80,24 @@ pub struct DebugRequestBuilder {
 
 impl HttpClient {
     pub fn get<U: reqwest::IntoUrl>(&self, url: U) -> DebugRequestBuilder {
-        DebugRequestBuilder { client: self.inner.clone(), inner: self.inner.get(url) }
+        DebugRequestBuilder {
+            client: self.inner.clone(),
+            inner: self.inner.get(url),
+        }
     }
 
     pub fn post<U: reqwest::IntoUrl>(&self, url: U) -> DebugRequestBuilder {
-        DebugRequestBuilder { client: self.inner.clone(), inner: self.inner.post(url) }
+        DebugRequestBuilder {
+            client: self.inner.clone(),
+            inner: self.inner.post(url),
+        }
     }
 
     pub fn patch<U: reqwest::IntoUrl>(&self, url: U) -> DebugRequestBuilder {
-        DebugRequestBuilder { client: self.inner.clone(), inner: self.inner.patch(url) }
+        DebugRequestBuilder {
+            client: self.inner.clone(),
+            inner: self.inner.patch(url),
+        }
     }
 }
 
@@ -97,19 +109,31 @@ impl DebugRequestBuilder {
         reqwest::header::HeaderValue: TryFrom<V>,
         <reqwest::header::HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
     {
-        Self { inner: self.inner.header(key, value), client: self.client }
+        Self {
+            inner: self.inner.header(key, value),
+            client: self.client,
+        }
     }
 
     pub fn query<T: Serialize + ?Sized>(self, query: &T) -> Self {
-        Self { inner: self.inner.query(query), client: self.client }
+        Self {
+            inner: self.inner.query(query),
+            client: self.client,
+        }
     }
 
     pub fn multipart(self, form: reqwest::blocking::multipart::Form) -> Self {
-        Self { inner: self.inner.multipart(form), client: self.client }
+        Self {
+            inner: self.inner.multipart(form),
+            client: self.client,
+        }
     }
 
     pub fn body<T: Into<reqwest::blocking::Body>>(self, body: T) -> Self {
-        Self { inner: self.inner.body(body), client: self.client }
+        Self {
+            inner: self.inner.body(body),
+            client: self.client,
+        }
     }
 
     pub fn send(self) -> reqwest::Result<reqwest::blocking::Response> {
@@ -127,7 +151,10 @@ impl DebugRequestBuilder {
         debug(&format!("→ {} {}", request.method(), request.url()));
         debug(&format!("  Request headers: {:?}", request.headers()));
         match COOKIE_JAR.cookies(request.url()) {
-            Some(cookies) => debug(&format!("  Cookie: {}", cookies.to_str().unwrap_or("<binary>"))),
+            Some(cookies) => debug(&format!(
+                "  Cookie: {}",
+                cookies.to_str().unwrap_or("<binary>")
+            )),
             None => debug("  Cookie: (none in jar for this URL)"),
         }
 
@@ -141,7 +168,9 @@ impl DebugRequestBuilder {
 }
 
 pub fn http_client() -> HttpClient {
-    HttpClient { inner: SHARED_CLIENT.clone() }
+    HttpClient {
+        inner: SHARED_CLIENT.clone(),
+    }
 }
 
 #[cfg(not(test))]
@@ -162,7 +191,11 @@ where
                 let delay = RETRY_BACKOFF_SECS[attempt];
                 eprintln!(
                     "Network error during {}: {}. Retrying in {}s... ({}/{})",
-                    operation, e, delay, attempt + 1, RETRY_BACKOFF_SECS.len()
+                    operation,
+                    e,
+                    delay,
+                    attempt + 1,
+                    RETRY_BACKOFF_SECS.len()
                 );
                 std::thread::sleep(std::time::Duration::from_secs(delay));
                 attempt += 1;
@@ -199,68 +232,81 @@ pub fn upload_zip(
     project_name: &str,
     repo_info: Option<utils::generic::RepoInfo>,
     scan_type: Option<String>,
-    policy: Option<String>
+    policy: Option<String>,
 ) -> Result<UploadZipResult, Box<dyn std::error::Error>> {
     let client = http_client();
     let file_size = std::fs::metadata(file_path)?.len();
-    let file_name = Path::new(file_path)
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap();
+    let file_name = Path::new(file_path).file_name().unwrap().to_str().unwrap();
     let json_object = json!({
         "file_name": file_name,
         "file_size": file_size
     });
 
     let form = reqwest::blocking::multipart::Form::new()
-        .part("files", reqwest::blocking::multipart::Part::bytes(Vec::new())
-        .file_name(file_name.to_string()))
+        .part(
+            "files",
+            reqwest::blocking::multipart::Part::bytes(Vec::new()).file_name(file_name.to_string()),
+        )
         .text("json", json_object.to_string());
 
     let response_object = client
         .post(format!("{}{}/start-scan", url, API_BASE))
-        .query(&[
-            ("scan_type", "blast"),
-        ])
+        .query(&[("scan_type", "blast")])
         .multipart(form)
         .send();
     let response_object = match response_object {
         Ok(response) => {
             check_for_warnings(response.headers(), response.status());
             response
-        },
-        Err(err) => return Err(format!("Network error: Unable to reach the server. Please try again later. Error: {}", err).into()),
+        }
+        Err(err) => {
+            return Err(format!(
+                "Network error: Unable to reach the server. Please try again later. Error: {}",
+                err
+            )
+            .into())
+        }
     };
     let response_status = response_object.status();
     let response_text = response_object.text()?;
-    
+
     if response_status != StatusCode::OK {
-        debug(&format!("Initial scan request failed with status: {}. Response body: {}", response_status, response_text));
-        
+        debug(&format!(
+            "Initial scan request failed with status: {}. Response body: {}",
+            response_status, response_text
+        ));
+
         if response_status == StatusCode::BAD_REQUEST {
-            if let Ok(error_response) = serde_json::from_str::<HashMap<String, Value>>(&response_text) {
+            if let Ok(error_response) =
+                serde_json::from_str::<HashMap<String, Value>>(&response_text)
+            {
                 if let Some(message) = error_response.get("message").and_then(Value::as_str) {
                     return Err(format!("Request failed: {}", message).into());
                 }
             }
             return Err(format!("Request failed (400): {}", response_text).into());
         }
-        
+
         return Err("Error getting server response, Please try again later.".into());
     }
-    
+
     let response: HashMap<String, Value> = match serde_json::from_str(&response_text) {
         Ok(json) => json,
         Err(_) => {
-            debug(&format!("Failed to parse initial scan response as JSON. Response body: {}", response_text));
+            debug(&format!(
+                "Failed to parse initial scan response as JSON. Response body: {}",
+                response_text
+            ));
             return Err("Error getting server response, Please try again later.".into());
-        },
+        }
     };
 
     let transfer_id = match response["transfer_id"].as_str() {
         Some(transfer_id) => transfer_id,
-        None => return Err("Failed to retrieve transfer ID. Please check the request parameters and try again.".into()),
+        None => return Err(
+            "Failed to retrieve transfer ID. Please check the request parameters and try again."
+                .into(),
+        ),
     };
     let mut file = File::open(file_path)?;
     let mut buffer = vec![0; CHUNK_SIZE];
@@ -275,14 +321,17 @@ pub fn upload_zip(
         let chunk = &buffer[..bytes_read];
 
         let mut form = Form::new()
-        .part(
-            "chunk_data",
-            Part::bytes(chunk.to_vec())
-                .file_name(file_name.to_string())
-                .mime_str("application/octet-stream")?,
-        )
-        .part("project_name", multipart::Part::text(project_name.to_string()))
-        .part("file_size", multipart::Part::text(file_size.to_string()));
+            .part(
+                "chunk_data",
+                Part::bytes(chunk.to_vec())
+                    .file_name(file_name.to_string())
+                    .mime_str("application/octet-stream")?,
+            )
+            .part(
+                "project_name",
+                multipart::Part::text(project_name.to_string()),
+            )
+            .part("file_size", multipart::Part::text(file_size.to_string()));
         if let Some(ref info) = repo_info {
             if let Some(branch) = &info.branch {
                 form = form.part("branch", multipart::Part::text(branch.to_string()));
@@ -307,43 +356,50 @@ pub fn upload_zip(
         }
 
         let response = match client
-        .patch(format!("{}{}/start-scan/{}/", url, API_BASE, transfer_id))
-        .header("Upload-Offset", offset.to_string())
-        .header("Upload-Length", file_size.to_string())
-        .header("Upload-Name", file_name)
-        .query(&[
-            ("scan_type", "blast")
-        ])
-        .multipart(form)
-        .send() {
+            .patch(format!("{}{}/start-scan/{}/", url, API_BASE, transfer_id))
+            .header("Upload-Offset", offset.to_string())
+            .header("Upload-Length", file_size.to_string())
+            .header("Upload-Name", file_name)
+            .query(&[("scan_type", "blast")])
+            .multipart(form)
+            .send()
+        {
             Ok(response) => {
                 check_for_warnings(response.headers(), response.status());
                 response
-            },
+            }
             Err(e) => {
                 return Err(format!("Failed to send request: {}", e).into());
             }
         };
         if !response.status().is_success() {
             let status_code = response.status();
-            let response_text = response.text().unwrap_or_else(|_| "Unable to read response body".to_string());
-            debug(&format!("Chunk upload failed with status: {}. Response body: {}", status_code, response_text));
-            
+            let response_text = response
+                .text()
+                .unwrap_or_else(|_| "Unable to read response body".to_string());
+            debug(&format!(
+                "Chunk upload failed with status: {}. Response body: {}",
+                status_code, response_text
+            ));
+
             if status_code.is_client_error() && response_text.contains("Invalid policy ids") {
-                return Err("Invalid policy ids passed. Please check the policy ids and try again.".into());
+                return Err(
+                    "Invalid policy ids passed. Please check the policy ids and try again.".into(),
+                );
             }
-            
+
             if status_code == StatusCode::BAD_REQUEST {
-                if let Ok(error_response) = serde_json::from_str::<HashMap<String, Value>>(&response_text) {
+                if let Ok(error_response) =
+                    serde_json::from_str::<HashMap<String, Value>>(&response_text)
+                {
                     if let Some(message) = error_response.get("message").and_then(Value::as_str) {
                         return Err(format!("Upload failed: {}", message).into());
                     }
                 }
                 return Err(format!("Upload failed (400): {}", response_text).into());
             }
-            
-            return Err(format!("Failed to upload file: {}", status_code).into());
 
+            return Err(format!("Failed to upload file: {}", status_code).into());
         }
         utils::terminal::show_progress_bar(offset as f32 / file_size as f32);
         offset += bytes_read as u64;
@@ -355,10 +411,14 @@ pub fn upload_zip(
             if let Some(scan_id_value) = body.get("scan_id") {
                 let scan_id = scan_id_value.as_str().unwrap().to_string();
                 let project_id = body.get("project_id").and_then(|v| {
-                    v.as_str().map(|s| s.to_string())
+                    v.as_str()
+                        .map(|s| s.to_string())
                         .or_else(|| v.as_i64().map(|n| n.to_string()))
                 });
-                return Ok(UploadZipResult { scan_id, project_id });
+                return Ok(UploadZipResult {
+                    scan_id,
+                    project_id,
+                });
             } else {
                 return Err("Failed to get scan_id from response".into());
             }
@@ -368,14 +428,24 @@ pub fn upload_zip(
     Err("Failed to upload file".into())
 }
 
-pub fn get_all_issues(url: &str, project: &str, scan_id: Option<String>) -> Result<Vec<Issue>, Box<dyn std::error::Error>> {
+pub fn get_all_issues(
+    url: &str,
+    project: &str,
+    scan_id: Option<String>,
+) -> Result<Vec<Issue>, Box<dyn std::error::Error>> {
     let mut all_issues = Vec::new();
     let mut current_page: u32 = 1;
 
     loop {
-        let response = match get_scan_issues(url, project, Some(current_page as u16), Some(30), scan_id.clone()) {
+        let response = match get_scan_issues(
+            url,
+            project,
+            Some(current_page as u16),
+            Some(30),
+            scan_id.clone(),
+        ) {
             Ok(response) => response,
-            Err(e) => return Err(format!("Failed to get scan issues: {}", e).into())
+            Err(e) => return Err(format!("Failed to get scan issues: {}", e).into()),
         };
 
         if let Some(mut issues) = response.issues {
@@ -402,19 +472,14 @@ pub fn get_scan_issues(
     project: &str,
     page: Option<u16>,
     page_size: Option<u16>,
-    scan_id: Option<String>
-)  -> Result<ProjectIssuesResponse, Box<dyn std::error::Error>> {
+    scan_id: Option<String>,
+) -> Result<ProjectIssuesResponse, Box<dyn std::error::Error>> {
     let mut seperator = "?";
     let mut url = match scan_id {
         Some(scan_id) => format!("{}{}/scan/{}/issues", url, API_BASE, scan_id),
         None => {
             seperator = "&";
-            format!(
-                "{}{}/issues?project={}",
-                url,
-                API_BASE,
-                project
-            )
+            format!("{}{}/issues?project={}", url, API_BASE, project)
         }
     };
     if let Some(p) = page {
@@ -433,14 +498,18 @@ pub fn get_scan_issues(
         Ok(res) => {
             check_for_warnings(res.headers(), res.status());
             res
-        },
+        }
         Err(e) => return Err(format!("Failed to send request: {}", e).into()),
     };
     let response_text = response.text()?;
-    let project_issues_response: ProjectIssuesResponse = serde_json::from_str(&response_text).map_err(|e| {
-        debug(&format!("Failed to parse response: {}. Response body: {}", e, response_text));
-        format!("Failed to parse response: {}", e)
-    })?;
+    let project_issues_response: ProjectIssuesResponse = serde_json::from_str(&response_text)
+        .map_err(|e| {
+            debug(&format!(
+                "Failed to parse response: {}. Response body: {}",
+                e, response_text
+            ));
+            format!("Failed to parse response: {}", e)
+        })?;
 
     if project_issues_response.status == "ok" {
         Ok(project_issues_response)
@@ -451,7 +520,7 @@ pub fn get_scan_issues(
     }
 }
 
-pub fn get_scan(url: &str, scan_id: &str) -> Result<ScanResponse, Box<dyn std::error::Error>>  {
+pub fn get_scan(url: &str, scan_id: &str) -> Result<ScanResponse, Box<dyn std::error::Error>> {
     let url = format!("{}{}/scan/{}", url, API_BASE, scan_id);
 
     let client = http_client();
@@ -466,16 +535,27 @@ pub fn get_scan(url: &str, scan_id: &str) -> Result<ScanResponse, Box<dyn std::e
     if response.status().is_success() {
         let response_text = response.text()?;
         let scan_response: ScanResponse = serde_json::from_str(&response_text).map_err(|e| {
-            debug(&format!("Failed to parse response: {}. Response body: {}", e, response_text));
+            debug(&format!(
+                "Failed to parse response: {}. Response body: {}",
+                e, response_text
+            ));
             format!("Failed to parse response: {}", e)
         })?;
         Ok(scan_response)
     } else {
-        Err(format!("Error: Unable to fetch scan status. Status code: {}", response.status()).into())
+        Err(format!(
+            "Error: Unable to fetch scan status. Status code: {}",
+            response.status()
+        )
+        .into())
     }
 }
 
-pub fn get_scan_report(url: &str, scan_id: &str, format: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+pub fn get_scan_report(
+    url: &str,
+    scan_id: &str,
+    format: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let url = if let Some(fmt) = format {
         format!("{}{}/scan/{}/report?format={}", url, API_BASE, scan_id, fmt)
     } else {
@@ -496,43 +576,129 @@ pub fn get_scan_report(url: &str, scan_id: &str, format: Option<&str>) -> Result
     if response.status().is_success() {
         Ok(response.text()?)
     } else {
-        Err(format!("Error: Unable to fetch scan report. Status code: {}", response.status()).into())
+        Err(format!(
+            "Error: Unable to fetch scan report. Status code: {}",
+            response.status()
+        )
+        .into())
     }
 }
 
 pub fn get_issue(url: &str, issue: &str) -> Result<FullIssueResponse, Box<dyn std::error::Error>> {
-    let url = format!(
-        "{}{}/issue/{}",
-        url,
-        API_BASE,
-        issue,
-    );
+    let url = format!("{}{}/issue/{}", url, API_BASE, issue,);
     let client = http_client();
     debug(&format!("Sending request to URL: {}", url));
     let response = match client.get(&url).send() {
         Ok(res) => {
             check_for_warnings(res.headers(), res.status());
             res
-        },
+        }
         Err(e) => return Err(format!("Failed to send request: {}", e).into()),
     };
     let response_text = response.text()?;
     return match serde_json::from_str::<FullIssueResponse>(&response_text) {
         Ok(body) => Ok(body),
         Err(e) => {
-            debug(&format!("Failed to parse response: {}. Response body: {}", e, response_text));
+            debug(&format!(
+                "Failed to parse response: {}. Response body: {}",
+                e, response_text
+            ));
             Err(format!("Failed to parse response: {}", e).into())
-        },
+        }
     };
 }
 
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+pub struct SkillInfo {
+    pub name: String,
+    pub slug: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub is_installable: bool,
+    #[serde(default)]
+    pub latest_approved_version: Option<String>,
+}
 
+#[derive(Deserialize, Debug)]
+pub struct SkillVersionInfo {
+    pub version: String,
+    pub status: String,
+    #[serde(default)]
+    pub is_installable: bool,
+    #[serde(default)]
+    pub security_concerns: String,
+    #[serde(default)]
+    pub content: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+pub struct SkillResponse {
+    #[serde(default)]
+    pub status: String,
+    pub skill: SkillInfo,
+    #[serde(default)]
+    pub version: Option<SkillVersionInfo>,
+}
+
+/// Fetch a single skill (optionally a specific version) for installation.
+///
+/// Returns `Ok(None)` when no skill/version matches (HTTP 404), `Ok(Some(..))`
+/// on success, and `Err(..)` for auth or other failures.
+pub fn get_skill(
+    url: &str,
+    slug: &str,
+    version: Option<&str>,
+) -> Result<Option<SkillResponse>, Box<dyn Error>> {
+    let mut request_url = format!("{}{}/skills/{}", url, API_BASE, slug);
+    if let Some(v) = version {
+        request_url = format!("{}?version={}", request_url, v);
+    }
+
+    let client = http_client();
+    debug(&format!("Sending request to URL: {}", request_url));
+
+    let response = client
+        .get(&request_url)
+        .send()
+        .map_err(|e| format!("Failed to send request: {}", e))?;
+
+    check_for_warnings(response.headers(), response.status());
+
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if status == StatusCode::UNAUTHORIZED {
+        return Err("Authentication failed. Please run 'corgea login'.".into());
+    }
+    if status == StatusCode::FORBIDDEN {
+        return Err("Permission denied: you do not have access to skills.".into());
+    }
+    if !status.is_success() {
+        return Err(format!("Unable to fetch skill. Status code: {}", status).into());
+    }
+
+    let response_text = response.text()?;
+    let skill_response: SkillResponse = serde_json::from_str(&response_text).map_err(|e| {
+        debug(&format!(
+            "Failed to parse response: {}. Response body: {}",
+            e, response_text
+        ));
+        format!("Failed to parse response: {}", e)
+    })?;
+    Ok(Some(skill_response))
+}
 
 pub fn query_scan_list(
     url: &str,
     project: Option<&str>,
     page: Option<u16>,
-    page_size: Option<u16>
+    page_size: Option<u16>,
 ) -> Result<ScansResponse, Box<dyn Error>> {
     let url = format!("{}{}/scans", url, API_BASE);
     let page = page.unwrap_or(1);
@@ -546,34 +712,29 @@ pub fn query_scan_list(
         query_params.push(("project", project.to_string()));
     }
 
-
     let client = http_client();
     debug(&format!("Sending request to URL: {}", url));
-    let response = match client
-        .get(url)
-        .query(&query_params)
-        .send() {
-            Ok(res) => {
-                check_for_warnings(res.headers(), res.status());
-                res
-            },
-            Err(e) => return Err(format!("API request failed: {}", e).into()),
-        };
-        if response.status().is_success() {
-            let response_text = response.text()?;
-            let api_response: ScansResponse = serde_json::from_str(&response_text).map_err(|e| {
-                debug(&format!("Failed to parse response: {}. Response body: {}", e, response_text));
-                format!("Failed to parse response: {}", e)
-            })?;
-            Ok(api_response)
-        } else {
-            Err(format!(
-                "API request failed with status: {}",
-                response.status()
-            ).into())
+    let response = match client.get(url).query(&query_params).send() {
+        Ok(res) => {
+            check_for_warnings(res.headers(), res.status());
+            res
         }
+        Err(e) => return Err(format!("API request failed: {}", e).into()),
+    };
+    if response.status().is_success() {
+        let response_text = response.text()?;
+        let api_response: ScansResponse = serde_json::from_str(&response_text).map_err(|e| {
+            debug(&format!(
+                "Failed to parse response: {}. Response body: {}",
+                e, response_text
+            ));
+            format!("Failed to parse response: {}", e)
+        })?;
+        Ok(api_response)
+    } else {
+        Err(format!("API request failed with status: {}", response.status()).into())
+    }
 }
-
 
 pub fn exchange_code_for_token(
     base_url: &str,
@@ -581,25 +742,27 @@ pub fn exchange_code_for_token(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let client = reqwest::blocking::Client::new();
     let exchange_url = format!("{}{}/authorize", base_url, API_BASE);
-    
+
     let response = client
         .get(&exchange_url)
         .header("CORGEA-SOURCE", get_source())
         .query(&[("code", code)])
         .send()?;
-    
+
     if response.status().is_success() {
         let response_json: HashMap<String, serde_json::Value> = response.json()?;
-        
+
         if let Some(user_token) = response_json.get("user_token") {
             if let Some(user_token_str) = user_token.as_str() {
                 return Ok(user_token_str.to_string());
             }
         }
-        
+
         Err("User token not found in response".into())
     } else {
-        let error_text = response.text().unwrap_or_else(|_| "Unknown error".to_string());
+        let error_text = response
+            .text()
+            .unwrap_or_else(|_| "Unknown error".to_string());
         Err(format!("Failed to exchange code for user token: {}", error_text).into())
     }
 }
@@ -609,9 +772,7 @@ pub fn verify_token(corgea_url: &str) -> Result<bool, Box<dyn Error>> {
     let client = http_client();
     debug(&format!("Sending request to URL: {}", url));
 
-    let response = client
-        .get(&url)
-        .send()?;
+    let response = client.get(&url).send()?;
 
     check_for_warnings(response.headers(), response.status());
 
@@ -620,7 +781,10 @@ pub fn verify_token(corgea_url: &str) -> Result<bool, Box<dyn Error>> {
         let body: HashMap<String, String> = match serde_json::from_str(&body_text) {
             Ok(json) => json,
             Err(e) => {
-                debug(&format!("Failed to parse response as JSON: {}. Response body: {}", e, body_text));
+                debug(&format!(
+                    "Failed to parse response as JSON: {}. Response body: {}",
+                    e, body_text
+                ));
                 return Err(format!("Failed to parse response").into());
             }
         };
@@ -634,9 +798,12 @@ pub fn verify_token(corgea_url: &str) -> Result<bool, Box<dyn Error>> {
 pub fn check_blocking_rules(
     url: &str,
     sast_scan_id: &str,
-    page: Option<u32>
+    page: Option<u32>,
 ) -> Result<BlockingRuleResponse, Box<dyn Error>> {
-    let url = format!("{}{}/scan/{}/check_blocking_rules", url, API_BASE, sast_scan_id);
+    let url = format!(
+        "{}{}/scan/{}/check_blocking_rules",
+        url, API_BASE, sast_scan_id
+    );
     let page = page.unwrap_or(1);
     let query_params = vec![("page", page.to_string())];
 
@@ -644,43 +811,40 @@ pub fn check_blocking_rules(
     debug(&format!("Sending request to URL: {}", url));
     debug(&format!("Query params: {:?}", query_params));
 
-    let response = match client
-        .get(url)
-        .query(&query_params)
-        .send() {
-            Ok(res) => {
-                check_for_warnings(res.headers(), res.status());
-                debug(&format!("Response status: {}", res.status()));
-                debug(&format!("Response headers: {:?}", res.headers()));
-                res
-            },
-            Err(e) => return Err(format!("API request failed: {}", e).into()),
-        };
+    let response = match client.get(url).query(&query_params).send() {
+        Ok(res) => {
+            check_for_warnings(res.headers(), res.status());
+            debug(&format!("Response status: {}", res.status()));
+            debug(&format!("Response headers: {:?}", res.headers()));
+            res
+        }
+        Err(e) => return Err(format!("API request failed: {}", e).into()),
+    };
 
     if response.status().is_success() {
         let response_text = response.text()?;
-        let api_response: BlockingRuleResponse = serde_json::from_str(&response_text).map_err(|e| {
-            debug(&format!("Failed to parse response: {}. Response body: {}", e, response_text));
-            format!("Failed to parse response: {}", e)
-        })?;
+        let api_response: BlockingRuleResponse =
+            serde_json::from_str(&response_text).map_err(|e| {
+                debug(&format!(
+                    "Failed to parse response: {}. Response body: {}",
+                    e, response_text
+                ));
+                format!("Failed to parse response: {}", e)
+            })?;
         Ok(api_response)
     } else {
         let status = response.status();
         let response_text = response.text()?;
         debug(&format!("Response body: {}", response_text));
-        Err(format!(
-            "API request failed with status: {}",
-            status
-        ).into())
+        Err(format!("API request failed with status: {}", status).into())
     }
 }
-
 
 pub fn get_sca_issues(
     url: &str,
     page: Option<u16>,
     page_size: Option<u16>,
-    scan_id: Option<String>
+    scan_id: Option<String>,
 ) -> Result<SCAIssuesResponse, Box<dyn std::error::Error>> {
     let client = http_client();
     let mut query_params = vec![];
@@ -700,10 +864,7 @@ pub fn get_sca_issues(
     debug(&format!("Sending request to URL: {}", endpoint));
     debug(&format!("Query params: {:?}", query_params));
 
-    let response = client
-        .get(&endpoint)
-        .query(&query_params)
-        .send();
+    let response = client.get(&endpoint).query(&query_params).send();
 
     let response = match response {
         Ok(response) => {
@@ -711,14 +872,23 @@ pub fn get_sca_issues(
             debug(&format!("Response status: {}", response.status()));
             debug(&format!("Response headers: {:?}", response.headers()));
             response
-        },
-        Err(err) => return Err(format!("Network error: Unable to reach the server. Please try again later. Error: {}", err).into()),
+        }
+        Err(err) => {
+            return Err(format!(
+                "Network error: Unable to reach the server. Please try again later. Error: {}",
+                err
+            )
+            .into())
+        }
     };
 
     let status = response.status();
     if !status.is_success() {
         if status == StatusCode::NOT_FOUND {
-            return Err("SCA issues not found. Please check the scan ID or ensure the scan has SCA issues.".into());
+            return Err(
+                "SCA issues not found. Please check the scan ID or ensure the scan has SCA issues."
+                    .into(),
+            );
         }
         return Err(format!("Request failed with status: {}", status).into());
     }
@@ -727,9 +897,12 @@ pub fn get_sca_issues(
     let response_data: SCAIssuesResponse = match serde_json::from_str(&response_text) {
         Ok(json) => json,
         Err(e) => {
-            debug(&format!("Failed to parse response: {}. Response body: {}", e, response_text));
-            return Err("Error parsing server response. Please try again later.".into())
-        },
+            debug(&format!(
+                "Failed to parse response: {}. Response body: {}",
+                e, response_text
+            ));
+            return Err("Error parsing server response. Please try again later.".into());
+        }
     };
 
     Ok(response_data)
@@ -738,16 +911,17 @@ pub fn get_sca_issues(
 pub fn get_all_sca_issues(
     url: &str,
     _project: &str,
-    scan_id: Option<String>
+    scan_id: Option<String>,
 ) -> Result<Vec<SCAIssue>, Box<dyn std::error::Error>> {
     let mut all_issues = Vec::new();
     let mut current_page: u32 = 1;
 
     loop {
-        let response = match get_sca_issues(url, Some(current_page as u16), Some(30), scan_id.clone()) {
-            Ok(response) => response,
-            Err(e) => return Err(format!("Failed to get SCA issues: {}", e).into())
-        };
+        let response =
+            match get_sca_issues(url, Some(current_page as u16), Some(30), scan_id.clone()) {
+                Ok(response) => response,
+                Err(e) => return Err(format!("Failed to get SCA issues: {}", e).into()),
+            };
 
         if response.issues.is_empty() {
             break;
@@ -765,7 +939,7 @@ pub fn get_all_sca_issues(
 }
 
 #[derive(Deserialize, Serialize, Debug)]
-pub struct ScanResponse  {
+pub struct ScanResponse {
     pub id: String,
     pub project: String,
     pub repo: Option<String>,
@@ -781,9 +955,8 @@ pub struct ProjectIssuesResponse {
     pub issues: Option<Vec<Issue>>,
     pub page: Option<u32>,
     pub total_pages: Option<u32>,
-    pub total_issues: Option<u32>
+    pub total_issues: Option<u32>,
 }
-
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ScansResponse {
@@ -792,7 +965,6 @@ pub struct ScansResponse {
     pub total_pages: Option<u32>,
     pub scans: Option<Vec<ScanResponse>>,
 }
-
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct FullIssueResponse {
@@ -829,7 +1001,6 @@ pub struct IssueWithBlockingRules {
     pub blocked: bool,
     pub blocking_rules: Option<Vec<String>>,
 }
-
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Classification {
@@ -905,7 +1076,7 @@ pub struct BlockingRuleResponse {
 #[derive(Deserialize, Debug, Clone)]
 pub struct BlockingIssue {
     pub id: String,
-    pub triggered_by_rules: Vec<String>
+    pub triggered_by_rules: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -952,7 +1123,10 @@ mod tests {
 
     fn connection_refused_error() -> reqwest::Error {
         let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
-        let port = listener.local_addr().expect("failed to get listener addr").port();
+        let port = listener
+            .local_addr()
+            .expect("failed to get listener addr")
+            .port();
         drop(listener);
 
         reqwest::blocking::Client::builder()
@@ -966,7 +1140,10 @@ mod tests {
 
     fn timeout_error() -> reqwest::Error {
         let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
-        let port = listener.local_addr().expect("failed to get listener addr").port();
+        let port = listener
+            .local_addr()
+            .expect("failed to get listener addr")
+            .port();
 
         thread::spawn(move || {
             if let Ok((_, _)) = listener.accept() {
