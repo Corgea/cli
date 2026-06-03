@@ -221,12 +221,13 @@ pub fn upload_scan(
         let mut success = false;
 
         while attempts < 3 && !success {
-            let form = reqwest::blocking::multipart::Form::new()
-                .file("file", fp)
-                .expect("Failed to read file");
-
             debug(&format!("POST: {}", src_upload_url));
-            let res = client.post(&src_upload_url).multipart(form).send();
+            let res = utils::api::retry_on_network_error("file upload", || {
+                let form = reqwest::blocking::multipart::Form::new()
+                    .file("file", fp)
+                    .expect("Failed to read file");
+                client.post(&src_upload_url).multipart(form).send()
+            });
 
             match res {
                 Ok(response) => {
@@ -249,8 +250,12 @@ pub fn upload_scan(
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to send request: {}", e);
-                    std::process::exit(1);
+                    upload_error_count += 1;
+                    eprintln!(
+                        "Failed to upload file {} after network retries: {}",
+                        path, e
+                    );
+                    break;
                 }
             }
         }
@@ -302,13 +307,15 @@ pub fn upload_scan(
                 index + 1,
                 total_chunks
             ));
-            let response = client
-                .post(&scan_upload_url)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("Upload-Offset", offset.to_string())
-                .header("Upload-Length", input_size.to_string())
-                .body(chunk.to_vec())
-                .send();
+            let response = utils::api::retry_on_network_error("scan chunk upload", || {
+                client
+                    .post(&scan_upload_url)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("Upload-Offset", offset.to_string())
+                    .header("Upload-Length", input_size.to_string())
+                    .body(chunk.to_vec())
+                    .send()
+            });
 
             let should_break = match &response {
                 Ok(res) => {
@@ -353,11 +360,13 @@ pub fn upload_scan(
         last_response.expect("Failed to upload scan.")
     } else {
         debug(&format!("POST: {}", scan_upload_url));
-        client
-            .post(&scan_upload_url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(input.clone())
-            .send()
+        utils::api::retry_on_network_error("scan upload", || {
+            client
+                .post(&scan_upload_url)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(input.clone())
+                .send()
+        })
     };
 
     let mut sast_scan_id: Option<String> = None;
@@ -431,12 +440,13 @@ pub fn upload_scan(
 
     if git_config_path.exists() {
         debug("Uploading .git/config");
-        let form = reqwest::blocking::multipart::Form::new()
-            .file("file", git_config_path)
-            .expect("Failed to read file");
-
         debug(&format!("POST: {}", git_config_upload_url));
-        let res = client.post(&git_config_upload_url).multipart(form).send();
+        let res = utils::api::retry_on_network_error("git config upload", || {
+            let form = reqwest::blocking::multipart::Form::new()
+                .file("file", git_config_path)
+                .expect("Failed to read file");
+            client.post(&git_config_upload_url).multipart(form).send()
+        });
 
         match res {
             Ok(response) => {

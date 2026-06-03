@@ -678,8 +678,7 @@ mod tests {
             Arc::new(Mutex::new(None::<String>)),
         ));
 
-        assert!(result.is_err());
-        let error = result.err().expect("expected bind error").to_string();
+        let error = result.expect_err("expected bind error").to_string();
         assert!(error.contains("Failed to bind"));
     }
 
