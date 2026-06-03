@@ -24,18 +24,18 @@ pub fn run(
 ) {
     // Validate that only_uncommitted and target are not used together
     if *only_uncommitted && target.is_some() {
-        eprintln!("--only_uncommitted and --target cannot be used together.");
+        log::error!("--only_uncommitted and --target cannot be used together.");
         std::process::exit(1);
     }
 
     if *only_uncommitted {
         match utils::generic::is_git_repo("./") {
             Ok(false) => {
-                eprintln!("This is not a git repository. Without a git repository Corgea CLI can't determine which files have been modified or added thus only a full scan is possible.");
+                log::error!("This is not a git repository. Without a git repository Corgea CLI can't determine which files have been modified or added thus only a full scan is possible.");
                 std::process::exit(1);
             }
             Err(e) => {
-                eprintln!("Error checking git repository information: {}. Without a git repository Corgea CLI can't determine which files have been modified or added thus only a full scan is possible.", e);
+                log::error!("Error checking git repository information: {}. Without a git repository Corgea CLI can't determine which files have been modified or added thus only a full scan is possible.", e);
                 std::process::exit(1);
             }
             Ok(true) => {
@@ -63,7 +63,7 @@ pub fn run(
     match utils::generic::create_path_if_not_exists(&temp_dir) {
         Ok(_) => (),
         Err(e) => {
-            eprintln!(
+            log::error!(
                 "\n\nOops! Something went wrong while creating the directory at '{}'.\nPlease check if you have the necessary permissions or if the path is valid.\nError details:\n{}\n\n", 
                 temp_dir.display(), e
             );
@@ -96,20 +96,21 @@ pub fn run(
                         "\r{}",
                         utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
                     );
-                    eprintln!("\n\nError: target resolved to zero files.\n");
-                    eprintln!("Target value: {}\n", target_value);
-                    eprintln!("Segment results:");
+                    log::error!("\n\nError: target resolved to zero files.\n");
+                    log::error!("Target value: {}\n", target_value);
+                    log::error!("Segment results:");
                     for segment_result in &result.segments {
                         if let Some(ref error) = segment_result.error {
-                            eprintln!("  {}: ERROR - {}", segment_result.segment, error);
+                            log::error!("  {}: ERROR - {}", segment_result.segment, error);
                         } else {
-                            eprintln!(
+                            log::error!(
                                 "  {}: {} matches",
-                                segment_result.segment, segment_result.matches
+                                segment_result.segment,
+                                segment_result.matches
                             );
                         }
                     }
-                    eprintln!("\nPlease check your target specification and try again.\n");
+                    log::error!("\nPlease check your target specification and try again.\n");
                     std::process::exit(1);
                 }
 
@@ -152,7 +153,7 @@ pub fn run(
                     "\r{}",
                     utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
                 );
-                eprintln!("\n\nError resolving targets: {}\n", e);
+                log::error!("\n\nError resolving targets: {}\n", e);
                 std::process::exit(1);
             }
         }
@@ -168,11 +169,11 @@ pub fn run(
                     utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
                 );
                 if *only_uncommitted {
-                    eprintln!(
+                    log::error!(
                         "\n\nOops! It seems there are no scannable uncommitted changes in your project.\nYou may have uncommitted changes, but none match the types of files we can scan.\n\n"
                     );
                 } else {
-                    eprintln!("\n\nOops! No valid files found to scan after filtering.\n\n");
+                    log::error!("\n\nOops! No valid files found to scan after filtering.\n\n");
                 }
                 std::process::exit(1);
             }
@@ -184,7 +185,7 @@ pub fn run(
                 "\r{}",
                 utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
             );
-            eprintln!(
+            log::error!(
                 "\n\nUh-oh! We couldn't package your project at '{}'.\nThis might be due to insufficient permissions, invalid file paths, or a file system error.\nPlease check the directory and try again.\nError details:\n{}\n\n", 
                 zip_path, e
             );
@@ -208,7 +209,7 @@ pub fn run(
     ) {
         Ok(result) => result,
         Err(e) => {
-            eprintln!("\n\nOh no! We encountered an issue while uploading the zip file '{}' to the server.\nPlease ensure that:
+            log::error!("\n\nOh no! We encountered an issue while uploading the zip file '{}' to the server.\nPlease ensure that:
     - Blast is enabled on your Corgea account.
     - Your network connection is stable.
     - The server URL '{}' is correct.
@@ -271,7 +272,7 @@ pub fn run(
         Err(e) => {
             *stop_signal.lock().unwrap() = true;
             let _ = results_thread.join();
-            eprintln!(
+            log::error!(
                 "\r{}\n\n{}\n\n\
                 However, the scan results may still be accessible at the following link:\n\n\
                 {}\n\n\
@@ -298,7 +299,7 @@ pub fn run(
             match utils::api::check_blocking_rules(&config.get_url(), &scan_id, None) {
                 Ok(rules) => rules,
                 Err(e) => {
-                    eprintln!("Failed to check blocking rules: {}", e);
+                    log::error!("Failed to check blocking rules: {}", e);
                     std::process::exit(1);
                 }
             };
@@ -333,7 +334,7 @@ pub fn run(
                 ) {
                     Ok(issues) => issues,
                     Err(e) => {
-                        eprintln!("\n\nFailed to fetch issues: {}\n\n", e);
+                        log::error!("\n\nFailed to fetch issues: {}\n\n", e);
                         std::process::exit(1);
                     }
                 };
@@ -344,7 +345,7 @@ pub fn run(
                 ) {
                     Ok(issues) => issues,
                     Err(e) => {
-                        eprintln!("\n\nFailed to fetch SCA issues: {}\n\n", e);
+                        log::error!("\n\nFailed to fetch SCA issues: {}\n\n", e);
                         std::process::exit(1);
                     }
                 };
@@ -364,7 +365,7 @@ pub fn run(
                 let report = match utils::api::get_scan_report(&config.get_url(), &scan_id, None) {
                     Ok(html) => html,
                     Err(e) => {
-                        eprintln!("\n\nFailed to fetch scan report: {}\n\n", e);
+                        log::error!("\n\nFailed to fetch scan report: {}\n\n", e);
                         std::process::exit(1);
                     }
                 };
@@ -378,7 +379,7 @@ pub fn run(
                     match utils::api::get_scan_report(&config.get_url(), &scan_id, Some("sarif")) {
                         Ok(sarif) => sarif,
                         Err(e) => {
-                            eprintln!("\n\nFailed to fetch SARIF report: {}\n\n", e);
+                            log::error!("\n\nFailed to fetch SARIF report: {}\n\n", e);
                             std::process::exit(1);
                         }
                     };
@@ -395,7 +396,7 @@ pub fn run(
                 ) {
                     Ok(markdown) => markdown,
                     Err(e) => {
-                        eprintln!("\n\nFailed to fetch Markdown report: {}\n\n", e);
+                        log::error!("\n\nFailed to fetch Markdown report: {}\n\n", e);
                         std::process::exit(1);
                     }
                 };
@@ -459,7 +460,7 @@ pub fn wait_for_scan(config: &Config, scan_id: &str) {
             }
             Ok(false) => {}
             Err(e) => {
-                eprintln!(
+                log::error!(
                     "\n\nUnable to check the scan status for scan ID '{}'.\nPlease verify that:
             - The server URL '{}' is reachable.
             - Your authentication token is valid.

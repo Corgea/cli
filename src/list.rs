@@ -28,12 +28,12 @@ pub fn run(
                 debug(&format!("Error Sending Request: {}", e));
                 if e.to_string().contains("404") {
                     if scan_id.is_some() {
-                        eprintln!("Scan with ID '{}' doesn't exist or has no SCA issues. Please run 'corgea scan' to create a new scan for this project.", scan_id.as_ref().unwrap());
+                        log::error!("Scan with ID '{}' doesn't exist or has no SCA issues. Please run 'corgea scan' to create a new scan for this project.", scan_id.as_ref().unwrap());
                     } else {
-                        eprintln!("No SCA issues found for project '{}'. Please run 'corgea scan' to create a new scan for this project.", project_name);
+                        log::error!("No SCA issues found for project '{}'. Please run 'corgea scan' to create a new scan for this project.", project_name);
                     }
                 } else {
-                    eprintln!(
+                    log::error!(
                         "Unable to fetch SCA issues. Please check your connection and ensure that:\n\
                         - The server URL is reachable.\n\
                         - Your authentication token is valid.\n\n\
@@ -119,12 +119,12 @@ pub fn run(
                 debug(&format!("Error Sending Request: {}", e));
                 if e.to_string().contains("404") {
                     if scan_id.is_some() {
-                        eprintln!("Scan with ID '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", scan_id.as_ref().unwrap());
+                        log::error!("Scan with ID '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", scan_id.as_ref().unwrap());
                     } else {
-                        eprintln!("Project with name '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", project_name);
+                        log::error!("Project with name '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", project_name);
                     }
                 } else {
-                    eprintln!(
+                    log::error!(
                         "Unable to fetch scan issues. Please check your connection and ensure that:\n\
                         - The server URL is reachable.\n\
                         - Your authentication token is valid.\n\n\
@@ -162,7 +162,7 @@ pub fn run(
                         }
                     }
                     Err(e) => {
-                        eprintln!("Failed to check blocking rules: {}", e);
+                        log::error!("Failed to check blocking rules: {}", e);
                         std::process::exit(1);
                     }
                 }
@@ -277,9 +277,9 @@ pub fn run(
             }
             Err(e) => {
                 if e.to_string().contains("404") {
-                    eprintln!("Project with name '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", project_name);
+                    log::error!("Project with name '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", project_name);
                 } else {
-                    eprintln!(
+                    log::error!(
                         "Unable to fetch scans. Please check your connection and ensure that:\n\
                         - The server URL is reachable.\n\
                         - Your authentication token is valid.\n\n\

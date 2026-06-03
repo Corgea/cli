@@ -38,7 +38,7 @@ impl ScanParser for CoverityParser {
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => {
-                    eprintln!("Error parsing XML: {}", e);
+                    log::error!("Error parsing XML: {}", e);
                     return None;
                 }
                 _ => {}

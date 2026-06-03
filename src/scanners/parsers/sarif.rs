@@ -45,7 +45,7 @@ impl ScanParser for SarifParser {
                 "codeql".to_string()
             }
             _ => {
-                eprintln!("{} is not supported at this time.", tool);
+                log::error!("{} is not supported at this time.", tool);
                 return None;
             }
         };

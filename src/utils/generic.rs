@@ -113,14 +113,14 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
 
     // Print warnings for excluded files
     if !excluded_files.is_empty() {
-        eprintln!(
+        log::warn!(
             "\n{}",
             set_text_color(
                 "⚠️  Not everything in your target is scannable.",
                 TerminalColor::Yellow
             )
         );
-        eprintln!(
+        log::warn!(
             "   {}",
             set_text_color(
                 "We skipped files that typically aren't useful for analysis (like vendor/dependency code, test fixtures, style assets, and other non-source files).",
@@ -128,13 +128,13 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
             )
         );
         for excluded_file in &excluded_files {
-            eprintln!(
+            log::warn!(
                 "   {} {}",
                 set_text_color("•", TerminalColor::Yellow),
                 excluded_file.display()
             );
         }
-        eprintln!();
+        log::warn!("");
     }
 
     zip.finish()?;

@@ -202,7 +202,7 @@ where
             Ok(result) => return Ok(result),
             Err(e) if (e.is_connect() || e.is_timeout()) && attempt < RETRY_BACKOFF_SECS.len() => {
                 let delay = RETRY_BACKOFF_SECS[attempt];
-                eprintln!(
+                log::warn!(
                     "Network error during {}: {}. Retrying in {}s... ({}/{})",
                     operation,
                     e,
@@ -220,10 +220,10 @@ where
 
 fn check_for_warnings(headers: &HeaderMap, status: StatusCode) {
     if should_warn_deprecated(headers) {
-        eprintln!("This version of the Corgea plugin is deprecated. Please upgrade to the latest version to ensure continued support and better performance.");
+        log::warn!("This version of the Corgea plugin is deprecated. Please upgrade to the latest version to ensure continued support and better performance.");
     }
     if status == StatusCode::GONE {
-        eprintln!("Support for this extension version has dropped. Please upgrade Corgea extension immediately to continue using it.");
+        log::error!("Support for this extension version has dropped. Please upgrade Corgea extension immediately to continue using it.");
         std::process::exit(1);
     }
 }
