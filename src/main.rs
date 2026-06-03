@@ -224,14 +224,20 @@ impl FromStr for Scanner {
 /// exactly as they did when they were `eprintln!`s.
 fn init_logging(config: &Config) {
     use std::io::Write;
-    let default_level = if config.get_debug() == 1 {
-        "debug"
-    } else {
-        "info"
-    };
+    let default_level = default_log_level(config.get_debug());
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
         .format(|buf, record| writeln!(buf, "{}", record.args()))
         .init();
+}
+
+/// Map the resolved debug flag to env_logger's default filter level.
+/// `RUST_LOG` still overrides this at runtime (env_logger precedence).
+fn default_log_level(debug_flag: i8) -> &'static str {
+    if debug_flag == 1 {
+        "debug"
+    } else {
+        "info"
+    }
 }
 
 fn main() {
@@ -494,5 +500,18 @@ fn main() {
             let _ = Cli::command().print_help();
             println!();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_log_level_maps_debug_flag() {
+        assert_eq!(default_log_level(1), "debug");
+        assert_eq!(default_log_level(0), "info");
+        assert_eq!(default_log_level(2), "info"); // only ==1 means debug
+        assert_eq!(default_log_level(-1), "info");
     }
 }

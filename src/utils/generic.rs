@@ -308,3 +308,52 @@ pub struct RepoInfo {
     pub repo_url: Option<String>,
     pub sha: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn create_zip_from_target_excludes_default_globs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // A file matched by DEFAULT_EXCLUDE_GLOBS (`**/node_modules/**`)...
+        let node_modules = root.join("node_modules");
+        fs::create_dir_all(&node_modules).unwrap();
+        let excluded = node_modules.join("x.js");
+        fs::write(&excluded, "console.log(1)").unwrap();
+
+        // ...alongside an ordinary source file that should be kept.
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let included = src_dir.join("main.py");
+        fs::write(&included, "print(1)").unwrap();
+
+        // Explicit, comma-separated file targets resolve to these exact paths,
+        // so the test is independent of cwd and .gitignore.
+        let output_zip = root.join("out.zip");
+        let target = format!("{},{}", excluded.display(), included.display());
+
+        // Scope the exclude globs explicitly to one real default
+        // (`**/node_modules/**`): the system tempdir can itself live under a
+        // path the full DEFAULT_EXCLUDE_GLOBS would match (e.g. `/tmp/**`),
+        // which would exclude *everything*. The filter + warn path under test
+        // is identical either way.
+        let excludes: &[&str] = &["**/node_modules/**"];
+        let added = create_zip_from_target(Some(&target), &output_zip, Some(excludes))
+            .expect("zip creation should succeed");
+
+        assert!(
+            added.iter().any(|p| p.ends_with("src/main.py")),
+            "source file should be included: {:?}",
+            added
+        );
+        assert!(
+            !added.iter().any(|p| p.ends_with("node_modules/x.js")),
+            "node_modules file should be excluded: {:?}",
+            added
+        );
+    }
+}
