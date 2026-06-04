@@ -2,7 +2,7 @@
 # Project development tasks. Bash + cargo + git only.
 # Usage: ./harness <command> [--verbose] [--min=N]
 #
-# Commands: check, fix, lint, test, audit, coverage, pre-commit, ci,
+# Commands: check, fix, lint, test, deny, coverage, pre-commit, ci,
 #           post-edit, setup-hooks, suppressions
 
 set -u
@@ -160,21 +160,21 @@ cmd_test() {
     run_with_summary "Tests" 0 -- cargo test
 }
 
-cmd_audit() {
-    _cmd_audit_inner 0
+cmd_deny() {
+    _cmd_deny_inner 0
 }
 
-_cmd_audit_inner() {
+_cmd_deny_inner() {
     local strict="$1"
-    if cargo audit --version >/dev/null 2>&1; then
-        run "Dep audit" 0 -- cargo audit
+    if cargo deny --version >/dev/null 2>&1; then
+        run "Dep policy" 0 -- cargo deny check
         return
     fi
     if [ "$strict" = "1" ]; then
-        printf "  %s✗%s Dep audit (cargo-audit not installed)\n" "$RED" "$RESET"
+        printf "  %s✗%s Dep policy (cargo-deny not installed)\n" "$RED" "$RESET"
         exit 1
     fi
-    printf "  %s⊘ Dep audit skipped (install: cargo install cargo-audit)%s\n" "$DIM" "$RESET"
+    printf "  %s⊘ Dep policy skipped (install: cargo install cargo-deny)%s\n" "$DIM" "$RESET"
 }
 
 cmd_coverage() {
@@ -244,7 +244,7 @@ cmd_ci() {
     printf "\n%s[ci]%s\n\n" "$BLUE" "$RESET"
     run "Clippy (strict)" 0 -- cargo clippy -- -D warnings
     run "Format check" 0 -- cargo fmt --check
-    _cmd_audit_inner 1
+    _cmd_deny_inner 1
     if ! cargo llvm-cov --version >/dev/null 2>&1; then
         printf "  %s✗%s Coverage (cargo-llvm-cov not installed)\n" "$RED" "$RESET"
         printf "  %sInstall:%s cargo install cargo-llvm-cov\n" "$DIM" "$RESET"
@@ -274,7 +274,7 @@ case "$cmd" in
     fix)          cmd_fix ;;
     lint)         cmd_lint ;;
     test)         cmd_test ;;
-    audit)        cmd_audit ;;
+    deny)         cmd_deny ;;
     coverage)     cmd_coverage ;;
     pre-commit)   cmd_pre_commit ;;
     ci)           cmd_ci ;;
@@ -283,7 +283,7 @@ case "$cmd" in
     suppressions) cmd_suppressions ;;
     -h|--help|help)
         printf "Usage: ./harness <command> [--verbose] [--min=N]\n\n"
-        printf "Commands: check, fix, lint, test, audit, coverage, pre-commit,\n"
+        printf "Commands: check, fix, lint, test, deny, coverage, pre-commit,\n"
         printf "          ci, post-edit, setup-hooks, suppressions\n"
         ;;
     *)
