@@ -599,6 +599,65 @@ fn cli_diff_format_json_reports_real_version_change_from_base_ref() {
 }
 
 #[test]
+fn cli_diff_reports_same_version_integrity_change_from_base_ref() {
+    let repo = TempDir::new().expect("temp repo");
+    init_git_repo(repo.path());
+    write_exact_node_project_with_artifact(repo.path(), "left-pad", "1.3.0", "1.3.0", "sha512-old");
+    commit_all(repo.path(), "base");
+    write_exact_node_project_with_artifact(repo.path(), "left-pad", "1.3.0", "1.3.0", "sha512-new");
+
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .current_dir(repo.path())
+        .args(["deps", "diff", "--base", "HEAD", "."])
+        .output()
+        .expect("failed to run corgea");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("~ left-pad 1.3.0 integrity changed"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn cli_diff_format_json_reports_same_version_integrity_change_from_base_ref() {
+    let repo = TempDir::new().expect("temp repo");
+    init_git_repo(repo.path());
+    write_exact_node_project_with_artifact(repo.path(), "left-pad", "1.3.0", "1.3.0", "sha512-old");
+    commit_all(repo.path(), "base");
+    write_exact_node_project_with_artifact(repo.path(), "left-pad", "1.3.0", "1.3.0", "sha512-new");
+
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .current_dir(repo.path())
+        .args(["deps", "diff", "--base", "HEAD", ".", "--format", "json"])
+        .output()
+        .expect("failed to run corgea");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["artifact_changed"][0]["name"], "left-pad");
+    assert_eq!(parsed["artifact_changed"][0]["version"], "1.3.0");
+    assert_eq!(
+        parsed["artifact_changed"][0]["integrity"]["from"],
+        "sha512-old"
+    );
+    assert_eq!(
+        parsed["artifact_changed"][0]["integrity"]["to"],
+        "sha512-new"
+    );
+}
+
+#[test]
 fn cli_diff_fail_on_new_ignores_existing_high_findings() {
     let repo = TempDir::new().expect("temp repo");
     init_git_repo(repo.path());
@@ -680,6 +739,37 @@ fn cli_diff_fail_on_new_applies_severity_to_new_findings() {
 }
 
 #[test]
+fn cli_diff_fail_on_new_blocks_same_version_integrity_change() {
+    let repo = TempDir::new().expect("temp repo");
+    init_git_repo(repo.path());
+    write_exact_node_project_with_artifact(repo.path(), "left-pad", "1.3.0", "1.3.0", "sha512-old");
+    commit_all(repo.path(), "base");
+    write_exact_node_project_with_artifact(repo.path(), "left-pad", "1.3.0", "1.3.0", "sha512-new");
+
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .current_dir(repo.path())
+        .args([
+            "deps",
+            "diff",
+            "--base",
+            "HEAD",
+            ".",
+            "--fail-on-new",
+            "high",
+        ])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn cli_diff_rejects_invalid_fail_on_new_severity() {
     let repo = TempDir::new().expect("temp repo");
     init_git_repo(repo.path());
@@ -739,6 +829,16 @@ fn finding_ids(json: &serde_json::Value) -> Vec<String> {
 }
 
 fn write_exact_node_project(root: &std::path::Path, name: &str, declared: &str, resolved: &str) {
+    write_exact_node_project_with_artifact(root, name, declared, resolved, "sha512-example");
+}
+
+fn write_exact_node_project_with_artifact(
+    root: &std::path::Path,
+    name: &str,
+    declared: &str,
+    resolved: &str,
+    integrity: &str,
+) {
     let package_json = format!(
         r#"{{
   "name": "diff-project",
@@ -766,7 +866,7 @@ fn write_exact_node_project(root: &std::path::Path, name: &str, declared: &str, 
     "node_modules/{name}": {{
       "version": "{resolved}",
       "resolved": "https://registry.npmjs.org/{name}/-/{name}-{resolved}.tgz",
-      "integrity": "sha512-example"
+      "integrity": "{integrity}"
     }}
   }}
 }}

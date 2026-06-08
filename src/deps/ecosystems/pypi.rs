@@ -116,6 +116,8 @@ fn scan_poetry(ctx: &mut ScanContext<'_>, dir: &Path) -> Result<(), DepsError> {
                 lockfile: Some(poetry_lock.display().to_string()),
                 declared_constraint: Some(declared.clone()),
                 lock_integrity: None,
+                lock_resolved: None,
+                lock_integrity_hash: None,
             };
             ctx.graph.edges.push(DependencyEdge {
                 from: PackageId::root(),
@@ -149,6 +151,8 @@ fn scan_poetry(ctx: &mut ScanContext<'_>, dir: &Path) -> Result<(), DepsError> {
             lockfile: Some(poetry_lock.display().to_string()),
             declared_constraint: first_parent_constraint(&locked, name),
             lock_integrity: None,
+            lock_resolved: None,
+            lock_integrity_hash: None,
         });
     }
 
@@ -240,6 +244,8 @@ fn scan_requirements(
                 lockfile: None,
                 declared_constraint: Some(declared.to_string()),
                 lock_integrity: None,
+                lock_resolved: None,
+                lock_integrity_hash: None,
             });
         } else if declared.contains("git+") {
             ctx.graph.nodes.push(DependencyNode {
@@ -255,6 +261,8 @@ fn scan_requirements(
                 lockfile: None,
                 declared_constraint: Some(declared.to_string()),
                 lock_integrity: None,
+                lock_resolved: None,
+                lock_integrity_hash: None,
             });
         }
     }

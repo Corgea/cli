@@ -142,10 +142,11 @@ fn scan_one_npm(
             }
         });
         if seen_nodes.insert(name.clone()) {
-            let integrity = lock_packages
+            let lock_package = lock_packages
                 .get(name)
                 .or_else(|| lock_packages.get(&format!("node_modules/{name}")))
-                .map(|p| p.has_integrity);
+                .cloned();
+            let has_integrity = lock_package.as_ref().map(|p| p.has_integrity);
             let node = DependencyNode {
                 id: package_id
                     .clone()
@@ -160,7 +161,9 @@ fn scan_one_npm(
                 manifest_file: Some(rel_manifest.into()),
                 lockfile: lock_path.as_ref().map(|p| p.display().to_string()),
                 declared_constraint: Some(declared.clone()),
-                lock_integrity: integrity,
+                lock_integrity: has_integrity,
+                lock_resolved: lock_package.as_ref().and_then(|p| p.resolved.clone()),
+                lock_integrity_hash: lock_package.as_ref().and_then(|p| p.integrity.clone()),
             };
             dep008(ctx.findings, ctx.policy, &node);
             ctx.graph.nodes.push(node.clone());
@@ -200,6 +203,8 @@ fn scan_one_npm(
             lockfile: lock_path.as_ref().map(|p| p.display().to_string()),
             declared_constraint: lp.declared.clone(),
             lock_integrity: Some(lp.has_integrity),
+            lock_resolved: lp.resolved.clone(),
+            lock_integrity_hash: lp.integrity.clone(),
         };
         dep008(ctx.findings, ctx.policy, &node);
         ctx.graph.nodes.push(node);
@@ -231,9 +236,12 @@ fn scan_one_npm(
     Ok(())
 }
 
+#[derive(Clone)]
 struct LockPackage {
     version: String,
     has_integrity: bool,
+    resolved: Option<String>,
+    integrity: Option<String>,
     declared: Option<String>,
     parent: Option<String>,
 }
@@ -253,12 +261,22 @@ fn parse_npm_lock(path: &Path) -> Result<HashMap<String, LockPackage>, DepsError
                 .unwrap_or("?")
                 .to_string();
             let has_integrity = entry.get("integrity").is_some();
+            let resolved = entry
+                .get("resolved")
+                .and_then(|x| x.as_str())
+                .map(str::to_string);
+            let integrity = entry
+                .get("integrity")
+                .and_then(|x| x.as_str())
+                .map(str::to_string);
             let name = package_name_from_lock_key(key).to_string();
             out.insert(
                 key.clone(),
                 LockPackage {
                     version: version.clone(),
                     has_integrity,
+                    resolved: resolved.clone(),
+                    integrity: integrity.clone(),
                     declared: None,
                     parent: None,
                 },
@@ -266,6 +284,8 @@ fn parse_npm_lock(path: &Path) -> Result<HashMap<String, LockPackage>, DepsError
             out.entry(name).or_insert(LockPackage {
                 version,
                 has_integrity,
+                resolved,
+                integrity,
                 declared: None,
                 parent: None,
             });

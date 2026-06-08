@@ -81,6 +81,8 @@ fn scan_maven_pom(ctx: &mut ScanContext<'_>, dir: &Path, pom_path: &Path) -> Res
             lockfile: None,
             declared_constraint: Some(declared),
             lock_integrity: None,
+            lock_resolved: None,
+            lock_integrity_hash: None,
         });
     }
     let _ = dir;
@@ -195,6 +197,8 @@ fn scan_gradle(ctx: &mut ScanContext<'_>, dir: &Path, gradle_path: &Path) -> Res
             lockfile: lock_path.as_ref().map(|p| p.display().to_string()),
             declared_constraint: Some(declared),
             lock_integrity: None,
+            lock_resolved: None,
+            lock_integrity_hash: None,
         });
     }
     Ok(())

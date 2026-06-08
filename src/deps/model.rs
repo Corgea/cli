@@ -141,6 +141,8 @@ pub struct DependencyNode {
     pub(crate) lockfile: Option<String>,
     pub(crate) declared_constraint: Option<String>,
     pub(crate) lock_integrity: Option<bool>,
+    pub(crate) lock_resolved: Option<String>,
+    pub(crate) lock_integrity_hash: Option<String>,
 }
 
 impl DependencyNode {
@@ -158,6 +160,8 @@ impl DependencyNode {
             lockfile: None,
             declared_constraint: None,
             lock_integrity: None,
+            lock_resolved: None,
+            lock_integrity_hash: None,
         }
     }
 

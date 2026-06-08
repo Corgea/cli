@@ -183,6 +183,20 @@ fn npm_lock_entry_with_integrity_no_dep008() {
 }
 
 #[test]
+fn npm_lock_entry_preserves_artifact_evidence() {
+    let inv = scan_fixture("node-app");
+    let express = inv.node("express").expect("express node missing");
+    assert_eq!(
+        express.lock_resolved.as_deref(),
+        Some("https://registry.npmjs.org/express/-/express-4.18.2.tgz")
+    );
+    assert_eq!(
+        express.lock_integrity_hash.as_deref(),
+        Some("sha512-5/PsL6iGPdfQ/lKM1UuielYgv3BUoJfz1aUwU9vHZ+J7gyvwdQXFEBIEIaxeGf0GIcreATNyBExtalisDbuMqQ==")
+    );
+}
+
+#[test]
 fn node_manifest_dep_missing_from_lock_is_dep002() {
     let inv = scan_fixture("node-stale");
     let f = inv.with_code("DEP002");

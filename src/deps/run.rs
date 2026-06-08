@@ -227,7 +227,9 @@ fn run_inner(sub: DepsSubcommand) -> Result<u8, DepsError> {
             let output = render_diff(&base, &diff, render.resolve()?);
             emit_output(&output, None)?;
             if let Some(threshold) = new_threshold {
-                if has_new_findings_at_or_above(&base_inv, &head, threshold) {
+                if has_new_findings_at_or_above(&base_inv, &head, threshold)
+                    || (Severity::High.at_least(threshold) && !diff.artifact_changed.is_empty())
+                {
                     return Ok(1);
                 }
             }
@@ -571,6 +573,14 @@ fn human_diff_output(base: &str, diff: &crate::deps::diff::GraphDiff) -> String 
             change.name, change.from, change.to
         ));
     }
+    for change in &diff.artifact_changed {
+        out.push_str(&format!(
+            "  ~ {} {} {} changed\n",
+            change.name,
+            change.version,
+            artifact_change_label(change)
+        ));
+    }
     out
 }
 
@@ -598,6 +608,22 @@ fn agent_diff_output(diff: &crate::deps::diff::GraphDiff) -> String {
             tsv_cell(&change.to)
         ));
     }
+    for change in &diff.artifact_changed {
+        out.push_str(&format!(
+            "artifact_changed\t{}\t{}\t{}\n",
+            tsv_cell(&change.name),
+            tsv_cell(&artifact_summary(
+                &change.version,
+                change.old_resolved.as_deref(),
+                change.old_integrity.as_deref()
+            )),
+            tsv_cell(&artifact_summary(
+                &change.version,
+                change.new_resolved.as_deref(),
+                change.new_integrity.as_deref()
+            ))
+        ));
+    }
     out
 }
 
@@ -613,12 +639,54 @@ fn diff_json(base: &str, diff: &crate::deps::diff::GraphDiff) -> Value {
             })
         })
         .collect();
+    let artifact_changed: Vec<Value> = diff
+        .artifact_changed
+        .iter()
+        .map(|change| {
+            json!({
+                "name": change.name,
+                "version": change.version,
+                "resolved": {
+                    "from": change.old_resolved,
+                    "to": change.new_resolved,
+                },
+                "integrity": {
+                    "from": change.old_integrity,
+                    "to": change.new_integrity,
+                },
+            })
+        })
+        .collect();
     json!({
         "base": base,
         "added": diff_nodes_json(&diff.added),
         "removed": diff_nodes_json(&diff.removed),
         "changed": changed,
+        "artifact_changed": artifact_changed,
     })
+}
+
+fn artifact_change_label(change: &crate::deps::diff::ArtifactChange) -> &'static str {
+    match (
+        change.old_resolved != change.new_resolved,
+        change.old_integrity != change.new_integrity,
+    ) {
+        (true, true) => "artifact",
+        (true, false) => "resolved",
+        (false, true) => "integrity",
+        (false, false) => "artifact",
+    }
+}
+
+fn artifact_summary(version: &str, resolved: Option<&str>, integrity: Option<&str>) -> String {
+    let mut parts = vec![version.to_string()];
+    if let Some(resolved) = resolved {
+        parts.push(format!("resolved={resolved}"));
+    }
+    if let Some(integrity) = integrity {
+        parts.push(format!("integrity={integrity}"));
+    }
+    parts.join(" ")
 }
 
 fn diff_nodes_json(nodes: &[DependencyNode]) -> Vec<Value> {
