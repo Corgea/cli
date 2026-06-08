@@ -3,7 +3,7 @@
 # Usage: ./harness <command> [--verbose] [--min=N]
 #
 # Commands: check, fix, lint, test, audit, coverage, pre-commit, ci,
-#           post-edit, setup-hooks, suppressions
+#           post-edit, setup-hooks, suppressions, deps-skill
 # Use `./harness post-edit codex` for Codex hooks that require JSON-safe stdout.
 
 set -u
@@ -175,6 +175,10 @@ cmd_test() {
     run_with_summary "Tests" 0 -- cargo test
 }
 
+cmd_deps_skill() {
+    run "Deps skill drift" 0 -- cargo run --example deps_skill -- check
+}
+
 cmd_audit() {
     _cmd_audit_inner 0
 }
@@ -282,6 +286,8 @@ cmd_check() {
     [ $? -eq 0 ] && passed=$(( passed + 1 )) || failed=$(( failed + 1 ))
     run_with_summary "Tests" 1 -- cargo test
     [ $? -eq 0 ] && passed=$(( passed + 1 )) || failed=$(( failed + 1 ))
+    run "Deps skill drift" 1 -- cargo run --example deps_skill -- check
+    [ $? -eq 0 ] && passed=$(( passed + 1 )) || failed=$(( failed + 1 ))
 
     cmd_suppressions
 
@@ -337,10 +343,11 @@ case "$cmd" in
     post-edit)    cmd_post_edit "${@:2}" ;;
     setup-hooks)  cmd_setup_hooks ;;
     suppressions) cmd_suppressions ;;
+    deps-skill)    cmd_deps_skill ;;
     -h|--help|help)
         printf "Usage: ./harness <command> [--verbose] [--min=N]\n\n"
         printf "Commands: check, fix, lint, test, audit, coverage, pre-commit,\n"
-        printf "          ci, post-edit, setup-hooks, suppressions\n"
+        printf "          ci, post-edit, setup-hooks, suppressions, deps-skill\n"
         printf "\nCodex hook mode: ./harness post-edit codex\n"
         ;;
     *)

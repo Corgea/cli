@@ -15,6 +15,9 @@ use crate::deps::{scan, DepsError};
 #[derive(Subcommand, Debug, Clone)]
 pub enum DepsSubcommand {
     /// Scan manifests and lockfiles, build inventory, evaluate policy
+    #[command(
+        after_help = "Examples:\n  corgea deps scan --format agent\n  corgea deps scan --format quiet --fail-on high\n  corgea deps scan --out-format sarif --out-file deps.sarif"
+    )]
     Scan {
         #[arg(default_value = ".")]
         path: String,
@@ -28,6 +31,9 @@ pub enum DepsSubcommand {
         render: RenderArgs,
     },
     /// Print the dependency graph
+    #[command(
+        after_help = "Examples:\n  corgea deps graph --format agent\n  corgea deps graph tests/fixtures/node-app --format json"
+    )]
     Graph {
         #[arg(default_value = ".")]
         path: String,
@@ -35,6 +41,9 @@ pub enum DepsSubcommand {
         render: RenderArgs,
     },
     /// Explain why a package is present
+    #[command(
+        after_help = "Examples:\n  corgea deps explain lodash --format agent\n  corgea deps explain left-pad tests/fixtures/node-app --format json"
+    )]
     Explain {
         package: String,
         #[arg(default_value = ".")]
@@ -43,6 +52,9 @@ pub enum DepsSubcommand {
         render: RenderArgs,
     },
     /// Compare dependency graph against a git ref
+    #[command(
+        after_help = "Examples:\n  corgea deps diff --base origin/main --format json\n  corgea deps diff --base HEAD . --fail-on-new high"
+    )]
     Diff {
         #[arg(long)]
         base: String,
@@ -54,6 +66,9 @@ pub enum DepsSubcommand {
         render: RenderArgs,
     },
     /// Generate an SBOM
+    #[command(
+        after_help = "Examples:\n  corgea deps sbom --format cyclonedx\n  corgea deps sbom --format cyclonedx --out bom.json"
+    )]
     Sbom {
         #[arg(long, default_value = "cyclonedx")]
         format: String,
@@ -72,6 +87,9 @@ pub enum DepsSubcommand {
 #[derive(Subcommand, Debug, Clone)]
 pub enum DepsPolicySubcommand {
     /// Write a starter `.corgea/deps.yml` policy file
+    #[command(
+        after_help = "Examples:\n  corgea deps policy init\n  corgea deps policy init --exist-ok --format quiet"
+    )]
     Init {
         #[arg(default_value = ".")]
         path: String,
@@ -137,6 +155,11 @@ fn run_inner(sub: DepsSubcommand) -> Result<u8, DepsError> {
             let root = Path::new(&path);
             let policy = load_policy(root)?;
             let inv = scan(root, &policy)?;
+            let render_format = if out_format.is_some() {
+                None
+            } else {
+                Some(render.resolve()?)
+            };
             let output = if let Some(out_format) = out_format.as_deref() {
                 match ReportFormat::parse(out_format)? {
                     ReportFormat::Table => table_output(&inv),
@@ -144,10 +167,13 @@ fn run_inner(sub: DepsSubcommand) -> Result<u8, DepsError> {
                     ReportFormat::Sarif => json_line(to_sarif(&inv)),
                 }
             } else {
-                render_scan(&inv, render.resolve()?)
+                render_scan(&inv, render_format.expect("render format resolved"))
             };
 
             emit_output(&output, out_file.as_deref())?;
+            if let Some(format) = render_format {
+                emit_scan_hints(&path, &inv, format);
+            }
 
             if let Some(threshold) = fail_threshold {
                 if should_fail(&inv, threshold) {
@@ -229,7 +255,8 @@ fn run_inner(sub: DepsSubcommand) -> Result<u8, DepsError> {
                 exist_ok,
                 render,
             } => {
-                let dir = PathBuf::from(path).join(".corgea");
+                let render_format = render.resolve()?;
+                let dir = PathBuf::from(&path).join(".corgea");
                 std::fs::create_dir_all(&dir)
                     .map_err(|e| DepsError(format!("create .corgea: {e}")))?;
                 let policy_path = dir.join("deps.yml");
@@ -240,8 +267,9 @@ fn run_inner(sub: DepsSubcommand) -> Result<u8, DepsError> {
                         .map_err(|e| DepsError(format!("write policy: {e}")))?;
                     true
                 };
-                let output = render_policy_init(&policy_path, created, render.resolve()?);
+                let output = render_policy_init(&policy_path, created, render_format);
                 emit_output(&output, None)?;
+                emit_policy_init_hint(&path, render_format);
                 Ok(0)
             }
         },
@@ -290,6 +318,15 @@ impl RenderFormat {
             None => Ok(Self::Human),
         }
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+            Self::Json => "json",
+            Self::Quiet => "quiet",
+        }
+    }
 }
 
 fn agent_env_detected() -> bool {
@@ -324,6 +361,45 @@ fn emit_output(output: &str, out_file: Option<&str>) -> Result<(), DepsError> {
 
 fn json_line(value: Value) -> String {
     format!("{value}\n")
+}
+
+fn emit_scan_hints(path: &str, inv: &crate::deps::Inventory, format: RenderFormat) {
+    if format == RenderFormat::Quiet {
+        return;
+    }
+
+    let format = format.as_str();
+    if let Some(package) = inv
+        .findings
+        .iter()
+        .filter_map(|finding| finding.package.as_ref())
+        .map(|package| package.name())
+        .find(|name| *name != "project")
+    {
+        eprintln!(
+            "Hint: Run `corgea deps explain {} {} --format {}` to inspect why this package is present.",
+            shell_word(package),
+            shell_word(path),
+            format
+        );
+    }
+
+    eprintln!(
+        "Hint: Run `corgea deps diff --base origin/main {} --format {}` before merging dependency changes.",
+        shell_word(path),
+        format
+    );
+}
+
+fn emit_policy_init_hint(path: &str, format: RenderFormat) {
+    if format == RenderFormat::Quiet {
+        return;
+    }
+
+    eprintln!(
+        "Hint: Run `corgea deps scan {} --format json` to verify the policy.",
+        shell_word(path)
+    );
 }
 
 fn render_scan(inv: &crate::deps::Inventory, format: RenderFormat) -> String {
@@ -570,6 +646,18 @@ fn render_policy_init(path: &Path, created: bool, format: RenderFormat) -> Strin
 
 fn tsv_cell(value: &str) -> String {
     value.replace(['\t', '\r', '\n'], " ")
+}
+
+fn shell_word(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | '@'))
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn load_policy(root: &Path) -> Result<Policy, DepsError> {

@@ -138,6 +138,21 @@ fn cli_scan_format_json_outputs_parseable_inventory() {
         serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
     assert!(parsed.get("nodes").is_some());
     assert!(parsed.get("findings").is_some());
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("Hint:"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Hint: Run `corgea deps explain"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Hint: Run `corgea deps diff"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -160,6 +175,32 @@ fn cli_scan_format_quiet_suppresses_stdout_and_preserves_fail_code() {
 }
 
 #[test]
+fn cli_scan_agent_hints_go_to_stderr_only() {
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .args(["deps", "scan", &fixture("node-app"), "--format", "agent"])
+        .output()
+        .expect("failed to run corgea");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.starts_with("record\troot\t"), "stdout: {stdout}");
+    assert!(!stdout.contains("Hint:"), "stdout: {stdout}");
+    assert!(
+        stderr.contains("Hint: Run `corgea deps explain"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Hint: Run `corgea deps diff"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn cli_graph_format_json_outputs_parseable_nodes() {
     let (mut cmd, _home) = corgea_isolated();
     let out = cmd
@@ -177,6 +218,82 @@ fn cli_graph_format_json_outputs_parseable_nodes() {
     assert!(nodes
         .iter()
         .any(|node| node["id"] == "pkg:npm/left-pad@1.3.0"));
+}
+
+#[test]
+fn cli_deps_help_includes_copy_paste_examples() {
+    let cases = [
+        (
+            vec!["deps", "scan", "--help"],
+            vec![
+                "Examples:",
+                "corgea deps scan --format agent",
+                "corgea deps scan --out-format sarif --out-file deps.sarif",
+            ],
+        ),
+        (
+            vec!["deps", "graph", "--help"],
+            vec![
+                "Examples:",
+                "corgea deps graph --format agent",
+                "corgea deps graph tests/fixtures/node-app --format json",
+            ],
+        ),
+        (
+            vec!["deps", "explain", "--help"],
+            vec![
+                "Examples:",
+                "corgea deps explain lodash --format agent",
+                "corgea deps explain left-pad tests/fixtures/node-app --format json",
+            ],
+        ),
+        (
+            vec!["deps", "diff", "--help"],
+            vec![
+                "Examples:",
+                "corgea deps diff --base origin/main --format json",
+                "corgea deps diff --base HEAD . --fail-on-new high",
+            ],
+        ),
+        (
+            vec!["deps", "sbom", "--help"],
+            vec![
+                "Examples:",
+                "corgea deps sbom --format cyclonedx",
+                "corgea deps sbom --format cyclonedx --out bom.json",
+            ],
+        ),
+        (
+            vec!["deps", "policy", "init", "--help"],
+            vec![
+                "Examples:",
+                "corgea deps policy init",
+                "corgea deps policy init --exist-ok --format quiet",
+            ],
+        ),
+    ];
+
+    for (args, expected) in cases {
+        let (mut cmd, _home) = corgea_isolated();
+        let out = cmd
+            .args(args.clone())
+            .output()
+            .expect("failed to run corgea");
+        assert!(
+            out.status.success(),
+            "args: {:?}\nstderr: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for needle in expected {
+            assert!(
+                stdout.contains(needle),
+                "args: {:?}\nmissing: {needle}\nstdout: {stdout}",
+                args
+            );
+        }
+    }
 }
 
 #[test]
@@ -366,6 +483,16 @@ fn cli_policy_init_exist_ok_preserves_existing_policy() {
     let parsed: serde_json::Value =
         serde_json::from_slice(&init_out.stdout).expect("stdout must be valid JSON");
     assert_eq!(parsed["created"], false);
+    assert!(
+        !String::from_utf8_lossy(&init_out.stdout).contains("Hint:"),
+        "stdout: {}",
+        String::from_utf8_lossy(&init_out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&init_out.stderr).contains("Hint: Run `corgea deps scan"),
+        "stderr: {}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
     assert_eq!(
         std::fs::read_to_string(&policy_path).expect("read existing policy"),
         "custom: true\n"

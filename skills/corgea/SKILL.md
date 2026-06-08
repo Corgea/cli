@@ -109,25 +109,27 @@ corgea setup-hooks --default-config            # Default: secrets + PII, fail on
 
 Installs a pre-commit hook running `corgea scan blast --only-uncommitted`. Bypass with `git commit --no-verify`.
 
+<!-- BEGIN GENERATED CORGEA DEPS SKILL -->
 ### Deps — `corgea deps <command>`
 
 Offline dependency inventory and policy checks. No Corgea token or network required.
+Agent environments default to compact TSV; force output with `--format human|agent|json|quiet`.
 
-```bash
-corgea deps scan                               # Human table; auto-agent TSV under AI_AGENT/CODEX_SANDBOX/etc.
-corgea deps scan --format agent                # Compact TSV summary + findings
-corgea deps scan --format json                 # JSON inventory on stdout
-corgea deps scan --format quiet --fail-on high # No stdout; exit code still applies
-corgea deps scan --out-format sarif --out-file deps.sarif  # Export table/json/sarif report
-corgea deps graph --format agent               # TSV graph: id, name, version, direct, scope, depth
-corgea deps graph --format json                # JSON graph nodes
-corgea deps explain lodash --format agent      # TSV dependency paths for a package
-corgea deps diff --base origin/main --format json  # JSON added/removed/changed dependencies
-corgea deps sbom --format cyclonedx            # CycloneDX SBOM JSON
-corgea deps policy init --exist-ok --format quiet  # Keep existing policy, no stdout
-```
+- `corgea deps scan [PATH]` — Scan manifests and lockfiles, build inventory, evaluate policy. Flags: `--fail-on`, `--out-format`, `--out-file`, `--format`
+  Examples: `corgea deps scan --format agent`; `corgea deps scan --format quiet --fail-on high`
+- `corgea deps graph [PATH]` — Print the dependency graph. Flags: `--format`
+  Examples: `corgea deps graph --format agent`; `corgea deps graph tests/fixtures/node-app --format json`
+- `corgea deps explain <PACKAGE> [PATH]` — Explain why a package is present. Flags: `--format`
+  Examples: `corgea deps explain lodash --format agent`; `corgea deps explain left-pad tests/fixtures/node-app --format json`
+- `corgea deps diff --base <BASE> [PATH]` — Compare dependency graph against a git ref. Flags: `--base`, `--fail-on-new`, `--format`
+  Examples: `corgea deps diff --base origin/main --format json`; `corgea deps diff --base HEAD . --fail-on-new high`
+- `corgea deps sbom [PATH]` — Generate an SBOM. Flags: `--format`, `--out`
+  Examples: `corgea deps sbom --format cyclonedx`; `corgea deps sbom --format cyclonedx --out bom.json`
+- `corgea deps policy init [PATH]` — Write a starter `.corgea/deps.yml` policy file. Flags: `--exist-ok`, `--format`
+  Examples: `corgea deps policy init`; `corgea deps policy init --exist-ok --format quiet`
 
-Render modes for deps commands are `--format human|agent|json|quiet`. `deps scan --out-format table|json|sarif` remains the report/export selector; do not combine it with `deps scan --format`.
+Notes: `deps scan --out-format table|json|sarif` is the report/export selector; do not combine it with `deps scan --format`.
+<!-- END GENERATED CORGEA DEPS SKILL -->
 
 ## Common Workflows
 

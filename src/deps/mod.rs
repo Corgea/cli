@@ -12,6 +12,7 @@ pub mod parse;
 pub mod policy;
 pub mod report;
 pub mod run;
+pub mod skill;
 
 use std::path::{Path, PathBuf};
 
