@@ -20,6 +20,8 @@ pub fn scan_pypi_projects(ctx: &mut ScanContext<'_>) -> Result<(), DepsError> {
                     continue;
                 }
                 scan_poetry(ctx, &dir)?;
+            } else if scan_pyproject_manifest(ctx, &dir, &f.path)? {
+                handled_dirs.insert(dir);
             }
         }
     }
@@ -53,34 +55,7 @@ fn scan_poetry(ctx: &mut ScanContext<'_>, dir: &Path) -> Result<(), DepsError> {
     let toml: toml::Value =
         toml::from_str(&content).map_err(|e| DepsError(format!("parse pyproject: {e}")))?;
 
-    let mut direct: HashMap<String, (String, Scope)> = HashMap::new();
-    if let Some(deps) = toml
-        .get("tool")
-        .and_then(|t| t.get("poetry"))
-        .and_then(|p| p.get("dependencies"))
-        .and_then(|d| d.as_table())
-    {
-        for (k, v) in deps {
-            if k == "python" {
-                continue;
-            }
-            let spec = v.as_str().unwrap_or(&v.to_string()).to_string();
-            direct.insert(k.clone(), (spec, Scope::Production));
-        }
-    }
-    if let Some(deps) = toml
-        .get("tool")
-        .and_then(|t| t.get("poetry"))
-        .and_then(|p| p.get("group"))
-        .and_then(|g| g.get("dev"))
-        .and_then(|d| d.get("dependencies"))
-        .and_then(|d| d.as_table())
-    {
-        for (k, v) in deps {
-            let spec = v.as_str().unwrap_or(&v.to_string()).to_string();
-            direct.insert(k.clone(), (spec, Scope::Development));
-        }
-    }
+    let direct = poetry_manifest_dependencies(&toml);
 
     let locked = parse_poetry_lock(&poetry_lock)?;
     let mut seen = HashSet::new();
@@ -175,6 +150,32 @@ fn scan_poetry(ctx: &mut ScanContext<'_>, dir: &Path) -> Result<(), DepsError> {
     Ok(())
 }
 
+fn scan_pyproject_manifest(
+    ctx: &mut ScanContext<'_>,
+    _dir: &Path,
+    pyproject: &Path,
+) -> Result<bool, DepsError> {
+    let rel = pyproject
+        .strip_prefix(ctx.root)
+        .unwrap_or(pyproject)
+        .display()
+        .to_string();
+    let content = std::fs::read_to_string(pyproject)
+        .map_err(|e| DepsError(format!("read pyproject: {e}")))?;
+    let toml: toml::Value =
+        toml::from_str(&content).map_err(|e| DepsError(format!("parse pyproject: {e}")))?;
+    let deps = pyproject_manifest_dependencies(&toml);
+    if deps.is_empty() {
+        return Ok(false);
+    }
+
+    dep001(ctx.findings, ctx.policy, &rel, "Python");
+    for (name, declared, scope) in deps {
+        add_unlocked_pypi_dependency(ctx, &rel, &name, &declared, scope);
+    }
+    Ok(true)
+}
+
 fn scan_requirements(
     ctx: &mut ScanContext<'_>,
     dir: &Path,
@@ -195,79 +196,85 @@ fn scan_requirements(
             continue;
         }
         let (name, declared) = parse_requirement_line(line);
-        let kind = classify_constraint(Ecosystem::PyPI, &declared);
-        let is_exact = matches!(kind, crate::deps::model::ConstraintKind::Exact);
-        ctx.findings.extend(constraint_to_findings(
-            ctx.policy,
-            &kind,
-            true,
-            &name,
-            &declared,
-            if is_exact {
-                declared.strip_prefix("==").map(str::trim)
-            } else {
-                None
-            },
-            &rel,
-            is_exact
-                .then(|| {
-                    PackageId::pypi(
-                        &name,
-                        declared.strip_prefix("==").unwrap_or(&declared).trim(),
-                    )
-                })
-                .or_else(|| {
-                    if declared.contains("git+") {
-                        Some(PackageId::pypi(&name, "git"))
-                    } else {
-                        Some(PackageId::pypi(&name, "?"))
-                    }
-                }),
-            false,
-        ));
-        if is_exact {
-            let ver = declared.strip_prefix("==").unwrap_or(&declared);
-            ctx.graph.nodes.push(DependencyNode {
-                id: PackageId::pypi(&name, ver),
-                name: name.clone(),
-                ecosystem: Ecosystem::PyPI,
-                version: Some(ver.to_string()),
-                direct: true,
-                scope: Scope::Production,
-                depth: 1,
-                source_type: if declared.contains("git+") {
-                    SourceType::GitBranch
-                } else {
-                    SourceType::Registry
-                },
-                manifest_file: Some(rel.clone()),
-                lockfile: None,
-                declared_constraint: Some(declared.to_string()),
-                lock_integrity: None,
-                lock_resolved: None,
-                lock_integrity_hash: None,
-            });
-        } else if declared.contains("git+") {
-            ctx.graph.nodes.push(DependencyNode {
-                id: PackageId::pypi(&name, "git"),
-                name: name.clone(),
-                ecosystem: Ecosystem::PyPI,
-                version: Some("git".into()),
-                direct: true,
-                scope: Scope::Production,
-                depth: 1,
-                source_type: SourceType::GitBranch,
-                manifest_file: Some(rel.clone()),
-                lockfile: None,
-                declared_constraint: Some(declared.to_string()),
-                lock_integrity: None,
-                lock_resolved: None,
-                lock_integrity_hash: None,
-            });
-        }
+        add_unlocked_pypi_dependency(ctx, &rel, &name, &declared, Scope::Production);
     }
     let _ = dir;
     Ok(())
+}
+
+fn add_unlocked_pypi_dependency(
+    ctx: &mut ScanContext<'_>,
+    source_file: &str,
+    name: &str,
+    declared: &str,
+    scope: Scope,
+) {
+    let name = normalize_pypi_name(name);
+    let kind = classify_constraint(Ecosystem::PyPI, declared);
+    let is_exact = matches!(kind, crate::deps::model::ConstraintKind::Exact);
+    let exact_version = if is_exact {
+        exact_version_from_declared(&name, declared)
+    } else {
+        None
+    };
+    let package_id = exact_version
+        .as_deref()
+        .map(|version| PackageId::pypi(&name, version))
+        .or_else(|| {
+            if declared.contains("git+") {
+                Some(PackageId::pypi(&name, "git"))
+            } else {
+                Some(PackageId::pypi(&name, "?"))
+            }
+        });
+
+    ctx.findings.extend(constraint_to_findings(
+        ctx.policy,
+        &kind,
+        true,
+        &name,
+        declared,
+        exact_version.as_deref(),
+        source_file,
+        package_id.clone(),
+        false,
+    ));
+
+    if let Some(version) = exact_version {
+        ctx.graph.nodes.push(DependencyNode {
+            id: PackageId::pypi(&name, &version),
+            name: name.clone(),
+            ecosystem: Ecosystem::PyPI,
+            version: Some(version),
+            direct: true,
+            scope,
+            depth: 1,
+            source_type: SourceType::Registry,
+            manifest_file: Some(source_file.to_string()),
+            lockfile: None,
+            declared_constraint: Some(declared.to_string()),
+            lock_integrity: None,
+            lock_resolved: None,
+            lock_integrity_hash: None,
+        });
+    } else if declared.contains("git+") {
+        ctx.graph.nodes.push(DependencyNode {
+            id: PackageId::pypi(&name, "git"),
+            name: name.clone(),
+            ecosystem: Ecosystem::PyPI,
+            version: Some("git".into()),
+            direct: true,
+            scope,
+            depth: 1,
+            source_type: SourceType::GitBranch,
+            manifest_file: Some(source_file.to_string()),
+            lockfile: None,
+            declared_constraint: Some(declared.to_string()),
+            lock_integrity: None,
+            lock_resolved: None,
+            lock_integrity_hash: None,
+        });
+    }
 }
 
 fn parse_requirement_line(line: &str) -> (String, String) {
@@ -284,6 +291,97 @@ fn parse_requirement_line(line: &str) -> (String, String) {
         return (name.to_string(), line.to_string());
     }
     (line.to_string(), line.to_string())
+}
+
+fn poetry_manifest_dependencies(toml: &toml::Value) -> HashMap<String, (String, Scope)> {
+    let mut direct = HashMap::new();
+    if let Some(deps) = toml
+        .get("tool")
+        .and_then(|t| t.get("poetry"))
+        .and_then(|p| p.get("dependencies"))
+        .and_then(|d| d.as_table())
+    {
+        for (name, value) in deps {
+            let name = normalize_pypi_name(name);
+            if name == "python" {
+                continue;
+            }
+            direct.insert(name, (toml_dependency_spec(value), Scope::Production));
+        }
+    }
+    if let Some(deps) = toml
+        .get("tool")
+        .and_then(|t| t.get("poetry"))
+        .and_then(|p| p.get("group"))
+        .and_then(|g| g.get("dev"))
+        .and_then(|d| d.get("dependencies"))
+        .and_then(|d| d.as_table())
+    {
+        for (name, value) in deps {
+            direct.insert(
+                normalize_pypi_name(name),
+                (toml_dependency_spec(value), Scope::Development),
+            );
+        }
+    }
+    direct
+}
+
+fn pyproject_manifest_dependencies(toml: &toml::Value) -> Vec<(String, String, Scope)> {
+    let mut deps = Vec::new();
+    if let Some(project_deps) = toml
+        .get("project")
+        .and_then(|project| project.get("dependencies"))
+        .and_then(|dependencies| dependencies.as_array())
+    {
+        for value in project_deps {
+            if let Some(raw) = value.as_str() {
+                let (name, declared) = parse_requirement_line(raw);
+                deps.push((name, declared, Scope::Production));
+            }
+        }
+    }
+    for (name, (declared, scope)) in poetry_manifest_dependencies(toml) {
+        deps.push((name, declared, scope));
+    }
+    deps
+}
+
+fn toml_dependency_spec(value: &toml::Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn exact_version_from_declared(name: &str, declared: &str) -> Option<String> {
+    let declared = declared.trim();
+    if let Some(version) = declared.strip_prefix("==") {
+        return Some(version.trim().to_string());
+    }
+    if let Some((left, version)) = declared.split_once("==") {
+        if normalize_pypi_name(left.trim()) == name {
+            return Some(version.trim().to_string());
+        }
+    }
+    Some(declared.trim_start_matches('=').trim().to_string())
+}
+
+fn normalize_pypi_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_separator = false;
+    for c in name.trim().chars() {
+        if matches!(c, '-' | '_' | '.') {
+            if !last_was_separator {
+                out.push('-');
+                last_was_separator = true;
+            }
+        } else {
+            out.push(c.to_ascii_lowercase());
+            last_was_separator = false;
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -331,7 +429,7 @@ fn parse_poetry_lock(path: &Path) -> Result<HashMap<String, PoetryLockPackage>, 
         if in_dependencies {
             if let Some((name, spec)) = line.split_once('=') {
                 current_dependencies.insert(
-                    name.trim().trim_matches('"').to_string(),
+                    normalize_pypi_name(name.trim().trim_matches('"')),
                     spec.trim().trim_matches('"').to_string(),
                 );
             }
@@ -354,7 +452,7 @@ fn insert_poetry_package(
 ) {
     if let (Some(name), Some(version)) = (name, version) {
         packages.insert(
-            name,
+            normalize_pypi_name(&name),
             PoetryLockPackage {
                 version,
                 dependencies,

@@ -47,6 +47,8 @@ fn npm_classify_git_commit_sha_is_immutable_ref() {
 use super::common::scan_fixture;
 use crate::deps::explain::explain;
 use crate::deps::model::{PackageId, Scope, Severity, SourceType};
+use crate::deps::policy::Policy;
+use crate::deps::scan;
 
 #[test]
 fn npm_graph_classifies_express_as_direct_production() {
@@ -250,4 +252,99 @@ fn pnpm_lock_is_explicitly_unsupported_without_stale_noise() {
     let inv = scan_fixture("node-pnpm");
     assert!(!inv.with_code("DEP019").is_empty());
     assert!(inv.with_code("DEP002").is_empty());
+}
+
+#[test]
+fn npm_manifest_without_lockfile_is_dep001_not_dep002() {
+    let tmp = tempfile::TempDir::new().expect("temp project");
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{
+  "name": "npm-no-lock",
+  "version": "1.0.0",
+  "dependencies": {
+    "left-pad": "*"
+  }
+}
+"#,
+    )
+    .expect("write package.json");
+
+    let inv = scan(tmp.path(), &Policy::default()).expect("scan");
+
+    assert!(!inv.with_code("DEP001").is_empty());
+    assert!(inv.with_code("DEP002").is_empty());
+    assert!(!inv.with_code("DEP004").is_empty());
+}
+
+#[test]
+fn npm_lock_preserves_duplicate_transitive_versions() {
+    let tmp = tempfile::TempDir::new().expect("temp project");
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{
+  "name": "npm-duplicates",
+  "version": "1.0.0",
+  "dependencies": {
+    "a": "1.0.0",
+    "b": "1.0.0"
+  }
+}
+"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        tmp.path().join("package-lock.json"),
+        r#"{
+  "name": "npm-duplicates",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "name": "npm-duplicates",
+      "version": "1.0.0",
+      "dependencies": {
+        "a": "1.0.0",
+        "b": "1.0.0"
+      }
+    },
+    "node_modules/a": {
+      "version": "1.0.0",
+      "integrity": "sha512-a",
+      "dependencies": {
+        "foo": "1.0.0"
+      }
+    },
+    "node_modules/b": {
+      "version": "1.0.0",
+      "integrity": "sha512-b",
+      "dependencies": {
+        "foo": "2.0.0"
+      }
+    },
+    "node_modules/a/node_modules/foo": {
+      "version": "1.0.0",
+      "integrity": "sha512-foo1"
+    },
+    "node_modules/b/node_modules/foo": {
+      "version": "2.0.0",
+      "integrity": "sha512-foo2"
+    }
+  }
+}
+"#,
+    )
+    .expect("write package-lock.json");
+
+    let inv = scan(tmp.path(), &Policy::default()).expect("scan");
+    let mut versions: Vec<String> = inv
+        .graph
+        .nodes_named("foo")
+        .into_iter()
+        .filter_map(|node| node.version().map(str::to_string))
+        .collect();
+    versions.sort();
+
+    assert_eq!(versions, vec!["1.0.0".to_string(), "2.0.0".to_string()]);
+    assert!(!inv.with_code("DEP014").is_empty());
 }

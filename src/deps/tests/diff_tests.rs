@@ -1,5 +1,5 @@
 use crate::deps::diff::diff_graphs;
-use crate::deps::model::{DependencyGraph, DependencyNode};
+use crate::deps::model::{DependencyGraph, DependencyNode, Ecosystem, PackageId};
 
 fn graph(nodes: Vec<DependencyNode>) -> DependencyGraph {
     DependencyGraph {
@@ -17,6 +17,13 @@ fn npm_with_artifact(
     let mut node = DependencyNode::new_npm(name, version);
     node.lock_resolved = resolved.map(str::to_string);
     node.lock_integrity_hash = integrity.map(str::to_string);
+    node
+}
+
+fn pypi_node(name: &str, version: &str) -> DependencyNode {
+    let mut node = DependencyNode::new_npm(name, version);
+    node.id = PackageId::pypi(name, version);
+    node.ecosystem = Ecosystem::PyPI;
     node
 }
 
@@ -94,4 +101,32 @@ fn diff_detects_same_version_resolved_change() {
         change.new_resolved.as_deref(),
         Some("https://mirror.example/lodash/-/lodash-4.17.21.tgz")
     );
+}
+
+#[test]
+fn diff_does_not_collapse_same_name_across_ecosystems() {
+    let base = graph(vec![DependencyNode::new_npm("foo", "1.0.0")]);
+    let head = graph(vec![
+        DependencyNode::new_npm("foo", "1.0.0"),
+        pypi_node("foo", "2.0.0"),
+    ]);
+
+    let d = diff_graphs(&base, &head);
+
+    assert!(d.changed.is_empty());
+    assert!(d.added.iter().any(|n| n.id().0 == "pkg:pypi/foo@2.0.0"));
+}
+
+#[test]
+fn diff_reports_removed_duplicate_version() {
+    let base = graph(vec![
+        DependencyNode::new_npm("foo", "1.0.0"),
+        DependencyNode::new_npm("foo", "2.0.0"),
+    ]);
+    let head = graph(vec![DependencyNode::new_npm("foo", "2.0.0")]);
+
+    let d = diff_graphs(&base, &head);
+
+    assert!(d.changed.is_empty());
+    assert!(d.removed.iter().any(|n| n.id().0 == "pkg:npm/foo@1.0.0"));
 }

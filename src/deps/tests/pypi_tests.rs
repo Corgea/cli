@@ -41,6 +41,8 @@ fn pypi_classify_git_branch_is_mutable_ref() {
 use super::common::scan_fixture;
 use crate::deps::explain::explain;
 use crate::deps::model::Scope;
+use crate::deps::policy::Policy;
+use crate::deps::scan;
 
 #[test]
 fn pypi_graph_classifies_pytest_as_development_scope() {
@@ -125,4 +127,57 @@ fn uv_lock_does_not_suppress_requirements_scan() {
         .findings_for("requests")
         .iter()
         .any(|f| f.id == "DEP004"));
+}
+
+#[test]
+fn pyproject_only_dependencies_are_scanned_without_lockfile() {
+    let tmp = tempfile::TempDir::new().expect("temp project");
+    std::fs::write(
+        tmp.path().join("pyproject.toml"),
+        r#"[project]
+name = "pyproject-only"
+version = "0.1.0"
+dependencies = ["requests>=2"]
+"#,
+    )
+    .expect("write pyproject.toml");
+
+    let inv = scan(tmp.path(), &Policy::default()).expect("scan");
+
+    assert!(!inv.with_code("DEP001").is_empty());
+    assert!(!inv.with_code("DEP004").is_empty());
+}
+
+#[test]
+fn poetry_manifest_and_lock_names_are_normalized() {
+    let tmp = tempfile::TempDir::new().expect("temp project");
+    std::fs::write(
+        tmp.path().join("pyproject.toml"),
+        r#"[tool.poetry]
+name = "poetry-normalized"
+version = "0.1.0"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+Django = "^4.2"
+"#,
+    )
+    .expect("write pyproject.toml");
+    std::fs::write(
+        tmp.path().join("poetry.lock"),
+        r#"[[package]]
+name = "django"
+version = "4.2.7"
+"#,
+    )
+    .expect("write poetry.lock");
+
+    let inv = scan(tmp.path(), &Policy::default()).expect("scan");
+    let nodes = inv.graph.nodes_named("django");
+
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].version(), Some("4.2.7"));
+    assert!(nodes[0].is_direct());
+    assert!(inv.graph.nodes_named("Django").is_empty());
+    assert!(inv.with_code("DEP001").is_empty());
 }

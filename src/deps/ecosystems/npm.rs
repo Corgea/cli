@@ -4,8 +4,8 @@ use std::path::Path;
 use crate::deps::detect::DepFileKind;
 use crate::deps::ecosystems::classify_constraint;
 use crate::deps::ecosystems::evaluate::{
-    constraint_to_findings, dep002, dep008, dep019_unsupported_lockfile, file_in_dir, parent_dir,
-    read_json, source_type_from_declared, ScanContext,
+    constraint_to_findings, dep001, dep002, dep008, dep019_unsupported_lockfile, file_in_dir,
+    parent_dir, read_json, source_type_from_declared, ScanContext,
 };
 use crate::deps::model::{
     ConstraintKind, DependencyEdge, DependencyNode, Ecosystem, PackageId, Scope, SourceType,
@@ -73,15 +73,14 @@ fn scan_one_npm(
                 .display()
                 .to_string();
             dep019_unsupported_lockfile(ctx.findings, &rel_lock, "npm");
+        } else {
+            dep001(ctx.findings, ctx.policy, rel_manifest, "npm");
         }
     }
 
-    let lock_has = |name: &str| -> bool {
-        lock_packages.contains_key(name)
-            || lock_packages.contains_key(&format!("node_modules/{name}"))
-    };
+    let lock_has = |name: &str| -> bool { lock_packages.contains_key(&top_level_lock_key(name)) };
 
-    if ctx.policy.fail_on_stale_lockfile && unsupported_lock_path.is_none() {
+    if ctx.policy.fail_on_stale_lockfile && lock_path.is_some() {
         for name in direct_prod.keys().chain(direct_dev.keys()) {
             let declared = direct_prod
                 .get(name)
@@ -97,7 +96,9 @@ fn scan_one_npm(
         }
     }
 
-    let mut seen_nodes: HashSet<String> = HashSet::new();
+    let mut seen_node_ids: HashSet<String> = HashSet::new();
+    let mut direct_lock_keys: HashSet<String> = HashSet::new();
+    let mut node_ids_by_lock_key: HashMap<String, PackageId> = HashMap::new();
 
     for (name, declared) in direct_prod.iter().chain(direct_dev.iter()) {
         let scope = if direct_dev.contains_key(name) {
@@ -105,10 +106,12 @@ fn scan_one_npm(
         } else {
             Scope::Production
         };
-        let resolved = lock_packages
-            .get(name)
-            .or_else(|| lock_packages.get(&format!("node_modules/{name}")))
-            .map(|p| p.version.clone());
+        let lock_key = top_level_lock_key(name);
+        let lock_package = lock_packages.get(&lock_key).cloned();
+        if lock_package.is_some() {
+            direct_lock_keys.insert(lock_key.clone());
+        }
+        let resolved = lock_package.as_ref().map(|p| p.version.clone());
         let reproducible = resolved.is_some() && lock_path.is_some();
         let kind = classify_constraint(Ecosystem::Npm, declared);
         let package_id = resolved
@@ -141,16 +144,13 @@ fn scan_one_npm(
                 None
             }
         });
-        if seen_nodes.insert(name.clone()) {
-            let lock_package = lock_packages
-                .get(name)
-                .or_else(|| lock_packages.get(&format!("node_modules/{name}")))
-                .cloned();
+        let node_id = package_id
+            .clone()
+            .unwrap_or_else(|| PackageId::npm(name, version.as_deref().unwrap_or("?")));
+        if seen_node_ids.insert(node_id.0.clone()) {
             let has_integrity = lock_package.as_ref().map(|p| p.has_integrity);
             let node = DependencyNode {
-                id: package_id
-                    .clone()
-                    .unwrap_or_else(|| PackageId::npm(name, version.as_deref().unwrap_or("?"))),
+                id: node_id.clone(),
                 name: name.clone(),
                 ecosystem: Ecosystem::Npm,
                 version,
@@ -167,6 +167,9 @@ fn scan_one_npm(
             };
             dep008(ctx.findings, ctx.policy, &node);
             ctx.graph.nodes.push(node.clone());
+            if lock_package.is_some() {
+                node_ids_by_lock_key.insert(lock_key, node.id.clone());
+            }
             ctx.graph.edges.push(DependencyEdge {
                 from: PackageId::root(),
                 to: node.id.clone(),
@@ -178,20 +181,22 @@ fn scan_one_npm(
         }
     }
 
-    // Transitive nodes from lockfile (canonical node_modules/* keys only).
+    // Transitive nodes from lockfile. Nested lock keys may carry the same package name
+    // at different versions, so de-duplicate by package identity instead of name.
     for (key, lp) in &lock_packages {
         if !key.starts_with("node_modules/") {
             continue;
         }
-        let name = package_name_from_lock_key(key);
-        if direct_prod.contains_key(name) || direct_dev.contains_key(name) {
+        if direct_lock_keys.contains(key) {
             continue;
         }
-        if !seen_nodes.insert(name.to_string()) {
+        let name = package_name_from_lock_key(key);
+        let id = PackageId::npm(name, &lp.version);
+        if !seen_node_ids.insert(id.0.clone()) {
             continue;
         }
         let node = DependencyNode {
-            id: PackageId::npm(name, &lp.version),
+            id,
             name: name.to_string(),
             ecosystem: Ecosystem::Npm,
             version: Some(lp.version.clone()),
@@ -207,6 +212,7 @@ fn scan_one_npm(
             lock_integrity_hash: lp.integrity.clone(),
         };
         dep008(ctx.findings, ctx.policy, &node);
+        node_ids_by_lock_key.insert(key.clone(), node.id.clone());
         ctx.graph.nodes.push(node);
     }
 
@@ -214,17 +220,16 @@ fn scan_one_npm(
         if !key.starts_with("node_modules/") {
             continue;
         }
-        if let Some(parent) = &lp.parent {
-            let name = package_name_from_lock_key(key);
-            let Some(child) = ctx.graph.node(name) else {
+        if let Some(parent_key) = &lp.parent_key {
+            let Some(child_id) = node_ids_by_lock_key.get(key) else {
                 continue;
             };
-            let Some(parent_node) = ctx.graph.node(parent) else {
+            let Some(parent_id) = node_ids_by_lock_key.get(parent_key) else {
                 continue;
             };
             ctx.graph.edges.push(DependencyEdge {
-                from: parent_node.id().clone(),
-                to: child.id().clone(),
+                from: parent_id.clone(),
+                to: child_id.clone(),
                 declared_constraint: lp.declared.clone().unwrap_or_else(|| lp.version.clone()),
                 resolved_version: Some(lp.version.clone()),
                 scope: Scope::Production,
@@ -243,7 +248,7 @@ struct LockPackage {
     resolved: Option<String>,
     integrity: Option<String>,
     declared: Option<String>,
-    parent: Option<String>,
+    parent_key: Option<String>,
 }
 
 fn parse_npm_lock(path: &Path) -> Result<HashMap<String, LockPackage>, DepsError> {
@@ -269,7 +274,6 @@ fn parse_npm_lock(path: &Path) -> Result<HashMap<String, LockPackage>, DepsError
                 .get("integrity")
                 .and_then(|x| x.as_str())
                 .map(str::to_string);
-            let name = package_name_from_lock_key(key).to_string();
             out.insert(
                 key.clone(),
                 LockPackage {
@@ -278,27 +282,14 @@ fn parse_npm_lock(path: &Path) -> Result<HashMap<String, LockPackage>, DepsError
                     resolved: resolved.clone(),
                     integrity: integrity.clone(),
                     declared: None,
-                    parent: None,
+                    parent_key: None,
                 },
             );
-            out.entry(name).or_insert(LockPackage {
-                version,
-                has_integrity,
-                resolved,
-                integrity,
-                declared: None,
-                parent: None,
-            });
         }
 
         for (parent_key, entry) in packages {
             let Some(deps) = entry.get("dependencies").and_then(|d| d.as_object()) else {
                 continue;
-            };
-            let parent = if parent_key.is_empty() {
-                None
-            } else {
-                Some(package_name_from_lock_key(parent_key).to_string())
             };
             for (child_name, spec) in deps {
                 let Some(spec) = spec.as_str() else {
@@ -307,12 +298,11 @@ fn parse_npm_lock(path: &Path) -> Result<HashMap<String, LockPackage>, DepsError
                 if let Some(child_key) = child_lock_key(parent_key, child_name, packages) {
                     if let Some(lp) = out.get_mut(&child_key) {
                         lp.declared = Some(spec.to_string());
-                        lp.parent = parent.clone();
-                    }
-                    if parent.is_none() {
-                        if let Some(lp) = out.get_mut(child_name) {
-                            lp.declared = Some(spec.to_string());
-                        }
+                        lp.parent_key = if parent_key.is_empty() {
+                            None
+                        } else {
+                            Some(parent_key.clone())
+                        };
                     }
                 }
             }
@@ -336,6 +326,10 @@ fn package_name_from_lock_key(key: &str) -> &str {
         }
     }
     first
+}
+
+fn top_level_lock_key(name: &str) -> String {
+    format!("node_modules/{name}")
 }
 
 fn child_lock_key(
