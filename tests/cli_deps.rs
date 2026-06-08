@@ -104,3 +104,378 @@ fn cli_scan_out_file_writes_json() {
     let written = std::fs::read_to_string(&out_file).expect("out-file should exist");
     let _: serde_json::Value = serde_json::from_str(&written).expect("valid JSON");
 }
+
+#[test]
+fn cli_scan_rejects_invalid_out_format() {
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .args(["deps", "scan", &fixture("node-app"), "--out-format", "typo"])
+        .output()
+        .expect("failed to run corgea");
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unsupported --out-format"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn cli_scan_rejects_invalid_fail_on_severity() {
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .args(["deps", "scan", &fixture("node-app"), "--fail-on", "hihg"])
+        .output()
+        .expect("failed to run corgea");
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unsupported severity for --fail-on"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn cli_scan_loads_policy_created_by_policy_init() {
+    let project = TempDir::new().expect("temp project");
+    write_exact_node_project(project.path(), "lodash", "*", "4.17.21");
+
+    let (mut default_cmd, _home) = corgea_isolated();
+    let default_out = default_cmd
+        .args([
+            "deps",
+            "scan",
+            project.path().to_str().unwrap(),
+            "--out-format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run corgea");
+    assert!(default_out.status.success());
+    let default_json: serde_json::Value =
+        serde_json::from_slice(&default_out.stdout).expect("valid JSON");
+    assert!(finding_ids(&default_json).contains(&"DEP004".to_string()));
+
+    let (mut init_cmd, _home) = corgea_isolated();
+    let init_out = init_cmd
+        .args(["deps", "policy", "init", project.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run corgea");
+    assert!(
+        init_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+    let policy_path = project.path().join(".corgea").join("deps.yml");
+    let policy = std::fs::read_to_string(&policy_path)
+        .expect("policy init should create .corgea/deps.yml")
+        .replace("fail_on_wildcard: true", "fail_on_wildcard: false")
+        .replace("fail_on_latest: true", "fail_on_latest: false");
+    std::fs::write(&policy_path, policy).expect("write edited policy");
+
+    let (mut scan_cmd, _home) = corgea_isolated();
+    let out = scan_cmd
+        .args([
+            "deps",
+            "scan",
+            project.path().to_str().unwrap(),
+            "--out-format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run corgea");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert!(!finding_ids(&parsed).contains(&"DEP004".to_string()));
+}
+
+#[test]
+fn cli_scan_fails_closed_on_invalid_policy_yaml() {
+    let project = TempDir::new().expect("temp project");
+    write_exact_node_project(project.path(), "lodash", "4.17.21", "4.17.21");
+    let policy_dir = project.path().join(".corgea");
+    std::fs::create_dir_all(&policy_dir).expect("create policy dir");
+    std::fs::write(policy_dir.join("deps.yml"), "dependency_policy: [")
+        .expect("write invalid policy");
+
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .args(["deps", "scan", project.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run corgea");
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid policy YAML")
+            || String::from_utf8_lossy(&out.stderr).contains("invalid policy"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn cli_diff_same_ref_has_empty_diff() {
+    let repo = TempDir::new().expect("temp repo");
+    init_git_repo(repo.path());
+    write_exact_node_project(repo.path(), "left-pad", "1.3.0", "1.3.0");
+    commit_all(repo.path(), "base");
+
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .current_dir(repo.path())
+        .args(["deps", "diff", "--base", "HEAD", "."])
+        .output()
+        .expect("failed to run corgea");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("\n  + "), "stdout: {stdout}");
+    assert!(!stdout.contains("\n  - "), "stdout: {stdout}");
+    assert!(!stdout.contains("\n  ~ "), "stdout: {stdout}");
+}
+
+#[test]
+fn cli_diff_reports_real_version_change_from_base_ref() {
+    let repo = TempDir::new().expect("temp repo");
+    init_git_repo(repo.path());
+    write_exact_node_project(repo.path(), "left-pad", "1.3.0", "1.3.0");
+    commit_all(repo.path(), "base");
+    write_exact_node_project(repo.path(), "left-pad", "1.3.1", "1.3.1");
+
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .current_dir(repo.path())
+        .args(["deps", "diff", "--base", "HEAD", "."])
+        .output()
+        .expect("failed to run corgea");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("~ left-pad 1.3.0 -> 1.3.1"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn cli_diff_fail_on_new_ignores_existing_high_findings() {
+    let repo = TempDir::new().expect("temp repo");
+    init_git_repo(repo.path());
+    write_exact_node_project(repo.path(), "lodash", "*", "4.17.21");
+    commit_all(repo.path(), "base");
+
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .current_dir(repo.path())
+        .args([
+            "deps",
+            "diff",
+            "--base",
+            "HEAD",
+            ".",
+            "--fail-on-new",
+            "high",
+        ])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn cli_diff_fail_on_new_applies_severity_to_new_findings() {
+    let repo = TempDir::new().expect("temp repo");
+    init_git_repo(repo.path());
+    write_exact_node_project(repo.path(), "left-pad", "1.3.0", "1.3.0");
+    commit_all(repo.path(), "base");
+
+    write_exact_node_project(repo.path(), "left-pad", "^1.3.0", "1.3.0");
+    let (mut medium_cmd, _home) = corgea_isolated();
+    let medium_out = medium_cmd
+        .current_dir(repo.path())
+        .args([
+            "deps",
+            "diff",
+            "--base",
+            "HEAD",
+            ".",
+            "--fail-on-new",
+            "high",
+        ])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(
+        medium_out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&medium_out.stderr)
+    );
+
+    write_exact_node_project(repo.path(), "left-pad", "*", "1.3.0");
+    let (mut high_cmd, _home) = corgea_isolated();
+    let high_out = high_cmd
+        .current_dir(repo.path())
+        .args([
+            "deps",
+            "diff",
+            "--base",
+            "HEAD",
+            ".",
+            "--fail-on-new",
+            "high",
+        ])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(
+        high_out.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&high_out.stderr)
+    );
+}
+
+#[test]
+fn cli_diff_rejects_invalid_fail_on_new_severity() {
+    let repo = TempDir::new().expect("temp repo");
+    init_git_repo(repo.path());
+    write_exact_node_project(repo.path(), "left-pad", "1.3.0", "1.3.0");
+    commit_all(repo.path(), "base");
+
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .current_dir(repo.path())
+        .args([
+            "deps",
+            "diff",
+            "--base",
+            "HEAD",
+            ".",
+            "--fail-on-new",
+            "hihg",
+        ])
+        .output()
+        .expect("failed to run corgea");
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unsupported severity for --fail-on-new"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn cli_diff_rejects_unknown_base_ref() {
+    let repo = TempDir::new().expect("temp repo");
+    init_git_repo(repo.path());
+    write_exact_node_project(repo.path(), "left-pad", "1.3.0", "1.3.0");
+    commit_all(repo.path(), "base");
+
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .current_dir(repo.path())
+        .args(["deps", "diff", "--base", "missing-ref", "."])
+        .output()
+        .expect("failed to run corgea");
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("git failed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn finding_ids(json: &serde_json::Value) -> Vec<String> {
+    json["findings"]
+        .as_array()
+        .expect("findings array")
+        .iter()
+        .filter_map(|finding| finding["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn write_exact_node_project(root: &std::path::Path, name: &str, declared: &str, resolved: &str) {
+    let package_json = format!(
+        r#"{{
+  "name": "diff-project",
+  "version": "1.0.0",
+  "dependencies": {{
+    "{name}": "{declared}"
+  }}
+}}
+"#
+    );
+    let package_lock = format!(
+        r#"{{
+  "name": "diff-project",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {{
+    "": {{
+      "name": "diff-project",
+      "version": "1.0.0",
+      "dependencies": {{
+        "{name}": "{declared}"
+      }}
+    }},
+    "node_modules/{name}": {{
+      "version": "{resolved}",
+      "resolved": "https://registry.npmjs.org/{name}/-/{name}-{resolved}.tgz",
+      "integrity": "sha512-example"
+    }}
+  }}
+}}
+"#
+    );
+    std::fs::write(root.join("package.json"), package_json).expect("write package.json");
+    std::fs::write(root.join("package-lock.json"), package_lock).expect("write package-lock.json");
+}
+
+fn init_git_repo(repo: &std::path::Path) {
+    run_git(repo, &["init", "-q"]);
+}
+
+fn commit_all(repo: &std::path::Path, message: &str) {
+    run_git(repo, &["add", "."]);
+    run_git(
+        repo,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+    );
+}
+
+fn run_git(repo: &std::path::Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {:?} failed\nstdout: {}\nstderr: {}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

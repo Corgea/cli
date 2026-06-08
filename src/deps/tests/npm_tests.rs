@@ -45,6 +45,7 @@ fn npm_classify_git_commit_sha_is_immutable_ref() {
 }
 
 use super::common::scan_fixture;
+use crate::deps::explain::explain;
 use crate::deps::model::{PackageId, Scope, Severity, SourceType};
 
 #[test]
@@ -192,5 +193,47 @@ fn node_manifest_dep_missing_from_lock_is_dep002() {
 #[test]
 fn node_app_lock_in_sync_no_dep002() {
     let inv = scan_fixture("node-app");
+    assert!(inv.with_code("DEP002").is_empty());
+}
+
+#[test]
+fn npm_graph_uses_generic_lockfile_edges() {
+    let inv = scan_fixture("node-transitive");
+    let child = inv.node("child-lib").expect("child-lib node missing");
+    assert!(!child.is_direct());
+    let explanation = explain(&inv.graph, "child-lib").expect("child-lib explain");
+    let paths: Vec<Vec<String>> = explanation
+        .paths
+        .iter()
+        .map(|path| path.iter().map(|p| p.name().to_string()).collect())
+        .collect();
+    assert!(
+        paths
+            .iter()
+            .any(|path| path == &["root", "parent-lib", "child-lib"]),
+        "expected parent-lib -> child-lib path, got {paths:?}"
+    );
+}
+
+#[test]
+fn npm_scoped_transitive_package_keeps_full_name() {
+    let inv = scan_fixture("node-transitive");
+    let node = inv.node("@types/node").expect("@types/node node missing");
+    assert_eq!(node.name(), "@types/node");
+    assert_eq!(node.id().name(), "@types/node");
+    assert_eq!(*node.id(), PackageId("pkg:npm/@types/node@18.19.0".into()));
+}
+
+#[test]
+fn yarn_lock_is_explicitly_unsupported_without_stale_noise() {
+    let inv = scan_fixture("node-yarn");
+    assert!(!inv.with_code("DEP019").is_empty());
+    assert!(inv.with_code("DEP002").is_empty());
+}
+
+#[test]
+fn pnpm_lock_is_explicitly_unsupported_without_stale_noise() {
+    let inv = scan_fixture("node-pnpm");
+    assert!(!inv.with_code("DEP019").is_empty());
     assert!(inv.with_code("DEP002").is_empty());
 }

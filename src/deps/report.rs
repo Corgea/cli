@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::fmt::Write as _;
 
 use crate::deps::model::DependencyGraph;
 use crate::deps::Inventory;
@@ -129,27 +130,40 @@ pub fn inventory_to_json(inv: &Inventory) -> Value {
     })
 }
 
-pub fn print_table(inv: &Inventory) {
-    println!("Corgea dependency inventory\n");
-    println!("Detected {} dependency file(s)", inv.detected_files.len());
-    println!(
+pub fn table_output(inv: &Inventory) -> String {
+    let mut out = String::new();
+    writeln!(&mut out, "Corgea dependency inventory\n").unwrap();
+    writeln!(
+        &mut out,
+        "Detected {} dependency file(s)",
+        inv.detected_files.len()
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
         "Inventory: {} packages, {} findings\n",
         inv.graph.nodes.len(),
         inv.findings.len()
-    );
+    )
+    .unwrap();
 
     let mut by_sev: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for f in &inv.findings {
         *by_sev.entry(format!("{:?}", f.severity)).or_default() += 1;
     }
     for (sev, count) in by_sev {
-        println!("  {sev}: {count}");
+        writeln!(&mut out, "  {sev}: {count}").unwrap();
     }
 
     for f in &inv.findings {
         let pkg = f.package.as_ref().map(|p| p.name()).unwrap_or("project");
-        println!("\n  {}  {:?}  {}", f.id, f.severity, f.title);
-        println!("    package: {pkg}");
-        println!("    {}", f.recommendation);
+        writeln!(&mut out, "\n  {}  {:?}  {}", f.id, f.severity, f.title).unwrap();
+        writeln!(&mut out, "    package: {pkg}").unwrap();
+        writeln!(&mut out, "    {}", f.recommendation).unwrap();
     }
+    out
+}
+
+pub fn print_table(inv: &Inventory) {
+    print!("{}", table_output(inv));
 }

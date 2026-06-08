@@ -4,8 +4,8 @@ use std::path::Path;
 use crate::deps::detect::DepFileKind;
 use crate::deps::ecosystems::classify_constraint;
 use crate::deps::ecosystems::evaluate::{
-    constraint_to_findings, dep002, dep008, file_in_dir, parent_dir, read_json,
-    source_type_from_declared, ScanContext,
+    constraint_to_findings, dep002, dep008, dep019_unsupported_lockfile, file_in_dir, parent_dir,
+    read_json, source_type_from_declared, ScanContext,
 };
 use crate::deps::model::{
     ConstraintKind, DependencyEdge, DependencyNode, Ecosystem, PackageId, Scope, SourceType,
@@ -40,6 +40,8 @@ fn scan_one_npm(
 ) -> Result<(), DepsError> {
     let pkg = read_json(manifest_path)?;
     let lock_path = file_in_dir(ctx.detected, dir, DepFileKind::NpmLockfile);
+    let unsupported_lock_path = file_in_dir(ctx.detected, dir, DepFileKind::YarnLockfile)
+        .or_else(|| file_in_dir(ctx.detected, dir, DepFileKind::PnpmLockfile));
 
     let mut direct_prod: HashMap<String, String> = HashMap::new();
     let mut direct_dev: HashMap<String, String> = HashMap::new();
@@ -63,13 +65,23 @@ fn scan_one_npm(
     } else {
         HashMap::new()
     };
+    if lock_path.is_none() {
+        if let Some(lock) = unsupported_lock_path.as_ref() {
+            let rel_lock = lock
+                .strip_prefix(ctx.root)
+                .unwrap_or(lock)
+                .display()
+                .to_string();
+            dep019_unsupported_lockfile(ctx.findings, &rel_lock, "npm");
+        }
+    }
 
     let lock_has = |name: &str| -> bool {
         lock_packages.contains_key(name)
             || lock_packages.contains_key(&format!("node_modules/{name}"))
     };
 
-    if ctx.policy.fail_on_stale_lockfile {
+    if ctx.policy.fail_on_stale_lockfile && unsupported_lock_path.is_none() {
         for name in direct_prod.keys().chain(direct_dev.keys()) {
             let declared = direct_prod
                 .get(name)
@@ -163,17 +175,12 @@ fn scan_one_npm(
         }
     }
 
-    // Transitive from lockfile (canonical node_modules/* keys only)
+    // Transitive nodes from lockfile (canonical node_modules/* keys only).
     for (key, lp) in &lock_packages {
         if !key.starts_with("node_modules/") {
             continue;
         }
-        let name = key
-            .strip_prefix("node_modules/")
-            .unwrap_or(key.as_str())
-            .rsplit('/')
-            .next()
-            .unwrap_or(key);
+        let name = package_name_from_lock_key(key);
         if direct_prod.contains_key(name) || direct_dev.contains_key(name) {
             continue;
         }
@@ -196,16 +203,23 @@ fn scan_one_npm(
         };
         dep008(ctx.findings, ctx.policy, &node);
         ctx.graph.nodes.push(node);
+    }
 
+    for (key, lp) in &lock_packages {
+        if !key.starts_with("node_modules/") {
+            continue;
+        }
         if let Some(parent) = &lp.parent {
-            let from = ctx
-                .graph
-                .node(parent)
-                .map(|n| n.id.clone())
-                .unwrap_or_else(|| PackageId::npm(parent, &lp.version));
+            let name = package_name_from_lock_key(key);
+            let Some(child) = ctx.graph.node(name) else {
+                continue;
+            };
+            let Some(parent_node) = ctx.graph.node(parent) else {
+                continue;
+            };
             ctx.graph.edges.push(DependencyEdge {
-                from,
-                to: PackageId::npm(name, &lp.version),
+                from: parent_node.id().clone(),
+                to: child.id().clone(),
                 declared_constraint: lp.declared.clone().unwrap_or_else(|| lp.version.clone()),
                 resolved_version: Some(lp.version.clone()),
                 scope: Scope::Production,
@@ -239,28 +253,14 @@ fn parse_npm_lock(path: &Path) -> Result<HashMap<String, LockPackage>, DepsError
                 .unwrap_or("?")
                 .to_string();
             let has_integrity = entry.get("integrity").is_some();
-            let name = key
-                .strip_prefix("node_modules/")
-                .unwrap_or(key)
-                .rsplit('/')
-                .next()
-                .unwrap_or(key)
-                .to_string();
-            let parent = entry.get("dependencies").and_then(|_| {
-                if key.contains('/') {
-                    key.rsplit_once('/')
-                        .map(|(p, _)| p.strip_prefix("node_modules/").unwrap_or(p).to_string())
-                } else {
-                    None
-                }
-            });
+            let name = package_name_from_lock_key(key).to_string();
             out.insert(
                 key.clone(),
                 LockPackage {
                     version: version.clone(),
                     has_integrity,
                     declared: None,
-                    parent,
+                    parent: None,
                 },
             );
             out.entry(name).or_insert(LockPackage {
@@ -271,25 +271,27 @@ fn parse_npm_lock(path: &Path) -> Result<HashMap<String, LockPackage>, DepsError
             });
         }
 
-        // Parse dependency declarations from root and express
-        if let Some(root) = packages.get("") {
-            if let Some(deps) = root.get("dependencies").and_then(|d| d.as_object()) {
-                for (n, spec) in deps {
-                    if let Some(s) = spec.as_str() {
-                        if let Some(lp) = out.get_mut(n) {
-                            lp.declared = Some(s.to_string());
-                        }
+        for (parent_key, entry) in packages {
+            let Some(deps) = entry.get("dependencies").and_then(|d| d.as_object()) else {
+                continue;
+            };
+            let parent = if parent_key.is_empty() {
+                None
+            } else {
+                Some(package_name_from_lock_key(parent_key).to_string())
+            };
+            for (child_name, spec) in deps {
+                let Some(spec) = spec.as_str() else {
+                    continue;
+                };
+                if let Some(child_key) = child_lock_key(parent_key, child_name, packages) {
+                    if let Some(lp) = out.get_mut(&child_key) {
+                        lp.declared = Some(spec.to_string());
+                        lp.parent = parent.clone();
                     }
-                }
-            }
-        }
-        if let Some(express) = packages.get("node_modules/express") {
-            if let Some(deps) = express.get("dependencies").and_then(|d| d.as_object()) {
-                for (n, spec) in deps {
-                    if let Some(s) = spec.as_str() {
-                        if let Some(lp) = out.get_mut(&format!("node_modules/{n}")) {
-                            lp.declared = Some(s.to_string());
-                            lp.parent = Some("express".into());
+                    if parent.is_none() {
+                        if let Some(lp) = out.get_mut(child_name) {
+                            lp.declared = Some(spec.to_string());
                         }
                     }
                 }
@@ -298,4 +300,37 @@ fn parse_npm_lock(path: &Path) -> Result<HashMap<String, LockPackage>, DepsError
     }
 
     Ok(out)
+}
+
+fn package_name_from_lock_key(key: &str) -> &str {
+    let package_path = key
+        .rsplit_once("node_modules/")
+        .map(|(_, name)| name)
+        .unwrap_or(key);
+    let mut parts = package_path.split('/');
+    let first = parts.next().unwrap_or(package_path);
+    if first.starts_with('@') {
+        if let Some(second) = parts.next() {
+            let scoped_len = first.len() + 1 + second.len();
+            return &package_path[..scoped_len];
+        }
+    }
+    first
+}
+
+fn child_lock_key(
+    parent_key: &str,
+    child_name: &str,
+    packages: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let nested = if parent_key.is_empty() {
+        format!("node_modules/{child_name}")
+    } else {
+        format!("{parent_key}/node_modules/{child_name}")
+    };
+    if packages.contains_key(&nested) {
+        return Some(nested);
+    }
+    let hoisted = format!("node_modules/{child_name}");
+    packages.contains_key(&hoisted).then_some(hoisted)
 }

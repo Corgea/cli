@@ -198,6 +198,27 @@ pub fn dep002(findings: &mut Vec<Finding>, policy: &Policy, manifest_file: &str,
     }
 }
 
+pub fn dep019_unsupported_lockfile(
+    findings: &mut Vec<Finding>,
+    source_file: &str,
+    ecosystem_label: &str,
+) {
+    add_pinning_finding(
+        findings,
+        "DEP019",
+        Severity::Medium,
+        "Unsupported lockfile",
+        None,
+        source_file,
+        None,
+        None,
+        false,
+        &format!(
+            "{ecosystem_label} lockfile support is not implemented yet; use a supported lockfile or wait for parser support."
+        ),
+    );
+}
+
 pub fn dep008(findings: &mut Vec<Finding>, policy: &Policy, node: &DependencyNode) {
     if !policy.require_integrity_hashes {
         return;

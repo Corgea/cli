@@ -39,6 +39,7 @@ fn pypi_classify_git_branch_is_mutable_ref() {
 }
 
 use super::common::scan_fixture;
+use crate::deps::explain::explain;
 use crate::deps::model::Scope;
 
 #[test]
@@ -95,4 +96,33 @@ fn pypi_git_branch_dep_is_dep005() {
         .findings_for("internal-lib")
         .iter()
         .any(|f| f.id == "DEP005"));
+}
+
+#[test]
+fn poetry_graph_uses_dependency_tables_for_multiple_parents() {
+    let inv = scan_fixture("python-poetry-multi");
+    for (target, parent) in [("gamma", "alpha"), ("delta", "beta")] {
+        let node = inv.node(target).expect("transitive node missing");
+        assert!(!node.is_direct());
+        let explanation = explain(&inv.graph, target).expect("transitive explain");
+        let paths: Vec<Vec<String>> = explanation
+            .paths
+            .iter()
+            .map(|path| path.iter().map(|p| p.name().to_string()).collect())
+            .collect();
+        assert!(
+            paths.iter().any(|path| path == &["root", parent, target]),
+            "expected {parent} -> {target} path, got {paths:?}"
+        );
+    }
+}
+
+#[test]
+fn uv_lock_does_not_suppress_requirements_scan() {
+    let inv = scan_fixture("python-uv-requirements");
+    assert!(!inv.with_code("DEP001").is_empty());
+    assert!(inv
+        .findings_for("requests")
+        .iter()
+        .any(|f| f.id == "DEP004"));
 }

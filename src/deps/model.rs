@@ -28,6 +28,12 @@ impl PackageId {
             return "root";
         }
         let before_at = self.0.rsplit_once('@').map(|(l, _)| l).unwrap_or(&self.0);
+        if let Some(name) = before_at.strip_prefix("pkg:npm/") {
+            return name;
+        }
+        if let Some(name) = before_at.strip_prefix("pkg:pypi/") {
+            return name;
+        }
         before_at
             .rsplit_once('/')
             .map(|(_, r)| r)
