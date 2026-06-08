@@ -22,6 +22,7 @@ jobs:
   linux-x86:
     runs-on: ${{ matrix.platform.runner }}
     strategy:
+      fail-fast: false
       matrix:
         platform:
           - runner: ubuntu-latest
@@ -31,20 +32,19 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y libssl-dev openssl pkg-config musl-tools
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist
           manylinux: auto
-          before-script-linux: |
-            # If we're running on rhel centos, install needed packages.
-            if command -v yum &> /dev/null; then
-                yum update -y && yum install -y perl-core openssl openssl-devel pkgconfig libatomic
-            else
-                # If we're running on debian-based system.
-                apt update -y && apt-get install -y libssl-dev openssl pkg-config musl-tools
-            fi
+          # Host build uses @actions/tool-cache (authenticated) for maturin downloads.
+          # manylinux Docker uses raw `curl | tar`, which flakes on partial CDN responses.
+          container: off
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
