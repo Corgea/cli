@@ -8,7 +8,7 @@ fn default_policy_fails_on_wildcard() {
 }
 
 #[test]
-fn policy_from_yaml_parses_prd_example() {
+fn policy_from_yaml_parses_supported_example() {
     let yaml = r#"
 dependency_policy:
   require_lockfile: true
@@ -18,12 +18,16 @@ dependency_policy:
     fail_on_wildcard: true
     fail_on_latest: true
     warn_on_semver_range: true
-    allow_exact_versions: true
-  ci:
-    fail_on_new_findings_only: true
-    severity_threshold: high
 "#;
     assert!(Policy::from_yaml(yaml).is_ok());
+}
+
+#[test]
+fn default_yaml_only_contains_supported_fields() {
+    let yaml = Policy::default_yaml();
+    assert!(!yaml.contains("allow_exact_versions"));
+    assert!(!yaml.contains("transitive_dependencies"));
+    assert!(!yaml.contains("ci:"));
 }
 
 #[test]

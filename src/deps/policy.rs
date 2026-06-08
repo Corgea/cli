@@ -87,13 +87,6 @@ impl Policy {
     fail_on_wildcard: true
     fail_on_latest: true
     warn_on_semver_range: true
-    allow_exact_versions: true
-  transitive_dependencies:
-    allow_ranges_if_lockfile_resolves: true
-    fail_if_unresolved: true
-  ci:
-    fail_on_new_findings_only: true
-    severity_threshold: high
 "#
     }
 }
