@@ -3,12 +3,13 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use clap::Subcommand;
+use clap::{Args, Subcommand};
+use serde_json::{json, Value};
 
 use crate::deps::findings::Finding;
-use crate::deps::model::Severity;
+use crate::deps::model::{DependencyNode, Severity};
 use crate::deps::policy::Policy;
-use crate::deps::report::{print_table, table_output, to_cyclonedx, to_json, to_sarif};
+use crate::deps::report::{graph_nodes_json, table_output, to_cyclonedx, to_json, to_sarif};
 use crate::deps::{scan, DepsError};
 
 #[derive(Subcommand, Debug, Clone)]
@@ -23,17 +24,23 @@ pub enum DepsSubcommand {
         out_format: Option<String>,
         #[arg(long, help = "Write output to this file")]
         out_file: Option<String>,
+        #[command(flatten)]
+        render: RenderArgs,
     },
     /// Print the dependency graph
     Graph {
         #[arg(default_value = ".")]
         path: String,
+        #[command(flatten)]
+        render: RenderArgs,
     },
     /// Explain why a package is present
     Explain {
         package: String,
         #[arg(default_value = ".")]
         path: String,
+        #[command(flatten)]
+        render: RenderArgs,
     },
     /// Compare dependency graph against a git ref
     Diff {
@@ -43,6 +50,8 @@ pub enum DepsSubcommand {
         path: String,
         #[arg(long)]
         fail_on_new: Option<String>,
+        #[command(flatten)]
+        render: RenderArgs,
     },
     /// Generate an SBOM
     Sbom {
@@ -66,7 +75,34 @@ pub enum DepsPolicySubcommand {
     Init {
         #[arg(default_value = ".")]
         path: String,
+        #[arg(
+            long,
+            help = "Succeed without rewriting when .corgea/deps.yml already exists"
+        )]
+        exist_ok: bool,
+        #[command(flatten)]
+        render: RenderArgs,
     },
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct RenderArgs {
+    #[arg(
+        long,
+        value_name = "human|agent|json|quiet",
+        help = "Render output for humans, agents, JSON parsers, or suppress stdout"
+    )]
+    format: Option<String>,
+}
+
+impl RenderArgs {
+    fn is_set(&self) -> bool {
+        self.format.is_some()
+    }
+
+    fn resolve(&self) -> Result<RenderFormat, DepsError> {
+        RenderFormat::resolve(self.format.as_deref())
+    }
 }
 
 pub fn run(sub: DepsSubcommand) -> u8 {
@@ -86,8 +122,14 @@ fn run_inner(sub: DepsSubcommand) -> Result<u8, DepsError> {
             fail_on,
             out_format,
             out_file,
+            render,
         } => {
-            let format = OutputFormat::parse(out_format.as_deref())?;
+            if out_format.is_some() && render.is_set() {
+                return Err(DepsError(
+                    "--format cannot be used with --out-format; choose one output selector"
+                        .to_string(),
+                ));
+            }
             let fail_threshold = fail_on
                 .as_deref()
                 .map(|threshold| parse_severity(threshold, "--fail-on"))
@@ -95,20 +137,17 @@ fn run_inner(sub: DepsSubcommand) -> Result<u8, DepsError> {
             let root = Path::new(&path);
             let policy = load_policy(root)?;
             let inv = scan(root, &policy)?;
-            let output = match format {
-                OutputFormat::Table => table_output(&inv),
-                OutputFormat::Json => to_json(&inv).to_string(),
-                OutputFormat::Sarif => to_sarif(&inv).to_string(),
+            let output = if let Some(out_format) = out_format.as_deref() {
+                match ReportFormat::parse(out_format)? {
+                    ReportFormat::Table => table_output(&inv),
+                    ReportFormat::Json => json_line(to_json(&inv)),
+                    ReportFormat::Sarif => json_line(to_sarif(&inv)),
+                }
+            } else {
+                render_scan(&inv, render.resolve()?)
             };
 
-            if let Some(ref file) = out_file {
-                std::fs::write(file, &output)
-                    .map_err(|e| DepsError(format!("write out-file: {e}")))?;
-            } else if format == OutputFormat::Table {
-                print_table(&inv);
-            } else {
-                println!("{output}");
-            }
+            emit_output(&output, out_file.as_deref())?;
 
             if let Some(threshold) = fail_threshold {
                 if should_fail(&inv, threshold) {
@@ -117,33 +156,26 @@ fn run_inner(sub: DepsSubcommand) -> Result<u8, DepsError> {
             }
             Ok(0)
         }
-        DepsSubcommand::Graph { path } => {
+        DepsSubcommand::Graph { path, render } => {
             let root = Path::new(&path);
             let policy = load_policy(root)?;
             let inv = scan(root, &policy)?;
-            for n in &inv.graph.nodes {
-                println!(
-                    "{} {} direct={} scope={:?} depth={}",
-                    n.name(),
-                    n.version().unwrap_or("?"),
-                    n.is_direct(),
-                    n.scope(),
-                    n.depth()
-                );
-            }
+            let output = render_graph(&inv, render.resolve()?);
+            emit_output(&output, None)?;
             Ok(0)
         }
-        DepsSubcommand::Explain { package, path } => {
+        DepsSubcommand::Explain {
+            package,
+            path,
+            render,
+        } => {
             let root = Path::new(&path);
             let policy = load_policy(root)?;
             let inv = scan(root, &policy)?;
             match crate::deps::explain::explain(&inv.graph, &package) {
                 Some(e) => {
-                    println!("{} direct={} depth={}", package, e.direct, e.depth);
-                    for path in &e.paths {
-                        let line: Vec<_> = path.iter().map(|p| p.name()).collect();
-                        println!("  path: {}", line.join(" -> "));
-                    }
+                    let output = render_explanation(&package, &e, render.resolve()?);
+                    emit_output(&output, None)?;
                 }
                 None => {
                     return Err(DepsError(format!("package not found: {package}")));
@@ -155,6 +187,7 @@ fn run_inner(sub: DepsSubcommand) -> Result<u8, DepsError> {
             base,
             path,
             fail_on_new,
+            render,
         } => {
             let new_threshold = fail_on_new
                 .as_deref()
@@ -165,22 +198,13 @@ fn run_inner(sub: DepsSubcommand) -> Result<u8, DepsError> {
             let head = scan(root, &policy)?;
             let base_inv = scan_base_ref(root, &base)?;
             let diff = crate::deps::diff::diff_graphs(&base_inv.graph, &head.graph);
-            println!("Dependency diff against {base}");
-            for n in &diff.added {
-                println!("  + {}@{}", n.name(), n.version().unwrap_or("?"));
-            }
-            for n in &diff.removed {
-                println!("  - {}@{}", n.name(), n.version().unwrap_or("?"));
-            }
-            for c in &diff.changed {
-                println!("  ~ {} {} -> {}", c.name, c.from, c.to);
-            }
+            let output = render_diff(&base, &diff, render.resolve()?);
+            emit_output(&output, None)?;
             if let Some(threshold) = new_threshold {
                 if has_new_findings_at_or_above(&base_inv, &head, threshold) {
                     return Ok(1);
                 }
             }
-            let _ = diff;
             Ok(0)
         }
         DepsSubcommand::Sbom { format, path, out } => {
@@ -200,14 +224,24 @@ fn run_inner(sub: DepsSubcommand) -> Result<u8, DepsError> {
             Ok(0)
         }
         DepsSubcommand::Policy { command } => match command {
-            DepsPolicySubcommand::Init { path } => {
+            DepsPolicySubcommand::Init {
+                path,
+                exist_ok,
+                render,
+            } => {
                 let dir = PathBuf::from(path).join(".corgea");
                 std::fs::create_dir_all(&dir)
                     .map_err(|e| DepsError(format!("create .corgea: {e}")))?;
                 let policy_path = dir.join("deps.yml");
-                std::fs::write(&policy_path, Policy::default_yaml())
-                    .map_err(|e| DepsError(format!("write policy: {e}")))?;
-                println!("Wrote {}", policy_path.display());
+                let created = if policy_path.exists() && exist_ok {
+                    false
+                } else {
+                    std::fs::write(&policy_path, Policy::default_yaml())
+                        .map_err(|e| DepsError(format!("write policy: {e}")))?;
+                    true
+                };
+                let output = render_policy_init(&policy_path, created, render.resolve()?);
+                emit_output(&output, None)?;
                 Ok(0)
             }
         },
@@ -215,15 +249,15 @@ fn run_inner(sub: DepsSubcommand) -> Result<u8, DepsError> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutputFormat {
+enum ReportFormat {
     Table,
     Json,
     Sarif,
 }
 
-impl OutputFormat {
-    fn parse(value: Option<&str>) -> Result<Self, DepsError> {
-        match value.unwrap_or("table") {
+impl ReportFormat {
+    fn parse(value: &str) -> Result<Self, DepsError> {
+        match value {
             "table" => Ok(Self::Table),
             "json" => Ok(Self::Json),
             "sarif" => Ok(Self::Sarif),
@@ -232,6 +266,310 @@ impl OutputFormat {
             ))),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderFormat {
+    Human,
+    Agent,
+    Json,
+    Quiet,
+}
+
+impl RenderFormat {
+    fn resolve(value: Option<&str>) -> Result<Self, DepsError> {
+        match value {
+            Some("human") => Ok(Self::Human),
+            Some("agent") => Ok(Self::Agent),
+            Some("json") => Ok(Self::Json),
+            Some("quiet") => Ok(Self::Quiet),
+            Some(other) => Err(DepsError(format!(
+                "unsupported --format: {other}; expected human, agent, json, or quiet"
+            ))),
+            None if agent_env_detected() => Ok(Self::Agent),
+            None => Ok(Self::Human),
+        }
+    }
+}
+
+fn agent_env_detected() -> bool {
+    [
+        "AI_AGENT",
+        "CODEX_SANDBOX",
+        "CLAUDECODE",
+        "CLAUDE_CODE",
+        "CURSOR_AGENT",
+        "CURSOR_TRACE_ID",
+        "GEMINI_CLI",
+        "PI_AGENT",
+    ]
+    .iter()
+    .any(|name| match std::env::var(name) {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            !normalized.is_empty() && normalized != "0" && normalized != "false"
+        }
+        Err(_) => false,
+    })
+}
+
+fn emit_output(output: &str, out_file: Option<&str>) -> Result<(), DepsError> {
+    if let Some(file) = out_file {
+        std::fs::write(file, output).map_err(|e| DepsError(format!("write out-file: {e}")))?;
+    } else if !output.is_empty() {
+        print!("{output}");
+    }
+    Ok(())
+}
+
+fn json_line(value: Value) -> String {
+    format!("{value}\n")
+}
+
+fn render_scan(inv: &crate::deps::Inventory, format: RenderFormat) -> String {
+    match format {
+        RenderFormat::Human => table_output(inv),
+        RenderFormat::Agent => agent_scan_output(inv),
+        RenderFormat::Json => json_line(to_json(inv)),
+        RenderFormat::Quiet => String::new(),
+    }
+}
+
+fn agent_scan_output(inv: &crate::deps::Inventory) -> String {
+    let mut out = String::new();
+    out.push_str("record\troot\tdetected_files\tpackages\tfindings\n");
+    out.push_str(&format!(
+        "summary\t{}\t{}\t{}\t{}\n",
+        tsv_cell(&inv.root.display().to_string()),
+        inv.detected_files.len(),
+        inv.graph.nodes.len(),
+        inv.findings.len()
+    ));
+    out.push_str("record\tid\tseverity\tpackage\ttitle\trecommendation\n");
+    for finding in &inv.findings {
+        let package = finding
+            .package
+            .as_ref()
+            .map(|package| package.0.as_str())
+            .unwrap_or("project");
+        out.push_str(&format!(
+            "finding\t{}\t{:?}\t{}\t{}\t{}\n",
+            tsv_cell(&finding.id),
+            finding.severity,
+            tsv_cell(package),
+            tsv_cell(&finding.title),
+            tsv_cell(&finding.recommendation)
+        ));
+    }
+    out
+}
+
+fn render_graph(inv: &crate::deps::Inventory, format: RenderFormat) -> String {
+    match format {
+        RenderFormat::Human => human_graph_output(inv),
+        RenderFormat::Agent => agent_graph_output(inv),
+        RenderFormat::Json => json_line(json!({ "nodes": graph_nodes_json(&inv.graph) })),
+        RenderFormat::Quiet => String::new(),
+    }
+}
+
+fn human_graph_output(inv: &crate::deps::Inventory) -> String {
+    let mut out = String::new();
+    for node in &inv.graph.nodes {
+        out.push_str(&format!(
+            "{} {} direct={} scope={:?} depth={}\n",
+            node.name(),
+            node.version().unwrap_or("?"),
+            node.is_direct(),
+            node.scope(),
+            node.depth()
+        ));
+    }
+    out
+}
+
+fn agent_graph_output(inv: &crate::deps::Inventory) -> String {
+    let mut out = String::from("id\tname\tversion\tdirect\tscope\tdepth\n");
+    for node in &inv.graph.nodes {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{:?}\t{}\n",
+            tsv_cell(&node.id().0),
+            tsv_cell(node.name()),
+            tsv_cell(node.version().unwrap_or("")),
+            node.is_direct(),
+            node.scope(),
+            node.depth()
+        ));
+    }
+    out
+}
+
+fn render_explanation(
+    package: &str,
+    explanation: &crate::deps::explain::Explanation,
+    format: RenderFormat,
+) -> String {
+    match format {
+        RenderFormat::Human => human_explanation_output(package, explanation),
+        RenderFormat::Agent => agent_explanation_output(package, explanation),
+        RenderFormat::Json => json_line(explanation_json(package, explanation)),
+        RenderFormat::Quiet => String::new(),
+    }
+}
+
+fn human_explanation_output(
+    package: &str,
+    explanation: &crate::deps::explain::Explanation,
+) -> String {
+    let mut out = format!(
+        "{} direct={} depth={}\n",
+        package, explanation.direct, explanation.depth
+    );
+    for path in &explanation.paths {
+        let line: Vec<_> = path.iter().map(|package| package.name()).collect();
+        out.push_str(&format!("  path: {}\n", line.join(" -> ")));
+    }
+    out
+}
+
+fn agent_explanation_output(
+    package: &str,
+    explanation: &crate::deps::explain::Explanation,
+) -> String {
+    let mut out = String::from("record\tpackage\tdirect\tdepth\tpath\n");
+    for path in &explanation.paths {
+        let line: Vec<_> = path.iter().map(|package| package.name()).collect();
+        out.push_str(&format!(
+            "path\t{}\t{}\t{}\t{}\n",
+            tsv_cell(package),
+            explanation.direct,
+            explanation.depth,
+            tsv_cell(&line.join(" -> "))
+        ));
+    }
+    out
+}
+
+fn explanation_json(package: &str, explanation: &crate::deps::explain::Explanation) -> Value {
+    let paths: Vec<Vec<&str>> = explanation
+        .paths
+        .iter()
+        .map(|path| path.iter().map(|package| package.name()).collect())
+        .collect();
+    json!({
+        "package": package,
+        "direct": explanation.direct,
+        "depth": explanation.depth,
+        "paths": paths,
+    })
+}
+
+fn render_diff(base: &str, diff: &crate::deps::diff::GraphDiff, format: RenderFormat) -> String {
+    match format {
+        RenderFormat::Human => human_diff_output(base, diff),
+        RenderFormat::Agent => agent_diff_output(diff),
+        RenderFormat::Json => json_line(diff_json(base, diff)),
+        RenderFormat::Quiet => String::new(),
+    }
+}
+
+fn human_diff_output(base: &str, diff: &crate::deps::diff::GraphDiff) -> String {
+    let mut out = format!("Dependency diff against {base}\n");
+    for node in &diff.added {
+        out.push_str(&format!(
+            "  + {}@{}\n",
+            node.name(),
+            node.version().unwrap_or("?")
+        ));
+    }
+    for node in &diff.removed {
+        out.push_str(&format!(
+            "  - {}@{}\n",
+            node.name(),
+            node.version().unwrap_or("?")
+        ));
+    }
+    for change in &diff.changed {
+        out.push_str(&format!(
+            "  ~ {} {} -> {}\n",
+            change.name, change.from, change.to
+        ));
+    }
+    out
+}
+
+fn agent_diff_output(diff: &crate::deps::diff::GraphDiff) -> String {
+    let mut out = String::from("change\tname\tfrom\tto\n");
+    for node in &diff.added {
+        out.push_str(&format!(
+            "added\t{}\t\t{}\n",
+            tsv_cell(node.name()),
+            tsv_cell(node.version().unwrap_or(""))
+        ));
+    }
+    for node in &diff.removed {
+        out.push_str(&format!(
+            "removed\t{}\t{}\t\n",
+            tsv_cell(node.name()),
+            tsv_cell(node.version().unwrap_or(""))
+        ));
+    }
+    for change in &diff.changed {
+        out.push_str(&format!(
+            "changed\t{}\t{}\t{}\n",
+            tsv_cell(&change.name),
+            tsv_cell(&change.from),
+            tsv_cell(&change.to)
+        ));
+    }
+    out
+}
+
+fn diff_json(base: &str, diff: &crate::deps::diff::GraphDiff) -> Value {
+    let changed: Vec<Value> = diff
+        .changed
+        .iter()
+        .map(|change| {
+            json!({
+                "name": change.name,
+                "from": change.from,
+                "to": change.to,
+            })
+        })
+        .collect();
+    json!({
+        "base": base,
+        "added": diff_nodes_json(&diff.added),
+        "removed": diff_nodes_json(&diff.removed),
+        "changed": changed,
+    })
+}
+
+fn diff_nodes_json(nodes: &[DependencyNode]) -> Vec<Value> {
+    nodes
+        .iter()
+        .map(|node| {
+            json!({
+                "name": node.name(),
+                "version": node.version(),
+            })
+        })
+        .collect()
+}
+
+fn render_policy_init(path: &Path, created: bool, format: RenderFormat) -> String {
+    let path = path.display().to_string();
+    match format {
+        RenderFormat::Human if created => format!("Wrote {path}\n"),
+        RenderFormat::Human => format!("Exists {path}\n"),
+        RenderFormat::Agent => format!("path\n{}\n", tsv_cell(&path)),
+        RenderFormat::Json => json_line(json!({ "path": path, "created": created })),
+        RenderFormat::Quiet => String::new(),
+    }
+}
+
+fn tsv_cell(value: &str) -> String {
+    value.replace(['\t', '\r', '\n'], " ")
 }
 
 fn load_policy(root: &Path) -> Result<Policy, DepsError> {

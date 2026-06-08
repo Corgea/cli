@@ -91,9 +91,8 @@ pub fn to_cyclonedx(graph: &DependencyGraph) -> Value {
     })
 }
 
-pub fn inventory_to_json(inv: &Inventory) -> Value {
-    let nodes: Vec<Value> = inv
-        .graph
+pub fn graph_nodes_json(graph: &DependencyGraph) -> Vec<Value> {
+    graph
         .nodes
         .iter()
         .map(|n| {
@@ -106,7 +105,11 @@ pub fn inventory_to_json(inv: &Inventory) -> Value {
                 "depth": n.depth(),
             })
         })
-        .collect();
+        .collect()
+}
+
+pub fn inventory_to_json(inv: &Inventory) -> Value {
+    let nodes = graph_nodes_json(&inv.graph);
 
     let findings: Vec<Value> = inv
         .findings

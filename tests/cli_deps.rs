@@ -7,7 +7,15 @@ fn corgea_isolated() -> (Command, TempDir) {
     cmd.env("HOME", home.path())
         .env("USERPROFILE", home.path())
         .env_remove("CORGEA_TOKEN")
-        .env_remove("CORGEA_URL");
+        .env_remove("CORGEA_URL")
+        .env_remove("AI_AGENT")
+        .env_remove("CODEX_SANDBOX")
+        .env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CODE")
+        .env_remove("CURSOR_AGENT")
+        .env_remove("CURSOR_TRACE_ID")
+        .env_remove("GEMINI_CLI")
+        .env_remove("PI_AGENT");
     (cmd, home)
 }
 
@@ -74,6 +82,119 @@ fn cli_scan_clean_fixture_fail_on_high_exits_zero() {
 }
 
 #[test]
+fn cli_scan_agent_env_defaults_to_agent_format() {
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .env("AI_AGENT", "1")
+        .args(["deps", "scan", &fixture("node-app")])
+        .output()
+        .expect("failed to run corgea");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("record\troot\t"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("\nfinding\tDEP004\tHigh\tpkg:npm/lodash@4.17.21\t"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn cli_scan_format_human_overrides_agent_env() {
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .env("AI_AGENT", "1")
+        .args(["deps", "scan", &fixture("node-app"), "--format", "human"])
+        .output()
+        .expect("failed to run corgea");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Corgea dependency inventory"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn cli_scan_format_json_outputs_parseable_inventory() {
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .args(["deps", "scan", &fixture("node-app"), "--format", "json"])
+        .output()
+        .expect("failed to run corgea");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert!(parsed.get("nodes").is_some());
+    assert!(parsed.get("findings").is_some());
+}
+
+#[test]
+fn cli_scan_format_quiet_suppresses_stdout_and_preserves_fail_code() {
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .args([
+            "deps",
+            "scan",
+            &fixture("node-app"),
+            "--format",
+            "quiet",
+            "--fail-on",
+            "high",
+        ])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.stdout, b"");
+}
+
+#[test]
+fn cli_graph_format_json_outputs_parseable_nodes() {
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .args(["deps", "graph", &fixture("node-app"), "--format", "json"])
+        .output()
+        .expect("failed to run corgea");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    let nodes = parsed["nodes"].as_array().expect("nodes array");
+    assert!(nodes
+        .iter()
+        .any(|node| node["id"] == "pkg:npm/left-pad@1.3.0"));
+}
+
+#[test]
+fn cli_deps_rejects_invalid_render_format() {
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .args(["deps", "graph", &fixture("node-app"), "--format", "typo"])
+        .output()
+        .expect("failed to run corgea");
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unsupported --format"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn cli_deps_without_subcommand_exits_nonzero() {
     let (mut cmd, _home) = corgea_isolated();
     let out = cmd.args(["deps"]).output().expect("failed to run corgea");
@@ -115,6 +236,29 @@ fn cli_scan_rejects_invalid_out_format() {
     assert_ne!(out.status.code(), Some(0));
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("unsupported --out-format"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn cli_scan_rejects_render_format_with_out_format() {
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .args([
+            "deps",
+            "scan",
+            &fixture("node-app"),
+            "--format",
+            "agent",
+            "--out-format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run corgea");
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--format cannot be used with --out-format"),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -194,6 +338,41 @@ fn cli_scan_loads_policy_created_by_policy_init() {
 }
 
 #[test]
+fn cli_policy_init_exist_ok_preserves_existing_policy() {
+    let project = TempDir::new().expect("temp project");
+    let policy_dir = project.path().join(".corgea");
+    std::fs::create_dir_all(&policy_dir).expect("create policy dir");
+    let policy_path = policy_dir.join("deps.yml");
+    std::fs::write(&policy_path, "custom: true\n").expect("write existing policy");
+
+    let (mut init_cmd, _home) = corgea_isolated();
+    let init_out = init_cmd
+        .args([
+            "deps",
+            "policy",
+            "init",
+            project.path().to_str().unwrap(),
+            "--exist-ok",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run corgea");
+    assert!(
+        init_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&init_out.stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["created"], false);
+    assert_eq!(
+        std::fs::read_to_string(&policy_path).expect("read existing policy"),
+        "custom: true\n"
+    );
+}
+
+#[test]
 fn cli_scan_fails_closed_on_invalid_policy_yaml() {
     let project = TempDir::new().expect("temp project");
     write_exact_node_project(project.path(), "lodash", "4.17.21", "4.17.21");
@@ -264,6 +443,32 @@ fn cli_diff_reports_real_version_change_from_base_ref() {
         stdout.contains("~ left-pad 1.3.0 -> 1.3.1"),
         "stdout: {stdout}"
     );
+}
+
+#[test]
+fn cli_diff_format_json_reports_real_version_change_from_base_ref() {
+    let repo = TempDir::new().expect("temp repo");
+    init_git_repo(repo.path());
+    write_exact_node_project(repo.path(), "left-pad", "1.3.0", "1.3.0");
+    commit_all(repo.path(), "base");
+    write_exact_node_project(repo.path(), "left-pad", "1.3.1", "1.3.1");
+
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .current_dir(repo.path())
+        .args(["deps", "diff", "--base", "HEAD", ".", "--format", "json"])
+        .output()
+        .expect("failed to run corgea");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["changed"][0]["name"], "left-pad");
+    assert_eq!(parsed["changed"][0]["from"], "1.3.0");
+    assert_eq!(parsed["changed"][0]["to"], "1.3.1");
 }
 
 #[test]

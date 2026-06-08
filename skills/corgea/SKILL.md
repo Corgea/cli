@@ -109,6 +109,26 @@ corgea setup-hooks --default-config            # Default: secrets + PII, fail on
 
 Installs a pre-commit hook running `corgea scan blast --only-uncommitted`. Bypass with `git commit --no-verify`.
 
+### Deps — `corgea deps <command>`
+
+Offline dependency inventory and policy checks. No Corgea token or network required.
+
+```bash
+corgea deps scan                               # Human table; auto-agent TSV under AI_AGENT/CODEX_SANDBOX/etc.
+corgea deps scan --format agent                # Compact TSV summary + findings
+corgea deps scan --format json                 # JSON inventory on stdout
+corgea deps scan --format quiet --fail-on high # No stdout; exit code still applies
+corgea deps scan --out-format sarif --out-file deps.sarif  # Export table/json/sarif report
+corgea deps graph --format agent               # TSV graph: id, name, version, direct, scope, depth
+corgea deps graph --format json                # JSON graph nodes
+corgea deps explain lodash --format agent      # TSV dependency paths for a package
+corgea deps diff --base origin/main --format json  # JSON added/removed/changed dependencies
+corgea deps sbom --format cyclonedx            # CycloneDX SBOM JSON
+corgea deps policy init --exist-ok --format quiet  # Keep existing policy, no stdout
+```
+
+Render modes for deps commands are `--format human|agent|json|quiet`. `deps scan --out-format table|json|sarif` remains the report/export selector; do not combine it with `deps scan --format`.
+
 ## Common Workflows
 
 ### Scan full project
