@@ -4,6 +4,7 @@
 #
 # Commands: check, fix, lint, test, audit, coverage, pre-commit, ci,
 #           post-edit, setup-hooks, suppressions
+# Use `./harness post-edit codex` for Codex hooks that require JSON-safe stdout.
 
 set -u
 
@@ -95,6 +96,20 @@ run_with_summary() {
             "$GREEN" "$RESET" "$desc" "$DIM" "$total_passed" "$duration" "$RESET"
     fi
     return 0
+}
+
+json_escape() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf "%s" "$value"
+}
+
+codex_system_message() {
+    printf '{"systemMessage":"%s"}\n' "$(json_escape "$1")"
 }
 
 # ── Git helpers ─────────────────────────────────────────────────────
@@ -192,8 +207,49 @@ cmd_coverage() {
 }
 
 cmd_post_edit() {
+    local codex=0
+    local hook_input=""
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            codex) codex=1 ;;
+            "")
+                ;;
+            *)
+                printf "Unknown post-edit option: %s\n" "$arg" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    if [ ! -t 0 ]; then
+        hook_input="$(cat || true)"
+        if printf "%s" "$hook_input" | grep -qE '"hook_event_name"[[:space:]]*:'; then
+            codex=1
+        fi
+    fi
+
     local changed; changed="$(changed_rs_files)"
     [ -z "$changed" ] && return 0
+
+    if [ "$codex" -eq 1 ]; then
+        local tmp; tmp="$(mktemp)"
+        cargo fmt >"$tmp" 2>&1
+        local rc=$?
+        local output; output="$(tail -40 "$tmp")"
+        rm -f "$tmp"
+
+        [ "$rc" -eq 0 ] && return 0
+
+        if [ -n "$output" ]; then
+            codex_system_message "cargo fmt failed:
+$output"
+        else
+            codex_system_message "cargo fmt failed without output."
+        fi
+        return 0
+    fi
+
     # Never fail the Stop hook.
     run "Format" 1 -- cargo fmt || true
     return 0
@@ -278,13 +334,14 @@ case "$cmd" in
     coverage)     cmd_coverage ;;
     pre-commit)   cmd_pre_commit ;;
     ci)           cmd_ci ;;
-    post-edit)    cmd_post_edit ;;
+    post-edit)    cmd_post_edit "${@:2}" ;;
     setup-hooks)  cmd_setup_hooks ;;
     suppressions) cmd_suppressions ;;
     -h|--help|help)
         printf "Usage: ./harness <command> [--verbose] [--min=N]\n\n"
         printf "Commands: check, fix, lint, test, audit, coverage, pre-commit,\n"
         printf "          ci, post-edit, setup-hooks, suppressions\n"
+        printf "\nCodex hook mode: ./harness post-edit codex\n"
         ;;
     *)
         printf "Unknown command: %s\n" "$cmd" >&2
