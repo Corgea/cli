@@ -4,12 +4,13 @@
 [advisories]
 version = 2
 # RustSec DB: fail on vulnerable/unmaintained/unsound/yanked crates.
+yanked = "deny"
 # ignore = []  # add "RUSTSEC-YYYY-NNNN" with a justification comment if ever needed
 
 [licenses]
 version = 2
-# SPDX ids allowed to ship in the distributed binary. All permissive,
-# plus option-ext's file-level MPL-2.0 (transitive via `dirs`).
+# SPDX ids allowed to ship in the distributed binary. All permissive.
+# Copyleft exceptions must stay crate-scoped below.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -22,8 +23,9 @@ allow = [
     "MIT-0",
     "Zlib",
     "BSL-1.0",
-    "MPL-2.0",
 ]
+# option-ext is file-level MPL-2.0 and comes transitively via `dirs`.
+exceptions = [{ crate = "option-ext", allow = ["MPL-2.0"] }]
 # The `corgea` crate's own LICENSE file is LGPL-2.1; it ships only as a binary
 # (never `cargo publish`ed) so it's marked `publish = false` in Cargo.toml,
 # which makes it "private" and exempt from these dep-license rules.
