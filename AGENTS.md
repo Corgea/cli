@@ -16,3 +16,9 @@ This subproject is the Corgea developer CLI (Rust → npm + pip via maturin).
 - Auto-format: `./harness post-edit` — runs `cargo fmt` on changed Rust files (wire into your editor/agent's post-edit hook)
 
 Add `--verbose` to stream raw command output instead of the quiet summary.
+
+Coverage needs LLVM's `llvm-cov`/`llvm-profdata`. On a rustup toolchain, run
+`rustup component add llvm-tools-preview`. On a non-rustup toolchain (e.g.
+Homebrew Rust) those are missing, so point cargo-llvm-cov at a system LLVM:
+`LLVM_COV="$(brew --prefix llvm)/bin/llvm-cov" LLVM_PROFDATA="$(brew --prefix llvm)/bin/llvm-profdata" ./harness coverage`.
+CI uses its own toolchain and is unaffected.

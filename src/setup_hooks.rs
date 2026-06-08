@@ -9,12 +9,12 @@ pub fn setup_pre_commit_hook(include_default_scan_types: bool) {
             if metadata.is_dir() {
                 ".git"
             } else {
-                eprintln!("Error: .git exists but is not a directory");
+                log::error!("Error: .git exists but is not a directory");
                 std::process::exit(1);
             }
         }
         Err(_) => {
-            eprintln!("Error: Not a git repository (or any of the parent directories)");
+            log::error!("Error: Not a git repository (or any of the parent directories)");
             std::process::exit(1);
         }
     };
@@ -24,7 +24,7 @@ pub fn setup_pre_commit_hook(include_default_scan_types: bool) {
 
     // Create hooks directory if it doesn't exist
     std::fs::create_dir_all(&hooks_dir).unwrap_or_else(|e| {
-        eprintln!("Failed to create hooks directory: {}", e);
+        log::error!("Failed to create hooks directory: {}", e);
         std::process::exit(1);
     });
 
@@ -75,7 +75,7 @@ corgea scan blast --only-uncommitted --fail-on LO --scan-type {}
 
     // Write pre-commit hook
     std::fs::write(&pre_commit_path, hook_content).unwrap_or_else(|e| {
-        eprintln!("Failed to write pre-commit hook: {}", e);
+        log::error!("Failed to write pre-commit hook: {}", e);
         std::process::exit(1);
     });
 
@@ -85,7 +85,7 @@ corgea scan blast --only-uncommitted --fail-on LO --scan-type {}
         std::os::unix::fs::PermissionsExt::from_mode(0o755),
     )
     .unwrap_or_else(|e| {
-        eprintln!("Failed to set pre-commit hook permissions: {}", e);
+        log::error!("Failed to set pre-commit hook permissions: {}", e);
         std::process::exit(1);
     });
 

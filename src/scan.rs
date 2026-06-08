@@ -16,7 +16,7 @@ pub fn run_command(base_cmd: &String, mut command: Command) -> String {
             let output = match command.output() {
                 Ok(output) => output,
                 Err(e) => {
-                    eprintln!("Failed to execute command: {}", e);
+                    log::error!("Failed to execute command: {}", e);
                     std::process::exit(1);
                 }
             };
@@ -26,7 +26,7 @@ pub fn run_command(base_cmd: &String, mut command: Command) -> String {
                 let stdout = String::from_utf8(output.stdout).expect("Failed to parse stdout");
 
                 if stdout.contains("run `semgrep login`") {
-                    eprintln!("You are not authenticated with semgrep. Please run 'semgrep login' to authenticate.");
+                    log::error!("You are not authenticated with semgrep. Please run 'semgrep login' to authenticate.");
                     std::process::exit(1);
                 }
 
@@ -34,13 +34,13 @@ pub fn run_command(base_cmd: &String, mut command: Command) -> String {
             } else {
                 let stderr = String::from_utf8(output.stderr).expect("Failed to parse stderr");
                 let stdout = String::from_utf8(output.stdout).expect("Failed to parse stdout");
-                eprintln!("{} failed: {}", base_cmd, stderr);
-                eprintln!("{}", stdout);
+                log::error!("{} failed: {}", base_cmd, stderr);
+                log::error!("{}", stdout);
                 std::process::exit(1);
             }
         }
         Err(_) => {
-            eprintln!("{} binary not found, is it installed?", base_cmd);
+            log::error!("{} binary not found, is it installed?", base_cmd);
             std::process::exit(1);
         }
     }
@@ -96,7 +96,7 @@ pub fn read_file_report(config: &Config, file_path: &str, project_name: Option<S
     let input = match std::fs::read_to_string(file_path) {
         Ok(input) => input,
         Err(e) => {
-            eprintln!("Failed to read file: {}", e);
+            log::error!("Failed to read file: {}", e);
             std::process::exit(1);
         }
     };
@@ -120,7 +120,7 @@ pub fn parse_scan(
     match parser_factory.parse_scan_data(cleaned_input) {
         Ok(parse_result) => {
             if parse_result.paths.is_empty() {
-                eprintln!("No issues found in scan report, exiting.");
+                log::info!("No issues found in scan report, exiting.");
                 std::process::exit(0);
             }
 
@@ -135,7 +135,7 @@ pub fn parse_scan(
         }
 
         Err(error_message) => {
-            eprintln!("{}", error_message);
+            log::error!("{}", error_message);
             std::process::exit(1);
         }
     }
@@ -199,7 +199,7 @@ pub fn upload_scan(
 
     for path in &paths {
         if !Path::new(&path).exists() {
-            eprintln!(
+            log::error!(
                 "Required file {} not found which is required for the scan, exiting.",
                 path
             );
@@ -221,12 +221,13 @@ pub fn upload_scan(
         let mut success = false;
 
         while attempts < 3 && !success {
-            let form = reqwest::blocking::multipart::Form::new()
-                .file("file", fp)
-                .expect("Failed to read file");
-
             debug(&format!("POST: {}", src_upload_url));
-            let res = client.post(&src_upload_url).multipart(form).send();
+            let res = utils::api::retry_on_network_error("file upload", || {
+                let form = reqwest::blocking::multipart::Form::new()
+                    .file("file", fp)
+                    .expect("Failed to read file");
+                client.post(&src_upload_url).multipart(form).send()
+            });
 
             match res {
                 Ok(response) => {
@@ -239,7 +240,7 @@ pub fn upload_scan(
                             "Code upload failed with status: {}. Response body: {}",
                             status, body
                         ));
-                        eprintln!("Failed to upload file {} {}... retrying", status, path);
+                        log::warn!("Failed to upload file {} {}... retrying", status, path);
                         std::thread::sleep(std::time::Duration::from_secs(1));
                         attempts += 1;
                     } else {
@@ -249,15 +250,20 @@ pub fn upload_scan(
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to send request: {}", e);
-                    std::process::exit(1);
+                    upload_error_count += 1;
+                    log::warn!(
+                        "Failed to upload file {} after network retries: {}",
+                        path,
+                        e
+                    );
+                    break;
                 }
             }
         }
 
         if attempts == 3 && !success {
             upload_error_count += 1;
-            eprintln!(
+            log::warn!(
                 "Failed to upload file: {} after 3 attempts. skipping...",
                 path
             );
@@ -265,7 +271,7 @@ pub fn upload_scan(
     }
 
     if uploaded_count == 0 {
-        eprintln!("Failed to upload any files for the scan, exiting.");
+        log::error!("Failed to upload any files for the scan, exiting.");
         std::process::exit(1);
     }
 
@@ -282,7 +288,7 @@ pub fn upload_scan(
                 mb * 1024 * 1024
             }
             _ => {
-                eprintln!("Invalid DEBUG_CORGEA_OVERRIDE_REPORT_CHUNK_SIZE value '{}', using default 1 MB", val);
+                log::warn!("Invalid DEBUG_CORGEA_OVERRIDE_REPORT_CHUNK_SIZE value '{}', using default 1 MB", val);
                 1024 * 1024
             }
         },
@@ -302,13 +308,15 @@ pub fn upload_scan(
                 index + 1,
                 total_chunks
             ));
-            let response = client
-                .post(&scan_upload_url)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("Upload-Offset", offset.to_string())
-                .header("Upload-Length", input_size.to_string())
-                .body(chunk.to_vec())
-                .send();
+            let response = utils::api::retry_on_network_error("scan chunk upload", || {
+                client
+                    .post(&scan_upload_url)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("Upload-Offset", offset.to_string())
+                    .header("Upload-Length", input_size.to_string())
+                    .body(chunk.to_vec())
+                    .send()
+            });
 
             let should_break = match &response {
                 Ok(res) => {
@@ -320,7 +328,7 @@ pub fn upload_scan(
                             if let Ok(server_offset_str) = server_offset.to_str() {
                                 if let Ok(server_offset_val) = server_offset_str.parse::<usize>() {
                                     if server_offset_val != expected_offset {
-                                        eprintln!(
+                                        log::error!(
                                             "Upload offset mismatch on chunk {}/{}: server has {} bytes but expected {}. \
                                             This may indicate that chunks are being routed to different server instances. \
                                             Please contact support.",
@@ -353,11 +361,13 @@ pub fn upload_scan(
         last_response.expect("Failed to upload scan.")
     } else {
         debug(&format!("POST: {}", scan_upload_url));
-        client
-            .post(&scan_upload_url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(input.clone())
-            .send()
+        utils::api::retry_on_network_error("scan upload", || {
+            client
+                .post(&scan_upload_url)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(input.clone())
+                .send()
+        })
     };
 
     let mut sast_scan_id: Option<String> = None;
@@ -371,7 +381,7 @@ pub fn upload_scan(
                 let body_text = match response.text() {
                     Ok(text) => text,
                     Err(e) => {
-                        eprintln!("Failed to read response body: {}", e);
+                        log::warn!("Failed to read response body: {}", e);
                         String::new()
                     }
                 };
@@ -397,13 +407,13 @@ pub fn upload_scan(
                             }
                         }
                         Err(e) => {
-                            eprintln!("Failed to parse response JSON: {}", e);
+                            log::warn!("Failed to parse response JSON: {}", e);
                         }
                     }
                 }
 
                 if is_chunked && sast_scan_id.is_none() {
-                    eprintln!("Failed to upload scan: server did not return a scan ID after all chunks were sent. The scan was not created on the platform.");
+                    log::error!("Failed to upload scan: server did not return a scan ID after all chunks were sent. The scan was not created on the platform.");
                     upload_failed = true;
                 } else {
                     println!("Successfully uploaded scan.");
@@ -418,11 +428,11 @@ pub fn upload_scan(
                     "Scan upload failed with status: {}. Response body: {}",
                     status, body
                 ));
-                eprintln!("Failed to upload scan: {}", status);
+                log::error!("Failed to upload scan: {}", status);
             }
         }
         Err(e) => {
-            eprintln!("Failed to send request: {}", e);
+            log::error!("Failed to send request: {}", e);
             upload_failed = true;
         }
     }
@@ -431,21 +441,22 @@ pub fn upload_scan(
 
     if git_config_path.exists() {
         debug("Uploading .git/config");
-        let form = reqwest::blocking::multipart::Form::new()
-            .file("file", git_config_path)
-            .expect("Failed to read file");
-
         debug(&format!("POST: {}", git_config_upload_url));
-        let res = client.post(&git_config_upload_url).multipart(form).send();
+        let res = utils::api::retry_on_network_error("git config upload", || {
+            let form = reqwest::blocking::multipart::Form::new()
+                .file("file", git_config_path)
+                .expect("Failed to read file");
+            client.post(&git_config_upload_url).multipart(form).send()
+        });
 
         match res {
             Ok(response) => {
                 if !response.status().is_success() {
-                    eprintln!("Failed to upload git config: {}", response.status());
+                    log::warn!("Failed to upload git config: {}", response.status());
                 }
             }
             Err(e) => {
-                eprintln!("Failed to send request: {}", e);
+                log::warn!("Failed to send request: {}", e);
             }
         }
     }
@@ -464,7 +475,7 @@ pub fn upload_scan(
         let github_env_vars_json_string = match serde_json::to_string(&github_env_vars_json) {
             Ok(json_string) => json_string,
             Err(e) => {
-                eprintln!("Failed to serialize JSON: {}", e);
+                log::error!("Failed to serialize JSON: {}", e);
                 std::process::exit(1);
             }
         };
@@ -483,7 +494,7 @@ pub fn upload_scan(
 
         match std::fs::write(&file_path, input.clone()) {
             Ok(_) => println!("Successfully saved scan to {}", file_path.display()),
-            Err(e) => eprintln!("Failed to save scan to {}: {}", file_path.display(), e),
+            Err(e) => log::warn!("Failed to save scan to {}: {}", file_path.display(), e),
         }
     }
 

@@ -45,7 +45,7 @@ impl ScanParser for SarifParser {
                 "codeql".to_string()
             }
             _ => {
-                eprintln!("{} is not supported at this time.", tool);
+                log::error!("{} is not supported at this time.", tool);
                 return None;
             }
         };
@@ -78,5 +78,44 @@ impl ScanParser for SarifParser {
 
     fn scanner_name(&self) -> &str {
         "sarif"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_returns_none_for_unsupported_tool() {
+        // Valid JSON but an unsupported driver name hits the `_` arm
+        // (`log::error!("{} is not supported…")`) and returns `None`.
+        let input = r#"{"runs":[{"tool":{"driver":{"name":"FortifyXYZ"}}}]}"#;
+        assert!(SarifParser.parse(input).is_none());
+    }
+
+    #[test]
+    fn parse_returns_none_for_malformed_json() {
+        assert!(SarifParser.parse("{not valid json").is_none());
+    }
+
+    #[test]
+    fn parse_returns_paths_for_supported_tool() {
+        let input = r#"{
+            "runs": [{
+                "tool": {"driver": {"name": "SnykCode"}},
+                "results": [{
+                    "locations": [{
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": "src/app.py"}
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+        let result = SarifParser
+            .parse(input)
+            .expect("expected Some(ParseResult)");
+        assert_eq!(result.scanner, "snyk");
+        assert_eq!(result.paths, vec!["src/app.py".to_string()]);
     }
 }

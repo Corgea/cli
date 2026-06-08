@@ -6,7 +6,7 @@ pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>)
     let project_name = match utils::generic::get_current_working_directory() {
         Some(name) => name,
         None => {
-            eprintln!("Unable to retrieve the current working directory. Please check your permissions and try again.");
+            log::error!("Unable to retrieve the current working directory. Please check your permissions and try again.");
             std::process::exit(1);
         }
     };
@@ -16,7 +16,7 @@ pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>)
     let scans: Vec<utils::api::ScanResponse> = match scans_result {
         Ok(result) => result.scans.unwrap_or_default(),
         Err(e) => {
-            eprintln!(
+            log::error!(
                 "Unable to query the scan list. Please check your connection and ensure that:
                 - The server URL is reachable.
                 - Your authentication token is valid.
@@ -34,7 +34,7 @@ pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>)
             let processed = match blast::check_scan_status(&scan_id, &config.get_url()) {
                 Ok(processed) => processed,
                 Err(_) => {
-                    eprintln!(
+                    log::error!(
                         "\nOops! Something went wrong. Please try again later or check your setup.\n"
                     );
                     std::process::exit(1);
@@ -45,7 +45,7 @@ pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>)
         None => match scans.first() {
             Some(scan) => (scan.id.clone(), scan.status == "Complete"),
             None => {
-                eprintln!("Error querying scan list");
+                log::error!("Error querying scan list");
                 std::process::exit(1);
             }
         },
@@ -84,7 +84,7 @@ pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>)
             );
         }
         Err(e) => {
-            eprintln!(
+            log::error!(
                 "\n\n{}\n\n\
                 However, the scan results may still be accessible at the following link:\n\n\
                 {}\n\n\

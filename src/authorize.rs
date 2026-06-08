@@ -41,7 +41,7 @@ pub fn run(scope: Option<String>, url: Option<String>) -> Result<(), Box<dyn std
 
     // Open browser
     if let Err(e) = open::that(&auth_url) {
-        eprintln!("Failed to open browser automatically: {}", e);
+        log::warn!("Failed to open browser automatically: {}", e);
         println!("Please manually open the following URL in your browser:");
         println!("{}", auth_url);
     }
@@ -85,7 +85,7 @@ pub fn run(scope: Option<String>, url: Option<String>) -> Result<(), Box<dyn std
             Ok(())
         }
         Err(e) => {
-            eprintln!("\r❌ Authorization failed: {}", e);
+            log::error!("\r❌ Authorization failed: {}", e);
             Err(e)
         }
     }
@@ -154,7 +154,7 @@ async fn start_callback_server(
                         .serve_connection(io, service)
                         .await
                     {
-                        eprintln!("Error serving connection: {:?}", err);
+                        log::error!("Error serving connection: {:?}", err);
                     }
                 });
             }
@@ -678,8 +678,7 @@ mod tests {
             Arc::new(Mutex::new(None::<String>)),
         ));
 
-        assert!(result.is_err());
-        let error = result.err().expect("expected bind error").to_string();
+        let error = result.expect_err("expected bind error").to_string();
         assert!(error.contains("Failed to bind"));
     }
 

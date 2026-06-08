@@ -21,9 +21,10 @@ pub fn run(
         let issue_details = match utils::api::get_issue(&config.get_url(), id) {
             Ok(issue) => issue,
             Err(e) => {
-                eprintln!(
+                log::error!(
                     "Failed to fetch issue details for issue ID {} with error:\n{}",
-                    id, e
+                    id,
+                    e
                 );
                 if e.to_string().contains("404") {
                     println!("If you're trying to inspect a scan make sure to remove the --issue argument");
@@ -86,7 +87,7 @@ pub fn run(
         let scan_details = match utils::api::get_scan(&config.get_url(), id) {
             Ok(details) => details,
             Err(e) => {
-                eprintln!("Failed to fetch scan details for scan ID {}: {}", id, e);
+                log::error!("Failed to fetch scan details for scan ID {}: {}", id, e);
                 if e.to_string().contains("404") {
                     println!(
                         "If you're trying to inspect an issues make sure to pass --issue argument"
