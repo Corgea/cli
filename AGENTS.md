@@ -6,8 +6,8 @@ This subproject is the Corgea developer CLI (Rust → npm + pip via maturin).
 
 - After edits: `./harness check` — clippy fix, format, tests, suppression report
 - Pre-commit: `./harness pre-commit` — staged Rust files only (auto via git hook)
-- CI: `./harness ci` — strict clippy (`-D warnings`), format check, dep audit, tests + coverage gate (min 13%)
-- Audit: `./harness audit` — `cargo audit` for known dep vulnerabilities
+- CI: `./harness ci` — strict clippy (`-D warnings`), format check, dep policy (`cargo deny`: advisories + licenses + sources + bans), tests + coverage gate (min 13%)
+- Deny: `./harness deny` — `cargo deny --locked check` (vulns, licenses, sources, bans) per `deny.toml`
 - Coverage: `./harness coverage [--min=N]` — cargo-llvm-cov; HTML report under `target/llvm-cov/`; fails if line coverage < N (default 13)
 - Lint: `./harness lint` — clippy + format check, no fixes
 - Test: `./harness test` — `cargo test`

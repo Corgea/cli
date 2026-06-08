@@ -23,8 +23,8 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
