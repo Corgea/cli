@@ -32,19 +32,54 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - name: Install Linux build dependencies
+      - name: Prepare resilient maturin download for manylinux Docker
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y libssl-dev openssl pkg-config musl-tools
+          bin_dir="${RUNNER_TEMP}/maturin-docker-bin"
+          mkdir -p "$bin_dir"
+          cat > "$bin_dir/curl" <<'EOF'
+          #!/bin/bash
+          set -euo pipefail
+          if [[ " $* " == *" PyO3/maturin/releases "* ]]; then
+            exec /usr/bin/curl --fail --retry 5 --retry-delay 3 --retry-all-errors "$@"
+          fi
+          exec /usr/bin/curl "$@"
+          EOF
+          chmod +x "$bin_dir/curl"
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist
           manylinux: auto
-          # Host build uses @actions/tool-cache (authenticated) for maturin downloads.
-          # manylinux Docker uses raw `curl | tar`, which flakes on partial CDN responses.
-          container: off
+          docker-options: -v ${{ runner.temp }}/maturin-docker-bin/curl:/usr/local/bin/curl:ro
+          before-script-linux: |
+            # If we're running on rhel centos, install needed packages.
+            if command -v yum &> /dev/null; then
+                yum update -y && yum install -y perl-core openssl openssl-devel pkgconfig libatomic
+            else
+                # If we're running on debian-based system.
+                apt update -y && apt-get install -y libssl-dev openssl pkg-config musl-tools
+            fi
+      - name: Assert manylinux wheel compatibility tags
+        run: |
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if ((${#wheels[@]} == 0)); then
+            echo "No wheels found in dist/"
+            exit 1
+          fi
+          for wheel in "${wheels[@]}"; do
+            base=$(basename "$wheel")
+            if [[ "$base" == *manylinux_2_3[0-9]* ]]; then
+              echo "Wheel tag too new for broad Linux support: $base"
+              exit 1
+            fi
+            if [[ ! "$base" =~ manylinux2014 ]]; then
+              echo "Expected manylinux2014 compatibility tag, got: $base"
+              exit 1
+            fi
+            echo "OK: $base"
+          done
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
