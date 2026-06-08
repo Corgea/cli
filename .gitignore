@@ -3,5 +3,9 @@
 .DS_Store
 .dccache
 *.zip
+*.profraw
 node_modules/
 /packages/*/vendor/
+
+.claude/
+CLAUDE.md

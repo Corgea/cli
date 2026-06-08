@@ -1,12 +1,12 @@
+use crate::utils::terminal::{set_text_color, TerminalColor};
+use git2::Repository;
+use globset::{Glob, GlobSetBuilder};
+use ignore::WalkBuilder;
+use std::env;
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use zip::{write::FileOptions, ZipWriter};
-use ignore::WalkBuilder;
-use globset::{GlobSetBuilder, Glob};
-use std::fs::{self, File};
-use std::env;
-use git2::Repository;
-use crate::utils::terminal::{set_text_color, TerminalColor};
 
 // Global exclude globs used across multiple functions
 const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
@@ -32,7 +32,7 @@ const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
 ];
 
 /// Create a zip file from a target specification or full repository scan.
-/// 
+///
 /// - If `target` is `None`, performs a full repository scan (equivalent to scanning all files).
 /// - If `target` is `Some(target_str)`, resolves the target using the targets module and creates zip from those files.
 ///   The target string can be a comma-separated list of files, directories, globs, or git selectors.
@@ -53,8 +53,9 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
         let current_dir = env::current_dir()?;
         let result = crate::targets::resolve_targets(target_str)
             .map_err(|e| format!("Failed to resolve targets: {}", e))?;
-        
-        result.files
+
+        result
+            .files
             .iter()
             .filter_map(|file| {
                 if !file.exists() || !file.is_file() {
@@ -62,17 +63,13 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
                 }
                 match file.strip_prefix(&current_dir) {
                     Ok(relative) => Some((file.clone(), relative.to_path_buf())),
-                    Err(_) => {
-                        Some((file.clone(), file.clone()))
-                    }
+                    Err(_) => Some((file.clone(), file.clone())),
                 }
             })
             .collect()
     } else {
         let directory = Path::new(".");
-        let walker = WalkBuilder::new(directory)
-            .standard_filters(true)
-            .build();
+        let walker = WalkBuilder::new(directory).standard_filters(true).build();
 
         let mut files = Vec::new();
         for result in walker {
@@ -99,7 +96,7 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
 
     for (path, relative_path) in files_to_zip {
         let is_excluded = glob_set.is_match(&path);
-        
+
         if (path.is_file() || path.is_dir()) && !is_excluded {
             if path.is_file() {
                 zip.start_file(relative_path.to_string_lossy(), options)?;
@@ -116,14 +113,14 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
 
     // Print warnings for excluded files
     if !excluded_files.is_empty() {
-        eprintln!(
+        log::warn!(
             "\n{}",
             set_text_color(
                 "⚠️  Not everything in your target is scannable.",
                 TerminalColor::Yellow
             )
         );
-        eprintln!(
+        log::warn!(
             "   {}",
             set_text_color(
                 "We skipped files that typically aren't useful for analysis (like vendor/dependency code, test fixtures, style assets, and other non-source files).",
@@ -131,13 +128,13 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
             )
         );
         for excluded_file in &excluded_files {
-            eprintln!(
+            log::warn!(
                 "   {} {}",
                 set_text_color("•", TerminalColor::Yellow),
                 excluded_file.display()
             );
         }
-        eprintln!();
+        log::warn!("");
     }
 
     zip.finish()?;
@@ -152,13 +149,12 @@ pub fn create_path_if_not_exists<P: AsRef<Path>>(path: P) -> io::Result<()> {
     Ok(())
 }
 
-
 pub fn is_git_repo(dir: &str) -> Result<bool, git2::Error> {
     let git_path = Path::new(dir).join(".git");
     if git_path.exists() {
         return Ok(true);
     }
-    
+
     // Fall back to the more expensive discover method for cases like:
     // - We're in a subdirectory of a git repo
     // - .git is a file (worktrees, submodules)
@@ -183,9 +179,10 @@ pub fn delete_directory<P: AsRef<Path>>(path: P) -> io::Result<()> {
 }
 
 pub fn get_current_working_directory() -> Option<String> {
-    env::current_dir()
-        .ok()
-        .and_then(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
+    env::current_dir().ok().and_then(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_string())
+    })
 }
 
 /// Determine the project name with fallback logic:
@@ -227,25 +224,25 @@ fn extract_repo_name_from_url(url: &str) -> Option<String> {
     // - git@github.com:user/repo.git
     // - https://github.com/user/repo
     // - git@github.com:user/repo
-    
+
     let url = url.trim();
-    
+
     let url = url.strip_suffix(".git").unwrap_or(url);
-    
-    if let Some(name) = url.split('/').last() {
+
+    if let Some(name) = url.split('/').next_back() {
         let name = name.trim();
         if !name.is_empty() {
             return Some(name.to_string());
         }
     }
-    
-    if let Some(name) = url.split(':').last() {
+
+    if let Some(name) = url.split(':').next_back() {
         let name = name.trim();
         if !name.is_empty() {
             return Some(name.to_string());
         }
     }
-    
+
     None
 }
 
@@ -271,12 +268,23 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
     });
 
     // Get the latest commit SHA
-    let sha = repo.head().ok().and_then(|head| head.peel_to_commit().ok().map(|commit| commit.id().to_string()));
+    let sha = repo.head().ok().and_then(|head| {
+        head.peel_to_commit()
+            .ok()
+            .map(|commit| commit.id().to_string())
+    });
 
     // Get the remote URL (assuming "origin")
-    let repo_url = repo.find_remote("origin").ok().and_then(|remote| remote.url().map(|url| url.to_string()));
+    let repo_url = repo
+        .find_remote("origin")
+        .ok()
+        .and_then(|remote| remote.url().map(|url| url.to_string()));
 
-    Ok(Some(RepoInfo { branch, repo_url, sha }))
+    Ok(Some(RepoInfo {
+        branch,
+        repo_url,
+        sha,
+    }))
 }
 
 pub fn get_status(status: &str) -> &str {
@@ -301,3 +309,51 @@ pub struct RepoInfo {
     pub sha: Option<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn create_zip_from_target_excludes_default_globs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // A file matched by DEFAULT_EXCLUDE_GLOBS (`**/node_modules/**`)...
+        let node_modules = root.join("node_modules");
+        fs::create_dir_all(&node_modules).unwrap();
+        let excluded = node_modules.join("x.js");
+        fs::write(&excluded, "console.log(1)").unwrap();
+
+        // ...alongside an ordinary source file that should be kept.
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let included = src_dir.join("main.py");
+        fs::write(&included, "print(1)").unwrap();
+
+        // Explicit, comma-separated file targets resolve to these exact paths,
+        // so the test is independent of cwd and .gitignore.
+        let output_zip = root.join("out.zip");
+        let target = format!("{},{}", excluded.display(), included.display());
+
+        // Scope the exclude globs explicitly to one real default
+        // (`**/node_modules/**`): the system tempdir can itself live under a
+        // path the full DEFAULT_EXCLUDE_GLOBS would match (e.g. `/tmp/**`),
+        // which would exclude *everything*. The filter + warn path under test
+        // is identical either way.
+        let excludes: &[&str] = &["**/node_modules/**"];
+        let added = create_zip_from_target(Some(&target), &output_zip, Some(excludes))
+            .expect("zip creation should succeed");
+
+        assert!(
+            added.iter().any(|p| p.ends_with("src/main.py")),
+            "source file should be included: {:?}",
+            added
+        );
+        assert!(
+            !added.iter().any(|p| p.ends_with("node_modules/x.js")),
+            "node_modules file should be excluded: {:?}",
+            added
+        );
+    }
+}

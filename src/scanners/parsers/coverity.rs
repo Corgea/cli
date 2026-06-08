@@ -23,17 +23,13 @@ impl ScanParser for CoverityParser {
                     let is_merged_defect = e.name().as_ref() == b"cov:mergedDefect"
                         || e.name().as_ref() == b"mergedDefect";
                     if is_merged_defect {
-                        for attr in e.attributes() {
-                            if let Ok(attr) = attr {
-                                if attr.key.as_ref() == b"file" {
-                                    if let Ok(file_path) = std::str::from_utf8(attr.value.as_ref())
-                                    {
-                                        let clean_path = file_path
-                                            .trim_start_matches('/')
-                                            .trim_start_matches('\\');
-                                        if !clean_path.is_empty() {
-                                            paths.push(clean_path.to_string());
-                                        }
+                        for attr in e.attributes().flatten() {
+                            if attr.key.as_ref() == b"file" {
+                                if let Ok(file_path) = std::str::from_utf8(attr.value.as_ref()) {
+                                    let clean_path =
+                                        file_path.trim_start_matches('/').trim_start_matches('\\');
+                                    if !clean_path.is_empty() {
+                                        paths.push(clean_path.to_string());
                                     }
                                 }
                             }
@@ -42,7 +38,7 @@ impl ScanParser for CoverityParser {
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => {
-                    eprintln!("Error parsing XML: {}", e);
+                    log::error!("Error parsing XML: {}", e);
                     return None;
                 }
                 _ => {}
@@ -58,5 +54,29 @@ impl ScanParser for CoverityParser {
 
     fn scanner_name(&self) -> &str {
         "coverity"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_returns_none_for_malformed_xml() {
+        // An unterminated comment makes `read_event_into` return `Err`,
+        // hitting the `log::error!("Error parsing XML…")` arm -> `None`.
+        assert!(CoverityParser.parse("<!-- unterminated comment").is_none());
+    }
+
+    #[test]
+    fn parse_extracts_paths_from_merged_defect() {
+        let input = r#"<cov:mergedDefects xmlns:cov="http://coverity.com">
+            <cov:mergedDefect file="/src/main.c"/>
+        </cov:mergedDefects>"#;
+        let result = CoverityParser
+            .parse(input)
+            .expect("expected Some(ParseResult)");
+        assert_eq!(result.scanner, "coverity");
+        assert_eq!(result.paths, vec!["src/main.c".to_string()]);
     }
 }
