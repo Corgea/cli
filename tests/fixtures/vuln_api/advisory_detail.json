@@ -1,0 +1,15 @@
+{
+  "id": "GHSA-xxxx-yyyy-zzzz",
+  "source": "ghsa",
+  "source_url": "https://github.com/advisories/GHSA-xxxx-yyyy-zzzz",
+  "alias": "CVE-2026-12345",
+  "aliases": ["CVE-2026-12345"],
+  "ecosystem": "pypi",
+  "summary": "SQL injection in django",
+  "details": "A detailed description of the vulnerability.",
+  "severity": "HIGH",
+  "severity_badge": "HIGH",
+  "tier": 1,
+  "tier_score": 74.5,
+  "llm_summary": "Short developer-facing summary."
+}
