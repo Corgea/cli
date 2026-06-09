@@ -194,6 +194,11 @@ enum Commands {
         )]
         default_config: bool,
     },
+    /// Offline dependency inventory: scan, graph, explain, diff, sbom, policy
+    Deps {
+        #[command(subcommand)]
+        command: corgea::deps::run::DepsSubcommand,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -494,6 +499,10 @@ fn main() {
         }
         Some(Commands::SetupHooks { default_config }) => {
             setup_hooks::setup_pre_commit_hook(*default_config);
+        }
+        Some(Commands::Deps { command }) => {
+            // Offline: no token / network. Exit code propagates fail-on policy.
+            std::process::exit(i32::from(corgea::deps::run::run(command.clone())));
         }
         None => {
             utils::terminal::show_welcome_message();
