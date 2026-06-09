@@ -109,6 +109,30 @@ corgea setup-hooks --default-config            # Default: secrets + PII, fail on
 
 Installs a pre-commit hook running `corgea scan blast --only-uncommitted`. Bypass with `git commit --no-verify`.
 
+### Install Wrappers — `corgea pip|npm|yarn|pnpm|uv <args...>`
+
+Run a package manager through Corgea's install gate. Install commands with named
+targets are resolved against the public registry first; a version published within
+`--threshold` (default `2d`) blocks the install (exit 1). Everything else passes
+through with the package manager's own exit code. Offline-only inputs (git/URL/path
+specs, `-r requirements.txt`, bare `install`) are not checked and run with a printed note.
+
+```bash
+corgea pip install requests==2.31.0   # resolves, checks recency, then runs pip
+corgea npm install axios@^1.0.0       # same gate for npm ranges
+corgea pip --no-fail install newpkg   # demote a block to a warning
+corgea pip --json install newpkg      # machine-readable per-target report
+corgea pip list                       # non-install subcommands pass straight through
+```
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--threshold` | `-t` | Recency threshold (`2d`, `12h`). Younger resolved versions block. |
+| `--no-fail` | | Print the finding but run the install anyway. |
+| `--json` | | JSON report instead of text. |
+
+No Corgea token required. Registry overrides for testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`.
+
 <!-- BEGIN GENERATED CORGEA DEPS SKILL -->
 ### Deps — `corgea deps <command>`
 
