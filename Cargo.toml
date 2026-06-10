@@ -49,4 +49,3 @@ openssl = { version = "0.10", features = ["vendored"] }
 [profile.release]
 strip = true
 lto = "thin"
-opt-level = "z"
