@@ -421,7 +421,10 @@ fn pick_latest_stable(candidates: &[(String, DateTime<Utc>)]) -> Option<&(String
 /// `X.Y` or `X.Y.Z.postN` — the dotted-number form usually parses
 /// straight as semver if we pad to 3 components. Anything more exotic
 /// (`1.0a1`, `2!1.0`, etc.) is left alone and rejected by semver.
-pub(super) fn normalize_for_semver(v: &str) -> String {
+///
+/// Also used outside the registry (`precheck::safe_version`) as a lenient
+/// cross-ecosystem pad for ordering fixed versions; keep it ecosystem-agnostic.
+pub(crate) fn normalize_for_semver(v: &str) -> String {
     if v.contains('!')
         || v.contains('a')
         || v.contains('b')

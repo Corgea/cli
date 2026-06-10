@@ -692,6 +692,60 @@ fn exec_command(binary: &str, args: &[String]) -> i32 {
     }
 }
 
+/// Suffix for a vulnerable match line: the advisory's fix, if known.
+fn fix_note(m: &crate::vuln_api::VulnMatch) -> String {
+    match &m.fixed_version {
+        Some(v) => format!(" — fixed in {v}"),
+        None => " — no fixed version known".to_string(),
+    }
+}
+
+/// The one version certified to clear every match. Requires every match to
+/// carry a `fixed_version`: a single distinct value is returned as-is;
+/// several distinct values pick the highest by lenient semver. Any match
+/// without a fix — or an unparsable candidate among several — means no
+/// version can be certified, so `None`.
+fn safe_version(matches: &[crate::vuln_api::VulnMatch]) -> Option<String> {
+    let mut fixes: Vec<&str> = matches
+        .iter()
+        .map(|m| m.fixed_version.as_deref())
+        .collect::<Option<_>>()?;
+    fixes.sort_unstable();
+    fixes.dedup();
+    match fixes.as_slice() {
+        [] => None,
+        [only] => Some((*only).to_string()),
+        many => {
+            let mut best: Option<(semver::Version, &str)> = None;
+            for raw in many {
+                let v = semver::Version::parse(&verify_deps::registry::normalize_for_semver(raw))
+                    .ok()?;
+                match &best {
+                    Some((cur, _)) if cur >= &v => {}
+                    _ => best = Some((v, raw)),
+                }
+            }
+            best.map(|(_, raw)| (*raw).to_string())
+        }
+    }
+}
+
+/// Per-match advisory lines plus the safe-version steer, shared by the
+/// named-target and transitive vulnerable render arms.
+fn print_vulnerable_matches(name: &str, matches: &[crate::vuln_api::VulnMatch]) {
+    for m in matches {
+        println!(
+            "      {} ({}){}",
+            m.advisory_id,
+            m.severity_level,
+            fix_note(m)
+        );
+    }
+    if let Some(safe) = safe_version(matches) {
+        println!("      → safe version: {name}@{safe}");
+    }
+}
+
 fn print_text(report: &PrecheckReport) {
     println!(
         "Pre-checking `{} {} {}` (threshold {})",
@@ -727,9 +781,7 @@ fn print_text(report: &PrecheckReport) {
                             "  ✗ {}@{} (transitive)  known vulnerable:",
                             t.name, t.version
                         );
-                        for m in matches {
-                            println!("      {} ({})", m.advisory_id, m.severity_level);
-                        }
+                        print_vulnerable_matches(&t.name, matches);
                     }
                     VerdictStatus::Unverifiable(error) => {
                         println!(
@@ -762,9 +814,7 @@ fn print_text(report: &PrecheckReport) {
                         "  ✗ {} → {}@{}  known vulnerable:",
                         target.display, resolved.name, resolved.version,
                     );
-                    for m in matches {
-                        println!("      {} ({})", m.advisory_id, m.severity_level);
-                    }
+                    print_vulnerable_matches(&resolved.name, matches);
                 }
                 VerdictStatus::Unverifiable(error) => {
                     println!(
@@ -810,7 +860,11 @@ fn verdict_json(verdict: &VerdictStatus) -> serde_json::Value {
     match verdict {
         VerdictStatus::Clean => json!({ "status": "clean" }),
         VerdictStatus::Vulnerable(matches) => {
-            json!({ "status": "vulnerable", "matches": matches })
+            json!({
+                "status": "vulnerable",
+                "matches": matches,
+                "remediation": safe_version(matches),
+            })
         }
         VerdictStatus::Unverifiable(error) => {
             json!({ "status": "unverifiable", "error": error })
@@ -1234,5 +1288,70 @@ mod tests {
                 matches!(&evil.1, VerdictStatus::Vulnerable(m) if m[0].advisory_id == "MAL-2024-0001")
             );
         }
+    }
+
+    fn vm(advisory: &str, fixed: Option<&str>) -> crate::vuln_api::VulnMatch {
+        crate::vuln_api::VulnMatch {
+            advisory_id: advisory.to_string(),
+            severity_level: "high".to_string(),
+            tier: 1,
+            vulnerable_version_range: None,
+            fixed_version: fixed.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn safe_version_single_fix() {
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("2.0.0"))]),
+            Some("2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn safe_version_duplicate_fixes_collapse_without_parsing() {
+        // "1.0rc1" is unparsable, but a single distinct value needs no parse.
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("1.0rc1")), vm("A-2", Some("1.0rc1"))]),
+            Some("1.0rc1".to_string())
+        );
+    }
+
+    #[test]
+    fn safe_version_picks_highest_of_distinct_fixes() {
+        // Semver order, not lexical ("1.2.0" > "1.10.0" lexically).
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("1.2.0")), vm("A-2", Some("1.10.0"))]),
+            Some("1.10.0".to_string())
+        );
+    }
+
+    #[test]
+    fn safe_version_two_component_versions_normalize() {
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("4.0")), vm("A-2", Some("3.2.5"))]),
+            Some("4.0".to_string())
+        );
+    }
+
+    #[test]
+    fn safe_version_mixed_fix_and_none_is_none() {
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("2.0.0")), vm("A-2", None)]),
+            None
+        );
+    }
+
+    #[test]
+    fn safe_version_unparsable_among_distinct_is_none() {
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("2!1.0")), vm("A-2", Some("1.0.0"))]),
+            None
+        );
+    }
+
+    #[test]
+    fn safe_version_empty_matches_is_none() {
+        assert_eq!(safe_version(&[]), None);
     }
 }

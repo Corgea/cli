@@ -121,6 +121,10 @@ is skipped (recency-only) and stderr suggests `corgea login`. Everything else pa
 through with the package manager's own exit code. Offline-only inputs (git/URL/path
 specs, `-r requirements.txt`, bare `install`) are not checked and run with a printed note.
 
+Blocked findings steer to the fix: each advisory line shows `fixed in <version>` (or
+`no fixed version known`), and when every advisory on a package has a fix, a
+`→ safe version: <name>@<version>` line names the version to install instead.
+
 With a token, the vuln check covers the **full would-install set**, not just the
 named targets: `pip` and `npm` resolve the complete tree (named + transitive) via a
 safe dry-run (`pip install --dry-run …`; an isolated `npm install --package-lock-only`
@@ -151,6 +155,8 @@ corgea pip list                       # non-install subcommands pass straight th
 `--json` adds a `tree` object: `null` in recency-only mode; otherwise `mode` is `"full"`
 (transitive checked) or `"named-only"` (with a `reason`), plus `resolved_count` and a
 `transitive[]` array of `{name, version, verdict}` for packages beyond the named targets.
+Vulnerable `verdict` objects carry a `remediation` field: the certified safe version,
+or `null` when any advisory has no known fix.
 
 Recency gating needs no token; the vuln verdict uses the configured Corgea token when
 present. Overrides for testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`,
