@@ -6,3 +6,4 @@ pub mod verify_deps;
 // compiles cleanly in both crates.
 mod log;
 pub mod vuln_api;
+pub mod vuln_api_stub;

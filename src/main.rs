@@ -251,6 +251,12 @@ struct InstallWrapArgs {
 
     #[arg(
         long,
+        help = "Proceed with the install despite vulnerable, unverifiable, or recent findings. Findings are still printed."
+    )]
+    force: bool,
+
+    #[arg(
+        long,
         help = "Output the result as JSON instead of human-readable text."
     )]
     json: bool,
@@ -260,18 +266,38 @@ struct InstallWrapArgs {
     cmd: Vec<String>,
 }
 
-fn install_wrap_options(args: &InstallWrapArgs) -> corgea::precheck::PrecheckOptions {
+fn install_wrap_options(
+    args: &InstallWrapArgs,
+    config: &Config,
+) -> corgea::precheck::PrecheckOptions {
+    let token = config.get_token();
+    let token = token.trim();
+    let verdict = if token.is_empty() {
+        None
+    } else {
+        Some(corgea::precheck::VerdictConfig {
+            base_url: config.get_vuln_api_url(),
+            token: token.to_string(),
+        })
+    };
     corgea::precheck::PrecheckOptions {
         threshold: args.threshold,
         no_fail: args.no_fail,
+        force: args.force,
         json: args.json,
+        verdict,
         npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
         pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
     }
 }
 
-fn run_install_wrap_command(manager: corgea::precheck::PackageManager, args: &InstallWrapArgs) {
-    let code = corgea::precheck::run_install(manager, &args.cmd, install_wrap_options(args));
+fn run_install_wrap_command(
+    manager: corgea::precheck::PackageManager,
+    args: &InstallWrapArgs,
+    config: &Config,
+) {
+    let code =
+        corgea::precheck::run_install(manager, &args.cmd, install_wrap_options(args, config));
     std::process::exit(code);
 }
 
@@ -558,21 +584,23 @@ fn main() {
             // Offline: no token / network. Exit code propagates fail-on policy.
             std::process::exit(i32::from(corgea::deps::run::run(command.clone())));
         }
-        // Install wrappers: no auth gate — mirror `Deps` (offline-only in Phase 1).
+        // Install wrappers: no hard auth gate — the recency check is offline,
+        // and a token (when present) additionally enables the vuln-api verdict.
+        // Tokenless degrades to recency-only with a login prompt.
         Some(Commands::Npm(args)) => {
-            run_install_wrap_command(corgea::precheck::PackageManager::Npm, args)
+            run_install_wrap_command(corgea::precheck::PackageManager::Npm, args, &corgea_config)
         }
         Some(Commands::Yarn(args)) => {
-            run_install_wrap_command(corgea::precheck::PackageManager::Yarn, args)
+            run_install_wrap_command(corgea::precheck::PackageManager::Yarn, args, &corgea_config)
         }
         Some(Commands::Pnpm(args)) => {
-            run_install_wrap_command(corgea::precheck::PackageManager::Pnpm, args)
+            run_install_wrap_command(corgea::precheck::PackageManager::Pnpm, args, &corgea_config)
         }
         Some(Commands::Pip(args)) => {
-            run_install_wrap_command(corgea::precheck::PackageManager::Pip, args)
+            run_install_wrap_command(corgea::precheck::PackageManager::Pip, args, &corgea_config)
         }
         Some(Commands::Uv(args)) => {
-            run_install_wrap_command(corgea::precheck::PackageManager::Uv, args)
+            run_install_wrap_command(corgea::precheck::PackageManager::Uv, args, &corgea_config)
         }
         None => {
             utils::terminal::show_welcome_message();

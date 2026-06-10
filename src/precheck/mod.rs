@@ -56,14 +56,54 @@ impl PackageManager {
             PackageManager::Uv => false,
         }
     }
+
+    /// vuln-api ecosystem path segment for this manager's registry.
+    pub fn ecosystem(self) -> &'static str {
+        match self {
+            PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => "npm",
+            PackageManager::Pip | PackageManager::Uv => "pypi",
+        }
+    }
 }
+
+/// Connection details for the vuln-api verdict pass.
+/// `None` in `PrecheckOptions.verdict` ⇒ tokenless mode: verdicts are
+/// skipped and the gate degrades to recency-only cover.
+#[derive(Debug, Clone)]
+pub struct VerdictConfig {
+    pub base_url: String,
+    pub token: String,
+}
+
+/// Threat verdict for one resolved target.
+#[derive(Debug, Clone)]
+pub enum VerdictStatus {
+    /// vuln-api answered: no known advisories for this exact version.
+    Clean,
+    /// vuln-api answered: known vulnerable or malicious — blocks.
+    Vulnerable(Vec<crate::vuln_api::VulnMatch>),
+    /// The verdict could not be obtained (network/5xx/auth/integrity).
+    /// Blocks fail-closed.
+    Unverifiable(String),
+    /// Verdict never attempted (no token). Recency-only cover.
+    NotChecked(String),
+}
+
+/// Reason recorded on resolved targets when no token is configured.
+const NO_TOKEN_REASON: &str = "no Corgea token; vulnerability verdict skipped";
 
 #[derive(Debug, Clone)]
 pub struct PrecheckOptions {
     pub threshold: Duration,
     /// If true, demote a recent finding from "block" to "warn-and-run".
     pub no_fail: bool,
+    /// If true, never block: print findings (recent, vulnerable,
+    /// unverifiable) and run the install anyway.
+    pub force: bool,
     pub json: bool,
+    /// `Some` ⇒ run the vuln-api verdict pass against this endpoint;
+    /// `None` ⇒ tokenless recency-only mode.
+    pub verdict: Option<VerdictConfig>,
     /// Optional registry overrides, used by tests.
     pub npm_registry: Option<String>,
     pub pypi_registry: Option<String>,
@@ -100,6 +140,7 @@ pub enum TargetOutcome {
         resolved: crate::verify_deps::registry::ResolvedPackage,
         age: Duration,
         recent: bool,
+        verdict: VerdictStatus,
     },
     /// We deliberately couldn't verify this target (URL / git / etc.).
     Skipped {
@@ -131,6 +172,28 @@ impl PrecheckReport {
     }
     pub fn recent_count(&self) -> usize {
         self.count(|o| matches!(o, TargetOutcome::Resolved { recent: true, .. }))
+    }
+    pub fn vulnerable_count(&self) -> usize {
+        self.count(|o| {
+            matches!(
+                o,
+                TargetOutcome::Resolved {
+                    verdict: VerdictStatus::Vulnerable(_),
+                    ..
+                }
+            )
+        })
+    }
+    pub fn unverifiable_count(&self) -> usize {
+        self.count(|o| {
+            matches!(
+                o,
+                TargetOutcome::Resolved {
+                    verdict: VerdictStatus::Unverifiable(_),
+                    ..
+                }
+            )
+        })
     }
     pub fn skipped_count(&self) -> usize {
         self.count(|o| matches!(o, TargetOutcome::Skipped { .. }))
@@ -241,11 +304,18 @@ fn run_parsed_install(
     let threshold =
         chrono::Duration::from_std(opts.threshold).expect("threshold validated before run_install");
 
-    let outcomes: Vec<_> = parsed
+    let mut outcomes: Vec<_> = parsed
         .targets
         .iter()
         .map(|target| verify_one(target, &opts, &now, threshold))
         .collect();
+
+    run_verdict_pass(manager, &mut outcomes, &opts);
+    if opts.verdict.is_none() {
+        eprintln!(
+            "note: no Corgea token — vulnerability verdicts skipped (recency-only). Run `corgea login` for the full gate."
+        );
+    }
 
     let report = PrecheckReport {
         manager,
@@ -256,14 +326,18 @@ fn run_parsed_install(
     };
 
     if opts.json {
-        print_json(&report);
+        print_json(&report, &opts);
     } else {
         print_text(&report);
     }
 
     if should_block_install(&report, &opts) {
         if !opts.json {
-            eprintln!("Refusing to run install. Pass --no-fail to proceed anyway.");
+            if report.vulnerable_count() > 0 || report.unverifiable_count() > 0 {
+                eprintln!("Refusing to run install. Pass --force to proceed despite findings.");
+            } else {
+                eprintln!("Refusing to run install. Pass --no-fail to proceed anyway.");
+            }
         }
         return 1;
     }
@@ -271,8 +345,59 @@ fn run_parsed_install(
     exec()
 }
 
+/// Sequential vuln-api verdict pass over resolved targets. No-op without
+/// a `VerdictConfig` (tokenless mode — `verify_one` already marked every
+/// resolved target `NotChecked`). Any client/call failure is fail-closed:
+/// the target becomes `Unverifiable`, which blocks unless `--force`.
+fn run_verdict_pass(
+    manager: PackageManager,
+    outcomes: &mut [TargetOutcome],
+    opts: &PrecheckOptions,
+) {
+    let Some(cfg) = &opts.verdict else { return };
+
+    let client = match crate::vuln_api::http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            for o in outcomes.iter_mut() {
+                if let TargetOutcome::Resolved { verdict, .. } = o {
+                    *verdict = VerdictStatus::Unverifiable(e.clone());
+                }
+            }
+            return;
+        }
+    };
+
+    let ecosystem = manager.ecosystem();
+    for o in outcomes.iter_mut() {
+        let TargetOutcome::Resolved {
+            resolved, verdict, ..
+        } = o
+        else {
+            continue;
+        };
+        *verdict = match crate::vuln_api::check_package_version(
+            &client,
+            &cfg.base_url,
+            &cfg.token,
+            ecosystem,
+            &resolved.name,
+            &resolved.version,
+        ) {
+            Ok(resp) if resp.is_vulnerable => VerdictStatus::Vulnerable(resp.matches),
+            Ok(_) => VerdictStatus::Clean,
+            Err(e) => VerdictStatus::Unverifiable(e.to_string()),
+        };
+    }
+}
+
 fn should_block_install(report: &PrecheckReport, opts: &PrecheckOptions) -> bool {
-    !opts.no_fail && report.recent_count() > 0
+    if opts.force {
+        return false;
+    }
+    report.vulnerable_count() > 0
+        || report.unverifiable_count() > 0
+        || (!opts.no_fail && report.recent_count() > 0)
 }
 
 fn verify_one(
@@ -309,6 +434,7 @@ fn verify_one(
                 resolved,
                 age,
                 recent: age_chrono < threshold,
+                verdict: VerdictStatus::NotChecked(NO_TOKEN_REASON.to_string()),
             }
         }
         Err(e) => TargetOutcome::Error {
@@ -367,9 +493,11 @@ fn print_text(report: &PrecheckReport) {
         verify_deps::format_duration(report.threshold)
     );
     println!(
-        "  {} ok, {} recent, {} skipped, {} errors",
+        "  {} ok, {} recent, {} vulnerable, {} unverifiable, {} skipped, {} errors",
         report.ok_count(),
         report.recent_count(),
+        report.vulnerable_count(),
+        report.unverifiable_count(),
         report.skipped_count(),
         report.error_count(),
     );
@@ -381,26 +509,44 @@ fn print_text(report: &PrecheckReport) {
                 resolved,
                 age,
                 recent,
-            } => {
-                if *recent {
+                verdict,
+            } => match verdict {
+                VerdictStatus::Vulnerable(matches) => {
                     println!(
-                        "  ⚠ {} → {}@{}  published {} ago at {} (within threshold)",
-                        target.display,
-                        resolved.name,
-                        resolved.version,
-                        verify_deps::format_duration(*age),
-                        resolved.published_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                        "  ✗ {} → {}@{}  known vulnerable:",
+                        target.display, resolved.name, resolved.version,
                     );
-                } else {
+                    for m in matches {
+                        println!("      {} ({})", m.advisory_id, m.severity_level);
+                    }
+                }
+                VerdictStatus::Unverifiable(error) => {
                     println!(
-                        "  ✓ {} → {}@{}  published {} ago",
-                        target.display,
-                        resolved.name,
-                        resolved.version,
-                        verify_deps::format_duration(*age),
+                        "  ⚠ {} → {}@{}  could not be verified: {}",
+                        target.display, resolved.name, resolved.version, error,
                     );
                 }
-            }
+                VerdictStatus::Clean | VerdictStatus::NotChecked(_) => {
+                    if *recent {
+                        println!(
+                            "  ⚠ {} → {}@{}  published {} ago at {} (within threshold)",
+                            target.display,
+                            resolved.name,
+                            resolved.version,
+                            verify_deps::format_duration(*age),
+                            resolved.published_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                        );
+                    } else {
+                        println!(
+                            "  ✓ {} → {}@{}  published {} ago",
+                            target.display,
+                            resolved.name,
+                            resolved.version,
+                            verify_deps::format_duration(*age),
+                        );
+                    }
+                }
+            },
             TargetOutcome::Skipped { target, reason } => {
                 println!("  ? {}: {}", target.display, reason);
             }
@@ -411,7 +557,7 @@ fn print_text(report: &PrecheckReport) {
     }
 }
 
-fn print_json(report: &PrecheckReport) {
+fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
     use serde_json::json;
     let outcomes: Vec<_> = report
         .outcomes
@@ -422,14 +568,30 @@ fn print_json(report: &PrecheckReport) {
                 resolved,
                 age,
                 recent,
-            } => json!({
-                "status": if *recent { "recent" } else { "ok" },
-                "spec": target.display,
-                "name": resolved.name,
-                "resolved_version": resolved.version,
-                "published_at": resolved.published_at.to_rfc3339(),
-                "age_seconds": age.as_secs(),
-            }),
+                verdict,
+            } => {
+                let verdict_json = match verdict {
+                    VerdictStatus::Clean => json!({ "status": "clean" }),
+                    VerdictStatus::Vulnerable(matches) => {
+                        json!({ "status": "vulnerable", "matches": matches })
+                    }
+                    VerdictStatus::Unverifiable(error) => {
+                        json!({ "status": "unverifiable", "error": error })
+                    }
+                    VerdictStatus::NotChecked(reason) => {
+                        json!({ "status": "not_checked", "reason": reason })
+                    }
+                };
+                json!({
+                    "status": if *recent { "recent" } else { "ok" },
+                    "spec": target.display,
+                    "name": resolved.name,
+                    "resolved_version": resolved.version,
+                    "published_at": resolved.published_at.to_rfc3339(),
+                    "age_seconds": age.as_secs(),
+                    "verdict": verdict_json,
+                })
+            }
             TargetOutcome::Skipped { target, reason } => json!({
                 "status": "skipped",
                 "spec": target.display,
@@ -453,9 +615,12 @@ fn print_json(report: &PrecheckReport) {
         "summary": {
             "ok": report.ok_count(),
             "recent": report.recent_count(),
+            "vulnerable": report.vulnerable_count(),
+            "unverifiable": report.unverifiable_count(),
             "skipped": report.skipped_count(),
             "errors": report.error_count(),
         },
+        "verdict_mode": if opts.verdict.is_some() { "full" } else { "recency-only" },
         "results": outcomes,
     });
 
@@ -488,7 +653,9 @@ mod tests {
         PrecheckOptions {
             threshold: Duration::from_secs(2 * 86400),
             no_fail,
+            force: false,
             json: false,
+            verdict: None,
             npm_registry: None,
             pypi_registry: Some(pypi_registry),
         }
@@ -540,5 +707,159 @@ mod tests {
         let (code, exec_ran) = gate_pip_install(&["-r", "reqs.txt"], opts);
         assert_eq!(code, 42);
         assert!(exec_ran);
+    }
+
+    fn resolved_outcome(name: &str, version: &str, recent: bool) -> TargetOutcome {
+        TargetOutcome::Resolved {
+            target: InstallTarget {
+                name: name.to_string(),
+                display: format!("{name}=={version}"),
+                kind: TargetKind::Unverifiable {
+                    reason: "test".to_string(),
+                },
+            },
+            resolved: crate::verify_deps::registry::ResolvedPackage {
+                name: name.to_string(),
+                version: version.to_string(),
+                published_at: Utc::now() - chrono::Duration::days(365),
+            },
+            age: Duration::from_secs(365 * 86400),
+            recent,
+            verdict: VerdictStatus::NotChecked(NO_TOKEN_REASON.to_string()),
+        }
+    }
+
+    fn report_with(outcomes: Vec<TargetOutcome>) -> PrecheckReport {
+        PrecheckReport {
+            manager: PackageManager::Pip,
+            subcommand: "install".to_string(),
+            original_args: vec![],
+            outcomes,
+            threshold: Duration::from_secs(2 * 86400),
+        }
+    }
+
+    fn set_verdict(outcome: &mut TargetOutcome, v: VerdictStatus) {
+        if let TargetOutcome::Resolved { verdict, .. } = outcome {
+            *verdict = v;
+        }
+    }
+
+    #[test]
+    fn ecosystem_mapping() {
+        assert_eq!(PackageManager::Pip.ecosystem(), "pypi");
+        assert_eq!(PackageManager::Uv.ecosystem(), "pypi");
+        assert_eq!(PackageManager::Npm.ecosystem(), "npm");
+        assert_eq!(PackageManager::Yarn.ecosystem(), "npm");
+        assert_eq!(PackageManager::Pnpm.ecosystem(), "npm");
+    }
+
+    /// Full predicate matrix: force ⇒ never block; vulnerable and
+    /// unverifiable block regardless of --no-fail; recency keeps its
+    /// task-2 --no-fail demotion.
+    #[test]
+    fn block_predicate_matrix() {
+        let opts = |no_fail: bool, force: bool| PrecheckOptions {
+            no_fail,
+            force,
+            ..stub_opts("http://127.0.0.1:9".to_string(), false)
+        };
+
+        let clean = {
+            let mut o = resolved_outcome("pkg", "1.0.0", false);
+            set_verdict(&mut o, VerdictStatus::Clean);
+            report_with(vec![o])
+        };
+        let recent = report_with(vec![resolved_outcome("pkg", "1.0.0", true)]);
+        let vulnerable = {
+            let mut o = resolved_outcome("pkg", "1.0.0", false);
+            set_verdict(&mut o, VerdictStatus::Vulnerable(vec![]));
+            report_with(vec![o])
+        };
+        let unverifiable = {
+            let mut o = resolved_outcome("pkg", "1.0.0", false);
+            set_verdict(&mut o, VerdictStatus::Unverifiable("503".to_string()));
+            report_with(vec![o])
+        };
+
+        assert!(!should_block_install(&clean, &opts(false, false)));
+        assert!(should_block_install(&recent, &opts(false, false)));
+        assert!(!should_block_install(&recent, &opts(true, false)));
+        assert!(should_block_install(&vulnerable, &opts(false, false)));
+        assert!(
+            should_block_install(&vulnerable, &opts(true, false)),
+            "--no-fail must not waive a vulnerable block"
+        );
+        assert!(
+            should_block_install(&unverifiable, &opts(true, false)),
+            "--no-fail must not waive an unverifiable block"
+        );
+        for report in [&clean, &recent, &vulnerable, &unverifiable] {
+            assert!(
+                !should_block_install(report, &opts(false, true)),
+                "--force must never block"
+            );
+            assert!(!should_block_install(report, &opts(true, true)));
+        }
+    }
+
+    /// Verdict pass against an in-process stub: vulnerable body → Vulnerable
+    /// with matches; 503 override → Unverifiable; no VerdictConfig → outcomes
+    /// keep NotChecked.
+    #[test]
+    fn verdict_pass_maps_stub_responses() {
+        use std::collections::HashMap;
+
+        let key = |name: &str| ("pypi".to_string(), name.to_string(), "1.0.0".to_string());
+        let mut checks = HashMap::new();
+        checks.insert(
+            key("evil"),
+            r#"{"ecosystem":"pypi","package_name":"evil","version":"1.0.0","is_vulnerable":true,
+                "matches":[{"advisory_id":"MAL-2024-0001","severity_level":"critical","tier":1,
+                            "vulnerable_version_range":null,"fixed_version":null}]}"#
+                .to_string(),
+        );
+        checks.insert(key("flaky"), "{}".to_string());
+        let mut statuses = HashMap::new();
+        statuses.insert(key("flaky"), 503u16);
+        let stub = crate::vuln_api_stub::spawn_with_statuses(checks, statuses);
+
+        let mut opts = stub_opts("http://127.0.0.1:9".to_string(), false);
+        opts.verdict = Some(VerdictConfig {
+            base_url: stub.base_url.clone(),
+            token: "test-token".to_string(),
+        });
+
+        let mut outcomes = vec![
+            resolved_outcome("evil", "1.0.0", false),
+            resolved_outcome("flaky", "1.0.0", false),
+            resolved_outcome("goodpkg", "1.0.0", false), // unknown → stub default clean
+        ];
+        run_verdict_pass(PackageManager::Pip, &mut outcomes, &opts);
+
+        let verdicts: Vec<_> = outcomes
+            .iter()
+            .map(|o| match o {
+                TargetOutcome::Resolved { verdict, .. } => verdict.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert!(
+            matches!(&verdicts[0], VerdictStatus::Vulnerable(m) if m[0].advisory_id == "MAL-2024-0001")
+        );
+        assert!(matches!(&verdicts[1], VerdictStatus::Unverifiable(_)));
+        assert!(matches!(&verdicts[2], VerdictStatus::Clean));
+
+        // Without a VerdictConfig the pass is a no-op.
+        let mut untouched = vec![resolved_outcome("evil", "1.0.0", false)];
+        let no_verdict = stub_opts("http://127.0.0.1:9".to_string(), false);
+        run_verdict_pass(PackageManager::Pip, &mut untouched, &no_verdict);
+        assert!(matches!(
+            &untouched[0],
+            TargetOutcome::Resolved {
+                verdict: VerdictStatus::NotChecked(_),
+                ..
+            }
+        ));
     }
 }
