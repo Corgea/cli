@@ -82,8 +82,11 @@ fn spawn_pypi_stub() -> String {
 /// the exit code propagates.
 fn write_fake_pip(dir: &Path, marker: &Path, exit_code: i32) {
     use std::os::unix::fs::PermissionsExt;
+    // Simulate an old pip with no `--report`: exit 2 on the tree dry-run
+    // *without* touching the marker, so these tests exercise the named-only
+    // fallback path and keep their pre-tree semantics.
     let script = format!(
-        "#!/bin/sh\nprintf '%s' \"$*\" > '{}'\nexit {}\n",
+        "#!/bin/sh\ncase \" $* \" in *\" --dry-run \"*) exit 2;; esac\nprintf '%s' \"$*\" > '{}'\nexit {}\n",
         marker.display(),
         exit_code
     );

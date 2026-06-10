@@ -14,6 +14,7 @@
 //! warning (the install runs anyway).
 
 pub mod parse;
+pub mod tree;
 
 use std::ffi::OsString;
 use std::process::Command;
@@ -64,6 +65,17 @@ impl PackageManager {
             PackageManager::Pip | PackageManager::Uv => "pypi",
         }
     }
+
+    /// Canonical package name for dedup/matching across spec spellings:
+    /// PEP 503 for pypi (shared with `deps`), verbatim for npm.
+    pub fn normalize_name(self, name: &str) -> String {
+        match self {
+            PackageManager::Pip | PackageManager::Uv => {
+                crate::deps::ecosystems::pypi::normalize_pypi_name(name)
+            }
+            PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => name.to_string(),
+        }
+    }
 }
 
 /// Connection details for the vuln-api verdict pass.
@@ -107,6 +119,8 @@ pub struct PrecheckOptions {
     /// Optional registry overrides, used by tests.
     pub npm_registry: Option<String>,
     pub pypi_registry: Option<String>,
+    /// Max parallel vuln-api verdict requests; `verdict_pool` clamps to 1..=32.
+    pub concurrency: usize,
 }
 
 /// Each item the user (or a `-r` requirements file) asked us to install.
@@ -154,6 +168,29 @@ pub enum TargetOutcome {
     },
 }
 
+/// Verdict for one package the tree pass resolved beyond the named targets.
+#[derive(Debug)]
+pub struct TreeOutcome {
+    pub name: String,
+    pub version: String,
+    pub verdict: VerdictStatus,
+}
+
+/// Result of the tree pass. `PrecheckReport.tree` is `None` when the pass
+/// never ran (recency-only / tokenless mode).
+#[derive(Debug)]
+pub enum TreeReport {
+    /// The full would-install set was resolved and verdicted.
+    Full {
+        /// Distinct packages the dry-run resolved (named + transitive).
+        resolved_count: usize,
+        /// Verdicts for resolved packages beyond the named targets.
+        transitive: Vec<TreeOutcome>,
+    },
+    /// Resolution unavailable or failed — only named targets were verified.
+    NamedOnly { reason: String },
+}
+
 #[derive(Debug)]
 pub struct PrecheckReport {
     pub manager: PackageManager,
@@ -161,6 +198,8 @@ pub struct PrecheckReport {
     pub original_args: Vec<String>,
     pub outcomes: Vec<TargetOutcome>,
     pub threshold: Duration,
+    /// `None` ⇒ recency-only mode, the tree pass never ran.
+    pub tree: Option<TreeReport>,
 }
 
 impl PrecheckReport {
@@ -182,7 +221,7 @@ impl PrecheckReport {
                     ..
                 }
             )
-        })
+        }) + self.tree_finding_count(|v| matches!(v, VerdictStatus::Vulnerable(_)))
     }
     pub fn unverifiable_count(&self) -> usize {
         self.count(|o| {
@@ -193,7 +232,16 @@ impl PrecheckReport {
                     ..
                 }
             )
-        })
+        }) + self.tree_finding_count(|v| matches!(v, VerdictStatus::Unverifiable(_)))
+    }
+    /// Count transitive tree findings whose verdict matches `pred`.
+    fn tree_finding_count(&self, pred: impl Fn(&VerdictStatus) -> bool) -> usize {
+        match &self.tree {
+            Some(TreeReport::Full { transitive, .. }) => {
+                transitive.iter().filter(|o| pred(&o.verdict)).count()
+            }
+            Some(TreeReport::NamedOnly { .. }) | None => 0,
+        }
     }
     pub fn skipped_count(&self) -> usize {
         self.count(|o| matches!(o, TargetOutcome::Skipped { .. }))
@@ -284,19 +332,12 @@ fn run_parsed_install(
     exec: impl FnOnce() -> i32,
     opts: PrecheckOptions,
 ) -> i32 {
-    if !parsed.requirements_files.is_empty() {
-        let files: Vec<String> = parsed
-            .requirements_files
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect();
-        eprintln!(
-            "note: requirements files ({}) are not recency-checked by the baseline gate",
-            files.join(", ")
-        );
-    }
+    // With a verdict config, the tree pass resolves the full would-install
+    // set; `tree::covers_input` owns what each manager's resolver can chew on.
+    let tree_eligible = opts.verdict.is_some() && tree::covers_input(manager, &parsed);
 
-    if parsed.targets.is_empty() {
+    if parsed.targets.is_empty() && !tree_eligible {
+        requirements_note(&parsed);
         return exec();
     }
 
@@ -310,7 +351,24 @@ fn run_parsed_install(
         .map(|target| verify_one(target, &opts, &now, threshold))
         .collect();
 
-    run_verdict_pass(manager, &mut outcomes, &opts);
+    let tree = if tree_eligible {
+        Some(run_tree_pass(manager, rest, &mut outcomes, &opts))
+    } else {
+        run_verdict_pass(manager, &mut outcomes, &opts); // no-op tokenless
+        None
+    };
+
+    // The mandatory loud warning when the tree pass fell back to named-only.
+    if let Some(TreeReport::NamedOnly { reason }) = &tree {
+        eprintln!(
+            "warning: transitive dependencies not checked ({reason}); only named packages were verified."
+        );
+    }
+    // The requirements note only matters when the tree pass did *not* cover
+    // those files (fallback to named-only, or recency-only mode).
+    if !matches!(&tree, Some(TreeReport::Full { .. })) {
+        requirements_note(&parsed);
+    }
     if opts.verdict.is_none() {
         eprintln!(
             "note: no Corgea token — vulnerability verdicts skipped (recency-only). Run `corgea login` for the full gate."
@@ -323,6 +381,7 @@ fn run_parsed_install(
         original_args: rest.to_vec(),
         outcomes,
         threshold: opts.threshold,
+        tree,
     };
 
     if opts.json {
@@ -345,10 +404,177 @@ fn run_parsed_install(
     exec()
 }
 
-/// Sequential vuln-api verdict pass over resolved targets. No-op without
-/// a `VerdictConfig` (tokenless mode — `verify_one` already marked every
-/// resolved target `NotChecked`). Any client/call failure is fail-closed:
-/// the target becomes `Unverifiable`, which blocks unless `--force`.
+/// Print the "requirements files are not recency-checked" note when the
+/// install carried any `-r` files. No-op otherwise.
+fn requirements_note(parsed: &parse::ParsedInstall) {
+    if parsed.requirements_files.is_empty() {
+        return;
+    }
+    let files: Vec<String> = parsed
+        .requirements_files
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    eprintln!(
+        "note: requirements files ({}) are not recency-checked by the baseline gate",
+        files.join(", ")
+    );
+}
+
+/// Resolve the full would-install set and verdict it. On any resolution
+/// failure, fall back to the named-only verdict pass; the caller renders the
+/// loud warning from the returned `NamedOnly` reason. Only called when
+/// `opts.verdict.is_some()`.
+fn run_tree_pass(
+    manager: PackageManager,
+    rest: &[String],
+    outcomes: &mut [TargetOutcome],
+    opts: &PrecheckOptions,
+) -> TreeReport {
+    let set = match tree::resolve_tree(manager, rest) {
+        Ok(Some(set)) => set,
+        Ok(None) => {
+            run_verdict_pass(manager, outcomes, opts);
+            return TreeReport::NamedOnly {
+                reason: format!("{} has no safe dry-run", manager.binary_name()),
+            };
+        }
+        Err(reason) => {
+            run_verdict_pass(manager, outcomes, opts);
+            return TreeReport::NamedOnly { reason };
+        }
+    };
+
+    // Dedup the dry-run set (npm lockfiles repeat the same name@version at
+    // multiple nested paths), then union in the named-resolved targets — a
+    // named target already installed is absent from the dry-run delta but
+    // must still be verdicted.
+    let norm = |n: &str| manager.normalize_name(n);
+    let mut seen = std::collections::HashSet::new();
+    let mut jobs: Vec<tree::TreePackage> = Vec::with_capacity(set.len());
+    for p in set {
+        if seen.insert((norm(&p.name), p.version.clone())) {
+            jobs.push(p);
+        }
+    }
+    let resolved_count = jobs.len();
+    for o in outcomes.iter() {
+        if let TargetOutcome::Resolved { resolved, .. } = o {
+            if seen.insert((norm(&resolved.name), resolved.version.clone())) {
+                jobs.push(tree::TreePackage {
+                    name: resolved.name.clone(),
+                    version: resolved.version.clone(),
+                });
+            }
+        }
+    }
+
+    let cfg = opts
+        .verdict
+        .as_ref()
+        .expect("tree pass requires verdict config");
+    let results = verdict_pool(jobs, cfg, manager, opts.concurrency);
+    let transitive = apply_verdicts(manager, results, outcomes);
+    TreeReport::Full {
+        resolved_count,
+        transitive,
+    }
+}
+
+/// Bounded worker pool over the verdict jobs — owns client creation and the
+/// fail-closed policy: on client failure every job comes back `Unverifiable`.
+/// Plain work queue, no new crates; `reqwest::blocking::Client` is
+/// `Send + Sync`. Result order is not preserved; callers match results back
+/// by `(name, version)`.
+fn verdict_pool(
+    jobs: Vec<tree::TreePackage>,
+    cfg: &VerdictConfig,
+    manager: PackageManager,
+    concurrency: usize,
+) -> Vec<(tree::TreePackage, VerdictStatus)> {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    let client = match crate::vuln_api::http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            return jobs
+                .into_iter()
+                .map(|j| (j, VerdictStatus::Unverifiable(e.clone())))
+                .collect();
+        }
+    };
+
+    let ecosystem = manager.ecosystem();
+    let workers = concurrency.clamp(1, 32).min(jobs.len().max(1));
+    let queue = Mutex::new(VecDeque::from(jobs));
+    let results = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let Some(job) = queue.lock().unwrap().pop_front() else {
+                    break;
+                };
+                let verdict = match crate::vuln_api::check_package_version(
+                    &client,
+                    &cfg.base_url,
+                    &cfg.token,
+                    ecosystem,
+                    &job.name,
+                    &job.version,
+                ) {
+                    Ok(resp) if resp.is_vulnerable => VerdictStatus::Vulnerable(resp.matches),
+                    Ok(_) => VerdictStatus::Clean,
+                    Err(e) => VerdictStatus::Unverifiable(e.to_string()),
+                };
+                results.lock().unwrap().push((job, verdict));
+            });
+        }
+    });
+    results.into_inner().unwrap()
+}
+
+/// Assign pooled verdicts onto matching named outcomes (by normalized
+/// name + version) and return the unmatched leftovers — the transitive set.
+fn apply_verdicts(
+    manager: PackageManager,
+    results: Vec<(tree::TreePackage, VerdictStatus)>,
+    outcomes: &mut [TargetOutcome],
+) -> Vec<TreeOutcome> {
+    let norm = |n: &str| manager.normalize_name(n);
+    let mut transitive = Vec::new();
+    for (pkg, verdict) in results {
+        let key = (norm(&pkg.name), pkg.version.clone());
+        let mut matched = false;
+        for o in outcomes.iter_mut() {
+            if let TargetOutcome::Resolved {
+                resolved,
+                verdict: v,
+                ..
+            } = o
+            {
+                if (norm(&resolved.name), resolved.version.clone()) == key {
+                    *v = verdict.clone();
+                    matched = true;
+                }
+            }
+        }
+        if !matched {
+            transitive.push(TreeOutcome {
+                name: pkg.name,
+                version: pkg.version,
+                verdict,
+            });
+        }
+    }
+    transitive
+}
+
+/// Vuln-api verdict pass over resolved targets, run through the bounded
+/// worker pool. No-op without a `VerdictConfig` (tokenless mode — `verify_one`
+/// already marked every resolved target `NotChecked`). Any client/call failure
+/// is fail-closed: the target becomes `Unverifiable`, which blocks unless
+/// `--force`.
 fn run_verdict_pass(
     manager: PackageManager,
     outcomes: &mut [TargetOutcome],
@@ -356,39 +582,21 @@ fn run_verdict_pass(
 ) {
     let Some(cfg) = &opts.verdict else { return };
 
-    let client = match crate::vuln_api::http_client() {
-        Ok(c) => c,
-        Err(e) => {
-            for o in outcomes.iter_mut() {
-                if let TargetOutcome::Resolved { verdict, .. } = o {
-                    *verdict = VerdictStatus::Unverifiable(e.clone());
-                }
-            }
-            return;
-        }
-    };
+    // One job per resolved target; jobs are 1:1 with outcomes, so
+    // `apply_verdicts` matches everything and returns no leftovers.
+    let jobs: Vec<tree::TreePackage> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            TargetOutcome::Resolved { resolved, .. } => Some(tree::TreePackage {
+                name: resolved.name.clone(),
+                version: resolved.version.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
 
-    let ecosystem = manager.ecosystem();
-    for o in outcomes.iter_mut() {
-        let TargetOutcome::Resolved {
-            resolved, verdict, ..
-        } = o
-        else {
-            continue;
-        };
-        *verdict = match crate::vuln_api::check_package_version(
-            &client,
-            &cfg.base_url,
-            &cfg.token,
-            ecosystem,
-            &resolved.name,
-            &resolved.version,
-        ) {
-            Ok(resp) if resp.is_vulnerable => VerdictStatus::Vulnerable(resp.matches),
-            Ok(_) => VerdictStatus::Clean,
-            Err(e) => VerdictStatus::Unverifiable(e.to_string()),
-        };
-    }
+    let results = verdict_pool(jobs, cfg, manager, opts.concurrency);
+    apply_verdicts(manager, results, outcomes);
 }
 
 fn should_block_install(report: &PrecheckReport, opts: &PrecheckOptions) -> bool {
@@ -502,6 +710,44 @@ fn print_text(report: &PrecheckReport) {
         report.error_count(),
     );
 
+    match &report.tree {
+        Some(TreeReport::Full {
+            resolved_count,
+            transitive,
+        }) => {
+            println!(
+                "  tree: {} packages resolved, {} transitive checked",
+                resolved_count,
+                transitive.len()
+            );
+            for t in transitive {
+                match &t.verdict {
+                    VerdictStatus::Vulnerable(matches) => {
+                        println!(
+                            "  ✗ {}@{} (transitive)  known vulnerable:",
+                            t.name, t.version
+                        );
+                        for m in matches {
+                            println!("      {} ({})", m.advisory_id, m.severity_level);
+                        }
+                    }
+                    VerdictStatus::Unverifiable(error) => {
+                        println!(
+                            "  ⚠ {}@{} (transitive)  could not be verified: {}",
+                            t.name, t.version, error
+                        );
+                    }
+                    // Clean / not-checked transitive entries stay quiet in text mode.
+                    VerdictStatus::Clean | VerdictStatus::NotChecked(_) => {}
+                }
+            }
+        }
+        Some(TreeReport::NamedOnly { reason }) => {
+            println!("  tree: transitive dependencies NOT checked ({reason})");
+        }
+        None => {}
+    }
+
     for o in &report.outcomes {
         match o {
             TargetOutcome::Resolved {
@@ -557,6 +803,24 @@ fn print_text(report: &PrecheckReport) {
     }
 }
 
+/// JSON shape for a single verdict. Shared by named outcomes and tree
+/// (transitive) outcomes so both render verdicts identically.
+fn verdict_json(verdict: &VerdictStatus) -> serde_json::Value {
+    use serde_json::json;
+    match verdict {
+        VerdictStatus::Clean => json!({ "status": "clean" }),
+        VerdictStatus::Vulnerable(matches) => {
+            json!({ "status": "vulnerable", "matches": matches })
+        }
+        VerdictStatus::Unverifiable(error) => {
+            json!({ "status": "unverifiable", "error": error })
+        }
+        VerdictStatus::NotChecked(reason) => {
+            json!({ "status": "not_checked", "reason": reason })
+        }
+    }
+}
+
 fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
     use serde_json::json;
     let outcomes: Vec<_> = report
@@ -570,18 +834,7 @@ fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
                 recent,
                 verdict,
             } => {
-                let verdict_json = match verdict {
-                    VerdictStatus::Clean => json!({ "status": "clean" }),
-                    VerdictStatus::Vulnerable(matches) => {
-                        json!({ "status": "vulnerable", "matches": matches })
-                    }
-                    VerdictStatus::Unverifiable(error) => {
-                        json!({ "status": "unverifiable", "error": error })
-                    }
-                    VerdictStatus::NotChecked(reason) => {
-                        json!({ "status": "not_checked", "reason": reason })
-                    }
-                };
+                let verdict_json = verdict_json(verdict);
                 json!({
                     "status": if *recent { "recent" } else { "ok" },
                     "spec": target.display,
@@ -622,6 +875,24 @@ fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
         },
         "verdict_mode": if opts.verdict.is_some() { "full" } else { "recency-only" },
         "results": outcomes,
+        "tree": report.tree.as_ref().map(|t| match t {
+            TreeReport::Full { resolved_count, transitive } => json!({
+                "mode": "full",
+                "reason": serde_json::Value::Null,
+                "resolved_count": resolved_count,
+                "transitive": transitive.iter().map(|o| json!({
+                    "name": o.name,
+                    "version": o.version,
+                    "verdict": verdict_json(&o.verdict),
+                })).collect::<Vec<_>>(),
+            }),
+            TreeReport::NamedOnly { reason } => json!({
+                "mode": "named-only",
+                "reason": reason,
+                "resolved_count": 0,
+                "transitive": [],
+            }),
+        }),
     });
 
     println!("{}", serde_json::to_string_pretty(&body).unwrap());
@@ -658,6 +929,7 @@ mod tests {
             verdict: None,
             npm_registry: None,
             pypi_registry: Some(pypi_registry),
+            concurrency: 4,
         }
     }
 
@@ -736,6 +1008,7 @@ mod tests {
             original_args: vec![],
             outcomes,
             threshold: Duration::from_secs(2 * 86400),
+            tree: None,
         }
     }
 
@@ -752,6 +1025,22 @@ mod tests {
         assert_eq!(PackageManager::Npm.ecosystem(), "npm");
         assert_eq!(PackageManager::Yarn.ecosystem(), "npm");
         assert_eq!(PackageManager::Pnpm.ecosystem(), "npm");
+    }
+
+    #[test]
+    fn normalize_name_per_manager() {
+        // pypi: PEP 503 — lowercase, separator runs collapse to one `-`.
+        assert_eq!(
+            PackageManager::Pip.normalize_name("Flask_Cors"),
+            "flask-cors"
+        );
+        assert_eq!(
+            PackageManager::Uv.normalize_name("zope.interface"),
+            "zope-interface"
+        );
+        assert_eq!(PackageManager::Pip.normalize_name("a__b"), "a-b");
+        // npm names are case-sensitive and pass through verbatim.
+        assert_eq!(PackageManager::Npm.normalize_name("Left_Pad"), "Left_Pad");
     }
 
     /// Full predicate matrix: force ⇒ never block; vulnerable and
@@ -801,6 +1090,32 @@ mod tests {
             );
             assert!(!should_block_install(report, &opts(true, true)));
         }
+    }
+
+    /// A clean named outcome plus a vulnerable transitive tree finding must
+    /// roll into the block counts: `vulnerable_count() == 1`,
+    /// `should_block_install` true without `--force`, false with it.
+    #[test]
+    fn tree_findings_extend_block_counts() {
+        let mut named = resolved_outcome("pkg", "1.0.0", false);
+        set_verdict(&mut named, VerdictStatus::Clean);
+        let mut report = report_with(vec![named]);
+        report.tree = Some(TreeReport::Full {
+            resolved_count: 2,
+            transitive: vec![TreeOutcome {
+                name: "evildep".to_string(),
+                version: "0.4.2".to_string(),
+                verdict: VerdictStatus::Vulnerable(vec![]),
+            }],
+        });
+
+        assert_eq!(report.vulnerable_count(), 1);
+        let opts = |force: bool| PrecheckOptions {
+            force,
+            ..stub_opts("http://127.0.0.1:9".to_string(), false)
+        };
+        assert!(should_block_install(&report, &opts(false)));
+        assert!(!should_block_install(&report, &opts(true)));
     }
 
     /// Verdict pass against an in-process stub: vulnerable body → Vulnerable
@@ -861,5 +1176,63 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The pool must verdict every job exactly once and return the flagged
+    /// job `Vulnerable` with the rest `Clean`, regardless of `concurrency`
+    /// (1 = serial, 8 > job count = all workers spawn but some drain empty).
+    #[test]
+    fn verdict_pool_returns_all_results() {
+        use std::collections::HashMap;
+
+        let key = |name: &str| ("pypi".to_string(), name.to_string(), "1.0.0".to_string());
+        let mut checks = HashMap::new();
+        checks.insert(
+            key("evil"),
+            r#"{"ecosystem":"pypi","package_name":"evil","version":"1.0.0","is_vulnerable":true,
+                "matches":[{"advisory_id":"MAL-2024-0001","severity_level":"critical","tier":1,
+                            "vulnerable_version_range":null,"fixed_version":null}]}"#
+                .to_string(),
+        );
+        let stub = crate::vuln_api_stub::spawn_with_statuses(checks, HashMap::new());
+
+        let cfg = VerdictConfig {
+            base_url: stub.base_url.clone(),
+            token: "test-token".to_string(),
+        };
+
+        let jobs: Vec<tree::TreePackage> = ["a", "b", "evil", "c", "d", "e"]
+            .iter()
+            .map(|n| tree::TreePackage {
+                name: n.to_string(),
+                version: "1.0.0".to_string(),
+            })
+            .collect();
+
+        for concurrency in [1usize, 8] {
+            let results = verdict_pool(jobs.clone(), &cfg, PackageManager::Pip, concurrency);
+            assert_eq!(
+                results.len(),
+                6,
+                "concurrency {concurrency}: all jobs verdicted"
+            );
+            let flagged = results
+                .iter()
+                .filter(|(_, v)| matches!(v, VerdictStatus::Vulnerable(_)))
+                .count();
+            let clean = results
+                .iter()
+                .filter(|(_, v)| matches!(v, VerdictStatus::Clean))
+                .count();
+            assert_eq!(flagged, 1, "concurrency {concurrency}: only evil flagged");
+            assert_eq!(clean, 5, "concurrency {concurrency}: rest clean");
+            let evil = results
+                .iter()
+                .find(|(p, _)| p.name == "evil")
+                .expect("evil present");
+            assert!(
+                matches!(&evil.1, VerdictStatus::Vulnerable(m) if m[0].advisory_id == "MAL-2024-0001")
+            );
+        }
     }
 }

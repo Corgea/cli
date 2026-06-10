@@ -152,8 +152,11 @@ fn handle_connection(
     };
 
     let status_text = status_text(status_code);
+    // `Connection: close` is load-bearing: the stub serves one response per
+    // connection, so without it reqwest pools the socket and a second request
+    // (the gate's tree pass makes several per run) races the close and fails.
     let response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         status_code,
         status_text,
         response_body.len(),

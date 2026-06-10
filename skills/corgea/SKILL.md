@@ -121,6 +121,16 @@ is skipped (recency-only) and stderr suggests `corgea login`. Everything else pa
 through with the package manager's own exit code. Offline-only inputs (git/URL/path
 specs, `-r requirements.txt`, bare `install`) are not checked and run with a printed note.
 
+With a token, the vuln check covers the **full would-install set**, not just the
+named targets: `pip` and `npm` resolve the complete tree (named + transitive) via a
+safe dry-run (`pip install --dry-run …`; an isolated `npm install --package-lock-only`
+in a temp dir, never touching your lockfile) and verdict every package, so a flagged
+**transitive** dependency blocks the install too. `yarn`, `pnpm`, and `uv` have no safe
+dry-run, so they verify the named targets only and print
+`warning: transitive dependencies not checked (…); only named packages were verified.`
+The same warning is emitted (and the gate falls back to named-only) whenever a pip/npm
+dry-run fails. Verdict requests run in a bounded pool (`--concurrency`, default 8).
+
 ```bash
 corgea pip install requests==2.31.0   # resolves, checks recency + vuln verdict, then runs pip
 corgea npm install axios@^1.0.0       # same gate for npm ranges
@@ -135,7 +145,12 @@ corgea pip list                       # non-install subcommands pass straight th
 | `--threshold` | `-t` | Recency threshold (`2d`, `12h`). Younger resolved versions block. |
 | `--no-fail` | | Demote a recency block to a warning. Does NOT bypass vulnerable/unverifiable blocks. |
 | `--force` | | Proceed despite all findings (vulnerable, unverifiable, recent). Findings still print. |
-| `--json` | | JSON report instead of text. Per-result `verdict` object + `verdict_mode`. |
+| `--concurrency` | | Max parallel vuln-verdict requests during the gate (1-32, default 8). |
+| `--json` | | JSON report instead of text. Per-result `verdict` object + `verdict_mode` + `tree`. |
+
+`--json` adds a `tree` object: `null` in recency-only mode; otherwise `mode` is `"full"`
+(transitive checked) or `"named-only"` (with a `reason`), plus `resolved_count` and a
+`transitive[]` array of `{name, version, verdict}` for packages beyond the named targets.
 
 Recency gating needs no token; the vuln verdict uses the configured Corgea token when
 present. Overrides for testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`,
