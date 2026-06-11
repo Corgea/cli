@@ -49,6 +49,20 @@ pub(crate) fn encode_npm_name(name: &str) -> String {
 struct PypiUrl {
     upload_time_iso_8601: Option<String>,
     upload_time: Option<String>,
+    /// PEP 592. PyPI's JSON API emits a bool; some mirrors emit the
+    /// yank reason string instead. Either form means yanked.
+    #[serde(default)]
+    yanked: Option<serde_json::Value>,
+}
+
+impl PypiUrl {
+    fn is_yanked(&self) -> bool {
+        match &self.yanked {
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::String(_)) => true,
+            _ => false,
+        }
+    }
 }
 
 /// Parse an ISO-8601 timestamp from npm or PyPI. PyPI sometimes emits
@@ -315,17 +329,21 @@ pub fn pypi_resolve(
         .map_err(|e| format!("failed to parse PyPI response for '{}': {}", name, e))?;
 
     let candidates = collect_pypi_candidates(&meta);
+    // A yanked release resolves only via an exact pin (PEP 592), matching
+    // pip — otherwise we'd gate a version pip would never choose.
+    let installable: Vec<PypiCandidate> =
+        candidates.iter().filter(|c| !c.yanked).cloned().collect();
     let chosen = match spec {
-        PypiSpec::Latest => pick_latest_stable(&candidates).map(|c| c.0.clone()),
+        PypiSpec::Latest => pick_latest_stable(&installable).map(|c| c.version.clone()),
         PypiSpec::Exact(v) => {
-            if candidates.iter().any(|(ver, _)| ver == v) {
+            if candidates.iter().any(|c| &c.version == v) {
                 Some(v.clone())
             } else {
                 None
             }
         }
-        PypiSpec::Specifier(spec_str) => pypi_resolve_specifier(&candidates, spec_str)
-            .or_else(|| pick_latest_stable(&candidates).map(|c| c.0.clone())),
+        PypiSpec::Specifier(spec_str) => pypi_resolve_specifier(&installable, spec_str)
+            .map_err(|e| format!("{} for '{}'", e, name))?,
     };
 
     let chosen = chosen.ok_or_else(|| match spec {
@@ -340,8 +358,8 @@ pub fn pypi_resolve(
 
     let published_at = candidates
         .iter()
-        .find(|(ver, _)| ver == &chosen)
-        .map(|(_, dt)| *dt)
+        .find(|c| c.version == chosen)
+        .map(|c| c.uploaded)
         .ok_or_else(|| {
             format!(
                 "no upload timestamp for '{}' version '{}' on PyPI",
@@ -356,21 +374,24 @@ pub fn pypi_resolve(
     })
 }
 
-/// Returns `(version, earliest_upload_time)` for every non-yanked
-/// release that has at least one uploaded artifact. Empty release
-/// entries (which PyPI sometimes keeps around for yanked / private
-/// versions) are filtered out so we never pick them.
-fn collect_pypi_candidates(meta: &PypiInfoResponse) -> Vec<(String, DateTime<Utc>)> {
+/// One published release a `PypiSpec` can resolve to.
+#[derive(Debug, Clone)]
+struct PypiCandidate {
+    version: String,
+    uploaded: DateTime<Utc>,
+    /// Every artifact of this release is yanked (PEP 592) — pip skips
+    /// it for anything but an exact pin, so non-exact resolution must too.
+    yanked: bool,
+}
+
+/// Returns a candidate for every release that has at least one uploaded,
+/// timestamped artifact. Empty or timestampless release entries (which
+/// PyPI sometimes keeps around for deleted / private versions) are
+/// filtered out so we never pick them.
+fn collect_pypi_candidates(meta: &PypiInfoResponse) -> Vec<PypiCandidate> {
     let mut out = Vec::new();
     for (ver, files) in &meta.releases {
         if files.is_empty() {
-            continue;
-        }
-        // Skip yanked-only releases.
-        if files
-            .iter()
-            .all(|f| f.upload_time_iso_8601.is_none() && f.upload_time.is_none())
-        {
             continue;
         }
         let mut earliest: Option<DateTime<Utc>> = None;
@@ -389,7 +410,11 @@ fn collect_pypi_candidates(meta: &PypiInfoResponse) -> Vec<(String, DateTime<Utc
             }
         }
         if let Some(dt) = earliest {
-            out.push((ver.clone(), dt));
+            out.push(PypiCandidate {
+                version: ver.clone(),
+                uploaded: dt,
+                yanked: files.iter().all(PypiUrl::is_yanked),
+            });
         }
     }
     out
@@ -398,10 +423,10 @@ fn collect_pypi_candidates(meta: &PypiInfoResponse) -> Vec<(String, DateTime<Utc
 /// Pick the latest non-prerelease version using `semver` parsing as a
 /// best-effort PEP 440 ordering. Falls back to the entry with the
 /// latest upload time if no candidate parses as semver.
-fn pick_latest_stable(candidates: &[(String, DateTime<Utc>)]) -> Option<&(String, DateTime<Utc>)> {
-    let mut best_semver: Option<(semver::Version, &(String, DateTime<Utc>))> = None;
+fn pick_latest_stable(candidates: &[PypiCandidate]) -> Option<&PypiCandidate> {
+    let mut best_semver: Option<(semver::Version, &PypiCandidate)> = None;
     for c in candidates {
-        let normalized = normalize_for_semver(&c.0);
+        let normalized = normalize_for_semver(&c.version);
         if let Ok(v) = semver::Version::parse(&normalized) {
             if !v.pre.is_empty() {
                 continue;
@@ -415,7 +440,7 @@ fn pick_latest_stable(candidates: &[(String, DateTime<Utc>)]) -> Option<&(String
     if let Some((_, picked)) = best_semver {
         return Some(picked);
     }
-    candidates.iter().max_by_key(|c| c.1)
+    candidates.iter().max_by_key(|c| c.uploaded)
 }
 
 /// Best-effort PEP 440 → semver: PyPI versions are usually `X.Y.Z` or
@@ -443,10 +468,15 @@ pub(crate) fn normalize_for_semver(v: &str) -> String {
 }
 
 /// Apply a PEP 440-style specifier expression to the candidate list
-/// and return the highest match. Supported operators: `==`, `>=`, `>`,
-/// `<=`, `<`, `~=`, `!=`. Unknown operators cause us to give up and
-/// return `None` (the caller falls back to "latest stable").
-fn pypi_resolve_specifier(candidates: &[(String, DateTime<Utc>)], spec: &str) -> Option<String> {
+/// and return the highest match (`Ok(None)` when nothing satisfies it).
+/// Supported operators: `==`, `>=`, `>`, `<=`, `<`, `~=`, `!=`. An
+/// expression we can't parse (unknown operator, wildcard like `==1.*`)
+/// is `Err` — resolving anything else would gate a different version
+/// than the package manager installs.
+fn pypi_resolve_specifier(
+    candidates: &[PypiCandidate],
+    spec: &str,
+) -> Result<Option<String>, String> {
     let parts: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
     let mut requirements: Vec<(&'static str, semver::Version)> = Vec::new();
 
@@ -462,15 +492,18 @@ fn pypi_resolve_specifier(candidates: &[(String, DateTime<Utc>)], spec: &str) ->
         ("<", "<"),
     ];
     for p in &parts {
+        let unsupported = || format!("unsupported version specifier '{}'", spec);
         let (op, val) = OPERATORS
             .iter()
-            .find_map(|(prefix, op)| p.strip_prefix(prefix).map(|v| (*op, v.trim())))?;
-        let v = semver::Version::parse(&normalize_for_semver(val)).ok()?;
+            .find_map(|(prefix, op)| p.strip_prefix(prefix).map(|v| (*op, v.trim())))
+            .ok_or_else(unsupported)?;
+        let v = semver::Version::parse(&normalize_for_semver(val)).map_err(|_| unsupported())?;
         requirements.push((op, v));
     }
 
     let mut best: Option<(semver::Version, String)> = None;
-    for (raw, _) in candidates {
+    for c in candidates {
+        let raw = &c.version;
         let v = match semver::Version::parse(&normalize_for_semver(raw)) {
             Ok(v) => v,
             Err(_) => continue,
@@ -502,7 +535,7 @@ fn pypi_resolve_specifier(candidates: &[(String, DateTime<Utc>)], spec: &str) ->
             _ => best = Some((v, raw.clone())),
         }
     }
-    best.map(|(_, raw)| raw)
+    Ok(best.map(|(_, raw)| raw))
 }
 
 #[cfg(test)]
@@ -514,6 +547,92 @@ mod tests {
         assert_eq!(encode_npm_name("left-pad"), "left-pad");
         assert_eq!(encode_npm_name("@scope/pkg"), "@scope%2fpkg");
         assert_eq!(encode_npm_name("@types/node"), "@types%2fnode");
+    }
+
+    fn candidates(versions: &[&str]) -> Vec<PypiCandidate> {
+        versions
+            .iter()
+            .map(|v| PypiCandidate {
+                version: v.to_string(),
+                uploaded: Utc::now(),
+                yanked: false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn specifier_resolves_highest_match() {
+        let c = candidates(&["1.0.0", "2.5.0", "3.0.0"]);
+        assert_eq!(
+            pypi_resolve_specifier(&c, ">=1.0,<3").expect("parse"),
+            Some("2.5.0".to_string())
+        );
+    }
+
+    #[test]
+    fn specifier_with_no_match_is_ok_none() {
+        let c = candidates(&["1.0.0"]);
+        assert_eq!(pypi_resolve_specifier(&c, ">=9.0").expect("parse"), None);
+    }
+
+    #[test]
+    fn unparseable_specifier_errors_instead_of_falling_back() {
+        // `==1.*` is valid PEP 440 but not representable here; resolving
+        // "latest stable" instead would gate the wrong version.
+        let c = candidates(&["1.0.0", "2.0.0"]);
+        for spec in ["==1.*", "@weird", ">= not-a-version"] {
+            let err = pypi_resolve_specifier(&c, spec).expect_err(spec);
+            assert!(
+                err.contains("unsupported version specifier"),
+                "{spec}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn yanked_only_releases_are_flagged() {
+        // 2.0.0 has every file yanked (one bool, one mirror-style reason
+        // string); 1.0.0 has a non-yanked file. Timestamps alone must not
+        // decide yanked status — yanked files keep theirs.
+        let meta: PypiInfoResponse = serde_json::from_str(
+            r#"{"releases":{
+                "1.0.0":[{"upload_time_iso_8601":"2020-01-01T00:00:00Z","yanked":false}],
+                "2.0.0":[{"upload_time_iso_8601":"2021-01-01T00:00:00Z","yanked":true},
+                         {"upload_time_iso_8601":"2021-01-01T00:00:00Z","yanked":"broken build"}]
+            }}"#,
+        )
+        .expect("parse pypi json");
+        let candidates = collect_pypi_candidates(&meta);
+        let yanked_of = |v: &str| candidates.iter().find(|c| c.version == v).unwrap().yanked;
+        assert!(!yanked_of("1.0.0"));
+        assert!(yanked_of("2.0.0"));
+
+        // Latest/specifier resolution must skip the yanked release…
+        let installable: Vec<PypiCandidate> =
+            candidates.iter().filter(|c| !c.yanked).cloned().collect();
+        assert_eq!(
+            pick_latest_stable(&installable).map(|c| c.version.as_str()),
+            Some("1.0.0")
+        );
+        assert_eq!(
+            pypi_resolve_specifier(&installable, ">=1.0").expect("parse"),
+            Some("1.0.0".to_string())
+        );
+        // …while an exact pin still finds it (pip installs it with a warning).
+        assert!(candidates.iter().any(|c| c.version == "2.0.0"));
+    }
+
+    #[test]
+    fn release_with_partially_yanked_files_stays_installable() {
+        let meta: PypiInfoResponse = serde_json::from_str(
+            r#"{"releases":{"1.5.0":[
+                {"upload_time_iso_8601":"2020-06-01T00:00:00Z","yanked":true},
+                {"upload_time_iso_8601":"2020-06-01T00:00:00Z","yanked":false}
+            ]}}"#,
+        )
+        .expect("parse pypi json");
+        let candidates = collect_pypi_candidates(&meta);
+        assert!(!candidates[0].yanked);
     }
 
     #[test]
