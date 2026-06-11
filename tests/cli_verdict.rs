@@ -15,14 +15,13 @@ use common::{key, vulnerable_body, PipHarness};
 use corgea::vuln_api_stub::{header_value, spawn_capturing_vuln_api_stub};
 use std::collections::HashMap;
 
-fn vulnerable_oldpkg_body() -> String {
-    vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0"))
-}
-
 #[test]
 fn vulnerable_pin_blocks_without_running_install() {
     let mut checks = HashMap::new();
-    checks.insert(key("pypi", "oldpkg", "1.0.0"), vulnerable_oldpkg_body());
+    checks.insert(
+        key("pypi", "oldpkg", "1.0.0"),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0")),
+    );
     let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 0);
     let out = h
         .cmd
@@ -72,7 +71,10 @@ fn alternate_pypi_spelling_hits_canonical_verdict() {
 #[test]
 fn force_overrides_vulnerable_block_and_propagates_exit_code() {
     let mut checks = HashMap::new();
-    checks.insert(key("pypi", "oldpkg", "1.0.0"), vulnerable_oldpkg_body());
+    checks.insert(
+        key("pypi", "oldpkg", "1.0.0"),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0")),
+    );
     let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 7);
     let out = h
         .cmd
@@ -143,7 +145,10 @@ fn verdict_503_fails_closed() {
 fn tokenless_public_check_blocks_vulnerable_pin() {
     // No token still runs public CVE checks and blocks a vulnerable verdict.
     let mut checks = HashMap::new();
-    checks.insert(key("pypi", "oldpkg", "1.0.0"), vulnerable_oldpkg_body());
+    checks.insert(
+        key("pypi", "oldpkg", "1.0.0"),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0")),
+    );
     let mut h = PipHarness::new(checks, HashMap::new(), None, 0);
     let out = h
         .cmd
@@ -288,7 +293,10 @@ fn outage_noise_collapses_above_three_unverifiable() {
 #[test]
 fn json_carries_verdict_object_and_mode() {
     let mut checks = HashMap::new();
-    checks.insert(key("pypi", "oldpkg", "1.0.0"), vulnerable_oldpkg_body());
+    checks.insert(
+        key("pypi", "oldpkg", "1.0.0"),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0")),
+    );
     let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 0);
     let out = h
         .cmd

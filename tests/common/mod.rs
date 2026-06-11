@@ -247,16 +247,145 @@ pub fn write_fake_tree_pm(
     write_script(dir, binary, &script);
 }
 
+/// One configurable harness behind every gate test: isolated `corgea`, a
+/// private PATH of fake package managers, optional registry stubs, the
+/// vuln-api stub, optional token, and an optional throwaway project cwd.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub struct GateHarness {
+    pub cmd: Command,
+    marker: PathBuf,
+    project: Option<TempDir>,
+    checks: HashMap<PackageKey, String>,
+    statuses: HashMap<PackageKey, u16>,
+    _home: TempDir,
+    _bin: TempDir,
+    _vuln_stub: Option<corgea::vuln_api_stub::VulnApiStub>,
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+impl GateHarness {
+    pub fn new() -> Self {
+        let (mut cmd, home) = corgea_isolated();
+        let bin = TempDir::new().expect("temp bin dir");
+        let marker = bin.path().join("pm-argv.txt");
+        cmd.env("PATH", bin.path());
+        Self {
+            cmd,
+            marker,
+            project: None,
+            checks: HashMap::new(),
+            statuses: HashMap::new(),
+            _home: home,
+            _bin: bin,
+            _vuln_stub: None,
+        }
+    }
+
+    /// Tree-aware fake manager: emits `payload` on its tree flag, records
+    /// argv and exits `exit_code` otherwise.
+    pub fn fake_tree_pm(self, binary: &str, payload: &str, exit_code: i32) -> Self {
+        write_fake_tree_pm(self._bin.path(), binary, &self.marker, payload, exit_code);
+        self
+    }
+
+    /// Plain argv recorder. Call repeatedly for multiple binaries; call
+    /// never for an empty PATH.
+    pub fn fake_recorder(self, binary: &str, exit_code: i32) -> Self {
+        write_fake_recorder(self._bin.path(), binary, &self.marker, exit_code);
+        self
+    }
+
+    /// Raw script escape hatch.
+    pub fn script(self, binary: &str, script: &str) -> Self {
+        write_script(self._bin.path(), binary, script);
+        self
+    }
+
+    /// Raw script escape hatch for scripts that need the temp bin dir or
+    /// marker path.
+    pub fn script_with_paths<F>(self, binary: &str, make_script: F) -> Self
+    where
+        F: FnOnce(&std::path::Path, &std::path::Path) -> String,
+    {
+        let script = make_script(self._bin.path(), &self.marker);
+        write_script(self._bin.path(), binary, &script);
+        self
+    }
+
+    /// oldpkg stub on both registry env vars; only the exercised ecosystem
+    /// dials it.
+    pub fn oldpkg_registry(mut self) -> Self {
+        let url = spawn_oldpkg_registry_stub();
+        self.cmd
+            .env("CORGEA_PYPI_REGISTRY", &url)
+            .env("CORGEA_NPM_REGISTRY", &url);
+        self
+    }
+
+    pub fn wildcard_pypi_registry(mut self) -> Self {
+        let url = spawn_wildcard_pypi_stub();
+        self.cmd.env("CORGEA_PYPI_REGISTRY", &url);
+        self
+    }
+
+    pub fn registry_env(mut self, var: &str, url: &str) -> Self {
+        self.cmd.env(var, url);
+        self
+    }
+
+    pub fn vuln_checks(mut self, checks: HashMap<PackageKey, String>) -> Self {
+        self.checks = checks;
+        self
+    }
+
+    pub fn vuln_statuses(mut self, statuses: HashMap<PackageKey, u16>) -> Self {
+        self.statuses = statuses;
+        self
+    }
+
+    pub fn token(mut self, token: &str) -> Self {
+        self.cmd.env("CORGEA_TOKEN", token);
+        self
+    }
+
+    pub fn in_project_dir(mut self) -> Self {
+        let project = TempDir::new().expect("project dir");
+        self.cmd.current_dir(project.path());
+        self.project = Some(project);
+        self
+    }
+
+    pub fn with_project_file(mut self, name: &str, body: &str) -> Self {
+        if self.project.is_none() {
+            self = self.in_project_dir();
+        }
+        let dir = self.project.as_ref().unwrap().path();
+        std::fs::write(dir.join(name), body).expect("write project file");
+        self
+    }
+
+    pub fn build(mut self) -> Self {
+        let stub = corgea::vuln_api_stub::spawn_with_statuses(
+            std::mem::take(&mut self.checks),
+            std::mem::take(&mut self.statuses),
+        );
+        self.cmd.env("CORGEA_VULN_API_URL", &stub.base_url);
+        self._vuln_stub = Some(stub);
+        self
+    }
+
+    pub fn recorded_argv(&self) -> Option<String> {
+        std::fs::read_to_string(&self.marker).ok()
+    }
+}
+
 /// `corgea` wired to the wildcard pypi registry stub, a report-less fake pip
 /// (recording its argv to a marker), and a vuln-api stub.
 #[cfg(unix)]
 #[allow(dead_code)]
-pub struct PipHarness {
-    pub cmd: Command,
-    marker: PathBuf,
-    _home: TempDir,
-    _bin: TempDir,
-}
+pub struct PipHarness(GateHarness);
 
 #[cfg(unix)]
 #[allow(dead_code)]
@@ -268,30 +397,33 @@ impl PipHarness {
         token: Option<&str>,
         pip_exit_code: i32,
     ) -> Self {
-        let (mut cmd, home) = corgea_isolated();
-        let bin = TempDir::new().expect("temp bin dir");
-        let marker = bin.path().join("pm-argv.txt");
         // RESOLUTION_FAILS models an old pip with no `--report`: the tree
         // dry-run exits 2, so these tests exercise the named-only fallback.
-        write_fake_tree_pm(bin.path(), "pip", &marker, RESOLUTION_FAILS, pip_exit_code);
-        let registry = spawn_wildcard_pypi_stub();
-        let vuln_stub = corgea::vuln_api_stub::spawn_with_statuses(checks, statuses);
-        cmd.env("PATH", bin.path())
-            .env("CORGEA_PYPI_REGISTRY", &registry)
-            .env("CORGEA_VULN_API_URL", &vuln_stub.base_url);
+        let mut h = GateHarness::new()
+            .fake_tree_pm("pip", RESOLUTION_FAILS, pip_exit_code)
+            .wildcard_pypi_registry()
+            .vuln_checks(checks)
+            .vuln_statuses(statuses);
         if let Some(t) = token {
-            cmd.env("CORGEA_TOKEN", t);
+            h = h.token(t);
         }
-        Self {
-            cmd,
-            marker,
-            _home: home,
-            _bin: bin,
-        }
+        Self(h.build())
     }
+}
 
-    pub fn recorded_argv(&self) -> Option<String> {
-        std::fs::read_to_string(&self.marker).ok()
+#[cfg(unix)]
+impl std::ops::Deref for PipHarness {
+    type Target = GateHarness;
+
+    fn deref(&self) -> &GateHarness {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::DerefMut for PipHarness {
+    fn deref_mut(&mut self) -> &mut GateHarness {
+        &mut self.0
     }
 }
 
@@ -300,12 +432,7 @@ impl PipHarness {
 /// stub, and a token.
 #[cfg(unix)]
 #[allow(dead_code)]
-pub struct TreeHarness {
-    pub cmd: Command,
-    marker: PathBuf,
-    _home: TempDir,
-    _bin: TempDir,
-}
+pub struct TreeHarness(GateHarness);
 
 #[cfg(unix)]
 #[allow(dead_code)]
@@ -316,26 +443,30 @@ impl TreeHarness {
         statuses: HashMap<PackageKey, u16>,
         payload: &str,
     ) -> Self {
-        let (mut cmd, home) = corgea_isolated();
-        let bin = TempDir::new().expect("temp bin dir");
-        let marker = bin.path().join("pm-argv.txt");
-        write_fake_tree_pm(bin.path(), binary, &marker, payload, 0);
-        let registry = spawn_oldpkg_registry_stub();
-        let vuln_stub = corgea::vuln_api_stub::spawn_with_statuses(checks, statuses);
-        cmd.env("PATH", bin.path())
-            .env("CORGEA_PYPI_REGISTRY", &registry)
-            .env("CORGEA_NPM_REGISTRY", &registry)
-            .env("CORGEA_VULN_API_URL", &vuln_stub.base_url)
-            .env("CORGEA_TOKEN", "test-token");
-        Self {
-            cmd,
-            marker,
-            _home: home,
-            _bin: bin,
-        }
+        Self(
+            GateHarness::new()
+                .fake_tree_pm(binary, payload, 0)
+                .oldpkg_registry()
+                .vuln_checks(checks)
+                .vuln_statuses(statuses)
+                .token("test-token")
+                .build(),
+        )
     }
+}
 
-    pub fn recorded_argv(&self) -> Option<String> {
-        std::fs::read_to_string(&self.marker).ok()
+#[cfg(unix)]
+impl std::ops::Deref for TreeHarness {
+    type Target = GateHarness;
+
+    fn deref(&self) -> &GateHarness {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::DerefMut for TreeHarness {
+    fn deref_mut(&mut self) -> &mut GateHarness {
+        &mut self.0
     }
 }

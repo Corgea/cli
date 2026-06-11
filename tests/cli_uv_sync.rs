@@ -11,12 +11,9 @@
 
 mod common;
 
-use common::{corgea_isolated, key, vulnerable_body, write_fake_recorder};
-use corgea::vuln_api_stub::{self, PackageKey};
+use common::{key, vulnerable_body, GateHarness};
+use corgea::vuln_api_stub::PackageKey;
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::process::Command;
-use tempfile::TempDir;
 
 /// `proj` is the project itself (editable — skipped); `evildep` is the one
 /// index-sourced pin the gate must verdict.
@@ -34,45 +31,6 @@ version = "0.4.2"
 source = { registry = "https://pypi.org/simple" }
 "#;
 
-struct SyncHarness {
-    cmd: Command,
-    marker: PathBuf,
-    project: TempDir,
-    _home: TempDir,
-    _bin: TempDir,
-}
-
-impl SyncHarness {
-    fn new(checks: HashMap<PackageKey, String>) -> Self {
-        let (mut cmd, home) = corgea_isolated();
-        let bin = TempDir::new().expect("temp bin dir");
-        let project = TempDir::new().expect("project dir");
-        let marker = bin.path().join("pm-argv.txt");
-        write_fake_recorder(bin.path(), "uv", &marker, 0);
-        let vuln_stub = vuln_api_stub::spawn_with_statuses(checks, HashMap::new());
-        cmd.env("PATH", bin.path())
-            .env("CORGEA_VULN_API_URL", &vuln_stub.base_url)
-            .env("CORGEA_TOKEN", "test-token")
-            .current_dir(project.path());
-        Self {
-            cmd,
-            marker,
-            project,
-            _home: home,
-            _bin: bin,
-        }
-    }
-
-    fn with_uv_lock(self, content: &str) -> Self {
-        std::fs::write(self.project.path().join("uv.lock"), content).expect("write uv.lock");
-        self
-    }
-
-    fn recorded_argv(&self) -> Option<String> {
-        std::fs::read_to_string(&self.marker).ok()
-    }
-}
-
 fn vulnerable_evildep_checks() -> HashMap<PackageKey, String> {
     let mut checks = HashMap::new();
     checks.insert(
@@ -84,7 +42,12 @@ fn vulnerable_evildep_checks() -> HashMap<PackageKey, String> {
 
 #[test]
 fn uv_sync_vulnerable_lockfile_blocks() {
-    let mut h = SyncHarness::new(vulnerable_evildep_checks()).with_uv_lock(UV_LOCK);
+    let mut h = GateHarness::new()
+        .fake_recorder("uv", 0)
+        .vuln_checks(vulnerable_evildep_checks())
+        .token("test-token")
+        .with_project_file("uv.lock", UV_LOCK)
+        .build();
     let out = h.cmd.args(["uv", "sync"]).output().expect("run corgea");
     assert_eq!(out.status.code(), Some(1), "vulnerable lock must block");
     assert_eq!(
@@ -108,7 +71,12 @@ fn uv_sync_vulnerable_lockfile_blocks() {
 
 #[test]
 fn uv_sync_clean_lockfile_proceeds() {
-    let mut h = SyncHarness::new(HashMap::new()).with_uv_lock(UV_LOCK);
+    let mut h = GateHarness::new()
+        .fake_recorder("uv", 0)
+        .vuln_checks(HashMap::new())
+        .token("test-token")
+        .with_project_file("uv.lock", UV_LOCK)
+        .build();
     let out = h
         .cmd
         .args(["uv", "sync", "--frozen"])
@@ -129,7 +97,12 @@ fn uv_sync_clean_lockfile_proceeds() {
 
 #[test]
 fn uv_sync_force_overrides_block() {
-    let mut h = SyncHarness::new(vulnerable_evildep_checks()).with_uv_lock(UV_LOCK);
+    let mut h = GateHarness::new()
+        .fake_recorder("uv", 0)
+        .vuln_checks(vulnerable_evildep_checks())
+        .token("test-token")
+        .with_project_file("uv.lock", UV_LOCK)
+        .build();
     let out = h
         .cmd
         .args(["uv", "--force", "sync"])
@@ -145,7 +118,12 @@ fn uv_sync_force_overrides_block() {
 
 #[test]
 fn uv_sync_without_lockfile_execs_with_note() {
-    let mut h = SyncHarness::new(HashMap::new());
+    let mut h = GateHarness::new()
+        .fake_recorder("uv", 0)
+        .vuln_checks(HashMap::new())
+        .token("test-token")
+        .in_project_dir()
+        .build();
     let out = h.cmd.args(["uv", "sync"]).output().expect("run corgea");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(h.recorded_argv().as_deref(), Some("sync"));
@@ -158,7 +136,12 @@ fn uv_sync_without_lockfile_execs_with_note() {
 
 #[test]
 fn uv_sync_malformed_lockfile_fails_closed() {
-    let mut h = SyncHarness::new(HashMap::new()).with_uv_lock("not = [valid");
+    let mut h = GateHarness::new()
+        .fake_recorder("uv", 0)
+        .vuln_checks(HashMap::new())
+        .token("test-token")
+        .with_project_file("uv.lock", "not = [valid")
+        .build();
     let out = h.cmd.args(["uv", "sync"]).output().expect("run corgea");
     assert_eq!(out.status.code(), Some(1), "unparseable lock must block");
     assert_eq!(h.recorded_argv(), None);
@@ -172,7 +155,12 @@ fn uv_sync_malformed_lockfile_fails_closed() {
 
 #[test]
 fn uv_sync_tokenless_runs_public_lock_check() {
-    let mut h = SyncHarness::new(HashMap::new()).with_uv_lock(UV_LOCK);
+    let mut h = GateHarness::new()
+        .fake_recorder("uv", 0)
+        .vuln_checks(HashMap::new())
+        .token("test-token")
+        .with_project_file("uv.lock", UV_LOCK)
+        .build();
     h.cmd.env_remove("CORGEA_TOKEN");
     let out = h.cmd.args(["uv", "sync"]).output().expect("run corgea");
     assert_eq!(out.status.code(), Some(0));
@@ -188,7 +176,12 @@ fn uv_sync_tokenless_runs_public_lock_check() {
 #[test]
 fn uv_lock_stays_passthrough() {
     // `uv lock` installs nothing; the gate applies to the sync that follows.
-    let mut h = SyncHarness::new(vulnerable_evildep_checks()).with_uv_lock(UV_LOCK);
+    let mut h = GateHarness::new()
+        .fake_recorder("uv", 0)
+        .vuln_checks(vulnerable_evildep_checks())
+        .token("test-token")
+        .with_project_file("uv.lock", UV_LOCK)
+        .build();
     let out = h.cmd.args(["uv", "lock"]).output().expect("run corgea");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(h.recorded_argv().as_deref(), Some("lock"));

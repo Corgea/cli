@@ -15,83 +15,25 @@
 
 mod common;
 
-use common::{
-    corgea_isolated, key, spawn_oldpkg_registry_stub, vulnerable_body, write_fake_recorder,
-    write_fake_tree_pm, NPM_LOCK, RESOLUTION_FAILS,
-};
-use corgea::vuln_api_stub::{self, PackageKey};
+use common::{key, vulnerable_body, GateHarness, NPM_LOCK, RESOLUTION_FAILS};
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::process::Command;
-use tempfile::TempDir;
 
 const PACKAGE_JSON: &str = r#"{"name":"proj","version":"1.0.0","dependencies":{"oldpkg":"1.0.0"}}"#;
-
-fn vulnerable_evildep_body() -> String {
-    vulnerable_body("npm", "evildep", "0.4.2", "MAL-2024-0002", None)
-}
-
-/// `corgea` wired to a fake package manager, the registry + vuln-api stubs,
-/// a token, and a throwaway project dir as cwd.
-struct BareHarness {
-    cmd: Command,
-    marker: PathBuf,
-    project: TempDir,
-    _home: TempDir,
-    _bin: TempDir,
-}
-
-impl BareHarness {
-    /// `npm_payload`: `Some` wires a tree-aware fake npm with that canned
-    /// lockfile (or `RESOLUTION_FAILS`); `None` wires a plain recorder for
-    /// `binary`. `exit_code` is what the fake exits with on the exec'd
-    /// (non-tree) invocation.
-    fn new(
-        binary: &str,
-        checks: HashMap<PackageKey, String>,
-        npm_payload: Option<&str>,
-        exit_code: i32,
-    ) -> Self {
-        let (mut cmd, home) = corgea_isolated();
-        let bin = TempDir::new().expect("temp bin dir");
-        let project = TempDir::new().expect("project dir");
-        let marker = bin.path().join("pm-argv.txt");
-        match npm_payload {
-            Some(payload) => write_fake_tree_pm(bin.path(), "npm", &marker, payload, exit_code),
-            None => write_fake_recorder(bin.path(), binary, &marker, exit_code),
-        }
-        let registry = spawn_oldpkg_registry_stub();
-        let vuln_stub = vuln_api_stub::spawn_with_statuses(checks, HashMap::new());
-        cmd.env("PATH", bin.path())
-            .env("CORGEA_NPM_REGISTRY", &registry)
-            .env("CORGEA_VULN_API_URL", &vuln_stub.base_url)
-            .env("CORGEA_TOKEN", "test-token")
-            .current_dir(project.path());
-        Self {
-            cmd,
-            marker,
-            project,
-            _home: home,
-            _bin: bin,
-        }
-    }
-
-    fn with_package_json(self) -> Self {
-        std::fs::write(self.project.path().join("package.json"), PACKAGE_JSON)
-            .expect("write package.json");
-        self
-    }
-
-    fn recorded_argv(&self) -> Option<String> {
-        std::fs::read_to_string(&self.marker).ok()
-    }
-}
 
 #[test]
 fn bare_npm_install_vulnerable_lockfile_blocks() {
     let mut checks = HashMap::new();
-    checks.insert(key("npm", "evildep", "0.4.2"), vulnerable_evildep_body());
-    let mut h = BareHarness::new("npm", checks, Some(NPM_LOCK), 0).with_package_json();
+    checks.insert(
+        key("npm", "evildep", "0.4.2"),
+        vulnerable_body("npm", "evildep", "0.4.2", "MAL-2024-0002", None),
+    );
+    let mut h = GateHarness::new()
+        .fake_tree_pm("npm", NPM_LOCK, 0)
+        .oldpkg_registry()
+        .vuln_checks(checks)
+        .token("test-token")
+        .with_project_file("package.json", PACKAGE_JSON)
+        .build();
     let out = h.cmd.args(["npm", "install"]).output().expect("run corgea");
     assert_eq!(out.status.code(), Some(1), "vulnerable lockfile must block");
     assert_eq!(
@@ -118,7 +60,13 @@ fn bare_npm_install_vulnerable_lockfile_blocks() {
 
 #[test]
 fn bare_npm_install_clean_lockfile_proceeds() {
-    let mut h = BareHarness::new("npm", HashMap::new(), Some(NPM_LOCK), 0).with_package_json();
+    let mut h = GateHarness::new()
+        .fake_tree_pm("npm", NPM_LOCK, 0)
+        .oldpkg_registry()
+        .vuln_checks(HashMap::new())
+        .token("test-token")
+        .with_project_file("package.json", PACKAGE_JSON)
+        .build();
     let out = h.cmd.args(["npm", "install"]).output().expect("run corgea");
     assert_eq!(out.status.code(), Some(0), "clean tree must proceed");
     assert_eq!(h.recorded_argv().as_deref(), Some("install"));
@@ -132,8 +80,17 @@ fn bare_npm_install_clean_lockfile_proceeds() {
 #[test]
 fn bare_npm_install_force_overrides_block() {
     let mut checks = HashMap::new();
-    checks.insert(key("npm", "evildep", "0.4.2"), vulnerable_evildep_body());
-    let mut h = BareHarness::new("npm", checks, Some(NPM_LOCK), 0).with_package_json();
+    checks.insert(
+        key("npm", "evildep", "0.4.2"),
+        vulnerable_body("npm", "evildep", "0.4.2", "MAL-2024-0002", None),
+    );
+    let mut h = GateHarness::new()
+        .fake_tree_pm("npm", NPM_LOCK, 0)
+        .oldpkg_registry()
+        .vuln_checks(checks)
+        .token("test-token")
+        .with_project_file("package.json", PACKAGE_JSON)
+        .build();
     let out = h
         .cmd
         .args(["npm", "--force", "install"])
@@ -150,8 +107,17 @@ fn bare_npm_install_force_overrides_block() {
 #[test]
 fn bare_npm_install_json_carries_tree_object() {
     let mut checks = HashMap::new();
-    checks.insert(key("npm", "evildep", "0.4.2"), vulnerable_evildep_body());
-    let mut h = BareHarness::new("npm", checks, Some(NPM_LOCK), 0).with_package_json();
+    checks.insert(
+        key("npm", "evildep", "0.4.2"),
+        vulnerable_body("npm", "evildep", "0.4.2", "MAL-2024-0002", None),
+    );
+    let mut h = GateHarness::new()
+        .fake_tree_pm("npm", NPM_LOCK, 0)
+        .oldpkg_registry()
+        .vuln_checks(checks)
+        .token("test-token")
+        .with_project_file("package.json", PACKAGE_JSON)
+        .build();
     let out = h
         .cmd
         .args(["npm", "--json", "install"])
@@ -174,8 +140,13 @@ fn bare_npm_install_json_carries_tree_object() {
 fn bare_npm_resolution_failure_falls_back_with_warning() {
     // Fake npm exits 1 on `--package-lock-only`. Nothing named remains to
     // verify, so the install proceeds behind the loud fallback warning.
-    let mut h =
-        BareHarness::new("npm", HashMap::new(), Some(RESOLUTION_FAILS), 0).with_package_json();
+    let mut h = GateHarness::new()
+        .fake_tree_pm("npm", RESOLUTION_FAILS, 0)
+        .oldpkg_registry()
+        .vuln_checks(HashMap::new())
+        .token("test-token")
+        .with_project_file("package.json", PACKAGE_JSON)
+        .build();
     let out = h.cmd.args(["npm", "install"]).output().expect("run corgea");
     assert_eq!(out.status.code(), Some(0), "fallback must proceed");
     assert_eq!(h.recorded_argv().as_deref(), Some("install"));
@@ -189,7 +160,13 @@ fn bare_npm_resolution_failure_falls_back_with_warning() {
 #[test]
 fn bare_npm_without_package_json_passes_through() {
     // No package.json in cwd → nothing to resolve → straight exec, no gate.
-    let mut h = BareHarness::new("npm", HashMap::new(), Some(NPM_LOCK), 3);
+    let mut h = GateHarness::new()
+        .fake_tree_pm("npm", NPM_LOCK, 3)
+        .oldpkg_registry()
+        .vuln_checks(HashMap::new())
+        .token("test-token")
+        .in_project_dir()
+        .build();
     let out = h.cmd.args(["npm", "install"]).output().expect("run corgea");
     assert_eq!(out.status.code(), Some(3), "npm's own exit code propagates");
     assert_eq!(h.recorded_argv().as_deref(), Some("install"));
@@ -204,7 +181,13 @@ fn bare_npm_without_package_json_passes_through() {
 #[test]
 fn bare_npm_tokenless_runs_public_tree_check() {
     // package.json present but no token → public mode still verdicts the tree.
-    let mut h = BareHarness::new("npm", HashMap::new(), Some(NPM_LOCK), 0).with_package_json();
+    let mut h = GateHarness::new()
+        .fake_tree_pm("npm", NPM_LOCK, 0)
+        .oldpkg_registry()
+        .vuln_checks(HashMap::new())
+        .token("test-token")
+        .with_project_file("package.json", PACKAGE_JSON)
+        .build();
     h.cmd.env_remove("CORGEA_TOKEN");
     let out = h.cmd.args(["npm", "install"]).output().expect("run corgea");
     assert_eq!(out.status.code(), Some(0));
@@ -227,7 +210,13 @@ fn bare_ungated_managers_print_note_and_exec() {
         ("uv", &["uv", "pip", "install"][..], "pip install", 0),
     ];
     for (binary, args, forwarded_argv, exit_code) in cases {
-        let mut h = BareHarness::new(binary, HashMap::new(), None, exit_code);
+        let mut h = GateHarness::new()
+            .fake_recorder(binary, exit_code)
+            .oldpkg_registry()
+            .vuln_checks(HashMap::new())
+            .token("test-token")
+            .in_project_dir()
+            .build();
         let out = h.cmd.args(args).output().expect("run corgea");
         assert_eq!(out.status.code(), Some(exit_code), "{args:?}");
         assert_eq!(h.recorded_argv().as_deref(), Some(forwarded_argv));
@@ -245,7 +234,13 @@ fn bare_ungated_managers_print_note_and_exec() {
 
 #[test]
 fn bare_yarn_note_prints_without_token_too() {
-    let mut h = BareHarness::new("yarn", HashMap::new(), None, 0);
+    let mut h = GateHarness::new()
+        .fake_recorder("yarn", 0)
+        .oldpkg_registry()
+        .vuln_checks(HashMap::new())
+        .token("test-token")
+        .in_project_dir()
+        .build();
     h.cmd.env_remove("CORGEA_TOKEN");
     let out = h
         .cmd
@@ -263,7 +258,13 @@ fn bare_yarn_note_prints_without_token_too() {
 #[test]
 fn yarn_named_target_does_not_print_bare_note() {
     // A named target takes the gated path: named-only warning, no bare note.
-    let mut h = BareHarness::new("yarn", HashMap::new(), None, 0);
+    let mut h = GateHarness::new()
+        .fake_recorder("yarn", 0)
+        .oldpkg_registry()
+        .vuln_checks(HashMap::new())
+        .token("test-token")
+        .in_project_dir()
+        .build();
     let out = h
         .cmd
         .args(["yarn", "add", "oldpkg@1.0.0"])

@@ -25,10 +25,6 @@ const TREE_REFUSAL: &str = "Refusing to run install: your existing dependency tr
 /// Refusal when a named target carries a blocking verdict.
 const GENERIC_REFUSAL: &str = "Refusing to run install. Pass --force to proceed despite findings.";
 
-fn vulnerable_body(name: &str, version: &str) -> String {
-    common::vulnerable_body("pypi", name, version, "MAL-2024-0002", None)
-}
-
 fn harness(checks: HashMap<PackageKey, String>, statuses: HashMap<PackageKey, u16>) -> TreeHarness {
     TreeHarness::new("pip", checks, statuses, TREE_REPORT)
 }
@@ -48,7 +44,7 @@ fn named_install_with_transitive_vulnerable_keeps_generic_refusal() {
     let mut checks = HashMap::new();
     checks.insert(
         key("pypi", "evildep", "0.4.2"),
-        vulnerable_body("evildep", "0.4.2"),
+        common::vulnerable_body("pypi", "evildep", "0.4.2", "MAL-2024-0002", None),
     );
     let mut h = harness(checks, HashMap::new());
     let out = run_install(&mut h);
@@ -83,7 +79,7 @@ fn requirements_only_install_with_vulnerable_transitive_keeps_generic_refusal() 
     let mut checks = HashMap::new();
     checks.insert(
         key("pypi", "evildep", "0.4.2"),
-        vulnerable_body("evildep", "0.4.2"),
+        common::vulnerable_body("pypi", "evildep", "0.4.2", "MAL-2024-0002", None),
     );
     let mut h = harness(checks, HashMap::new());
     // `pip install -r reqs.txt` with no named targets — the canned tree
@@ -120,7 +116,7 @@ fn named_vulnerable_keeps_generic_refusal() {
     let mut checks = HashMap::new();
     checks.insert(
         key("pypi", "oldpkg", "1.0.0"),
-        vulnerable_body("oldpkg", "1.0.0"),
+        common::vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0002", None),
     );
     let mut h = harness(checks, HashMap::new());
     let out = run_install(&mut h);
@@ -154,7 +150,7 @@ fn named_unverifiable_with_transitive_vulnerable_keeps_generic_refusal() {
     let mut checks = HashMap::new();
     checks.insert(
         key("pypi", "evildep", "0.4.2"),
-        vulnerable_body("evildep", "0.4.2"),
+        common::vulnerable_body("pypi", "evildep", "0.4.2", "MAL-2024-0002", None),
     );
     let mut statuses = HashMap::new();
     statuses.insert(key("pypi", "oldpkg", "1.0.0"), 503u16);
