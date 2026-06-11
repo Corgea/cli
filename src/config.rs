@@ -109,10 +109,12 @@ impl Config {
     /// Base URL for the vuln-api service: `CORGEA_VULN_API_URL` env var,
     /// then the config file's `vuln_api_url`, then the public default.
     pub fn get_vuln_api_url(&self) -> String {
-        let url = crate::utils::generic::get_env_var_if_exists("CORGEA_VULN_API_URL")
+        crate::utils::generic::get_env_var_if_exists("CORGEA_VULN_API_URL")
             .or_else(|| self.vuln_api_url.clone())
-            .unwrap_or_else(|| "https://vuln-api.corgea.app".to_string());
-        url.trim().trim_end_matches('/').to_string()
+            .unwrap_or_else(|| "https://vuln-api.corgea.app".to_string())
+            .trim()
+            .trim_end_matches('/')
+            .to_string()
     }
 }
 

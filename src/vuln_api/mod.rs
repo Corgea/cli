@@ -65,9 +65,9 @@ pub fn http_client() -> Result<reqwest::blocking::Client, String> {
         .clone()
 }
 
-// Twin of `is_jwt` in the binary crate's `utils/api.rs` — unreachable from
-// this library crate (like `log`, re-declared in `lib.rs`). Keep in sync.
-fn is_jwt(token: &str) -> bool {
+/// Whether `token` looks like a JWT (three non-empty dot-separated parts).
+/// Decides the auth header shape here and in the binary crate's `utils/api.rs`.
+pub fn is_jwt(token: &str) -> bool {
     let parts: Vec<&str> = token.splitn(4, '.').collect();
     parts.len() == 3 && parts.iter().all(|p| !p.is_empty())
 }
@@ -476,8 +476,12 @@ mod tests {
     fn is_jwt_detection() {
         assert!(is_jwt("a.b.c"));
         assert!(!is_jwt("plain-token"));
+        assert!(!is_jwt(""));
         assert!(!is_jwt("a.b"));
+        assert!(!is_jwt("a.b.c.d"));
         assert!(!is_jwt("a..c"));
+        assert!(!is_jwt(".b.c"));
+        assert!(!is_jwt("a.b."));
     }
 
     // Fixture-based deserialization tests — committed JSON under tests/fixtures/vuln_api/,

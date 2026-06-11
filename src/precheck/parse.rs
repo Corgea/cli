@@ -207,7 +207,7 @@ fn extract_pip_positionals(args: &[String]) -> Result<PositionalSplit, String> {
 /// Parse a single npm-style positional, e.g. `axios`, `axios@1.0.0`,
 /// `axios@^1.0.0`, `axios@latest`, `@types/node@20.10.5`,
 /// `git+https://...`, `file:./local`, `./local`, `npm:other@1.0.0`.
-pub(crate) fn parse_npm_spec(raw: &str) -> InstallTarget {
+fn parse_npm_spec(raw: &str) -> InstallTarget {
     let display = raw.to_string();
     let trimmed = raw.trim();
 
@@ -320,7 +320,7 @@ fn is_npm_dist_tag(s: &str) -> bool {
 
 /// Parse a single pip-style positional, e.g. `requests`, `requests==2.31.0`,
 /// `requests>=2.0`, `requests[security]`, `git+https://...`, `./local`.
-pub(crate) fn parse_pypi_spec(raw: &str) -> InstallTarget {
+fn parse_pypi_spec(raw: &str) -> InstallTarget {
     let display = raw.to_string();
     let trimmed = raw.trim();
 

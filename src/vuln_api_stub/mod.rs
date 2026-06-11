@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
-use std::time::Duration;
 
 pub type PackageKey = (String, String, String);
 
@@ -48,8 +47,6 @@ pub fn spawn_with_retry_once(
             );
         }
     });
-
-    thread::sleep(Duration::from_millis(50));
 
     VulnApiStub {
         base_url,
@@ -136,7 +133,7 @@ fn handle_connection(
 
 /// Reason phrase for a stub status line. Shared with the in-crate test
 /// stubs so the mapping lives once.
-pub fn status_text(status_code: u16) -> &'static str {
+fn status_text(status_code: u16) -> &'static str {
     match status_code {
         404 => "Not Found",
         401 => "Unauthorized",
