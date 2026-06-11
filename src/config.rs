@@ -7,10 +7,6 @@ pub struct Config {
     pub(crate) url: String,
     pub(crate) debug: i8,
     pub(crate) token: String,
-    /// Override for the vuln-api host (install-gate package checks).
-    /// `#[serde(default)]` keeps pre-existing config files loading.
-    #[serde(default)]
-    pub(crate) vuln_api_url: Option<String>,
 }
 
 impl Config {
@@ -38,7 +34,6 @@ impl Config {
                 url: "https://www.corgea.app".to_string(),
                 debug: 0,
                 token: "".to_string(),
-                vuln_api_url: None,
             };
 
             let toml = toml::to_string(&config).expect("Failed to serialize config");
@@ -107,10 +102,9 @@ impl Config {
     }
 
     /// Base URL for the vuln-api service: `CORGEA_VULN_API_URL` env var,
-    /// then the config file's `vuln_api_url`, then the public default.
+    /// then the public default.
     pub fn get_vuln_api_url(&self) -> String {
         crate::utils::generic::get_env_var_if_exists("CORGEA_VULN_API_URL")
-            .or_else(|| self.vuln_api_url.clone())
             .unwrap_or_else(|| "https://vuln-api.corgea.app".to_string())
             .trim()
             .trim_end_matches('/')
@@ -122,12 +116,11 @@ impl Config {
 mod tests {
     use super::*;
 
-    fn config_with(vuln_api_url: Option<&str>) -> Config {
+    fn test_config() -> Config {
         Config {
             url: "https://www.corgea.app".to_string(),
             debug: 0,
             token: "".to_string(),
-            vuln_api_url: vuln_api_url.map(str::to_string),
         }
     }
 
@@ -138,60 +131,22 @@ mod tests {
     fn get_vuln_api_url_resolution_order() {
         env::remove_var("CORGEA_VULN_API_URL");
 
-        // Default when neither env nor config is set.
+        // Default when the env var is unset.
         assert_eq!(
-            config_with(None).get_vuln_api_url(),
+            test_config().get_vuln_api_url(),
             "https://vuln-api.corgea.app"
         );
 
-        // Config value wins over the default; trailing slash trimmed.
-        assert_eq!(
-            config_with(Some("https://custom.example.com/")).get_vuln_api_url(),
-            "https://custom.example.com"
-        );
-
-        // Surrounding whitespace trimmed.
-        assert_eq!(
-            config_with(Some("  https://ws.example.com  ")).get_vuln_api_url(),
-            "https://ws.example.com"
-        );
-
-        // Env var wins over the config value (and gets the same trims).
+        // Env var wins; whitespace and trailing slash trimmed.
         env::set_var("CORGEA_VULN_API_URL", " https://env.example.com/ ");
-        assert_eq!(
-            config_with(Some("https://custom.example.com")).get_vuln_api_url(),
-            "https://env.example.com"
-        );
+        assert_eq!(test_config().get_vuln_api_url(), "https://env.example.com");
 
         // Empty / whitespace-only env var is treated as unset.
         env::set_var("CORGEA_VULN_API_URL", "   ");
         assert_eq!(
-            config_with(Some("https://custom.example.com")).get_vuln_api_url(),
-            "https://custom.example.com"
+            test_config().get_vuln_api_url(),
+            "https://vuln-api.corgea.app"
         );
         env::remove_var("CORGEA_VULN_API_URL");
-    }
-
-    /// `Config::load()` writes the default file with `vuln_api_url: None`
-    /// and `save()` reserializes every config — both must round-trip.
-    #[test]
-    fn config_toml_round_trips_with_and_without_vuln_api_url() {
-        let without = toml::to_string(&config_with(None)).expect("serialize None field");
-        let parsed: Config = toml::from_str(&without).expect("deserialize");
-        assert_eq!(parsed.vuln_api_url, None);
-
-        let with = toml::to_string(&config_with(Some("https://custom.example.com")))
-            .expect("serialize Some field");
-        let parsed: Config = toml::from_str(&with).expect("deserialize");
-        assert_eq!(
-            parsed.vuln_api_url.as_deref(),
-            Some("https://custom.example.com")
-        );
-
-        // Pre-existing config files (no vuln_api_url key) must still load.
-        let legacy: Config =
-            toml::from_str("url = \"https://www.corgea.app\"\ndebug = 0\ntoken = \"\"\n")
-                .expect("legacy config without vuln_api_url");
-        assert_eq!(legacy.vuln_api_url, None);
     }
 }
