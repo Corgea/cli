@@ -403,7 +403,7 @@ fn parse_pypi_spec(raw: &str) -> InstallTarget {
     };
 
     // Strip extras: `requests[security]` -> `requests`.
-    let name_no_extras = name_part.split('[').next().unwrap_or(name_part).trim();
+    let name_no_extras = pypi_name_part(name_part, PypiNameCut::ParseNamePart);
 
     // Strip env markers: `package; python_version >= "3.7"`.
     let spec_no_marker = spec_part.split(';').next().unwrap_or(spec_part).trim();
@@ -430,6 +430,29 @@ fn parse_pypi_spec(raw: &str) -> InstallTarget {
         display,
         kind,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum PypiNameCut {
+    /// Existing `parse_pypi_spec` behavior: the caller already split at the
+    /// leftmost version operator, so only extras are removed from the name part.
+    ParseNamePart,
+    /// Existing requirements-line behavior: stop at extras, markers,
+    /// operators, or whitespace.
+    RequirementLine,
+}
+
+/// Bare PyPI name extraction only; callers normalize when they need a
+/// comparison key.
+pub(super) fn pypi_name_part(spec: &str, cut: PypiNameCut) -> &str {
+    let stop = |c: char| match cut {
+        PypiNameCut::ParseNamePart => c == '[',
+        PypiNameCut::RequirementLine => {
+            matches!(c, '[' | '<' | '>' | '=' | '!' | '~' | ';' | ' ')
+        }
+    };
+    let cut = spec.find(stop).unwrap_or(spec.len());
+    spec[..cut].trim()
 }
 
 #[cfg(test)]
@@ -625,6 +648,50 @@ mod tests {
             "env marker must not leak into the spec: {:?}",
             t.kind
         );
+
+        let marker_only = parse_pypi_spec("pkg; python_version >= \"3.7\"");
+        assert_eq!(marker_only.name, "pkg; python_version");
+        assert!(
+            matches!(marker_only.kind, TargetKind::Pypi(PypiSpec::Specifier(ref s)) if s == ">= \"3.7\""),
+            "got {:?}",
+            marker_only.kind
+        );
+    }
+
+    #[test]
+    fn pypi_name_part_strips_extras_markers_and_operators() {
+        assert_eq!(
+            pypi_name_part("requests", PypiNameCut::ParseNamePart),
+            "requests"
+        );
+        assert_eq!(
+            pypi_name_part("requests[security]", PypiNameCut::ParseNamePart),
+            "requests"
+        );
+        assert_eq!(
+            pypi_name_part("pkg; python_version ", PypiNameCut::ParseNamePart),
+            "pkg; python_version"
+        );
+        assert_eq!(
+            pypi_name_part("requests[security]==2.31.0", PypiNameCut::RequirementLine),
+            "requests"
+        );
+        assert_eq!(
+            pypi_name_part("Flask_Cors>=4.0", PypiNameCut::RequirementLine),
+            "Flask_Cors"
+        );
+        assert_eq!(
+            pypi_name_part(
+                "pkg; python_version >= \"3.7\"",
+                PypiNameCut::RequirementLine
+            ),
+            "pkg"
+        );
+        assert_eq!(
+            pypi_name_part("pkg ==1.0", PypiNameCut::RequirementLine),
+            "pkg"
+        );
+        assert_eq!(pypi_name_part("", PypiNameCut::RequirementLine), "");
     }
 
     #[test]

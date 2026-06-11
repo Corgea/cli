@@ -155,7 +155,8 @@ fn resolve_uv_tree(parsed: &super::parse::ParsedInstall) -> Result<Vec<TreePacka
     }
     parse_compiled_requirements(
         &String::from_utf8_lossy(&output.stdout),
-        &requested_names(parsed),
+        &requested_names(PackageManager::Uv, parsed),
+        PackageManager::Uv,
     )
 }
 
@@ -163,8 +164,11 @@ fn resolve_uv_tree(parsed: &super::parse::ParsedInstall) -> Result<Vec<TreePacka
 /// `-r` files — so tree findings label "(from requirements)" like pip's
 /// `requested` report flag. Best-effort line parse; anything unparsed just
 /// labels "(transitive)".
-fn requested_names(parsed: &super::parse::ParsedInstall) -> std::collections::HashSet<String> {
-    let norm = |n: &str| PackageManager::Uv.normalize_name(n);
+fn requested_names(
+    manager: PackageManager,
+    parsed: &super::parse::ParsedInstall,
+) -> std::collections::HashSet<String> {
+    let norm = |n: &str| manager.normalize_name(n);
     let mut out: std::collections::HashSet<String> = parsed
         .targets
         .iter()
@@ -180,12 +184,10 @@ fn requested_names(parsed: &super::parse::ParsedInstall) -> std::collections::Ha
             if line.is_empty() || line.starts_with(['#', '-']) || line.contains("://") {
                 continue;
             }
-            let name: String = line
-                .chars()
-                .take_while(|c| !matches!(c, '[' | '<' | '>' | '=' | '!' | '~' | ';' | ' '))
-                .collect();
+            let name =
+                super::parse::pypi_name_part(line, super::parse::PypiNameCut::RequirementLine);
             if !name.is_empty() {
-                out.insert(norm(&name));
+                out.insert(norm(name));
             }
         }
     }
@@ -198,6 +200,7 @@ fn requested_names(parsed: &super::parse::ParsedInstall) -> std::collections::Ha
 fn parse_compiled_requirements(
     out: &str,
     requested: &std::collections::HashSet<String>,
+    manager: PackageManager,
 ) -> Result<Vec<TreePackage>, String> {
     let mut pkgs = Vec::new();
     for line in out.lines() {
@@ -214,9 +217,10 @@ fn parse_compiled_requirements(
             ));
         };
         // Strip extras: `celery[redis]==5.3.4`.
-        let name = name.split('[').next().unwrap_or(name).trim().to_string();
+        let name = super::parse::pypi_name_part(name, super::parse::PypiNameCut::RequirementLine)
+            .to_string();
         pkgs.push(TreePackage {
-            requested: requested.contains(&PackageManager::Uv.normalize_name(&name)),
+            requested: requested.contains(&manager.normalize_name(&name)),
             name,
             version: version.trim().to_string(),
         });
@@ -396,7 +400,8 @@ mod tests {
     fn parse_compiled_requirements_pins_extras_and_markers() {
         let requested = std::collections::HashSet::from(["flask-cors".to_string()]);
         let out = "Flask_Cors==4.0.0\ncelery[redis]==5.3.4\nwerkzeug==3.1.8 ; python_version >= \"3.9\"\n\n# comment\n--index-url https://example.com\n";
-        let pkgs = parse_compiled_requirements(out, &requested).expect("parse pins");
+        let pkgs =
+            parse_compiled_requirements(out, &requested, PackageManager::Uv).expect("parse pins");
         assert_eq!(
             pkgs,
             vec![
@@ -422,9 +427,10 @@ mod tests {
     #[test]
     fn parse_compiled_requirements_rejects_non_pins() {
         let none = std::collections::HashSet::new();
-        let err = parse_compiled_requirements("flask>=2.0\n", &none).expect_err("not a pin");
+        let err = parse_compiled_requirements("flask>=2.0\n", &none, PackageManager::Uv)
+            .expect_err("not a pin");
         assert!(err.contains("unexpected line"), "got: {err}");
-        let err = parse_compiled_requirements("", &none).expect_err("empty");
+        let err = parse_compiled_requirements("", &none, PackageManager::Uv).expect_err("empty");
         assert!(err.contains("no packages"), "got: {err}");
     }
 
@@ -447,7 +453,7 @@ mod tests {
             }],
             requirements_files: vec![req],
         };
-        let names = requested_names(&parsed);
+        let names = requested_names(PackageManager::Uv, &parsed);
         for name in ["celery", "flask-cors", "requests"] {
             assert!(names.contains(name), "missing {name}: {names:?}");
         }
