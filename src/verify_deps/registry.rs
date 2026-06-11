@@ -18,8 +18,10 @@ const DEFAULT_PYPI_REGISTRY: &str = "https://pypi.org";
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
-fn user_agent() -> String {
-    format!("corgea-cli/{} (deps)", env!("CARGO_PKG_VERSION"))
+/// `corgea-cli/<version> (<label>)` user-agent string. Also used by
+/// `vuln_api` for its own client.
+pub(crate) fn user_agent(label: &str) -> String {
+    format!("corgea-cli/{} ({label})", env!("CARGO_PKG_VERSION"))
 }
 
 fn http_client() -> &'static reqwest::blocking::Client {
@@ -27,7 +29,7 @@ fn http_client() -> &'static reqwest::blocking::Client {
     CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
             .timeout(REQUEST_TIMEOUT)
-            .user_agent(user_agent())
+            .user_agent(user_agent("deps"))
             .build()
             .expect("registry http client")
     })

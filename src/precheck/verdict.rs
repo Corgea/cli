@@ -17,10 +17,8 @@ const VERDICT_CONCURRENCY: usize = 8;
 
 /// Bounded worker pool over the verdict jobs. On client/request failure every
 /// job comes back `Unverifiable`; `block_reason` decides whether that
-/// fails closed for the selected mode.
-/// Plain work queue, no new crates; `reqwest::blocking::Client` is
-/// `Send + Sync`. Result order is not preserved; callers match results back
-/// by `(name, version)`.
+/// fails closed for the selected mode. Order is preserved: result `i`
+/// belongs to job `i`.
 pub(super) fn verdict_pool(
     jobs: Vec<tree::TreePackage>,
     cfg: &VerdictConfig,
@@ -35,9 +33,6 @@ fn verdict_pool_with(
     manager: PackageManager,
     concurrency: usize,
 ) -> Vec<(tree::TreePackage, VerdictStatus)> {
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
-
     let client = match crate::vuln_api::http_client() {
         Ok(c) => c,
         Err(e) => {
@@ -53,35 +48,59 @@ fn verdict_pool_with(
     }
 
     let ecosystem = manager.ecosystem();
-    let workers = concurrency.min(jobs.len()).max(1);
-    let queue = Mutex::new(VecDeque::from(jobs));
-    let results = Mutex::new(Vec::new());
+    let verdicts = pooled_map(
+        &jobs,
+        concurrency,
+        |job| match crate::vuln_api::check_package_version(
+            &client,
+            &cfg.base_url,
+            cfg.mode.auth_token(),
+            ecosystem,
+            &job.name,
+            &job.version,
+        ) {
+            Ok(resp) if resp.is_vulnerable => VerdictStatus::Vulnerable(resp.matches),
+            Ok(_) => VerdictStatus::Clean,
+            Err(e) => VerdictStatus::Unverifiable(e.to_string()),
+        },
+    );
+    jobs.into_iter().zip(verdicts).collect()
+}
+
+/// Order-preserving bounded worker pool: `results[i]` is `f(&items[i])`.
+/// Each call is an independent blocking HTTP request on the gate's critical
+/// path, so they must not run serially. Plain work-stealing over an index,
+/// no new crates; single-item lists skip the thread machinery.
+fn pooled_map<T: Sync, R: Send>(
+    items: &[T],
+    concurrency: usize,
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    if items.len() <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<R>>> = Mutex::new(items.iter().map(|_| None).collect());
+    let workers = concurrency.clamp(1, items.len());
     std::thread::scope(|s| {
         for _ in 0..workers {
             s.spawn(|| loop {
-                let Some(job) = queue.lock().unwrap().pop_front() else {
-                    break;
-                };
-                // vuln-api advisories are keyed by canonical names; an
-                // alternate spelling (PEP 503: `Flask_Cors` ≡ `flask-cors`)
-                // would miss and read as clean.
-                let verdict = match crate::vuln_api::check_package_version(
-                    &client,
-                    &cfg.base_url,
-                    cfg.mode.auth_token(),
-                    ecosystem,
-                    &manager.normalize_name(&job.name),
-                    &job.version,
-                ) {
-                    Ok(resp) if resp.is_vulnerable => VerdictStatus::Vulnerable(resp.matches),
-                    Ok(_) => VerdictStatus::Clean,
-                    Err(e) => VerdictStatus::Unverifiable(e.to_string()),
-                };
-                results.lock().unwrap().push((job, verdict));
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(i) else { break };
+                let result = f(item);
+                results.lock().unwrap()[i] = Some(result);
             });
         }
     });
-    results.into_inner().unwrap()
+    results
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.expect("pooled_map worker filled every slot"))
+        .collect()
 }
 
 /// Assign pooled verdicts onto matching named outcomes (by normalized
@@ -135,16 +154,11 @@ pub(super) fn apply_verdicts(
     transitive
 }
 
+/// Authenticated mode fails closed: lookup errors block instead of warning.
 pub(super) fn authenticated_verdict(opts: &PrecheckOptions) -> bool {
     opts.verdict
         .as_ref()
-        .is_some_and(|cfg| cfg.mode.is_authenticated())
-}
-
-pub(super) fn public_verdict(opts: &PrecheckOptions) -> bool {
-    opts.verdict
-        .as_ref()
-        .is_some_and(|cfg| cfg.mode.is_public())
+        .is_some_and(|cfg| cfg.mode.auth_token().is_some())
 }
 
 /// Why the gate refuses to run the install. The single owner of both the
@@ -170,9 +184,7 @@ pub(super) fn block_reason(report: &PrecheckReport, opts: &PrecheckOptions) -> O
     // in authenticated mode it fails closed like `Unverifiable` — otherwise a
     // registry outage silently bypasses the gate.
     let fail_closed = authenticated_verdict(opts);
-    if report.vulnerable_count() > 0
-        || (fail_closed && report.unverifiable_count() > 0)
-        || (fail_closed && report.error_count() > 0)
+    if report.verdicts().any(|v| v.blocks(fail_closed)) || (fail_closed && report.error_count() > 0)
     {
         return Some(if blames_existing_tree(report, opts) {
             BlockReason::ExistingTree
@@ -187,23 +199,18 @@ pub(super) fn block_reason(report: &PrecheckReport, opts: &PrecheckOptions) -> O
 }
 
 /// True when the block is entirely the existing tree's doing: vulnerable
-/// findings exist, none sit on a named target (or block as unverifiable
-/// there), and every *blocking* tree finding — vulnerable or unverifiable,
-/// since `block_reason` refuses on both — genuinely predates this
-/// command. A `Requested` finding (pip `-r`) is added by this command and
-/// renders as `(from requirements)`; a `Transitive` finding on any install
-/// that names targets or requirements files is being pulled in by them
-/// right now. Only a truly bare install (`report.bare_install`) or
-/// manifest-declared `PreExisting` findings may blame the existing tree.
+/// findings exist, no named target blocks, and every *blocking* tree
+/// finding (`VerdictStatus::blocks`, same predicate `block_reason` refuses
+/// on) genuinely predates this command. A `Requested` finding (pip `-r`)
+/// is added by this command and renders as `(from requirements)`; a
+/// `Transitive` finding on any install that names targets or requirements
+/// files is being pulled in by them right now. Only a truly bare install
+/// (`report.bare_install`) or manifest-declared `PreExisting` findings may
+/// blame the existing tree.
 fn blames_existing_tree(report: &PrecheckReport, opts: &PrecheckOptions) -> bool {
     let fail_closed = authenticated_verdict(opts);
-    let named_findings = report.named_vulnerable_count()
-        + if fail_closed {
-            report.named_unverifiable_count()
-        } else {
-            0
-        };
-    if report.vulnerable_count() == 0 || named_findings > 0 {
+    let named_blocks = report.named_verdicts().any(|v| v.blocks(fail_closed));
+    if report.vulnerable_count() == 0 || named_blocks {
         return false;
     }
     let Some(TreeReport::Full { transitive, .. }) = &report.tree else {
@@ -211,10 +218,7 @@ fn blames_existing_tree(report: &PrecheckReport, opts: &PrecheckOptions) -> bool
     };
     transitive
         .iter()
-        .filter(|t| {
-            matches!(t.verdict, VerdictStatus::Vulnerable(_))
-                || (fail_closed && matches!(t.verdict, VerdictStatus::Unverifiable(_)))
-        })
+        .filter(|t| t.verdict.blocks(fail_closed))
         .all(|t| match t.origin {
             // A locked pin predates the sync command that installs it.
             TreeOrigin::PreExisting | TreeOrigin::Locked => true,
@@ -223,41 +227,14 @@ fn blames_existing_tree(report: &PrecheckReport, opts: &PrecheckOptions) -> bool
         })
 }
 
-/// Resolve every named target against its registry through a bounded worker
-/// pool — each lookup is an independent blocking HTTP GET on the gate's
-/// critical path, so they must not run serially. Order is preserved:
-/// outcome `i` belongs to `targets[i]`.
+/// Resolve every named target against its registry through the bounded
+/// worker pool. Order is preserved: outcome `i` belongs to `targets[i]`.
 pub(super) fn verify_all(
     targets: &[InstallTarget],
     opts: &PrecheckOptions,
     now: &chrono::DateTime<chrono::Utc>,
 ) -> Vec<TargetOutcome> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
-
-    if targets.len() <= 1 {
-        return targets.iter().map(|t| verify_one(t, opts, now)).collect();
-    }
-    let next = AtomicUsize::new(0);
-    let results: Mutex<Vec<Option<TargetOutcome>>> =
-        Mutex::new(targets.iter().map(|_| None).collect());
-    let workers = VERDICT_CONCURRENCY.min(targets.len());
-    std::thread::scope(|s| {
-        for _ in 0..workers {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(target) = targets.get(i) else { break };
-                let outcome = verify_one(target, opts, now);
-                results.lock().unwrap()[i] = Some(outcome);
-            });
-        }
-    });
-    results
-        .into_inner()
-        .unwrap()
-        .into_iter()
-        .map(|o| o.expect("verify_all worker filled every slot"))
-        .collect()
+    pooled_map(targets, VERDICT_CONCURRENCY, |t| verify_one(t, opts, now))
 }
 
 fn verify_one(
@@ -528,14 +505,11 @@ mod tests {
     fn verdict_pass_maps_stub_responses() {
         use std::collections::HashMap;
 
-        let key = |name: &str| ("pypi".to_string(), name.to_string(), "1.0.0".to_string());
+        let key = |name: &str| crate::vuln_api_stub::key("pypi", name, "1.0.0");
         let mut checks = HashMap::new();
         checks.insert(
             key("evil"),
-            r#"{"ecosystem":"pypi","package_name":"evil","version":"1.0.0","is_vulnerable":true,
-                "matches":[{"advisory_id":"MAL-2024-0001","severity_level":"critical","tier":1,
-                            "vulnerable_version_range":null,"fixed_version":null}]}"#
-                .to_string(),
+            crate::vuln_api_stub::vulnerable_body("pypi", "evil", "1.0.0", "MAL-2024-0001", None),
         );
         checks.insert(key("flaky"), "{}".to_string());
         let mut statuses = HashMap::new();
@@ -584,14 +558,10 @@ mod tests {
     fn verdict_pool_returns_all_results() {
         use std::collections::HashMap;
 
-        let key = |name: &str| ("pypi".to_string(), name.to_string(), "1.0.0".to_string());
         let mut checks = HashMap::new();
         checks.insert(
-            key("evil"),
-            r#"{"ecosystem":"pypi","package_name":"evil","version":"1.0.0","is_vulnerable":true,
-                "matches":[{"advisory_id":"MAL-2024-0001","severity_level":"critical","tier":1,
-                            "vulnerable_version_range":null,"fixed_version":null}]}"#
-                .to_string(),
+            crate::vuln_api_stub::key("pypi", "evil", "1.0.0"),
+            crate::vuln_api_stub::vulnerable_body("pypi", "evil", "1.0.0", "MAL-2024-0001", None),
         );
         let stub = crate::vuln_api_stub::spawn_with_statuses(checks, HashMap::new());
 

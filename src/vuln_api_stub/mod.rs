@@ -5,6 +5,29 @@ use std::thread;
 
 pub type PackageKey = (String, String, String);
 
+/// `(ecosystem, name, version)` key for the stub's route tables.
+pub fn key(eco: &str, name: &str, ver: &str) -> PackageKey {
+    (eco.to_string(), name.to_string(), ver.to_string())
+}
+
+/// Single-match vulnerable verdict body; `fixed: None` renders
+/// `"fixed_version":null`. Shared by the in-crate unit tests and the
+/// integration tests (via `tests/common`).
+pub fn vulnerable_body(
+    ecosystem: &str,
+    name: &str,
+    version: &str,
+    advisory: &str,
+    fixed: Option<&str>,
+) -> String {
+    let fixed = fixed.map_or("null".to_string(), |f| format!(r#""{f}""#));
+    format!(
+        r#"{{"ecosystem":"{ecosystem}","package_name":"{name}","version":"{version}","is_vulnerable":true,
+        "matches":[{{"advisory_id":"{advisory}","severity_level":"critical","tier":1,
+                    "vulnerable_version_range":null,"fixed_version":{fixed}}}]}}"#
+    )
+}
+
 const NOT_FOUND_BODY: &str = r#"{"error":"not found"}"#;
 
 pub struct VulnApiStub {
@@ -29,6 +52,31 @@ pub fn spawn_with_retry_once(
     status_overrides: HashMap<PackageKey, u16>,
     retry_once: HashSet<PackageKey>,
 ) -> VulnApiStub {
+    spawn(package_checks, status_overrides, retry_once, None)
+}
+
+/// Vuln-api stub that records raw requests and answers every package check
+/// with a clean verdict (echoing the eco/name/version from the path). Used
+/// to assert auth-header behavior, both in-crate and from the CLI.
+pub fn spawn_capturing_vuln_api_stub() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stub = spawn(
+        HashMap::new(),
+        HashMap::new(),
+        HashSet::new(),
+        Some(std::sync::Arc::clone(&requests)),
+    );
+    // Dropping the stub's join handle detaches the listener thread; the
+    // base URL keeps working for the caller's lifetime.
+    (stub.base_url, requests)
+}
+
+fn spawn(
+    package_checks: HashMap<PackageKey, String>,
+    status_overrides: HashMap<PackageKey, u16>,
+    retry_once: HashSet<PackageKey>,
+    capture: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+) -> VulnApiStub {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
     let bound_port = listener.local_addr().expect("stub local_addr").port();
     let base_url = format!("http://127.0.0.1:{bound_port}");
@@ -44,6 +92,7 @@ pub fn spawn_with_retry_once(
                 &package_checks,
                 &status_overrides,
                 &mut pending_retries,
+                capture.as_deref(),
             );
         }
     });
@@ -52,43 +101,6 @@ pub fn spawn_with_retry_once(
         base_url,
         _handle: handle,
     }
-}
-
-/// Vuln-api stub that records raw requests and answers every package check
-/// with a clean verdict (echoing the eco/name/version from the path). Used
-/// to assert auth-header behavior, both in-crate and from the CLI.
-pub fn spawn_capturing_vuln_api_stub() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-    use std::sync::{Arc, Mutex};
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind capture stub");
-    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let requests_in_stub = Arc::clone(&requests);
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let buf = read_http_request(&mut stream);
-            let req = String::from_utf8_lossy(&buf).into_owned();
-            requests_in_stub.lock().unwrap().push(req.clone());
-            let path = req
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .unwrap_or("");
-            let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-            let (eco, name, ver) = if parts.len() >= 7 {
-                (parts[2], parts[3], parts[5])
-            } else {
-                ("pypi", "unknown", "0.0.0")
-            };
-            let name = urlencoding::decode(name).unwrap_or_default();
-            let ver = urlencoding::decode(ver).unwrap_or_default();
-            let body = default_clean_response(eco, &name, &ver);
-            let response = http_response("200 OK", "", &body);
-            let _ = stream.write_all(response.as_bytes());
-        }
-    });
-    (base_url, requests)
 }
 
 /// One-shot JSON HTTP response. `Connection: close` is load-bearing: the
@@ -137,9 +149,13 @@ fn handle_connection(
     package_checks: &HashMap<PackageKey, String>,
     status_overrides: &HashMap<PackageKey, u16>,
     pending_retries: &mut HashSet<PackageKey>,
+    capture: Option<&std::sync::Mutex<Vec<String>>>,
 ) {
     let buf = read_http_request(stream);
     let req = String::from_utf8_lossy(&buf);
+    if let Some(capture) = capture {
+        capture.lock().unwrap().push(req.clone().into_owned());
+    }
 
     let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1));
 
@@ -224,10 +240,6 @@ mod tests {
         let mut resp = String::new();
         stream.read_to_string(&mut resp).unwrap();
         resp
-    }
-
-    fn key(eco: &str, name: &str, ver: &str) -> super::PackageKey {
-        (eco.to_string(), name.to_string(), ver.to_string())
     }
 
     #[test]

@@ -13,12 +13,11 @@
 //! *without* running the install. Use `--no-fail` to demote this to a
 //! warning (the install runs anyway).
 
-pub mod parse;
-pub mod tree;
-
 mod detect;
 mod exec;
+mod parse;
 mod render;
+mod tree;
 mod uv;
 mod verdict;
 
@@ -73,19 +72,15 @@ impl PackageManager {
         }
     }
 
-    /// Canonical package name for dedup/matching across spec spellings:
-    /// PEP 503 for pypi (shared with `deps`), verbatim for npm.
+    /// Canonical package name for dedup/matching across spec spellings —
+    /// the ecosystem's rule (`vuln_api::Ecosystem::normalize_name`).
     ///
-    /// Invariant: names are normalized at comparison/request time
-    /// (`verdict::verdict_pool` / `verdict::apply_verdicts` / tree dedup),
-    /// never at parse time — parsers and resolvers carry raw names.
+    /// Invariant: request-time normalization is owned by the vuln-api
+    /// client (`vuln_api::check_package_version`); comparison sites
+    /// (`verdict::apply_verdicts` / tree dedup) normalize here. Parsers
+    /// and resolvers carry raw names.
     pub fn normalize_name(self, name: &str) -> String {
-        match self {
-            PackageManager::Pip | PackageManager::Uv => {
-                crate::deps::ecosystems::pypi::normalize_pypi_name(name)
-            }
-            PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => name.to_string(),
-        }
+        self.ecosystem().normalize_name(name)
     }
 }
 
@@ -104,14 +99,6 @@ impl VerdictMode {
             VerdictMode::Public => None,
             VerdictMode::Authenticated { token } => Some(token.as_str()),
         }
-    }
-
-    fn is_authenticated(&self) -> bool {
-        matches!(self, VerdictMode::Authenticated { .. })
-    }
-
-    fn is_public(&self) -> bool {
-        matches!(self, VerdictMode::Public)
     }
 }
 
@@ -139,6 +126,20 @@ pub enum VerdictStatus {
     /// Verdict never attempted. The constant reason (`NO_VERDICT_REASON`)
     /// is attached at render time.
     NotChecked,
+}
+
+impl VerdictStatus {
+    /// Whether this verdict blocks the install: vulnerable always;
+    /// unverifiable only when the mode fails closed (authenticated).
+    /// The single definition of "blocking finding", shared by
+    /// `verdict::block_reason` and the refusal-blame test.
+    fn blocks(&self, fail_closed: bool) -> bool {
+        match self {
+            VerdictStatus::Vulnerable(_) => true,
+            VerdictStatus::Unverifiable(_) => fail_closed,
+            VerdictStatus::Clean | VerdictStatus::NotChecked => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -296,40 +297,40 @@ impl PrecheckReport {
     pub fn recent_count(&self) -> usize {
         self.count(|o| matches!(o, TargetOutcome::Resolved { age, .. } if self.is_recent(*age)))
     }
+    /// Every verdict in the report: named (resolved) outcomes, then
+    /// transitive tree findings.
+    fn verdicts(&self) -> impl Iterator<Item = &VerdictStatus> {
+        self.named_verdicts().chain(self.tree_verdicts())
+    }
+    /// Verdicts on the named targets this command adds.
+    fn named_verdicts(&self) -> impl Iterator<Item = &VerdictStatus> {
+        self.outcomes.iter().filter_map(|o| match o {
+            TargetOutcome::Resolved { verdict, .. } => Some(verdict),
+            _ => None,
+        })
+    }
+    /// Verdicts beyond the named targets (the resolved tree).
+    fn tree_verdicts(&self) -> impl Iterator<Item = &VerdictStatus> {
+        match &self.tree {
+            Some(TreeReport::Full { transitive, .. }) => transitive.as_slice(),
+            Some(TreeReport::NamedOnly { .. }) | None => &[],
+        }
+        .iter()
+        .map(|o| &o.verdict)
+    }
     pub fn vulnerable_count(&self) -> usize {
-        self.named_vulnerable_count() + self.tree_vulnerable_count()
+        count_vulnerable(self.verdicts())
     }
     pub fn unverifiable_count(&self) -> usize {
-        self.named_unverifiable_count() + self.tree_unverifiable_count()
-    }
-    /// Vulnerable findings among the named targets this command adds.
-    pub fn named_vulnerable_count(&self) -> usize {
-        self.named_finding_count(|v| matches!(v, VerdictStatus::Vulnerable(_)))
-    }
-    /// Unverifiable findings among the named targets this command adds.
-    pub fn named_unverifiable_count(&self) -> usize {
-        self.named_finding_count(|v| matches!(v, VerdictStatus::Unverifiable(_)))
-    }
-    /// Count named (resolved) outcomes whose verdict matches `pred`.
-    fn named_finding_count(&self, pred: impl Fn(&VerdictStatus) -> bool) -> usize {
-        self.count(|o| matches!(o, TargetOutcome::Resolved { verdict, .. } if pred(verdict)))
+        count_unverifiable(self.verdicts())
     }
     /// Vulnerable findings beyond the named targets (the resolved tree).
     pub fn tree_vulnerable_count(&self) -> usize {
-        self.tree_finding_count(|v| matches!(v, VerdictStatus::Vulnerable(_)))
+        count_vulnerable(self.tree_verdicts())
     }
     /// Unverifiable findings beyond the named targets (the resolved tree).
     pub fn tree_unverifiable_count(&self) -> usize {
-        self.tree_finding_count(|v| matches!(v, VerdictStatus::Unverifiable(_)))
-    }
-    /// Count transitive tree findings whose verdict matches `pred`.
-    fn tree_finding_count(&self, pred: impl Fn(&VerdictStatus) -> bool) -> usize {
-        match &self.tree {
-            Some(TreeReport::Full { transitive, .. }) => {
-                transitive.iter().filter(|o| pred(&o.verdict)).count()
-            }
-            Some(TreeReport::NamedOnly { .. }) | None => 0,
-        }
+        count_unverifiable(self.tree_verdicts())
     }
     pub fn skipped_count(&self) -> usize {
         self.count(|o| matches!(o, TargetOutcome::Skipped { .. }))
@@ -337,6 +338,18 @@ impl PrecheckReport {
     pub fn error_count(&self) -> usize {
         self.count(|o| matches!(o, TargetOutcome::Error { .. }))
     }
+}
+
+fn count_vulnerable<'a>(verdicts: impl Iterator<Item = &'a VerdictStatus>) -> usize {
+    verdicts
+        .filter(|v| matches!(v, VerdictStatus::Vulnerable(_)))
+        .count()
+}
+
+fn count_unverifiable<'a>(verdicts: impl Iterator<Item = &'a VerdictStatus>) -> usize {
+    verdicts
+        .filter(|v| matches!(v, VerdictStatus::Unverifiable(_)))
+        .count()
 }
 
 /// Canonical entry for ecosystem commands (`corgea npm install …`).
@@ -496,7 +509,7 @@ fn run_parsed_install(
     if opts
         .verdict
         .as_ref()
-        .is_some_and(|cfg| cfg.mode.is_public() && cfg.public_login_hint)
+        .is_some_and(|cfg| matches!(cfg.mode, VerdictMode::Public) && cfg.public_login_hint)
     {
         eprintln!(
             "warning: using public CVE checks; login enables authenticated enforcement and private Corgea intelligence."
@@ -522,12 +535,11 @@ fn run_parsed_install(
 /// Only called when `opts.verdict.is_some()`.
 fn run_tree_pass(
     manager: PackageManager,
-    resolution: Result<Option<Vec<tree::TreePackage>>, String>,
+    resolution: Result<Vec<tree::TreePackage>, String>,
     outcomes: &mut [TargetOutcome],
     opts: &PrecheckOptions,
 ) -> TreeReport {
-    let no_dry_run = || format!("{} has no safe dry-run", manager.binary_name());
-    let set = match resolution.and_then(|opt| opt.ok_or_else(no_dry_run)) {
+    let set = match resolution {
         Ok(set) => set,
         Err(reason) => {
             run_verdict_pass(manager, outcomes, opts);
@@ -591,8 +603,8 @@ fn run_verdict_pass(
 ) {
     let Some(cfg) = &opts.verdict else { return };
 
-    // One job per resolved target; jobs are 1:1 with outcomes, so
-    // `apply_verdicts` matches everything and returns no leftovers.
+    // One job per resolved target, in outcome order; the pool preserves
+    // order, so verdicts zip straight back onto the resolved outcomes.
     let jobs: Vec<tree::TreePackage> = outcomes
         .iter()
         .filter_map(|o| match o {
@@ -605,12 +617,12 @@ fn run_verdict_pass(
         })
         .collect();
 
-    let results = verdict::verdict_pool(jobs, cfg, manager);
-    let leftovers = verdict::apply_verdicts(manager, results, outcomes, &Default::default());
-    debug_assert!(
-        leftovers.is_empty(),
-        "named verdict pass left tree leftovers"
-    );
+    let mut results = verdict::verdict_pool(jobs, cfg, manager).into_iter();
+    for o in outcomes.iter_mut() {
+        if let TargetOutcome::Resolved { verdict, .. } = o {
+            *verdict = results.next().expect("one verdict per resolved outcome").1;
+        }
+    }
 }
 
 #[cfg(test)]

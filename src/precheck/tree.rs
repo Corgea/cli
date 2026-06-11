@@ -30,19 +30,20 @@ pub fn covers_input(manager: PackageManager, parsed: &super::parse::ParsedInstal
         || (manager == PackageManager::Npm && std::path::Path::new("package.json").exists())
 }
 
-/// `Ok(None)`: manager has no safe dry-run — named-only with warning.
-/// `Err(reason)`: dry-run attempted and failed — named-only, warning carries reason.
+/// `Err(reason)`: no safe dry-run for this manager, or the dry-run failed —
+/// the caller falls back to named-only and its warning carries `reason`.
 pub fn resolve_tree(
     manager: PackageManager,
     install_args: &[String],
     parsed: &super::parse::ParsedInstall,
-) -> Result<Option<Vec<TreePackage>>, String> {
+) -> Result<Vec<TreePackage>, String> {
     match manager {
-        PackageManager::Pip => resolve_pip_tree(manager.binary_name(), install_args).map(Some),
-        PackageManager::Npm => resolve_npm_tree(manager.binary_name(), install_args).map(Some),
-        PackageManager::Uv => resolve_uv_tree(parsed).map(Some),
-        // yarn/pnpm have no safe dry-run for installs.
-        PackageManager::Yarn | PackageManager::Pnpm => Ok(None),
+        PackageManager::Pip => resolve_pip_tree(manager.binary_name(), install_args),
+        PackageManager::Npm => resolve_npm_tree(manager.binary_name(), install_args),
+        PackageManager::Uv => resolve_uv_tree(parsed),
+        PackageManager::Yarn | PackageManager::Pnpm => {
+            Err(format!("{} has no safe dry-run", manager.binary_name()))
+        }
     }
 }
 

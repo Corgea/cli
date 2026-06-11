@@ -2,7 +2,12 @@
 //! pattern — included via `mod common;` from each integration-test crate, so
 //! items unused by one consumer are `#[allow(dead_code)]`).
 
+#[cfg(unix)]
 use corgea::vuln_api_stub::PackageKey;
+/// `(ecosystem, name, version)` stub key and the single-match vulnerable
+/// verdict body, shared with the in-crate unit tests.
+#[allow(unused_imports)]
+pub use corgea::vuln_api_stub::{key, vulnerable_body};
 #[cfg(unix)]
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -52,29 +57,6 @@ pub const OLDPKG_PYPI_JSON: &str = r#"{"info":{"name":"oldpkg"},"releases":{"1.0
 /// npm packument for `oldpkg` 1.0.0, published 2020 → never recent.
 #[allow(dead_code)]
 pub const OLDPKG_NPM_PACKUMENT: &str = r#"{"dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{}},"time":{"1.0.0":"2020-01-01T00:00:00Z"}}"#;
-
-#[allow(dead_code)]
-pub fn key(eco: &str, name: &str, ver: &str) -> PackageKey {
-    (eco.to_string(), name.to_string(), ver.to_string())
-}
-
-/// Single-match vulnerable verdict body for the vuln-api stub; `fixed: None`
-/// renders `"fixed_version":null`.
-#[allow(dead_code)]
-pub fn vulnerable_body(
-    ecosystem: &str,
-    name: &str,
-    version: &str,
-    advisory: &str,
-    fixed: Option<&str>,
-) -> String {
-    let fixed = fixed.map_or("null".to_string(), |f| format!(r#""{f}""#));
-    format!(
-        r#"{{"ecosystem":"{ecosystem}","package_name":"{name}","version":"{version}","is_vulnerable":true,
-        "matches":[{{"advisory_id":"{advisory}","severity_level":"critical","tier":1,
-                    "vulnerable_version_range":null,"fixed_version":{fixed}}}]}}"#
-    )
-}
 
 /// Pip `--report -` payload: `oldpkg` (named/requested) + `evildep`
 /// (transitive).

@@ -13,9 +13,8 @@
 
 mod common;
 
-use common::{key, tree_harness, NPM_LOCK};
+use common::{key, tree_harness, GateHarness, NPM_LOCK};
 use std::collections::HashMap;
-use tempfile::TempDir;
 
 /// Vulnerable verdict body; `fixed: None` renders `"fixed_version":null`.
 fn vulnerable_body(ecosystem: &str, name: &str, version: &str, fixed: Option<&str>) -> String {
@@ -37,12 +36,15 @@ const PIP_MIXED_REPORT: &str = r#"{"version":"1","pip_version":"24.0","install":
 const PROJECT_MANIFEST: &str =
     r#"{"name":"proj","version":"1.0.0","dependencies":{"evildep":"^0.4.0"}}"#;
 
-/// Project dir holding a `package.json` that already declares `evildep`.
-fn npm_project() -> TempDir {
-    let project = TempDir::new().expect("project dir");
-    std::fs::write(project.path().join("package.json"), PROJECT_MANIFEST)
-        .expect("write package.json");
-    project
+/// npm tree harness whose project dir holds a `package.json` that already
+/// declares `evildep` as a direct dep.
+fn npm_project_harness(
+    checks: HashMap<corgea::vuln_api_stub::PackageKey, String>,
+    statuses: HashMap<corgea::vuln_api_stub::PackageKey, u16>,
+    payload: &str,
+) -> GateHarness {
+    tree_harness("npm", checks, statuses, payload)
+        .with_project_file("package.json", PROJECT_MANIFEST)
 }
 
 #[test]
@@ -76,16 +78,14 @@ fn npm_preexisting_direct_dep_labeled_with_fix_hint() {
     // finding gets the pre-existing label plus the fix-command hint. The
     // fix 1.2.2 covers every advisory (`safe_version` is Some), so the hint
     // drops the "(advertised fix)" hedge.
-    let project = npm_project();
     let mut checks = HashMap::new();
     checks.insert(
         key("npm", "evildep", "0.4.2"),
         vulnerable_body("npm", "evildep", "0.4.2", Some("1.2.2")),
     );
-    let mut h = tree_harness("npm", checks, HashMap::new(), NPM_LOCK);
+    let mut h = npm_project_harness(checks, HashMap::new(), NPM_LOCK);
     let out = h
         .cmd
-        .current_dir(project.path())
         .args(["npm", "install", "oldpkg@1.0.0"])
         .output()
         .expect("run corgea");
@@ -108,7 +108,6 @@ fn npm_preexisting_fix_hint_keeps_hedge_when_fix_is_partial() {
     // still the best move but doesn't clear everything, so the steer line
     // stays quiet and the fix-command hint keeps its "(advertised fix)"
     // hedge.
-    let project = npm_project();
     let mut checks = HashMap::new();
     checks.insert(
         key("npm", "evildep", "0.4.2"),
@@ -119,10 +118,9 @@ fn npm_preexisting_fix_hint_keeps_hedge_when_fix_is_partial() {
                     "vulnerable_version_range":null,"fixed_version":null}]}"#
             .to_string(),
     );
-    let mut h = tree_harness("npm", checks, HashMap::new(), NPM_LOCK);
+    let mut h = npm_project_harness(checks, HashMap::new(), NPM_LOCK);
     let out = h
         .cmd
-        .current_dir(project.path())
         .args(["npm", "install", "oldpkg@1.0.0"])
         .output()
         .expect("run corgea");
@@ -149,7 +147,6 @@ fn preexisting_vulnerable_with_unverifiable_transitive_keeps_generic_refusal() {
       "node_modules/oldpkg":{"version":"1.0.0"},
       "node_modules/evildep":{"version":"0.4.2"},
       "node_modules/newdep":{"version":"2.0.0"}}}"#;
-    let project = npm_project();
     let mut checks = HashMap::new();
     checks.insert(
         key("npm", "evildep", "0.4.2"),
@@ -157,11 +154,10 @@ fn preexisting_vulnerable_with_unverifiable_transitive_keeps_generic_refusal() {
     );
     let mut statuses = HashMap::new();
     statuses.insert(key("npm", "newdep", "2.0.0"), 503u16);
-    let mut h = tree_harness("npm", checks, statuses, LOCK_WITH_NEWDEP);
+    let mut h = npm_project_harness(checks, statuses, LOCK_WITH_NEWDEP);
     h.cmd.env("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL", "1");
     let out = h
         .cmd
-        .current_dir(project.path())
         .args(["npm", "install", "oldpkg@1.0.0"])
         .output()
         .expect("run corgea");
@@ -179,16 +175,14 @@ fn preexisting_vulnerable_with_unverifiable_transitive_keeps_generic_refusal() {
 
 #[test]
 fn npm_preexisting_without_fix_has_no_hint() {
-    let project = npm_project();
     let mut checks = HashMap::new();
     checks.insert(
         key("npm", "evildep", "0.4.2"),
         vulnerable_body("npm", "evildep", "0.4.2", None),
     );
-    let mut h = tree_harness("npm", checks, HashMap::new(), NPM_LOCK);
+    let mut h = npm_project_harness(checks, HashMap::new(), NPM_LOCK);
     let out = h
         .cmd
-        .current_dir(project.path())
         .args(["npm", "install", "oldpkg@1.0.0"])
         .output()
         .expect("run corgea");
@@ -243,16 +237,14 @@ fn pip_json_carries_origin_per_tree_entry() {
 
 #[test]
 fn npm_json_carries_preexisting_origin() {
-    let project = npm_project();
     let mut checks = HashMap::new();
     checks.insert(
         key("npm", "evildep", "0.4.2"),
         vulnerable_body("npm", "evildep", "0.4.2", Some("1.2.2")),
     );
-    let mut h = tree_harness("npm", checks, HashMap::new(), NPM_LOCK);
+    let mut h = npm_project_harness(checks, HashMap::new(), NPM_LOCK);
     let out = h
         .cmd
-        .current_dir(project.path())
         .args(["npm", "--json", "install", "oldpkg@1.0.0"])
         .output()
         .expect("run corgea");

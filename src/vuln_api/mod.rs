@@ -41,9 +41,19 @@ impl Ecosystem {
             Ecosystem::Pypi => "pypi",
         }
     }
+
+    /// Canonical package name for requests and comparisons: PEP 503 for
+    /// pypi (shared with `deps`), verbatim for npm (names are
+    /// case-sensitive). The one definition of the per-ecosystem rule.
+    pub fn normalize_name(self, name: &str) -> String {
+        match self {
+            Ecosystem::Npm => name.to_string(),
+            Ecosystem::Pypi => crate::deps::ecosystems::pypi::normalize_pypi_name(name),
+        }
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct VulnCheckResponse {
     pub ecosystem: String,
     pub package_name: String,
@@ -61,10 +71,6 @@ pub struct VulnMatch {
     pub fixed_version: Option<String>,
 }
 
-fn user_agent() -> String {
-    format!("corgea-cli/{} (vuln-api)", env!("CARGO_PKG_VERSION"))
-}
-
 /// Build (once) and clone the shared vuln-api client. A blocking reqwest
 /// client owns a runtime thread, and a gate makes up to three verdict
 /// passes (tree, named-only, steers) — cache it like `registry.rs` does.
@@ -75,7 +81,7 @@ pub fn http_client() -> Result<reqwest::blocking::Client, String> {
         .get_or_init(|| {
             reqwest::blocking::Client::builder()
                 .timeout(REQUEST_TIMEOUT)
-                .user_agent(user_agent())
+                .user_agent(crate::verify_deps::registry::user_agent("vuln-api"))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| format!("failed to build vuln-api http client: {}", e))
@@ -84,7 +90,7 @@ pub fn http_client() -> Result<reqwest::blocking::Client, String> {
 }
 
 /// Whether `token` looks like a JWT (three non-empty dot-separated parts).
-pub fn is_jwt(token: &str) -> bool {
+fn is_jwt(token: &str) -> bool {
     let parts: Vec<&str> = token.splitn(4, '.').collect();
     parts.len() == 3 && parts.iter().all(|p| !p.is_empty())
 }
@@ -109,6 +115,13 @@ fn encode_package_name(ecosystem: Ecosystem, name: &str) -> String {
     }
 }
 
+/// Value for the `CORGEA-SOURCE` header: the `CORGEA_SOURCE` env override,
+/// otherwise `cli`. The one definition, shared with the binary crate's
+/// `utils/api.rs`.
+pub fn source() -> String {
+    std::env::var("CORGEA_SOURCE").unwrap_or_else(|_| "cli".to_string())
+}
+
 /// Build a JSON GET: the standard `Accept` / `CORGEA-SOURCE` headers plus,
 /// when present, the per-call auth header (JWT → `Authorization: Bearer`,
 /// otherwise `CORGEA-TOKEN`). The single place auth is attached, shared by
@@ -121,7 +134,7 @@ fn build_json_get(
     let mut req = client
         .get(url)
         .header("Accept", "application/json")
-        .header("CORGEA-SOURCE", "cli");
+        .header("CORGEA-SOURCE", source());
     if let Some(token) = token {
         let (name, value) = auth_header(token);
         req = req.header(name, value);
@@ -208,6 +221,11 @@ pub fn check_package_version(
     version: &str,
 ) -> Result<VulnCheckResponse, Box<dyn std::error::Error>> {
     let base = validated_base(base_url)?;
+    // vuln-api advisories are keyed by canonical names; an alternate
+    // spelling (PEP 503: `Flask_Cors` ≡ `flask-cors`) would miss and read
+    // as clean. The client owns request-time normalization so no caller
+    // can forget it.
+    let name = &ecosystem.normalize_name(name);
     let encoded_name = encode_package_name(ecosystem, name);
     let encoded_version = urlencoding::encode(version);
     let url = format!(
@@ -315,7 +333,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     fn lodash_key() -> PackageKey {
-        ("npm".into(), "lodash".into(), "4.17.20".into())
+        vuln_api_stub::key("npm", "lodash", "4.17.20")
     }
 
     fn check_with_stub_status(
@@ -416,21 +434,15 @@ mod tests {
     #[test]
     fn check_package_version_429_retries_then_succeeds() {
         let client = http_client().unwrap();
-        let vulnerable_body = r#"{
-            "ecosystem": "npm",
-            "package_name": "lodash",
-            "version": "4.17.20",
-            "is_vulnerable": true,
-            "matches": [{
-                "advisory_id": "GHSA-retry-test",
-                "severity_level": "high",
-                "tier": 1,
-                "vulnerable_version_range": "<4.17.21",
-                "fixed_version": "4.17.21"
-            }]
-        }"#;
+        let vulnerable_body = vuln_api_stub::vulnerable_body(
+            "npm",
+            "lodash",
+            "4.17.20",
+            "GHSA-retry-test",
+            Some("4.17.21"),
+        );
         let stub = vuln_api_stub::spawn_with_retry_once(
-            HashMap::from([(lodash_key(), vulnerable_body.to_string())]),
+            HashMap::from([(lodash_key(), vulnerable_body)]),
             HashMap::new(),
             HashSet::from([lodash_key()]),
         );

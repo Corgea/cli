@@ -272,7 +272,7 @@ fn install_wrap_options(
 ) -> corgea::precheck::PrecheckOptions {
     let token = config.get_token();
     let token = token.trim();
-    let base_url = config.get_vuln_api_url();
+    let base_url = config::vuln_api_url();
     let custom_vuln_api_url = base_url != config::DEFAULT_VULN_API_URL;
     let send_token_to_custom =
         utils::generic::get_env_var_if_exists("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL")

@@ -1,6 +1,6 @@
 use crate::log::debug;
 use crate::utils;
-use corgea::vuln_api::auth_header;
+use corgea::vuln_api::{auth_header, source as get_source};
 use reqwest::header::HeaderMap;
 use reqwest::StatusCode;
 use reqwest::{
@@ -18,10 +18,6 @@ use std::path::Path;
 
 const CHUNK_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 const API_BASE: &str = "/api/v1";
-
-fn get_source() -> String {
-    std::env::var("CORGEA_SOURCE").unwrap_or_else(|_| "cli".to_string())
-}
 
 fn auth_headers(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
