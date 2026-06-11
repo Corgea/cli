@@ -14,7 +14,7 @@
 mod common;
 
 use common::{
-    spawn_http_stub, GateHarness, NOT_FOUND_JSON, OLDPKG_NPM_PACKUMENT, OLDPKG_PYPI_JSON,
+    npm_packument, pypi_release_json, spawn_http_stub, GateHarness, NOT_FOUND_JSON, OLD_TS,
     RESOLUTION_FAILS,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,20 +40,10 @@ fn spawn_registry_stub() -> (String, Arc<AtomicUsize>) {
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
         match path {
-            "/pypi/oldpkg/json" => ("200 OK", OLDPKG_PYPI_JSON.to_string()),
-            "/pypi/freshpkg/json" => (
-                "200 OK",
-                format!(
-                    r#"{{"info":{{"name":"freshpkg"}},"releases":{{"9.9.9":[{{"upload_time_iso_8601":"{fresh_ts}"}}]}}}}"#,
-                ),
-            ),
-            "/oldpkg" => ("200 OK", OLDPKG_NPM_PACKUMENT.to_string()),
-            "/freshpkg" => (
-                "200 OK",
-                format!(
-                    r#"{{"dist-tags":{{"latest":"9.9.9"}},"versions":{{"9.9.9":{{}}}},"time":{{"9.9.9":"{fresh_ts}"}}}}"#,
-                ),
-            ),
+            "/pypi/oldpkg/json" => ("200 OK", pypi_release_json("oldpkg", "1.0.0", OLD_TS)),
+            "/pypi/freshpkg/json" => ("200 OK", pypi_release_json("freshpkg", "9.9.9", &fresh_ts)),
+            "/oldpkg" => ("200 OK", npm_packument("1.0.0", OLD_TS)),
+            "/freshpkg" => ("200 OK", npm_packument("9.9.9", &fresh_ts)),
             _ => ("404 Not Found", NOT_FOUND_JSON.to_string()),
         }
     });

@@ -529,6 +529,19 @@ fn run_parsed_install(
     report_and_exec(&report, &opts, exec)
 }
 
+/// One verdict job (`requested: true`) per named resolved target, in
+/// outcome order.
+fn resolved_jobs(outcomes: &[TargetOutcome]) -> impl Iterator<Item = tree::TreePackage> + '_ {
+    outcomes.iter().filter_map(|o| match o {
+        TargetOutcome::Resolved { resolved, .. } => Some(tree::TreePackage {
+            name: resolved.name.clone(),
+            version: resolved.version.clone(),
+            requested: true,
+        }),
+        _ => None,
+    })
+}
+
 /// Verdict the resolved would-install set (`tree::resolve_tree`'s result).
 /// On any resolution failure, fall back to the named-only verdict pass; the
 /// caller renders the loud warning from the returned `NamedOnly` reason.
@@ -560,15 +573,9 @@ fn run_tree_pass(
         }
     }
     let resolved_count = jobs.len();
-    for o in outcomes.iter() {
-        if let TargetOutcome::Resolved { resolved, .. } = o {
-            if seen.insert((norm(&resolved.name), resolved.version.clone())) {
-                jobs.push(tree::TreePackage {
-                    name: resolved.name.clone(),
-                    version: resolved.version.clone(),
-                    requested: true,
-                });
-            }
+    for p in resolved_jobs(outcomes) {
+        if seen.insert((norm(&p.name), p.version.clone())) {
+            jobs.push(p);
         }
     }
 
@@ -605,17 +612,7 @@ fn run_verdict_pass(
 
     // One job per resolved target, in outcome order; the pool preserves
     // order, so verdicts zip straight back onto the resolved outcomes.
-    let jobs: Vec<tree::TreePackage> = outcomes
-        .iter()
-        .filter_map(|o| match o {
-            TargetOutcome::Resolved { resolved, .. } => Some(tree::TreePackage {
-                name: resolved.name.clone(),
-                version: resolved.version.clone(),
-                requested: true,
-            }),
-            _ => None,
-        })
-        .collect();
+    let jobs: Vec<tree::TreePackage> = resolved_jobs(outcomes).collect();
 
     let mut results = verdict::verdict_pool(jobs, cfg, manager).into_iter();
     for o in outcomes.iter_mut() {

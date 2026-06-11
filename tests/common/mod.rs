@@ -50,13 +50,25 @@ pub fn fixture(name: &str) -> String {
 #[allow(dead_code)]
 pub const NOT_FOUND_JSON: &str = r#"{"message":"not found"}"#;
 
-/// PyPI release JSON for `oldpkg` 1.0.0, published 2020 → never recent.
+/// Publish timestamp far in the past → never recent.
 #[allow(dead_code)]
-pub const OLDPKG_PYPI_JSON: &str = r#"{"info":{"name":"oldpkg"},"releases":{"1.0.0":[{"upload_time_iso_8601":"2020-01-01T00:00:00Z"}]}}"#;
+pub const OLD_TS: &str = "2020-01-01T00:00:00Z";
 
-/// npm packument for `oldpkg` 1.0.0, published 2020 → never recent.
+/// PyPI release JSON: one release of `version`, published at `ts`.
 #[allow(dead_code)]
-pub const OLDPKG_NPM_PACKUMENT: &str = r#"{"dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{}},"time":{"1.0.0":"2020-01-01T00:00:00Z"}}"#;
+pub fn pypi_release_json(name: &str, version: &str, ts: &str) -> String {
+    format!(
+        r#"{{"info":{{"name":"{name}"}},"releases":{{"{version}":[{{"upload_time_iso_8601":"{ts}"}}]}}}}"#
+    )
+}
+
+/// npm packument: a single `version` as latest, published at `ts`.
+#[allow(dead_code)]
+pub fn npm_packument(version: &str, ts: &str) -> String {
+    format!(
+        r#"{{"dist-tags":{{"latest":"{version}"}},"versions":{{"{version}":{{}}}},"time":{{"{version}":"{ts}"}}}}"#
+    )
+}
 
 /// Pip `--report -` payload: `oldpkg` (named/requested) + `evildep`
 /// (transitive).
@@ -113,8 +125,8 @@ where
 #[allow(dead_code)]
 pub fn spawn_oldpkg_registry_stub() -> String {
     spawn_http_stub(|path| match path {
-        "/pypi/oldpkg/json" => ("200 OK", OLDPKG_PYPI_JSON.to_string()),
-        "/oldpkg" => ("200 OK", OLDPKG_NPM_PACKUMENT.to_string()),
+        "/pypi/oldpkg/json" => ("200 OK", pypi_release_json("oldpkg", "1.0.0", OLD_TS)),
+        "/oldpkg" => ("200 OK", npm_packument("1.0.0", OLD_TS)),
         _ => ("404 Not Found", NOT_FOUND_JSON.to_string()),
     })
 }
@@ -129,12 +141,7 @@ pub fn spawn_wildcard_pypi_stub() -> String {
             .and_then(|p| p.strip_suffix("/json"))
             .filter(|n| !n.is_empty() && !n.contains('/'));
         match name {
-            Some(name) => (
-                "200 OK",
-                format!(
-                    r#"{{"info":{{"name":"{name}"}},"releases":{{"1.0.0":[{{"upload_time_iso_8601":"2020-01-01T00:00:00Z"}}]}}}}"#
-                ),
-            ),
+            Some(name) => ("200 OK", pypi_release_json(name, "1.0.0", OLD_TS)),
             None => ("404 Not Found", NOT_FOUND_JSON.to_string()),
         }
     })

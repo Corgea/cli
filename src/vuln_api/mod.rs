@@ -212,6 +212,22 @@ fn send_package_check_with_429_retry(
     Ok(response)
 }
 
+/// The fixed error message for a recognized non-success status; `None` for
+/// statuses needing bespoke handling (404 → clean, anything else → body
+/// suffix). Tests assert these strings — keep them stable.
+fn status_error_message(code: u16, token_present: bool) -> Option<String> {
+    match code {
+        401 if token_present => {
+            Some("vuln-api rejected the Corgea token (run `corgea login` to refresh)".to_string())
+        }
+        401 => Some("vuln-api requires authentication".to_string()),
+        403 => Some("vuln-api access denied (check your Corgea plan/permissions)".to_string()),
+        429 => Some("vuln-api rate-limited this request (retry later)".to_string()),
+        500..=599 => Some(format!("vuln-api unavailable (HTTP {})", code)),
+        _ => None,
+    }
+}
+
 pub fn check_package_version(
     client: &reqwest::blocking::Client,
     base_url: &str,
@@ -241,38 +257,22 @@ pub fn check_package_version(
     let response = send_package_check_with_429_retry(client, &url, token)?;
 
     let status = response.status();
-    match status.as_u16() {
-        401 => {
-            if token.is_some() {
-                return Err(
-                    "vuln-api rejected the Corgea token (run `corgea login` to refresh)".into(),
-                );
-            }
-            return Err("vuln-api requires authentication".into());
-        }
-        403 => {
-            return Err("vuln-api access denied (check your Corgea plan/permissions)".into());
-        }
-        404 => {
-            return Ok(VulnCheckResponse {
-                ecosystem: ecosystem.path_segment().to_string(),
-                package_name: name.to_string(),
-                version: version.to_string(),
-                is_vulnerable: false,
-                matches: vec![],
-            });
-        }
-        429 => {
-            return Err("vuln-api rate-limited this request (retry later)".into());
-        }
-        500..=599 => {
-            return Err(format!("vuln-api unavailable (HTTP {})", status.as_u16()).into());
-        }
-        code if !status.is_success() => {
-            let suffix = error_body_suffix(response);
-            return Err(format!("vuln-api returned unexpected HTTP {}{}", code, suffix).into());
-        }
-        _ => {}
+    let code = status.as_u16();
+    if let Some(message) = status_error_message(code, token.is_some()) {
+        return Err(message.into());
+    }
+    if code == 404 {
+        return Ok(VulnCheckResponse {
+            ecosystem: ecosystem.path_segment().to_string(),
+            package_name: name.to_string(),
+            version: version.to_string(),
+            is_vulnerable: false,
+            matches: vec![],
+        });
+    }
+    if !status.is_success() {
+        let suffix = error_body_suffix(response);
+        return Err(format!("vuln-api returned unexpected HTTP {}{}", code, suffix).into());
     }
 
     let response_text = response.text()?;
