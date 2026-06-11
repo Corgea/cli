@@ -337,6 +337,7 @@ fn run_parsed_install(
     let tree_eligible = opts.verdict.is_some() && tree::covers_input(manager, &parsed);
 
     if parsed.targets.is_empty() && !tree_eligible {
+        bare_install_note(manager, subcommand_label);
         requirements_note(&parsed);
         return exec();
     }
@@ -402,6 +403,23 @@ fn run_parsed_install(
     }
 
     exec()
+}
+
+/// One honest stderr line when a zero-spec install can't be gated:
+/// yarn/pnpm/uv have no safe dry-run, so a bare install pulls its whole
+/// dependency set unchecked. No-op for other managers (bare npm is gated
+/// via the tree pass; bare pip installs nothing).
+fn bare_install_note(manager: PackageManager, subcommand_label: &str) {
+    if matches!(
+        manager,
+        PackageManager::Yarn | PackageManager::Pnpm | PackageManager::Uv
+    ) {
+        eprintln!(
+            "note: bare '{} {}' is not gated (no safe dry-run) — dependencies install unchecked",
+            manager.binary_name(),
+            subcommand_label
+        );
+    }
 }
 
 /// Print the "requirements files are not recency-checked" note when the
@@ -760,11 +778,16 @@ fn print_vulnerable_matches(name: &str, matches: &[crate::vuln_api::VulnMatch]) 
 }
 
 fn print_text(report: &PrecheckReport) {
+    // Build the echoed command from non-empty parts: a bare gated install
+    // (e.g. `npm install` with zero specs) has no args to append.
+    let mut command = format!("{} {}", report.manager.binary_name(), report.subcommand);
+    if !report.original_args.is_empty() {
+        command.push(' ');
+        command.push_str(&report.original_args.join(" "));
+    }
     println!(
-        "Pre-checking `{} {} {}` (threshold {})",
-        report.manager.binary_name(),
-        report.subcommand,
-        report.original_args.join(" "),
+        "Pre-checking `{}` (threshold {})",
+        command,
         verify_deps::format_duration(report.threshold)
     );
     println!(

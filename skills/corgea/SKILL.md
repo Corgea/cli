@@ -118,8 +118,12 @@ token is configured — each resolved version is checked against Corgea's vuln-a
 known-vulnerable or malicious versions block, and a verdict that cannot be obtained
 (network/5xx/auth errors) also blocks (fail-closed). Without a token the vuln check
 is skipped (recency-only) and stderr suggests `corgea login`. Everything else passes
-through with the package manager's own exit code. Offline-only inputs (git/URL/path
-specs, `-r requirements.txt`, bare `install`) are not checked and run with a printed note.
+through with the package manager's own exit code. Git/URL/path specs are noted, never
+blocked. With a token, bare `npm install` (zero specs, `package.json` present) is gated
+too: the full lockfile-resolved tree is verdicted, so a vulnerable lockfile blocks. Bare
+`yarn`/`pnpm`/`uv` installs have no safe dry-run; they run unchecked after a stderr note
+(`note: bare '<pm> <sub>' is not gated …`). `-r requirements.txt` files get a printed
+note when the tree pass doesn't cover them.
 
 Blocked findings steer to the fix: each advisory line shows `fixed in <version>` (or
 `no fixed version known`), and when every advisory on a package has a fix, a
