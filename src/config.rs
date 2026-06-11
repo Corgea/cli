@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::{env, fs, io};
 
+pub const DEFAULT_VULN_API_URL: &str = "https://cve-worker-staging.corgea.workers.dev";
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub(crate) url: String,
@@ -105,7 +107,7 @@ impl Config {
     /// then the public default.
     pub fn get_vuln_api_url(&self) -> String {
         crate::utils::generic::get_env_var_if_exists("CORGEA_VULN_API_URL")
-            .unwrap_or_else(|| "https://vuln-api.corgea.app".to_string())
+            .unwrap_or_else(|| DEFAULT_VULN_API_URL.to_string())
             .trim()
             .trim_end_matches('/')
             .to_string()
@@ -134,7 +136,7 @@ mod tests {
         // Default when the env var is unset.
         assert_eq!(
             test_config().get_vuln_api_url(),
-            "https://vuln-api.corgea.app"
+            "https://cve-worker-staging.corgea.workers.dev"
         );
 
         // Env var wins; whitespace and trailing slash trimmed.
@@ -145,7 +147,7 @@ mod tests {
         env::set_var("CORGEA_VULN_API_URL", "   ");
         assert_eq!(
             test_config().get_vuln_api_url(),
-            "https://vuln-api.corgea.app"
+            "https://cve-worker-staging.corgea.workers.dev"
         );
         env::remove_var("CORGEA_VULN_API_URL");
     }
