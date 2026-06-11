@@ -94,7 +94,8 @@ pub fn run(scope: Option<String>, url: Option<String>) -> Result<(), Box<dyn std
 fn find_available_port(start_port: u16) -> Result<u16, Box<dyn std::error::Error>> {
     // Try a more reliable approach - start from a higher range that's less likely to be used
     let search_ranges = vec![
-        (start_port, start_port + 50),
+        // Saturate: a start port near u16::MAX must clamp, not overflow.
+        (start_port, start_port.saturating_add(50)),
         (9000, 9100),
         (8000, 8100),
         (7000, 7100),
