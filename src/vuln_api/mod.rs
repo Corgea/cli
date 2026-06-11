@@ -65,6 +65,8 @@ pub fn http_client() -> Result<reqwest::blocking::Client, String> {
         .clone()
 }
 
+// Twin of `is_jwt` in the binary crate's `utils/api.rs` — unreachable from
+// this library crate (like `log`, re-declared in `lib.rs`). Keep in sync.
 fn is_jwt(token: &str) -> bool {
     let parts: Vec<&str> = token.splitn(4, '.').collect();
     parts.len() == 3 && parts.iter().all(|p| !p.is_empty())

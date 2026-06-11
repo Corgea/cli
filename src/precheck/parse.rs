@@ -20,23 +20,24 @@ pub struct ParsedInstall {
 
 /// `uv pip install` argument list (everything after `pip install`).
 pub fn parse_pip_install_args(args: &[String]) -> Result<ParsedInstall, String> {
-    Ok(build_parsed_install(extract_pip_positionals(args)?, true))
+    Ok(build_parsed_install(
+        extract_pip_positionals(args)?,
+        parse_pypi_spec,
+    ))
 }
 
 /// `uv add` argument list (everything after `add`).
 pub fn parse_pypi_positionals_args(args: &[String]) -> ParsedInstall {
-    build_parsed_install(extract_node_positionals(args), true)
+    build_parsed_install(extract_node_positionals(args), parse_pypi_spec)
 }
 
-fn build_parsed_install(positionals: PositionalSplit, pypi: bool) -> ParsedInstall {
+fn build_parsed_install(
+    positionals: PositionalSplit,
+    parse_spec: fn(&str) -> InstallTarget,
+) -> ParsedInstall {
     let mut parsed = ParsedInstall::default();
     for raw in &positionals.specs {
-        let target = if pypi {
-            parse_pypi_spec(raw)
-        } else {
-            parse_npm_spec(raw)
-        };
-        parsed.targets.push(target);
+        parsed.targets.push(parse_spec(raw));
     }
     parsed.requirements_files = positionals.requirements_files;
     parsed
@@ -48,9 +49,9 @@ pub fn parse_install_args(
 ) -> Result<ParsedInstall, String> {
     match manager {
         PackageManager::Pip => parse_pip_install_args(args),
-        PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => {
-            Ok(build_parsed_install(extract_node_positionals(args), false))
-        }
+        PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => Ok(
+            build_parsed_install(extract_node_positionals(args), parse_npm_spec),
+        ),
         PackageManager::Uv => unreachable!("uv uses classify_uv_command"),
     }
 }

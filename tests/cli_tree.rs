@@ -18,7 +18,7 @@ use common::{
 };
 use corgea::vuln_api_stub::{self, PackageKey};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
