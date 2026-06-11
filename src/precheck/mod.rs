@@ -213,26 +213,30 @@ impl PrecheckReport {
         self.count(|o| matches!(o, TargetOutcome::Resolved { recent: true, .. }))
     }
     pub fn vulnerable_count(&self) -> usize {
-        self.count(|o| {
-            matches!(
-                o,
-                TargetOutcome::Resolved {
-                    verdict: VerdictStatus::Vulnerable(_),
-                    ..
-                }
-            )
-        }) + self.tree_finding_count(|v| matches!(v, VerdictStatus::Vulnerable(_)))
+        self.named_vulnerable_count() + self.tree_vulnerable_count()
     }
     pub fn unverifiable_count(&self) -> usize {
-        self.count(|o| {
-            matches!(
-                o,
-                TargetOutcome::Resolved {
-                    verdict: VerdictStatus::Unverifiable(_),
-                    ..
-                }
-            )
-        }) + self.tree_finding_count(|v| matches!(v, VerdictStatus::Unverifiable(_)))
+        self.named_unverifiable_count() + self.tree_unverifiable_count()
+    }
+    /// Vulnerable findings among the named targets this command adds.
+    pub fn named_vulnerable_count(&self) -> usize {
+        self.named_finding_count(|v| matches!(v, VerdictStatus::Vulnerable(_)))
+    }
+    /// Unverifiable findings among the named targets this command adds.
+    pub fn named_unverifiable_count(&self) -> usize {
+        self.named_finding_count(|v| matches!(v, VerdictStatus::Unverifiable(_)))
+    }
+    /// Count named (resolved) outcomes whose verdict matches `pred`.
+    fn named_finding_count(&self, pred: impl Fn(&VerdictStatus) -> bool) -> usize {
+        self.count(|o| matches!(o, TargetOutcome::Resolved { verdict, .. } if pred(verdict)))
+    }
+    /// Vulnerable findings beyond the named targets (the resolved tree).
+    pub fn tree_vulnerable_count(&self) -> usize {
+        self.tree_finding_count(|v| matches!(v, VerdictStatus::Vulnerable(_)))
+    }
+    /// Unverifiable findings beyond the named targets (the resolved tree).
+    pub fn tree_unverifiable_count(&self) -> usize {
+        self.tree_finding_count(|v| matches!(v, VerdictStatus::Unverifiable(_)))
     }
     /// Count transitive tree findings whose verdict matches `pred`.
     fn tree_finding_count(&self, pred: impl Fn(&VerdictStatus) -> bool) -> usize {
@@ -393,11 +397,7 @@ fn run_parsed_install(
 
     if should_block_install(&report, &opts) {
         if !opts.json {
-            if report.vulnerable_count() > 0 || report.unverifiable_count() > 0 {
-                eprintln!("Refusing to run install. Pass --force to proceed despite findings.");
-            } else {
-                eprintln!("Refusing to run install. Pass --no-fail to proceed anyway.");
-            }
+            print_refusal(&report);
         }
         return 1;
     }
@@ -419,6 +419,24 @@ fn bare_install_note(manager: PackageManager, subcommand_label: &str) {
             manager.binary_name(),
             subcommand_label
         );
+    }
+}
+
+/// The refusal line on stderr. When vulnerable findings exist but none sit on
+/// a named target — and no named target is unverifiable either — the block is
+/// entirely the existing tree's doing, so say that instead of implying the
+/// package the user typed is at fault. Messaging only; the block decision
+/// stays with `should_block_install`.
+fn print_refusal(report: &PrecheckReport) {
+    let named_findings = report.named_vulnerable_count() + report.named_unverifiable_count();
+    if report.vulnerable_count() > 0 && named_findings == 0 {
+        eprintln!(
+            "Refusing to run install: your existing dependency tree has known-vulnerable packages (none were added by this command). Fix them or pass --force."
+        );
+    } else if report.vulnerable_count() > 0 || report.unverifiable_count() > 0 {
+        eprintln!("Refusing to run install. Pass --force to proceed despite findings.");
+    } else {
+        eprintln!("Refusing to run install. Pass --no-fail to proceed anyway.");
     }
 }
 
@@ -777,6 +795,18 @@ fn print_vulnerable_matches(name: &str, matches: &[crate::vuln_api::VulnMatch]) 
     }
 }
 
+/// One summary-line segment, e.g. `"2 vulnerable (2 from existing tree)"`.
+/// The parenthetical separates findings the resolved tree carried in from
+/// findings on the targets this command names; omitted when the tree
+/// contributed none.
+fn summary_segment(total: usize, from_tree: usize, label: &str) -> String {
+    if from_tree > 0 {
+        format!("{total} {label} ({from_tree} from existing tree)")
+    } else {
+        format!("{total} {label}")
+    }
+}
+
 fn print_text(report: &PrecheckReport) {
     // Build the echoed command from non-empty parts: a bare gated install
     // (e.g. `npm install` with zero specs) has no args to append.
@@ -791,11 +821,19 @@ fn print_text(report: &PrecheckReport) {
         verify_deps::format_duration(report.threshold)
     );
     println!(
-        "  {} ok, {} recent, {} vulnerable, {} unverifiable, {} skipped, {} errors",
+        "  {} ok, {} recent, {}, {}, {} skipped, {} errors",
         report.ok_count(),
         report.recent_count(),
-        report.vulnerable_count(),
-        report.unverifiable_count(),
+        summary_segment(
+            report.vulnerable_count(),
+            report.tree_vulnerable_count(),
+            "vulnerable"
+        ),
+        summary_segment(
+            report.unverifiable_count(),
+            report.tree_unverifiable_count(),
+            "unverifiable"
+        ),
         report.skipped_count(),
         report.error_count(),
     );
