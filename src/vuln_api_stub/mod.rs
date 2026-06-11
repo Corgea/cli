@@ -84,15 +84,25 @@ pub fn spawn_capturing_vuln_api_stub() -> (String, std::sync::Arc<std::sync::Mut
             let name = urlencoding::decode(name).unwrap_or_default();
             let ver = urlencoding::decode(ver).unwrap_or_default();
             let body = default_clean_response(eco, &name, &ver);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
+            let response = http_response("200 OK", "", &body);
             let _ = stream.write_all(response.as_bytes());
         }
     });
     (base_url, requests)
+}
+
+/// One-shot JSON HTTP response. `Connection: close` is load-bearing: the
+/// stubs serve one response per connection, so without it reqwest pools the
+/// socket and a second request (the gate's tree pass makes several per run)
+/// races the close and fails. `extra_headers` must be empty or end in `\r\n`.
+pub fn http_response(status_line: &str, extra_headers: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status_line,
+        extra_headers,
+        body.len(),
+        body
+    )
 }
 
 /// The value of header `name` in a raw captured HTTP request, if present.
@@ -168,17 +178,14 @@ fn handle_connection(
         None => (400, r#"{"error":"bad request"}"#.to_string(), false),
     };
 
-    let status_text = status_text(status_code);
-    // `Connection: close` is load-bearing: the stub serves one response per
-    // connection, so without it reqwest pools the socket and a second request
-    // (the gate's tree pass makes several per run) races the close and fails.
-    let response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-        status_code,
-        status_text,
-        if retry_after { "Retry-After: 1\r\n" } else { "" },
-        response_body.len(),
-        response_body
+    let response = http_response(
+        &format!("{} {}", status_code, status_text(status_code)),
+        if retry_after {
+            "Retry-After: 1\r\n"
+        } else {
+            ""
+        },
+        &response_body,
     );
     let _ = stream.write_all(response.as_bytes());
 }

@@ -3,7 +3,7 @@
 //!
 //! Composes the `cli_install.rs` harness pattern (fake package manager on a
 //! private PATH + local pypi registry stub) with the in-crate vuln-api stub —
-//! the shared `common::PipHarness`. `oldpkg==1.0.0` is published in 2020, so
+//! the shared `common::pip_harness`. `oldpkg==1.0.0` is published in 2020, so
 //! recency never blocks here — every block in this file is the verdict's
 //! doing.
 
@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{key, vulnerable_body, PipHarness};
+use common::{key, pip_harness, vulnerable_body};
 use corgea::vuln_api_stub::{header_value, spawn_capturing_vuln_api_stub};
 use std::collections::HashMap;
 
@@ -22,7 +22,7 @@ fn vulnerable_pin_blocks_without_running_install() {
         key("pypi", "oldpkg", "1.0.0"),
         vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0")),
     );
-    let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 0);
+    let mut h = pip_harness(checks, HashMap::new(), Some("test-token"), 0);
     let out = h
         .cmd
         .args(["pip", "install", "oldpkg==1.0.0"])
@@ -52,7 +52,7 @@ fn alternate_pypi_spelling_hits_canonical_verdict() {
         key("pypi", "flask-cors", "1.0.0"),
         vulnerable_body("pypi", "flask-cors", "1.0.0", "GHSA-TEST-0001", None),
     );
-    let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 0);
+    let mut h = pip_harness(checks, HashMap::new(), Some("test-token"), 0);
     let out = h
         .cmd
         .args(["pip", "install", "Flask_Cors==1.0.0"])
@@ -75,7 +75,7 @@ fn force_overrides_vulnerable_block_and_propagates_exit_code() {
         key("pypi", "oldpkg", "1.0.0"),
         vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0")),
     );
-    let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 7);
+    let mut h = pip_harness(checks, HashMap::new(), Some("test-token"), 7);
     let out = h
         .cmd
         .args(["pip", "--force", "install", "oldpkg==1.0.0"])
@@ -99,7 +99,7 @@ fn resolution_error_fails_closed_when_authenticated() {
     // The wildcard registry stub only knows version 1.0.0, so `==2.0.0`
     // is a resolution error: no verdict was obtained, and authenticated
     // mode must block — otherwise a registry outage bypasses the gate.
-    let mut h = PipHarness::new(HashMap::new(), HashMap::new(), Some("test-token"), 0);
+    let mut h = pip_harness(HashMap::new(), HashMap::new(), Some("test-token"), 0);
     h.cmd.env("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL", "1");
     let out = h
         .cmd
@@ -124,7 +124,7 @@ fn resolution_error_fails_closed_when_authenticated() {
 fn verdict_503_fails_closed() {
     let mut statuses = HashMap::new();
     statuses.insert(key("pypi", "oldpkg", "1.0.0"), 503u16);
-    let mut h = PipHarness::new(HashMap::new(), statuses, Some("test-token"), 0);
+    let mut h = pip_harness(HashMap::new(), statuses, Some("test-token"), 0);
     h.cmd.env("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL", "1");
     let out = h
         .cmd
@@ -149,7 +149,7 @@ fn tokenless_public_check_blocks_vulnerable_pin() {
         key("pypi", "oldpkg", "1.0.0"),
         vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0")),
     );
-    let mut h = PipHarness::new(checks, HashMap::new(), None, 0);
+    let mut h = pip_harness(checks, HashMap::new(), None, 0);
     let out = h
         .cmd
         .args(["pip", "install", "oldpkg==1.0.0"])
@@ -177,7 +177,7 @@ fn tokenless_public_check_blocks_vulnerable_pin() {
 
 #[test]
 fn tokenless_vuln_api_outage_warns_but_installs() {
-    let mut h = PipHarness::new(HashMap::new(), HashMap::new(), None, 0);
+    let mut h = pip_harness(HashMap::new(), HashMap::new(), None, 0);
     h.cmd.env("CORGEA_VULN_API_URL", "http://127.0.0.1:1");
     let out = h
         .cmd
@@ -200,7 +200,7 @@ fn tokenless_vuln_api_outage_warns_but_installs() {
 #[test]
 fn progress_line_prints_only_above_eight_verdict_jobs() {
     // Nine resolvable named targets → 9 verdict jobs (> 8) → progress line.
-    let mut h = PipHarness::new(HashMap::new(), HashMap::new(), Some("test-token"), 0);
+    let mut h = pip_harness(HashMap::new(), HashMap::new(), Some("test-token"), 0);
     let mut args = vec!["pip".to_string(), "install".to_string()];
     args.extend((1..=9).map(|i| format!("pkg{i}==1.0.0")));
     let out = h.cmd.args(&args).output().expect("run corgea");
@@ -212,7 +212,7 @@ fn progress_line_prints_only_above_eight_verdict_jobs() {
     );
 
     // Two jobs → quiet.
-    let mut h = PipHarness::new(HashMap::new(), HashMap::new(), Some("test-token"), 0);
+    let mut h = pip_harness(HashMap::new(), HashMap::new(), Some("test-token"), 0);
     let out = h
         .cmd
         .args(["pip", "install", "pkg1==1.0.0", "pkg2==1.0.0"])
@@ -231,7 +231,7 @@ fn outage_noise_collapses_above_three_unverifiable() {
     // vuln-api refuses connections: every check fails with the same
     // error-prefix (only the per-package URL differs). Four findings →
     // one collapsed line; counts and fail-closed exit code unchanged.
-    let mut h = PipHarness::new(HashMap::new(), HashMap::new(), Some("test-token"), 0);
+    let mut h = pip_harness(HashMap::new(), HashMap::new(), Some("test-token"), 0);
     h.cmd.env("CORGEA_VULN_API_URL", "http://127.0.0.1:1");
     h.cmd.env("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL", "1");
     let out = h
@@ -263,7 +263,7 @@ fn outage_noise_collapses_above_three_unverifiable() {
     );
 
     // Three findings stay per-line — no collapse at the threshold.
-    let mut h = PipHarness::new(HashMap::new(), HashMap::new(), Some("test-token"), 0);
+    let mut h = pip_harness(HashMap::new(), HashMap::new(), Some("test-token"), 0);
     h.cmd.env("CORGEA_VULN_API_URL", "http://127.0.0.1:1");
     h.cmd.env("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL", "1");
     let out = h
@@ -297,7 +297,7 @@ fn json_carries_verdict_object_and_mode() {
         key("pypi", "oldpkg", "1.0.0"),
         vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0")),
     );
-    let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 0);
+    let mut h = pip_harness(checks, HashMap::new(), Some("test-token"), 0);
     let out = h
         .cmd
         .args(["pip", "--json", "install", "oldpkg==1.0.0"])
@@ -323,7 +323,7 @@ fn json_carries_verdict_object_and_mode() {
 #[test]
 fn custom_vuln_api_url_with_token_does_not_send_token_by_default() {
     let (base_url, requests) = spawn_capturing_vuln_api_stub();
-    let mut h = PipHarness::new(HashMap::new(), HashMap::new(), Some("opaque-token"), 0);
+    let mut h = pip_harness(HashMap::new(), HashMap::new(), Some("opaque-token"), 0);
     h.cmd.env("CORGEA_VULN_API_URL", &base_url);
     let out = h
         .cmd
@@ -340,7 +340,7 @@ fn custom_vuln_api_url_with_token_does_not_send_token_by_default() {
 #[test]
 fn custom_vuln_api_url_sends_token_only_with_opt_in() {
     let (base_url, requests) = spawn_capturing_vuln_api_stub();
-    let mut h = PipHarness::new(HashMap::new(), HashMap::new(), Some("opaque-token"), 0);
+    let mut h = pip_harness(HashMap::new(), HashMap::new(), Some("opaque-token"), 0);
     h.cmd
         .env("CORGEA_VULN_API_URL", &base_url)
         .env("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL", "1");

@@ -83,7 +83,7 @@ fn run_uv_sync(cmd: &[String], opts: PrecheckOptions, exec: impl FnOnce() -> i32
         }
         Err(e) => {
             // The single documented bypass of the "all blocking goes through
-            // `verdict::should_block_install`" invariant: an unparsable
+            // `verdict::block_reason`" invariant: an unparsable
             // uv.lock means there is no report to feed the predicate, so the
             // gate refuses directly (--force above is the only escape).
             eprintln!("error: cannot verify 'uv sync': {e} (pass --force to proceed unchecked)");
@@ -92,8 +92,7 @@ fn run_uv_sync(cmd: &[String], opts: PrecheckOptions, exec: impl FnOnce() -> i32
     };
 
     let resolved_count = jobs.len();
-    let results =
-        verdict::verdict_pool(jobs, cfg, PackageManager::Uv, verdict::VERDICT_CONCURRENCY);
+    let results = verdict::verdict_pool(jobs, cfg, PackageManager::Uv);
     let transitive = results
         .into_iter()
         .map(|(pkg, verdict)| TreeOutcome {

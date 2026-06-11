@@ -97,8 +97,7 @@ pub const UV_COMPILED: &str = "oldpkg==1.0.0\nevildep==0.4.2\n";
 
 /// Spawn a one-response-per-connection HTTP stub on an ephemeral 127.0.0.1
 /// port; `route` maps a request path to `(status line, body)`. Returns the
-/// base URL. `Connection: close` is load-bearing — without it reqwest pools
-/// the socket and a second request races the close and fails.
+/// base URL.
 #[allow(dead_code)]
 pub fn spawn_http_stub<F>(route: F) -> String
 where
@@ -120,12 +119,7 @@ where
                 .and_then(|l| l.split_whitespace().nth(1))
                 .unwrap_or("");
             let (status, body) = route(path);
-            let response = format!(
-                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                status,
-                body.len(),
-                body
-            );
+            let response = corgea::vuln_api_stub::http_response(status, "", &body);
             let _ = stream.write_all(response.as_bytes());
         }
     });
@@ -297,12 +291,6 @@ impl GateHarness {
         self
     }
 
-    /// Raw script escape hatch.
-    pub fn script(self, binary: &str, script: &str) -> Self {
-        write_script(self._bin.path(), binary, script);
-        self
-    }
-
     /// Raw script escape hatch for scripts that need the temp bin dir or
     /// marker path.
     pub fn script_with_paths<F>(self, binary: &str, make_script: F) -> Self
@@ -383,48 +371,26 @@ impl GateHarness {
 
 /// `corgea` wired to the wildcard pypi registry stub, a report-less fake pip
 /// (recording its argv to a marker), and a vuln-api stub.
+/// `token: None` exercises public mode (no CORGEA_TOKEN set).
 #[cfg(unix)]
 #[allow(dead_code)]
-pub struct PipHarness(GateHarness);
-
-#[cfg(unix)]
-#[allow(dead_code)]
-impl PipHarness {
-    /// `token: None` exercises public mode (no CORGEA_TOKEN set).
-    pub fn new(
-        checks: HashMap<PackageKey, String>,
-        statuses: HashMap<PackageKey, u16>,
-        token: Option<&str>,
-        pip_exit_code: i32,
-    ) -> Self {
-        // RESOLUTION_FAILS models an old pip with no `--report`: the tree
-        // dry-run exits 2, so these tests exercise the named-only fallback.
-        let mut h = GateHarness::new()
-            .fake_tree_pm("pip", RESOLUTION_FAILS, pip_exit_code)
-            .wildcard_pypi_registry()
-            .vuln_checks(checks)
-            .vuln_statuses(statuses);
-        if let Some(t) = token {
-            h = h.token(t);
-        }
-        Self(h.build())
+pub fn pip_harness(
+    checks: HashMap<PackageKey, String>,
+    statuses: HashMap<PackageKey, u16>,
+    token: Option<&str>,
+    pip_exit_code: i32,
+) -> GateHarness {
+    // RESOLUTION_FAILS models an old pip with no `--report`: the tree
+    // dry-run exits 2, so these tests exercise the named-only fallback.
+    let mut h = GateHarness::new()
+        .fake_tree_pm("pip", RESOLUTION_FAILS, pip_exit_code)
+        .wildcard_pypi_registry()
+        .vuln_checks(checks)
+        .vuln_statuses(statuses);
+    if let Some(t) = token {
+        h = h.token(t);
     }
-}
-
-#[cfg(unix)]
-impl std::ops::Deref for PipHarness {
-    type Target = GateHarness;
-
-    fn deref(&self) -> &GateHarness {
-        &self.0
-    }
-}
-
-#[cfg(unix)]
-impl std::ops::DerefMut for PipHarness {
-    fn deref_mut(&mut self) -> &mut GateHarness {
-        &mut self.0
-    }
+    h.build()
 }
 
 /// `corgea` wired to the oldpkg registry stub, a tree-aware fake `binary`
@@ -432,41 +398,17 @@ impl std::ops::DerefMut for PipHarness {
 /// stub, and a token.
 #[cfg(unix)]
 #[allow(dead_code)]
-pub struct TreeHarness(GateHarness);
-
-#[cfg(unix)]
-#[allow(dead_code)]
-impl TreeHarness {
-    pub fn new(
-        binary: &str,
-        checks: HashMap<PackageKey, String>,
-        statuses: HashMap<PackageKey, u16>,
-        payload: &str,
-    ) -> Self {
-        Self(
-            GateHarness::new()
-                .fake_tree_pm(binary, payload, 0)
-                .oldpkg_registry()
-                .vuln_checks(checks)
-                .vuln_statuses(statuses)
-                .token("test-token")
-                .build(),
-        )
-    }
-}
-
-#[cfg(unix)]
-impl std::ops::Deref for TreeHarness {
-    type Target = GateHarness;
-
-    fn deref(&self) -> &GateHarness {
-        &self.0
-    }
-}
-
-#[cfg(unix)]
-impl std::ops::DerefMut for TreeHarness {
-    fn deref_mut(&mut self) -> &mut GateHarness {
-        &mut self.0
-    }
+pub fn tree_harness(
+    binary: &str,
+    checks: HashMap<PackageKey, String>,
+    statuses: HashMap<PackageKey, u16>,
+    payload: &str,
+) -> GateHarness {
+    GateHarness::new()
+        .fake_tree_pm(binary, payload, 0)
+        .oldpkg_registry()
+        .vuln_checks(checks)
+        .vuln_statuses(statuses)
+        .token("test-token")
+        .build()
 }

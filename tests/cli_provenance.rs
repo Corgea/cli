@@ -13,7 +13,7 @@
 
 mod common;
 
-use common::{key, TreeHarness, NPM_LOCK};
+use common::{key, tree_harness, NPM_LOCK};
 use std::collections::HashMap;
 use tempfile::TempDir;
 
@@ -54,7 +54,7 @@ fn pip_requirements_finding_labeled_from_requirements() {
         key("pypi", "reqpkg", "6.0.0"),
         vulnerable_body("pypi", "reqpkg", "6.0.0", None),
     );
-    let mut h = TreeHarness::new("pip", checks, HashMap::new(), PIP_REQ_REPORT);
+    let mut h = tree_harness("pip", checks, HashMap::new(), PIP_REQ_REPORT);
     let out = h
         .cmd
         .args(["pip", "install", "-r", "reqs.txt"])
@@ -82,7 +82,7 @@ fn npm_preexisting_direct_dep_labeled_with_fix_hint() {
         key("npm", "evildep", "0.4.2"),
         vulnerable_body("npm", "evildep", "0.4.2", Some("1.2.2")),
     );
-    let mut h = TreeHarness::new("npm", checks, HashMap::new(), NPM_LOCK);
+    let mut h = tree_harness("npm", checks, HashMap::new(), NPM_LOCK);
     let out = h
         .cmd
         .current_dir(project.path())
@@ -119,7 +119,7 @@ fn npm_preexisting_fix_hint_keeps_hedge_when_fix_is_partial() {
                     "vulnerable_version_range":null,"fixed_version":null}]}"#
             .to_string(),
     );
-    let mut h = TreeHarness::new("npm", checks, HashMap::new(), NPM_LOCK);
+    let mut h = tree_harness("npm", checks, HashMap::new(), NPM_LOCK);
     let out = h
         .cmd
         .current_dir(project.path())
@@ -157,7 +157,7 @@ fn preexisting_vulnerable_with_unverifiable_transitive_keeps_generic_refusal() {
     );
     let mut statuses = HashMap::new();
     statuses.insert(key("npm", "newdep", "2.0.0"), 503u16);
-    let mut h = TreeHarness::new("npm", checks, statuses, LOCK_WITH_NEWDEP);
+    let mut h = tree_harness("npm", checks, statuses, LOCK_WITH_NEWDEP);
     h.cmd.env("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL", "1");
     let out = h
         .cmd
@@ -185,7 +185,7 @@ fn npm_preexisting_without_fix_has_no_hint() {
         key("npm", "evildep", "0.4.2"),
         vulnerable_body("npm", "evildep", "0.4.2", None),
     );
-    let mut h = TreeHarness::new("npm", checks, HashMap::new(), NPM_LOCK);
+    let mut h = tree_harness("npm", checks, HashMap::new(), NPM_LOCK);
     let out = h
         .cmd
         .current_dir(project.path())
@@ -209,7 +209,7 @@ fn pip_json_carries_origin_per_tree_entry() {
     // All-clean run mixing origins: the named `oldpkg` matches its outcome,
     // `reqpkg` (requested) and `evildep` (transitive) land in `tree.transitive`
     // with their origins.
-    let mut h = TreeHarness::new("pip", HashMap::new(), HashMap::new(), PIP_MIXED_REPORT);
+    let mut h = tree_harness("pip", HashMap::new(), HashMap::new(), PIP_MIXED_REPORT);
     let out = h
         .cmd
         .args([
@@ -249,7 +249,7 @@ fn npm_json_carries_preexisting_origin() {
         key("npm", "evildep", "0.4.2"),
         vulnerable_body("npm", "evildep", "0.4.2", Some("1.2.2")),
     );
-    let mut h = TreeHarness::new("npm", checks, HashMap::new(), NPM_LOCK);
+    let mut h = tree_harness("npm", checks, HashMap::new(), NPM_LOCK);
     let out = h
         .cmd
         .current_dir(project.path())

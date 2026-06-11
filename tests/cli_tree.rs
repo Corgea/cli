@@ -13,7 +13,7 @@
 mod common;
 
 use common::{
-    key, vulnerable_body, TreeHarness, NPM_LOCK, RESOLUTION_FAILS, TREE_REPORT, UV_COMPILED,
+    key, tree_harness, vulnerable_body, NPM_LOCK, RESOLUTION_FAILS, TREE_REPORT, UV_COMPILED,
 };
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -48,7 +48,7 @@ fn transitive_vulnerable_blocks_install() {
     for (binary, eco, payload, args) in cases {
         let mut checks = HashMap::new();
         checks.insert(key(eco, "evildep", "0.4.2"), vulnerable_evildep_body(eco));
-        let mut h = TreeHarness::new(binary, checks, HashMap::new(), payload);
+        let mut h = tree_harness(binary, checks, HashMap::new(), payload);
         let out = h.cmd.args(args).output().expect("run corgea");
         assert_eq!(
             out.status.code(),
@@ -80,7 +80,7 @@ fn uv_requirements_file_install_is_tree_gated() {
         key("pypi", "evildep", "0.4.2"),
         vulnerable_evildep_body("pypi"),
     );
-    let mut h = TreeHarness::new("uv", checks, HashMap::new(), UV_COMPILED);
+    let mut h = tree_harness("uv", checks, HashMap::new(), UV_COMPILED);
     let out = h
         .cmd
         .current_dir(cwd.path())
@@ -110,7 +110,7 @@ fn tree_pass_runs_via_pip3_when_pip_is_absent() {
         key("pypi", "evildep", "0.4.2"),
         vulnerable_evildep_body("pypi"),
     );
-    let mut h = TreeHarness::new("pip3", checks, HashMap::new(), TREE_REPORT);
+    let mut h = tree_harness("pip3", checks, HashMap::new(), TREE_REPORT);
     let out = h
         .cmd
         .args(["pip", "install", "oldpkg==1.0.0"])
@@ -151,7 +151,7 @@ fn resolution_failure_falls_back_with_loud_warning() {
         ),
     ];
     for (binary, args, forwarded_argv) in cases {
-        let mut h = TreeHarness::new(binary, HashMap::new(), HashMap::new(), RESOLUTION_FAILS);
+        let mut h = tree_harness(binary, HashMap::new(), HashMap::new(), RESOLUTION_FAILS);
         let out = h.cmd.args(args).output().expect("run corgea");
         assert_eq!(
             out.status.code(),
@@ -174,7 +174,7 @@ fn pip_json_carries_tree_object() {
         key("pypi", "evildep", "0.4.2"),
         vulnerable_evildep_body("pypi"),
     );
-    let mut h = TreeHarness::new("pip", checks, HashMap::new(), TREE_REPORT);
+    let mut h = tree_harness("pip", checks, HashMap::new(), TREE_REPORT);
     let out = h
         .cmd
         .args(["pip", "--json", "install", "oldpkg==1.0.0"])
@@ -196,7 +196,7 @@ fn pip_json_carries_tree_object() {
 #[test]
 fn pip_clean_tree_proceeds() {
     // Stub default-clean (no overrides), so every resolved package is clean.
-    let mut h = TreeHarness::new("pip", HashMap::new(), HashMap::new(), TREE_REPORT);
+    let mut h = tree_harness("pip", HashMap::new(), HashMap::new(), TREE_REPORT);
     let out = h
         .cmd
         .args(["pip", "install", "oldpkg==1.0.0"])
@@ -228,7 +228,7 @@ fn npm_does_not_touch_project_lockfile() {
         key("npm", "evildep", "0.4.2"),
         vulnerable_evildep_body("npm"),
     );
-    let mut h = TreeHarness::new("npm", checks, HashMap::new(), NPM_LOCK);
+    let mut h = tree_harness("npm", checks, HashMap::new(), NPM_LOCK);
     let out = h
         .cmd
         .current_dir(project.path())

@@ -3,7 +3,7 @@
 //! covering every advisory. When any advisory has no known fix, no steer
 //! prints and JSON `remediation` is null.
 //!
-//! Uses the shared `common::PipHarness` (pypi stub published 2020 so recency
+//! Uses the shared `common::pip_harness` (pypi stub published 2020 so recency
 //! never blocks, a fake pip recording its argv, the in-crate vuln-api stub,
 //! and a set token) — every block here is the verdict's doing.
 
@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{key, vulnerable_body, PipHarness};
+use common::{key, pip_harness, vulnerable_body};
 use std::collections::HashMap;
 
 fn fixed_body() -> String {
@@ -26,7 +26,7 @@ fn no_fix_body() -> String {
 fn fixed_match_blocks_and_names_safe_version() {
     let mut checks = HashMap::new();
     checks.insert(key("pypi", "oldpkg", "1.0.0"), fixed_body());
-    let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 0);
+    let mut h = pip_harness(checks, HashMap::new(), Some("test-token"), 0);
     let out = h
         .cmd
         .args(["pip", "install", "oldpkg==1.0.0"])
@@ -50,7 +50,7 @@ fn fixed_match_blocks_and_names_safe_version() {
 fn no_fix_match_reports_no_fixed_version_known() {
     let mut checks = HashMap::new();
     checks.insert(key("pypi", "oldpkg", "1.0.0"), no_fix_body());
-    let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 0);
+    let mut h = pip_harness(checks, HashMap::new(), Some("test-token"), 0);
     let out = h
         .cmd
         .args(["pip", "install", "oldpkg==1.0.0"])
@@ -77,7 +77,7 @@ fn no_fix_match_reports_no_fixed_version_known() {
 fn json_remediation_carries_safe_version() {
     let mut checks = HashMap::new();
     checks.insert(key("pypi", "oldpkg", "1.0.0"), fixed_body());
-    let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 0);
+    let mut h = pip_harness(checks, HashMap::new(), Some("test-token"), 0);
     let out = h
         .cmd
         .args(["pip", "--json", "install", "oldpkg==1.0.0"])
@@ -97,7 +97,7 @@ fn json_remediation_carries_safe_version() {
 fn json_remediation_null_when_no_fix() {
     let mut checks = HashMap::new();
     checks.insert(key("pypi", "oldpkg", "1.0.0"), no_fix_body());
-    let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 0);
+    let mut h = pip_harness(checks, HashMap::new(), Some("test-token"), 0);
     let out = h
         .cmd
         .args(["pip", "--json", "install", "oldpkg==1.0.0"])

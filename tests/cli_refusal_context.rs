@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::{key, TreeHarness, TREE_REPORT};
+use common::{key, tree_harness, GateHarness, TREE_REPORT};
 use corgea::vuln_api_stub::PackageKey;
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -25,11 +25,11 @@ const TREE_REFUSAL: &str = "Refusing to run install: your existing dependency tr
 /// Refusal when a named target carries a blocking verdict.
 const GENERIC_REFUSAL: &str = "Refusing to run install. Pass --force to proceed despite findings.";
 
-fn harness(checks: HashMap<PackageKey, String>, statuses: HashMap<PackageKey, u16>) -> TreeHarness {
-    TreeHarness::new("pip", checks, statuses, TREE_REPORT)
+fn harness(checks: HashMap<PackageKey, String>, statuses: HashMap<PackageKey, u16>) -> GateHarness {
+    tree_harness("pip", checks, statuses, TREE_REPORT)
 }
 
-fn run_install(h: &mut TreeHarness) -> std::process::Output {
+fn run_install(h: &mut GateHarness) -> std::process::Output {
     h.cmd
         .args(["pip", "install", "oldpkg==1.0.0"])
         .output()

@@ -382,20 +382,11 @@ fn parse_pypi_spec(raw: &str) -> InstallTarget {
         };
     }
 
-    // Find the first specifier operator (`==`, `>=`, `<=`, `!=`, `~=`,
-    // `>`, `<`). PEP 440 also allows `===` (arbitrary equality).
-    // Find the leftmost specifier operator. On ties, prefer the
-    // longer operator (e.g. `==` over `=`).
+    // Split at the leftmost specifier operator (`==`, `>=`, `<=`, `!=`,
+    // `~=`, `>`, `<`; PEP 440 also allows `===`). Only the index matters —
+    // the operator itself stays with the spec part.
     let separators = ["===", "==", ">=", "<=", "!=", "~=", ">", "<"];
-    let mut split_at: Option<usize> = None;
-    for sep in &separators {
-        if let Some(idx) = trimmed.find(sep) {
-            split_at = match split_at {
-                Some(prev) if prev <= idx => Some(prev),
-                _ => Some(idx),
-            };
-        }
-    }
+    let split_at = separators.iter().filter_map(|sep| trimmed.find(sep)).min();
 
     let (name_part, spec_part): (&str, &str) = match split_at {
         Some(idx) => (&trimmed[..idx], &trimmed[idx..]),
@@ -403,7 +394,7 @@ fn parse_pypi_spec(raw: &str) -> InstallTarget {
     };
 
     // Strip extras: `requests[security]` -> `requests`.
-    let name_no_extras = pypi_name_part(name_part, PypiNameCut::ParseNamePart);
+    let name_no_extras = name_part.split('[').next().unwrap_or(name_part).trim();
 
     // Strip env markers: `package; python_version >= "3.7"`.
     let spec_no_marker = spec_part.split(';').next().unwrap_or(spec_part).trim();
@@ -432,25 +423,10 @@ fn parse_pypi_spec(raw: &str) -> InstallTarget {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(super) enum PypiNameCut {
-    /// Existing `parse_pypi_spec` behavior: the caller already split at the
-    /// leftmost version operator, so only extras are removed from the name part.
-    ParseNamePart,
-    /// Existing requirements-line behavior: stop at extras, markers,
-    /// operators, or whitespace.
-    RequirementLine,
-}
-
-/// Bare PyPI name extraction only; callers normalize when they need a
-/// comparison key.
-pub(super) fn pypi_name_part(spec: &str, cut: PypiNameCut) -> &str {
-    let stop = |c: char| match cut {
-        PypiNameCut::ParseNamePart => c == '[',
-        PypiNameCut::RequirementLine => {
-            matches!(c, '[' | '<' | '>' | '=' | '!' | '~' | ';' | ' ')
-        }
-    };
+/// Bare PyPI name from a requirement line: stop at extras, operators,
+/// markers, or whitespace. Callers normalize when they need a comparison key.
+pub(super) fn pypi_name_part(spec: &str) -> &str {
+    let stop = |c: char| matches!(c, '[' | '<' | '>' | '=' | '!' | '~' | ';' | ' ');
     let cut = spec.find(stop).unwrap_or(spec.len());
     spec[..cut].trim()
 }
@@ -660,38 +636,12 @@ mod tests {
 
     #[test]
     fn pypi_name_part_strips_extras_markers_and_operators() {
-        assert_eq!(
-            pypi_name_part("requests", PypiNameCut::ParseNamePart),
-            "requests"
-        );
-        assert_eq!(
-            pypi_name_part("requests[security]", PypiNameCut::ParseNamePart),
-            "requests"
-        );
-        assert_eq!(
-            pypi_name_part("pkg; python_version ", PypiNameCut::ParseNamePart),
-            "pkg; python_version"
-        );
-        assert_eq!(
-            pypi_name_part("requests[security]==2.31.0", PypiNameCut::RequirementLine),
-            "requests"
-        );
-        assert_eq!(
-            pypi_name_part("Flask_Cors>=4.0", PypiNameCut::RequirementLine),
-            "Flask_Cors"
-        );
-        assert_eq!(
-            pypi_name_part(
-                "pkg; python_version >= \"3.7\"",
-                PypiNameCut::RequirementLine
-            ),
-            "pkg"
-        );
-        assert_eq!(
-            pypi_name_part("pkg ==1.0", PypiNameCut::RequirementLine),
-            "pkg"
-        );
-        assert_eq!(pypi_name_part("", PypiNameCut::RequirementLine), "");
+        assert_eq!(pypi_name_part("requests"), "requests");
+        assert_eq!(pypi_name_part("requests[security]==2.31.0"), "requests");
+        assert_eq!(pypi_name_part("Flask_Cors>=4.0"), "Flask_Cors");
+        assert_eq!(pypi_name_part("pkg; python_version >= \"3.7\""), "pkg");
+        assert_eq!(pypi_name_part("pkg ==1.0"), "pkg");
+        assert_eq!(pypi_name_part(""), "");
     }
 
     #[test]

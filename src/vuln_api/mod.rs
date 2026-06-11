@@ -25,6 +25,24 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cloudflare HTML before it gets ugly.
 const ERROR_BODY_SNIPPET_LEN: usize = 300;
 
+/// Registry ecosystem a package check targets. Typed so the URL path
+/// segment and the per-ecosystem name encoding can't drift apart on a
+/// string spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ecosystem {
+    Npm,
+    Pypi,
+}
+
+impl Ecosystem {
+    pub fn path_segment(self) -> &'static str {
+        match self {
+            Ecosystem::Npm => "npm",
+            Ecosystem::Pypi => "pypi",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VulnCheckResponse {
     pub ecosystem: String,
@@ -84,11 +102,10 @@ pub fn auth_header(token: &str) -> (&'static str, String) {
 
 /// Encode package name for the vuln-api path segment.
 /// npm scoped names: `@scope/pkg` → `@scope%2fpkg`.
-fn encode_package_name(ecosystem: &str, name: &str) -> String {
-    if ecosystem.eq_ignore_ascii_case("npm") {
-        crate::verify_deps::registry::encode_npm_name(name)
-    } else {
-        urlencoding::encode(name).into_owned()
+fn encode_package_name(ecosystem: Ecosystem, name: &str) -> String {
+    match ecosystem {
+        Ecosystem::Npm => crate::verify_deps::registry::encode_npm_name(name),
+        Ecosystem::Pypi => urlencoding::encode(name).into_owned(),
     }
 }
 
@@ -186,7 +203,7 @@ pub fn check_package_version(
     client: &reqwest::blocking::Client,
     base_url: &str,
     token: Option<&str>,
-    ecosystem: &str,
+    ecosystem: Ecosystem,
     name: &str,
     version: &str,
 ) -> Result<VulnCheckResponse, Box<dyn std::error::Error>> {
@@ -195,7 +212,10 @@ pub fn check_package_version(
     let encoded_version = urlencoding::encode(version);
     let url = format!(
         "{}/v1/packages/{}/{}/versions/{}/check",
-        base, ecosystem, encoded_name, encoded_version
+        base,
+        ecosystem.path_segment(),
+        encoded_name,
+        encoded_version
     );
 
     debug(&format!("Sending vuln-api request to URL: {}", url));
@@ -217,7 +237,7 @@ pub fn check_package_version(
         }
         404 => {
             return Ok(VulnCheckResponse {
-                ecosystem: ecosystem.to_string(),
+                ecosystem: ecosystem.path_segment().to_string(),
                 package_name: name.to_string(),
                 version: version.to_string(),
                 is_vulnerable: false,
@@ -249,10 +269,15 @@ pub fn check_package_version(
     // Confused-deputy guard: refuse to attribute advisories to a different
     // (name, version, ecosystem) than what we asked about. The server is
     // allowed to be silent on identity, but if it answers, it must match.
-    if !parsed.ecosystem.is_empty() && !parsed.ecosystem.eq_ignore_ascii_case(ecosystem) {
+    if !parsed.ecosystem.is_empty()
+        && !parsed
+            .ecosystem
+            .eq_ignore_ascii_case(ecosystem.path_segment())
+    {
         return Err(format!(
             "vuln-api response ecosystem '{}' does not match request '{}'",
-            parsed.ecosystem, ecosystem
+            parsed.ecosystem,
+            ecosystem.path_segment()
         )
         .into());
     }
@@ -306,7 +331,7 @@ mod tests {
             &client,
             &stub.base_url,
             Some("test-token"),
-            "npm",
+            Ecosystem::Npm,
             "lodash",
             "4.17.20",
         )
@@ -317,8 +342,15 @@ mod tests {
     fn captured_request(auth_token: Option<&str>) -> String {
         let (base_url, requests) = spawn_capturing_vuln_api_stub();
         let client = http_client().expect("test client");
-        check_package_version(&client, &base_url, auth_token, "npm", "lodash", "4.17.20")
-            .expect("captured request should succeed");
+        check_package_version(
+            &client,
+            &base_url,
+            auth_token,
+            Ecosystem::Npm,
+            "lodash",
+            "4.17.20",
+        )
+        .expect("captured request should succeed");
         let requests = requests.lock().unwrap();
         requests[0].clone()
     }
@@ -406,7 +438,7 @@ mod tests {
             &client,
             &stub.base_url,
             Some("test-token"),
-            "npm",
+            Ecosystem::Npm,
             "lodash",
             "4.17.20",
         )
@@ -471,19 +503,16 @@ mod tests {
 
     #[test]
     fn encode_package_name_scoped_npm() {
-        assert_eq!(encode_package_name("npm", "@types/node"), "@types%2fnode");
-        assert_eq!(encode_package_name("npm", "lodash"), "lodash");
+        assert_eq!(
+            encode_package_name(Ecosystem::Npm, "@types/node"),
+            "@types%2fnode"
+        );
+        assert_eq!(encode_package_name(Ecosystem::Npm, "lodash"), "lodash");
     }
 
     #[test]
     fn encode_package_name_pypi() {
-        assert_eq!(encode_package_name("PyPI", "requests"), "requests");
-    }
-
-    #[test]
-    fn encode_package_name_npm_case_insensitive() {
-        // Defends against vuln_api_ecosystem() casing changes.
-        assert_eq!(encode_package_name("NPM", "@types/node"), "@types%2fnode");
+        assert_eq!(encode_package_name(Ecosystem::Pypi, "requests"), "requests");
     }
 
     #[test]

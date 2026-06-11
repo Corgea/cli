@@ -185,10 +185,8 @@ fn bare_npm_tokenless_runs_public_tree_check() {
         .fake_tree_pm("npm", NPM_LOCK, 0)
         .oldpkg_registry()
         .vuln_checks(HashMap::new())
-        .token("test-token")
         .with_project_file("package.json", PACKAGE_JSON)
         .build();
-    h.cmd.env_remove("CORGEA_TOKEN");
     let out = h.cmd.args(["npm", "install"]).output().expect("run corgea");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(h.recorded_argv().as_deref(), Some("install"));
@@ -238,10 +236,8 @@ fn bare_yarn_note_prints_without_token_too() {
         .fake_recorder("yarn", 0)
         .oldpkg_registry()
         .vuln_checks(HashMap::new())
-        .token("test-token")
         .in_project_dir()
         .build();
-    h.cmd.env_remove("CORGEA_TOKEN");
     let out = h
         .cmd
         .args(["yarn", "install"])

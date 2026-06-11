@@ -158,10 +158,8 @@ fn uv_sync_tokenless_runs_public_lock_check() {
     let mut h = GateHarness::new()
         .fake_recorder("uv", 0)
         .vuln_checks(HashMap::new())
-        .token("test-token")
         .with_project_file("uv.lock", UV_LOCK)
         .build();
-    h.cmd.env_remove("CORGEA_TOKEN");
     let out = h.cmd.args(["uv", "sync"]).output().expect("run corgea");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(h.recorded_argv().as_deref(), Some("sync"));

@@ -27,61 +27,21 @@ pub(super) fn bare_install_note(manager: PackageManager, subcommand_label: &str)
     }
 }
 
-/// The refusal line on stderr. When vulnerable findings exist but none sit on
-/// a named target — and no named target is unverifiable either — the block is
-/// entirely the existing tree's doing, so say that instead of implying the
-/// package the user typed is at fault. Messaging only; the block decision
-/// stays with `should_block_install`.
-pub(super) fn print_refusal(report: &PrecheckReport, opts: &PrecheckOptions) {
-    if refusal_blames_existing_tree(report, opts) {
-        eprintln!(
+/// The refusal line on stderr. Messaging only; the block decision and the
+/// choice of escape hatch live in `verdict::block_reason`.
+pub(super) fn print_refusal(reason: super::verdict::BlockReason) {
+    use super::verdict::BlockReason;
+    match reason {
+        BlockReason::ExistingTree => eprintln!(
             "Refusing to run install: your existing dependency tree has known-vulnerable packages (none were added by this command). Fix them or pass --force."
-        );
-    } else if report.vulnerable_count() > 0
-        || (super::verdict::authenticated_verdict(opts) && report.unverifiable_count() > 0)
-        || (super::verdict::authenticated_verdict(opts) && report.error_count() > 0)
-    {
-        eprintln!("Refusing to run install. Pass --force to proceed despite findings.");
-    } else {
-        eprintln!("Refusing to run install. Pass --no-fail to proceed anyway.");
+        ),
+        BlockReason::Findings => {
+            eprintln!("Refusing to run install. Pass --force to proceed despite findings.")
+        }
+        BlockReason::RecencyOnly => {
+            eprintln!("Refusing to run install. Pass --no-fail to proceed anyway.")
+        }
     }
-}
-
-/// True when the block is entirely the existing tree's doing: vulnerable
-/// findings exist, none sit on a named target (or block as unverifiable
-/// there), and every *blocking* tree finding — vulnerable or unverifiable,
-/// since `should_block_install` refuses on both — genuinely predates this
-/// command. A `Requested` finding (pip `-r`) is added by this command and
-/// renders as `(from requirements)`; a `Transitive` finding on any install
-/// that names targets or requirements files is being pulled in by them
-/// right now. Only a truly bare install (`report.bare_install`) or
-/// manifest-declared `PreExisting` findings may blame the existing tree.
-fn refusal_blames_existing_tree(report: &PrecheckReport, opts: &PrecheckOptions) -> bool {
-    let fail_closed = super::verdict::authenticated_verdict(opts);
-    let named_findings = report.named_vulnerable_count()
-        + if fail_closed {
-            report.named_unverifiable_count()
-        } else {
-            0
-        };
-    if report.vulnerable_count() == 0 || named_findings > 0 {
-        return false;
-    }
-    let Some(TreeReport::Full { transitive, .. }) = &report.tree else {
-        return false;
-    };
-    transitive
-        .iter()
-        .filter(|t| {
-            matches!(t.verdict, VerdictStatus::Vulnerable(_))
-                || (fail_closed && matches!(t.verdict, VerdictStatus::Unverifiable(_)))
-        })
-        .all(|t| match t.origin {
-            // A locked pin predates the sync command that installs it.
-            TreeOrigin::PreExisting | TreeOrigin::Locked => true,
-            TreeOrigin::Requested => false,
-            TreeOrigin::Transitive => report.bare_install,
-        })
 }
 
 /// Print the "requirements files are not recency-checked" note when the
@@ -127,21 +87,18 @@ fn highest_fix(mut fixes: Vec<&str>, all_must_parse: bool) -> Option<String> {
         [] => None,
         [only] => Some((*only).to_string()),
         many => {
-            let mut best: Option<(semver::Version, &str)> = None;
+            let mut parsed = Vec::with_capacity(many.len());
             for raw in many {
-                let v =
-                    match semver::Version::parse(&verify_deps::registry::normalize_for_semver(raw))
-                    {
-                        Ok(v) => v,
-                        Err(_) if all_must_parse => return None,
-                        Err(_) => continue,
-                    };
-                match &best {
-                    Some((cur, _)) if cur >= &v => {}
-                    _ => best = Some((v, raw)),
+                match semver::Version::parse(&verify_deps::registry::normalize_for_semver(raw)) {
+                    Ok(v) => parsed.push((v, *raw)),
+                    Err(_) if all_must_parse => return None,
+                    Err(_) => {}
                 }
             }
-            best.map(|(_, raw)| (*raw).to_string())
+            parsed
+                .into_iter()
+                .max_by(|(a, _), (b, _)| a.cmp(b))
+                .map(|(_, raw)| raw.to_string())
         }
     }
 }
@@ -655,108 +612,5 @@ mod tests {
             advertised_fix(&[vm("A-1", Some("1.2.0")), vm("A-2", Some("1.10.0"))]),
             Some("1.10.0".to_string())
         );
-    }
-
-    /// The existing-tree refusal fires only when every vulnerable finding
-    /// predates the command: a `Requested` finding (pip `-r`) is added by
-    /// this command, and a `Transitive` finding is being pulled in right
-    /// now unless the install is truly bare. `bare_install` is the explicit
-    /// discriminator — a requirements-only install also has no named
-    /// outcomes, but its resolved set is the command's doing.
-    #[test]
-    fn refusal_blame_respects_finding_origin() {
-        let tree_vulnerable = |origin| TreeOutcome {
-            name: "dep".to_string(),
-            version: "1.0.0".to_string(),
-            verdict: VerdictStatus::Vulnerable(vec![vm("A-1", None)]),
-            origin,
-        };
-        // (origin, named outcomes present, bare_install, expected).
-        // (origin, named=false, bare=false) is the requirements-only shape.
-        let cases = [
-            (TreeOrigin::PreExisting, false, true, true),
-            (TreeOrigin::PreExisting, false, false, true),
-            (TreeOrigin::PreExisting, true, false, true),
-            (TreeOrigin::Transitive, false, true, true),
-            (TreeOrigin::Transitive, false, false, false),
-            (TreeOrigin::Transitive, true, false, false),
-            (TreeOrigin::Requested, false, true, false),
-            (TreeOrigin::Requested, false, false, false),
-            (TreeOrigin::Requested, true, false, false),
-        ];
-        for (origin, with_named, bare_install, blames_tree) in cases {
-            let outcomes = if with_named {
-                vec![resolved_outcome("cleanpkg", "1.0.0", false)]
-            } else {
-                vec![]
-            };
-            let mut report = report_with(outcomes);
-            report.bare_install = bare_install;
-            report.tree = Some(TreeReport::Full {
-                resolved_count: 1,
-                transitive: vec![tree_vulnerable(origin)],
-            });
-            assert_eq!(
-                refusal_blames_existing_tree(&report, &authenticated_opts(false, false)),
-                blames_tree,
-                "origin {origin:?}, with_named {with_named}, bare {bare_install}"
-            );
-        }
-    }
-
-    /// Unverifiable tree findings block too (`should_block_install`), so
-    /// they must pass the same origin test before the refusal may blame the
-    /// existing tree: a command-added unverifiable transitive alongside a
-    /// pre-existing vulnerable dep keeps the generic refusal on a named
-    /// install, while on a bare install everything still predates the
-    /// command.
-    #[test]
-    fn refusal_blame_considers_unverifiable_tree_findings() {
-        let tree_finding = |name: &str, verdict, origin| TreeOutcome {
-            name: name.to_string(),
-            version: "1.0.0".to_string(),
-            verdict,
-            origin,
-        };
-        let mixed_tree = || {
-            Some(TreeReport::Full {
-                resolved_count: 2,
-                transitive: vec![
-                    tree_finding(
-                        "stickydep",
-                        VerdictStatus::Vulnerable(vec![vm("A-1", None)]),
-                        TreeOrigin::PreExisting,
-                    ),
-                    tree_finding(
-                        "newdep",
-                        VerdictStatus::Unverifiable("vuln-api unavailable".to_string()),
-                        TreeOrigin::Transitive,
-                    ),
-                ],
-            })
-        };
-
-        // Named install: the unverifiable transitive is being added by this
-        // command, so "none were added by this command" would lie.
-        let mut report = report_with(vec![resolved_outcome("cleanpkg", "1.0.0", false)]);
-        report.tree = mixed_tree();
-        assert!(!refusal_blames_existing_tree(
-            &report,
-            &authenticated_opts(false, false)
-        ));
-        assert!(refusal_blames_existing_tree(
-            &report,
-            &public_opts(false, false)
-        ));
-
-        // Bare install: nothing named, everything resolved predates the
-        // command — the mixed findings still blame the existing tree.
-        let mut report = report_with(vec![]);
-        report.bare_install = true;
-        report.tree = mixed_tree();
-        assert!(refusal_blames_existing_tree(
-            &report,
-            &authenticated_opts(false, false)
-        ));
     }
 }

@@ -1,27 +1,35 @@
 //! Verdict pass: bounded vuln-api worker pool, result matching, and the
-//! single block predicate (`should_block_install`).
+//! single block predicate (`block_reason`).
 
 use std::time::Duration;
 
 use super::{
     tree, InstallTarget, PackageManager, PrecheckOptions, PrecheckReport, TargetKind,
-    TargetOutcome, TreeOrigin, TreeOutcome, VerdictConfig, VerdictStatus,
+    TargetOutcome, TreeOrigin, TreeOutcome, TreeReport, VerdictConfig, VerdictStatus,
 };
 
 /// Above this many verdict jobs, print a stderr progress line so a big tree
 /// pass doesn't look hung.
 const VERDICT_PROGRESS_THRESHOLD: usize = 8;
 
-/// Max parallel vuln-api verdict requests.
-pub(super) const VERDICT_CONCURRENCY: usize = 8;
+/// Max parallel vuln-api / registry requests.
+const VERDICT_CONCURRENCY: usize = 8;
 
 /// Bounded worker pool over the verdict jobs. On client/request failure every
-/// job comes back `Unverifiable`; `should_block_install` decides whether that
+/// job comes back `Unverifiable`; `block_reason` decides whether that
 /// fails closed for the selected mode.
 /// Plain work queue, no new crates; `reqwest::blocking::Client` is
 /// `Send + Sync`. Result order is not preserved; callers match results back
 /// by `(name, version)`.
 pub(super) fn verdict_pool(
+    jobs: Vec<tree::TreePackage>,
+    cfg: &VerdictConfig,
+    manager: PackageManager,
+) -> Vec<(tree::TreePackage, VerdictStatus)> {
+    verdict_pool_with(jobs, cfg, manager, VERDICT_CONCURRENCY)
+}
+
+fn verdict_pool_with(
     jobs: Vec<tree::TreePackage>,
     cfg: &VerdictConfig,
     manager: PackageManager,
@@ -139,21 +147,120 @@ pub(super) fn public_verdict(opts: &PrecheckOptions) -> bool {
         .is_some_and(|cfg| cfg.mode.is_public())
 }
 
-pub(super) fn should_block_install(report: &PrecheckReport, opts: &PrecheckOptions) -> bool {
+/// Why the gate refuses to run the install. The single owner of both the
+/// block decision and the escape hatch the refusal advertises —
+/// `render::print_refusal` only maps variants to text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BlockReason {
+    /// Every blocking finding predates this command (existing tree only).
+    /// `--force` is the escape.
+    ExistingTree,
+    /// Vulnerable findings, or unverifiable/error findings in fail-closed
+    /// (authenticated) mode. `--force` is the escape.
+    Findings,
+    /// Only the recency threshold fired. `--no-fail` is the escape.
+    RecencyOnly,
+}
+
+pub(super) fn block_reason(report: &PrecheckReport, opts: &PrecheckOptions) -> Option<BlockReason> {
     if opts.force {
-        return false;
+        return None;
     }
     // A resolution error means no verdict was obtained for that target, so
     // in authenticated mode it fails closed like `Unverifiable` — otherwise a
     // registry outage silently bypasses the gate.
     let fail_closed = authenticated_verdict(opts);
-    report.vulnerable_count() > 0
+    if report.vulnerable_count() > 0
         || (fail_closed && report.unverifiable_count() > 0)
         || (fail_closed && report.error_count() > 0)
-        || (!opts.no_fail && report.recent_count() > 0)
+    {
+        return Some(if blames_existing_tree(report, opts) {
+            BlockReason::ExistingTree
+        } else {
+            BlockReason::Findings
+        });
+    }
+    if !opts.no_fail && report.recent_count() > 0 {
+        return Some(BlockReason::RecencyOnly);
+    }
+    None
 }
 
-pub(super) fn verify_one(
+/// True when the block is entirely the existing tree's doing: vulnerable
+/// findings exist, none sit on a named target (or block as unverifiable
+/// there), and every *blocking* tree finding — vulnerable or unverifiable,
+/// since `block_reason` refuses on both — genuinely predates this
+/// command. A `Requested` finding (pip `-r`) is added by this command and
+/// renders as `(from requirements)`; a `Transitive` finding on any install
+/// that names targets or requirements files is being pulled in by them
+/// right now. Only a truly bare install (`report.bare_install`) or
+/// manifest-declared `PreExisting` findings may blame the existing tree.
+fn blames_existing_tree(report: &PrecheckReport, opts: &PrecheckOptions) -> bool {
+    let fail_closed = authenticated_verdict(opts);
+    let named_findings = report.named_vulnerable_count()
+        + if fail_closed {
+            report.named_unverifiable_count()
+        } else {
+            0
+        };
+    if report.vulnerable_count() == 0 || named_findings > 0 {
+        return false;
+    }
+    let Some(TreeReport::Full { transitive, .. }) = &report.tree else {
+        return false;
+    };
+    transitive
+        .iter()
+        .filter(|t| {
+            matches!(t.verdict, VerdictStatus::Vulnerable(_))
+                || (fail_closed && matches!(t.verdict, VerdictStatus::Unverifiable(_)))
+        })
+        .all(|t| match t.origin {
+            // A locked pin predates the sync command that installs it.
+            TreeOrigin::PreExisting | TreeOrigin::Locked => true,
+            TreeOrigin::Requested => false,
+            TreeOrigin::Transitive => report.bare_install,
+        })
+}
+
+/// Resolve every named target against its registry through a bounded worker
+/// pool — each lookup is an independent blocking HTTP GET on the gate's
+/// critical path, so they must not run serially. Order is preserved:
+/// outcome `i` belongs to `targets[i]`.
+pub(super) fn verify_all(
+    targets: &[InstallTarget],
+    opts: &PrecheckOptions,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> Vec<TargetOutcome> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    if targets.len() <= 1 {
+        return targets.iter().map(|t| verify_one(t, opts, now)).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<TargetOutcome>>> =
+        Mutex::new(targets.iter().map(|_| None).collect());
+    let workers = VERDICT_CONCURRENCY.min(targets.len());
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(target) = targets.get(i) else { break };
+                let outcome = verify_one(target, opts, now);
+                results.lock().unwrap()[i] = Some(outcome);
+            });
+        }
+    });
+    results
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|o| o.expect("verify_all worker filled every slot"))
+        .collect()
+}
+
+fn verify_one(
     target: &InstallTarget,
     opts: &PrecheckOptions,
     now: &chrono::DateTime<chrono::Utc>,
@@ -201,9 +308,14 @@ mod tests {
     use super::super::test_support::*;
     use super::super::{
         run_verdict_pass, tree, InstallTarget, PackageManager, PrecheckOptions, TargetKind,
-        TargetOutcome, TreeOrigin, TreeOutcome, VerdictConfig, VerdictMode, VerdictStatus,
+        TargetOutcome, TreeOrigin, TreeOutcome, TreeReport, VerdictConfig, VerdictMode,
+        VerdictStatus,
     };
     use super::*;
+
+    fn should_block_install(report: &PrecheckReport, opts: &PrecheckOptions) -> bool {
+        block_reason(report, opts).is_some()
+    }
 
     /// Predicate matrix: force ⇒ never block; vulnerable blocks in every
     /// verdict mode; unverifiable/error findings block only in authenticated
@@ -290,7 +402,7 @@ mod tests {
         let mut named = resolved_outcome("pkg", "1.0.0", false);
         set_verdict(&mut named, VerdictStatus::Clean);
         let mut report = report_with(vec![named]);
-        report.tree = Some(super::super::TreeReport::Full {
+        report.tree = Some(TreeReport::Full {
             resolved_count: 2,
             transitive: vec![TreeOutcome {
                 name: "evildep".to_string(),
@@ -307,6 +419,106 @@ mod tests {
         };
         assert!(should_block_install(&report, &opts(false)));
         assert!(!should_block_install(&report, &opts(true)));
+    }
+
+    /// The existing-tree refusal fires only when every vulnerable finding
+    /// predates the command: a `Requested` finding (pip `-r`) is added by
+    /// this command, and a `Transitive` finding is being pulled in right
+    /// now unless the install is truly bare. `bare_install` is the explicit
+    /// discriminator — a requirements-only install also has no named
+    /// outcomes, but its resolved set is the command's doing.
+    #[test]
+    fn refusal_blame_respects_finding_origin() {
+        let tree_vulnerable = |origin| TreeOutcome {
+            name: "dep".to_string(),
+            version: "1.0.0".to_string(),
+            verdict: VerdictStatus::Vulnerable(vec![vm("A-1", None)]),
+            origin,
+        };
+        // (origin, named outcomes present, bare_install, expected).
+        // (origin, named=false, bare=false) is the requirements-only shape.
+        let cases = [
+            (TreeOrigin::PreExisting, false, true, true),
+            (TreeOrigin::PreExisting, false, false, true),
+            (TreeOrigin::PreExisting, true, false, true),
+            (TreeOrigin::Transitive, false, true, true),
+            (TreeOrigin::Transitive, false, false, false),
+            (TreeOrigin::Transitive, true, false, false),
+            (TreeOrigin::Requested, false, true, false),
+            (TreeOrigin::Requested, false, false, false),
+            (TreeOrigin::Requested, true, false, false),
+        ];
+        for (origin, with_named, bare_install, blames_tree) in cases {
+            let outcomes = if with_named {
+                vec![resolved_outcome("cleanpkg", "1.0.0", false)]
+            } else {
+                vec![]
+            };
+            let mut report = report_with(outcomes);
+            report.bare_install = bare_install;
+            report.tree = Some(TreeReport::Full {
+                resolved_count: 1,
+                transitive: vec![tree_vulnerable(origin)],
+            });
+            assert_eq!(
+                blames_existing_tree(&report, &authenticated_opts(false, false)),
+                blames_tree,
+                "origin {origin:?}, with_named {with_named}, bare {bare_install}"
+            );
+        }
+    }
+
+    /// Unverifiable tree findings block too (`block_reason`), so they must
+    /// pass the same origin test before the refusal may blame the existing
+    /// tree: a command-added unverifiable transitive alongside a
+    /// pre-existing vulnerable dep keeps the generic refusal on a named
+    /// install, while on a bare install everything still predates the
+    /// command.
+    #[test]
+    fn refusal_blame_considers_unverifiable_tree_findings() {
+        let tree_finding = |name: &str, verdict, origin| TreeOutcome {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            verdict,
+            origin,
+        };
+        let mixed_tree = || {
+            Some(TreeReport::Full {
+                resolved_count: 2,
+                transitive: vec![
+                    tree_finding(
+                        "stickydep",
+                        VerdictStatus::Vulnerable(vec![vm("A-1", None)]),
+                        TreeOrigin::PreExisting,
+                    ),
+                    tree_finding(
+                        "newdep",
+                        VerdictStatus::Unverifiable("vuln-api unavailable".to_string()),
+                        TreeOrigin::Transitive,
+                    ),
+                ],
+            })
+        };
+
+        // Named install: the unverifiable transitive is being added by this
+        // command, so "none were added by this command" would lie.
+        let mut report = report_with(vec![resolved_outcome("cleanpkg", "1.0.0", false)]);
+        report.tree = mixed_tree();
+        assert!(!blames_existing_tree(
+            &report,
+            &authenticated_opts(false, false)
+        ));
+        assert!(blames_existing_tree(&report, &public_opts(false, false)));
+
+        // Bare install: nothing named, everything resolved predates the
+        // command — the mixed findings still blame the existing tree.
+        let mut report = report_with(vec![]);
+        report.bare_install = true;
+        report.tree = mixed_tree();
+        assert!(blames_existing_tree(
+            &report,
+            &authenticated_opts(false, false)
+        ));
     }
 
     /// Verdict pass against an in-process stub: vulnerable body → Vulnerable
@@ -401,7 +613,7 @@ mod tests {
             .collect();
 
         for concurrency in [1usize, 8] {
-            let results = verdict_pool(jobs.clone(), &cfg, PackageManager::Pip, concurrency);
+            let results = verdict_pool_with(jobs.clone(), &cfg, PackageManager::Pip, concurrency);
             assert_eq!(
                 results.len(),
                 6,

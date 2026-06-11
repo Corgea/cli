@@ -63,11 +63,13 @@ impl PackageManager {
         }
     }
 
-    /// vuln-api ecosystem path segment for this manager's registry.
-    pub fn ecosystem(self) -> &'static str {
+    /// vuln-api ecosystem for this manager's registry.
+    pub fn ecosystem(self) -> crate::vuln_api::Ecosystem {
         match self {
-            PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => "npm",
-            PackageManager::Pip | PackageManager::Uv => "pypi",
+            PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => {
+                crate::vuln_api::Ecosystem::Npm
+            }
+            PackageManager::Pip | PackageManager::Uv => crate::vuln_api::Ecosystem::Pypi,
         }
     }
 
@@ -428,9 +430,9 @@ fn report_and_exec(
         render::print_text(report);
     }
     render::warn_public_lookup_failures(report, opts);
-    if verdict::should_block_install(report, opts) {
+    if let Some(reason) = verdict::block_reason(report, opts) {
         if !opts.json {
-            render::print_refusal(report, opts);
+            render::print_refusal(reason);
         }
         return 1;
     }
@@ -466,11 +468,7 @@ fn run_parsed_install(
     let now = Utc::now();
     let (mut outcomes, tree_resolution) = std::thread::scope(|s| {
         let tree = tree_eligible.then(|| s.spawn(|| tree::resolve_tree(manager, rest, &parsed)));
-        let outcomes: Vec<_> = parsed
-            .targets
-            .iter()
-            .map(|target| verdict::verify_one(target, &opts, &now))
-            .collect();
+        let outcomes = verdict::verify_all(&parsed.targets, &opts, &now);
         (
             outcomes,
             tree.map(|handle| handle.join().expect("tree resolution thread panicked")),
@@ -528,14 +526,9 @@ fn run_tree_pass(
     outcomes: &mut [TargetOutcome],
     opts: &PrecheckOptions,
 ) -> TreeReport {
-    let set = match resolution {
-        Ok(Some(set)) => set,
-        Ok(None) => {
-            run_verdict_pass(manager, outcomes, opts);
-            return TreeReport::NamedOnly {
-                reason: format!("{} has no safe dry-run", manager.binary_name()),
-            };
-        }
+    let no_dry_run = || format!("{} has no safe dry-run", manager.binary_name());
+    let set = match resolution.and_then(|opt| opt.ok_or_else(no_dry_run)) {
+        Ok(set) => set,
         Err(reason) => {
             run_verdict_pass(manager, outcomes, opts);
             return TreeReport::NamedOnly { reason };
@@ -579,7 +572,7 @@ fn run_tree_pass(
         .verdict
         .as_ref()
         .expect("tree pass requires verdict config");
-    let results = verdict::verdict_pool(jobs, cfg, manager, verdict::VERDICT_CONCURRENCY);
+    let results = verdict::verdict_pool(jobs, cfg, manager);
     let transitive = verdict::apply_verdicts(manager, results, outcomes, &direct_deps);
     TreeReport::Full {
         resolved_count,
@@ -612,7 +605,7 @@ fn run_verdict_pass(
         })
         .collect();
 
-    let results = verdict::verdict_pool(jobs, cfg, manager, verdict::VERDICT_CONCURRENCY);
+    let results = verdict::verdict_pool(jobs, cfg, manager);
     let leftovers = verdict::apply_verdicts(manager, results, outcomes, &Default::default());
     debug_assert!(
         leftovers.is_empty(),
@@ -693,11 +686,12 @@ mod tests {
 
     #[test]
     fn ecosystem_mapping() {
-        assert_eq!(PackageManager::Pip.ecosystem(), "pypi");
-        assert_eq!(PackageManager::Uv.ecosystem(), "pypi");
-        assert_eq!(PackageManager::Npm.ecosystem(), "npm");
-        assert_eq!(PackageManager::Yarn.ecosystem(), "npm");
-        assert_eq!(PackageManager::Pnpm.ecosystem(), "npm");
+        use crate::vuln_api::Ecosystem;
+        assert_eq!(PackageManager::Pip.ecosystem(), Ecosystem::Pypi);
+        assert_eq!(PackageManager::Uv.ecosystem(), Ecosystem::Pypi);
+        assert_eq!(PackageManager::Npm.ecosystem(), Ecosystem::Npm);
+        assert_eq!(PackageManager::Yarn.ecosystem(), Ecosystem::Npm);
+        assert_eq!(PackageManager::Pnpm.ecosystem(), Ecosystem::Npm);
     }
 
     #[test]

@@ -33,6 +33,42 @@ fn http_client() -> &'static reqwest::blocking::Client {
     })
 }
 
+/// Shared fetch/parse boilerplate for registry metadata GETs: 404 → "not
+/// found", other non-success → status error, then parse the JSON body.
+/// `label` names the registry in error messages ("npm registry" / "PyPI").
+fn fetch_registry_json<T: serde::de::DeserializeOwned>(
+    url: &str,
+    label: &str,
+    name: &str,
+    base: &str,
+) -> Result<T, String> {
+    let resp = http_client()
+        .get(url)
+        .header("Accept", "application/json")
+        .send()
+        .map_err(|e| format!("{} request failed: {}", label, e))?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(format!(
+            "package '{}' not found on {} ({})",
+            name, label, base
+        ));
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "{} returned status {} for '{}'",
+            label, status, name
+        ));
+    }
+
+    let body = resp
+        .text()
+        .map_err(|e| format!("failed to read {} response: {}", label, e))?;
+    serde_json::from_str(&body)
+        .map_err(|e| format!("failed to parse {} response for '{}': {}", label, name, e))
+}
+
 /// URL-encode an npm package name. Scoped names contain `@` and `/`,
 /// the latter must be encoded as `%2f` for the package metadata URL.
 /// Also used by `vuln_api` for its npm path segments.
@@ -129,38 +165,7 @@ pub fn npm_resolve(
         .unwrap_or(DEFAULT_NPM_REGISTRY)
         .trim_end_matches('/');
     let url = format!("{}/{}", base, encode_npm_name(name));
-
-    let client = http_client();
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/json")
-        .send()
-        .map_err(|e| format!("npm registry request failed: {}", e))?;
-
-    let status = resp.status();
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return Err(format!(
-            "package '{}' not found on npm registry ({})",
-            name, base
-        ));
-    }
-    if !status.is_success() {
-        return Err(format!(
-            "npm registry returned status {} for '{}'",
-            status, name
-        ));
-    }
-
-    let body = resp
-        .text()
-        .map_err(|e| format!("failed to read npm registry response: {}", e))?;
-
-    let meta: NpmFullMetadata = serde_json::from_str(&body).map_err(|e| {
-        format!(
-            "failed to parse npm registry response for '{}': {}",
-            name, e
-        )
-    })?;
+    let meta: NpmFullMetadata = fetch_registry_json(&url, "npm registry", name, base)?;
 
     let resolved_version = match spec {
         NpmSpec::Latest => meta.dist_tags.get("latest").cloned().ok_or_else(|| {
@@ -241,25 +246,12 @@ fn npm_pick_highest_matching(
 ) -> Option<String> {
     let req = parse_npm_range(range)?;
     let range_has_prerelease = range.contains('-');
-
-    let mut best: Option<(semver::Version, String)> = None;
-    for raw in versions.keys() {
-        let v = match semver::Version::parse(raw) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if !v.pre.is_empty() && !range_has_prerelease {
-            continue;
-        }
-        if !req.matches(&v) {
-            continue;
-        }
-        match &best {
-            Some((cur, _)) if cur >= &v => {}
-            _ => best = Some((v, raw.clone())),
-        }
-    }
-    best.map(|(_, raw)| raw)
+    versions
+        .keys()
+        .filter_map(|raw| semver::Version::parse(raw).ok().map(|v| (v, raw)))
+        .filter(|(v, _)| (v.pre.is_empty() || range_has_prerelease) && req.matches(v))
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, raw)| raw.clone())
 }
 
 /// PyPI version specifier used by install wrappers. We parse a
@@ -298,28 +290,7 @@ pub fn pypi_resolve(
         .unwrap_or(DEFAULT_PYPI_REGISTRY)
         .trim_end_matches('/');
     let url = format!("{}/pypi/{}/json", base, urlencoding::encode(name));
-
-    let client = http_client();
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/json")
-        .send()
-        .map_err(|e| format!("PyPI request failed: {}", e))?;
-
-    let status = resp.status();
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return Err(format!("package '{}' not found on PyPI ({})", name, base));
-    }
-    if !status.is_success() {
-        return Err(format!("PyPI returned status {} for '{}'", status, name));
-    }
-
-    let body = resp
-        .text()
-        .map_err(|e| format!("failed to read PyPI response: {}", e))?;
-
-    let meta: PypiInfoResponse = serde_json::from_str(&body)
-        .map_err(|e| format!("failed to parse PyPI response for '{}': {}", name, e))?;
+    let meta: PypiInfoResponse = fetch_registry_json(&url, "PyPI", name, base)?;
 
     let candidates = collect_pypi_candidates(&meta);
     // A yanked release resolves only via an exact pin (PEP 592), matching
@@ -387,21 +358,15 @@ fn collect_pypi_candidates(meta: &PypiInfoResponse) -> Vec<PypiCandidate> {
         if files.is_empty() {
             continue;
         }
-        let mut earliest: Option<DateTime<Utc>> = None;
-        for f in files {
-            let raw = f
-                .upload_time_iso_8601
-                .as_deref()
-                .or(f.upload_time.as_deref());
-            if let Some(raw) = raw {
-                if let Ok(dt) = parse_iso8601(raw) {
-                    earliest = match earliest {
-                        Some(prev) if prev <= dt => Some(prev),
-                        _ => Some(dt),
-                    };
-                }
-            }
-        }
+        let earliest = files
+            .iter()
+            .filter_map(|f| {
+                f.upload_time_iso_8601
+                    .as_deref()
+                    .or(f.upload_time.as_deref())
+            })
+            .filter_map(|raw| parse_iso8601(raw).ok())
+            .min();
         if let Some(dt) = earliest {
             out.push(PypiCandidate {
                 version: ver.clone(),
@@ -417,23 +382,17 @@ fn collect_pypi_candidates(meta: &PypiInfoResponse) -> Vec<PypiCandidate> {
 /// best-effort PEP 440 ordering. Falls back to the entry with the
 /// latest upload time if no candidate parses as semver.
 fn pick_latest_stable(candidates: &[PypiCandidate]) -> Option<&PypiCandidate> {
-    let mut best_semver: Option<(semver::Version, &PypiCandidate)> = None;
-    for c in candidates {
-        let normalized = normalize_for_semver(&c.version);
-        if let Ok(v) = semver::Version::parse(&normalized) {
-            if !v.pre.is_empty() {
-                continue;
-            }
-            match &best_semver {
-                Some((cur, _)) if cur >= &v => {}
-                _ => best_semver = Some((v, c)),
-            }
-        }
-    }
-    if let Some((_, picked)) = best_semver {
-        return Some(picked);
-    }
-    candidates.iter().max_by_key(|c| c.uploaded)
+    candidates
+        .iter()
+        .filter_map(|c| {
+            semver::Version::parse(&normalize_for_semver(&c.version))
+                .ok()
+                .filter(|v| v.pre.is_empty())
+                .map(|v| (v, c))
+        })
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, c)| c)
+        .or_else(|| candidates.iter().max_by_key(|c| c.uploaded))
 }
 
 /// Best-effort PEP 440 → semver: PyPI versions are usually `X.Y.Z` or
@@ -494,41 +453,28 @@ fn pypi_resolve_specifier(
         requirements.push((op, v));
     }
 
-    let mut best: Option<(semver::Version, String)> = None;
-    for c in candidates {
-        let raw = &c.version;
-        let v = match semver::Version::parse(&normalize_for_semver(raw)) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if !v.pre.is_empty() {
-            continue;
-        }
-        let satisfies = requirements.iter().all(|(op, want)| match *op {
-            "==" => &v == want,
-            ">=" => &v >= want,
-            "<=" => &v <= want,
-            "!=" => &v != want,
-            ">" => &v > want,
-            "<" => &v < want,
-            "~=" => {
-                if &v < want {
-                    return false;
-                }
-                let upper = semver::Version::new(want.major, want.minor + 1, 0);
-                v < upper
-            }
+    let satisfies = |v: &semver::Version| {
+        requirements.iter().all(|(op, want)| match *op {
+            "==" => v == want,
+            ">=" => v >= want,
+            "<=" => v <= want,
+            "!=" => v != want,
+            ">" => v > want,
+            "<" => v < want,
+            "~=" => *v >= *want && *v < semver::Version::new(want.major, want.minor + 1, 0),
             _ => false,
-        });
-        if !satisfies {
-            continue;
-        }
-        match &best {
-            Some((cur, _)) if cur >= &v => {}
-            _ => best = Some((v, raw.clone())),
-        }
-    }
-    Ok(best.map(|(_, raw)| raw))
+        })
+    };
+    Ok(candidates
+        .iter()
+        .filter_map(|c| {
+            semver::Version::parse(&normalize_for_semver(&c.version))
+                .ok()
+                .filter(|v| v.pre.is_empty() && satisfies(v))
+                .map(|v| (v, &c.version))
+        })
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, raw)| raw.clone()))
 }
 
 #[cfg(test)]
