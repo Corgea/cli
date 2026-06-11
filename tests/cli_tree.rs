@@ -28,7 +28,7 @@ fn transitive_vulnerable_blocks_install() {
             "pip",
             "pypi",
             TREE_REPORT,
-            &["pip", "--concurrency", "2", "install", "oldpkg==1.0.0"][..],
+            &["pip", "install", "oldpkg==1.0.0"][..],
         ),
         (
             "npm",

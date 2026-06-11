@@ -140,7 +140,7 @@ in a temp dir, never touching your lockfile) and verdict every package, so a fla
 dry-run, so they verify the named targets only and print
 `warning: transitive dependencies not checked (…); only named packages were verified.`
 The same warning is emitted (and the gate falls back to named-only) whenever a pip/npm
-dry-run fails. Verdict requests run in a bounded pool (`--concurrency`, default 8).
+dry-run fails. Verdict requests run in a bounded pool (8 parallel).
 
 ```bash
 corgea pip install requests==2.31.0   # resolves, checks recency + vuln verdict, then runs pip
@@ -156,7 +156,6 @@ corgea pip list                       # non-install subcommands pass straight th
 | `--threshold` | `-t` | Recency threshold (`2d`, `12h`). Younger resolved versions block. |
 | `--no-fail` | | Demote a recency block to a warning. Does NOT bypass vulnerable/unverifiable blocks. |
 | `--force` | | Proceed despite all findings (vulnerable, unverifiable, recent). Findings still print. |
-| `--concurrency` | | Max parallel vuln-verdict requests during the gate (1-32, default 8). |
 | `--json` | | JSON report instead of text. Per-result `verdict` object + `verdict_mode` + `tree`. |
 
 `--json` adds a `tree` object: `null` in recency-only mode; otherwise `mode` is `"full"`

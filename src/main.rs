@@ -261,13 +261,6 @@ struct InstallWrapArgs {
     )]
     json: bool,
 
-    #[arg(
-        long,
-        default_value_t = 8,
-        help = "Max parallel vulnerability-verdict requests during the gate (1-32)."
-    )]
-    concurrency: usize,
-
     /// Arguments forwarded to the package manager (subcommand and package specs).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     cmd: Vec<String>,
@@ -295,7 +288,6 @@ fn install_wrap_options(
         verdict,
         npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
         pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
-        concurrency: args.concurrency,
         npm_audit: utils::generic::get_env_var_if_exists("CORGEA_NO_NPM_AUDIT").is_none(),
     }
 }

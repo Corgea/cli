@@ -134,8 +134,6 @@ pub struct PrecheckOptions {
     /// Optional registry overrides, used by tests.
     pub npm_registry: Option<String>,
     pub pypi_registry: Option<String>,
-    /// Max parallel vuln-api verdict requests; `verdict_pool` clamps to 1..=32.
-    pub concurrency: usize,
     /// Run the warn-only `npm audit` second opinion during the npm tree
     /// pass. Cleared by `CORGEA_NO_NPM_AUDIT` (read in `main`, like the
     /// registry overrides).
@@ -637,7 +635,7 @@ fn run_tree_pass(
         .verdict
         .as_ref()
         .expect("tree pass requires verdict config");
-    let results = verdict_pool(jobs, cfg, manager, opts.concurrency);
+    let results = verdict_pool(jobs, cfg, manager, VERDICT_CONCURRENCY);
     // Collect the warn-only npm audit second opinion only after the verdict
     // pool so the two truly overlap. The wait is capped tight: this signal
     // never changes the outcome, so a finished gate won't stall long for it —
@@ -655,6 +653,9 @@ fn run_tree_pass(
 /// Above this many verdict jobs, print a stderr progress line so a big tree
 /// pass doesn't look hung.
 const VERDICT_PROGRESS_THRESHOLD: usize = 8;
+
+/// Max parallel vuln-api verdict requests.
+const VERDICT_CONCURRENCY: usize = 8;
 
 /// Bounded worker pool over the verdict jobs — owns client creation and the
 /// fail-closed policy: on client failure every job comes back `Unverifiable`.
@@ -685,7 +686,7 @@ fn verdict_pool(
     }
 
     let ecosystem = manager.ecosystem();
-    let workers = concurrency.clamp(1, 32).min(jobs.len().max(1));
+    let workers = concurrency.min(jobs.len()).max(1);
     let queue = Mutex::new(VecDeque::from(jobs));
     let results = Mutex::new(Vec::new());
     std::thread::scope(|s| {
@@ -790,7 +791,7 @@ fn run_verdict_pass(
         })
         .collect();
 
-    let results = verdict_pool(jobs, cfg, manager, opts.concurrency);
+    let results = verdict_pool(jobs, cfg, manager, VERDICT_CONCURRENCY);
     apply_verdicts(manager, results, outcomes, &Default::default());
 }
 
@@ -842,7 +843,7 @@ fn verify_steers(report: &mut PrecheckReport, opts: &PrecheckOptions) {
         return;
     }
 
-    let results = verdict_pool(jobs, cfg, manager, opts.concurrency);
+    let results = verdict_pool(jobs, cfg, manager, VERDICT_CONCURRENCY);
     report.steers = results
         .into_iter()
         .map(|(pkg, verdict)| {
@@ -1464,7 +1465,6 @@ mod tests {
             verdict: None,
             npm_registry: None,
             pypi_registry: Some("http://127.0.0.1:9".to_string()),
-            concurrency: 4,
             // Unit tests never want the real `npm audit` subprocess.
             npm_audit: false,
         }
