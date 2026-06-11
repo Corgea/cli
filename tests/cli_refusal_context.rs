@@ -148,6 +148,18 @@ impl Harness {
             .expect("run corgea")
     }
 
+    /// `pip install -r reqs.txt` with no named targets — the canned tree
+    /// report still resolves oldpkg (requested) + evildep (transitive).
+    fn run_requirements_install(&mut self) -> std::process::Output {
+        let reqs = self._bin.path().join("reqs.txt");
+        std::fs::write(&reqs, "oldpkg==1.0.0\n").expect("write reqs.txt");
+        self.cmd
+            .args(["pip", "install", "-r"])
+            .arg(&reqs)
+            .output()
+            .expect("run corgea")
+    }
+
     fn pip_ran(&self) -> bool {
         self.marker.exists()
     }
@@ -181,6 +193,33 @@ fn named_install_with_transitive_vulnerable_keeps_generic_refusal() {
     assert!(
         stdout.contains("1 vulnerable (1 from resolved tree)"),
         "summary must attribute the finding to the tree: {stdout}"
+    );
+}
+
+/// PR #108 review regression: a requirements-only install has no named
+/// outcomes — exactly like a bare install — but its resolved set is added
+/// by this command. A vulnerable transitive of a clean requirements entry
+/// must keep the generic refusal.
+#[test]
+fn requirements_only_install_with_vulnerable_transitive_keeps_generic_refusal() {
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("pypi", "evildep", "0.4.2"),
+        vulnerable_body("evildep", "0.4.2"),
+    );
+    let mut h = Harness::new(checks, HashMap::new());
+    let out = h.run_requirements_install();
+
+    assert_eq!(out.status.code(), Some(1), "transitive vuln must block");
+    assert!(!h.pip_ran(), "pip must not run on a blocked install");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(GENERIC_REFUSAL),
+        "requirements-driven transitives keep the generic refusal: {stderr}"
+    );
+    assert!(
+        !stderr.contains(TREE_REFUSAL),
+        "existing-tree refusal must not fire for a requirements-only install: {stderr}"
     );
 }
 

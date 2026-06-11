@@ -259,6 +259,12 @@ pub struct PrecheckReport {
     /// (normalized name, proposed version). Populated by `verify_steers`;
     /// consulted only at render time, never by the block predicate.
     pub steers: HashMap<(String, String), SteerCheck>,
+    /// True when the command named nothing — no CLI targets and no
+    /// requirements files — so everything the tree pass resolved predates
+    /// this command (bare `npm install`). Distinct from
+    /// `outcomes.is_empty()`: a requirements-only install also has no named
+    /// outcomes, but its resolved set IS added by the command.
+    pub bare_install: bool,
 }
 
 impl PrecheckReport {
@@ -398,6 +404,7 @@ fn run_parsed_install(
     // With a verdict config, the tree pass resolves the full would-install
     // set; `tree::covers_input` owns what each manager's resolver can chew on.
     let tree_eligible = opts.verdict.is_some() && tree::covers_input(manager, &parsed);
+    let bare_install = parsed.targets.is_empty() && parsed.requirements_files.is_empty();
 
     if parsed.targets.is_empty() && !tree_eligible {
         bare_install_note(manager, subcommand_label);
@@ -461,6 +468,7 @@ fn run_parsed_install(
         threshold: opts.threshold,
         tree,
         steers: HashMap::new(),
+        bare_install,
     };
     verify_steers(&mut report, &opts);
 
@@ -519,10 +527,10 @@ fn print_refusal(report: &PrecheckReport) {
 /// there), and every *blocking* tree finding — vulnerable or unverifiable,
 /// since `should_block_install` refuses on both — genuinely predates this
 /// command. A `Requested` finding (pip `-r`) is added by this command and
-/// renders as `(from requirements)`; a `Transitive` finding on an install
-/// *with* named targets is being pulled in by them right now. Only a bare
-/// install (no named targets) or manifest-declared `PreExisting` findings
-/// may blame the existing tree.
+/// renders as `(from requirements)`; a `Transitive` finding on any install
+/// that names targets or requirements files is being pulled in by them
+/// right now. Only a truly bare install (`report.bare_install`) or
+/// manifest-declared `PreExisting` findings may blame the existing tree.
 fn refusal_blames_existing_tree(report: &PrecheckReport) -> bool {
     let named_findings = report.named_vulnerable_count() + report.named_unverifiable_count();
     if report.vulnerable_count() == 0 || named_findings > 0 {
@@ -542,7 +550,7 @@ fn refusal_blames_existing_tree(report: &PrecheckReport) -> bool {
         .all(|t| match t.origin {
             TreeOrigin::PreExisting => true,
             TreeOrigin::Requested => false,
-            TreeOrigin::Transitive => report.outcomes.is_empty(),
+            TreeOrigin::Transitive => report.bare_install,
         })
 }
 
@@ -1533,6 +1541,9 @@ mod tests {
             threshold: Duration::from_secs(2 * 86400),
             tree: None,
             steers: HashMap::new(),
+            // Most tests model an install that named something; bare-install
+            // cases set this explicitly.
+            bare_install: false,
         }
     }
 
@@ -2053,9 +2064,10 @@ mod tests {
 
     /// The existing-tree refusal fires only when every vulnerable finding
     /// predates the command: a `Requested` finding (pip `-r`) is added by
-    /// this command, and a `Transitive` finding on an install *with* named
-    /// targets is being pulled in by them right now. On a bare install
-    /// (no named targets) everything resolved is the existing tree's.
+    /// this command, and a `Transitive` finding is being pulled in right
+    /// now unless the install is truly bare. `bare_install` is the explicit
+    /// discriminator — a requirements-only install also has no named
+    /// outcomes, but its resolved set is the command's doing.
     #[test]
     fn refusal_blame_respects_finding_origin() {
         let tree_vulnerable = |origin| TreeOutcome {
@@ -2064,22 +2076,27 @@ mod tests {
             verdict: VerdictStatus::Vulnerable(vec![vm("A-1", None)]),
             origin,
         };
-        // (origin, named targets present, expected)
+        // (origin, named outcomes present, bare_install, expected).
+        // (origin, named=false, bare=false) is the requirements-only shape.
         let cases = [
-            (TreeOrigin::PreExisting, false, true),
-            (TreeOrigin::PreExisting, true, true),
-            (TreeOrigin::Transitive, false, true),
-            (TreeOrigin::Transitive, true, false),
-            (TreeOrigin::Requested, false, false),
-            (TreeOrigin::Requested, true, false),
+            (TreeOrigin::PreExisting, false, true, true),
+            (TreeOrigin::PreExisting, false, false, true),
+            (TreeOrigin::PreExisting, true, false, true),
+            (TreeOrigin::Transitive, false, true, true),
+            (TreeOrigin::Transitive, false, false, false),
+            (TreeOrigin::Transitive, true, false, false),
+            (TreeOrigin::Requested, false, true, false),
+            (TreeOrigin::Requested, false, false, false),
+            (TreeOrigin::Requested, true, false, false),
         ];
-        for (origin, with_named, blames_tree) in cases {
+        for (origin, with_named, bare_install, blames_tree) in cases {
             let outcomes = if with_named {
                 vec![resolved_outcome("cleanpkg", "1.0.0", false)]
             } else {
                 vec![]
             };
             let mut report = report_with(outcomes);
+            report.bare_install = bare_install;
             report.tree = Some(TreeReport::Full {
                 resolved_count: 1,
                 transitive: vec![tree_vulnerable(origin)],
@@ -2088,7 +2105,7 @@ mod tests {
             assert_eq!(
                 refusal_blames_existing_tree(&report),
                 blames_tree,
-                "origin {origin:?}, with_named {with_named}"
+                "origin {origin:?}, with_named {with_named}, bare {bare_install}"
             );
         }
     }
@@ -2132,9 +2149,10 @@ mod tests {
         report.tree = mixed_tree();
         assert!(!refusal_blames_existing_tree(&report));
 
-        // Bare install: no named targets, everything resolved predates the
+        // Bare install: nothing named, everything resolved predates the
         // command — the mixed findings still blame the existing tree.
         let mut report = report_with(vec![]);
+        report.bare_install = true;
         report.tree = mixed_tree();
         assert!(refusal_blames_existing_tree(&report));
     }
