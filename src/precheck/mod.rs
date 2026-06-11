@@ -168,11 +168,45 @@ pub enum TargetOutcome {
     },
 }
 
+/// Why a tree-pass finding is in the would-install set. Drives the
+/// provenance label so a package the user asked for (or already depends on)
+/// is never mislabeled "(transitive)".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeOrigin {
+    /// Pulled in as a dependency of something else.
+    Transitive,
+    /// Explicitly requested (pip report `"requested"` — CLI arg or
+    /// requirements file; leftovers here come from `-r` files since named
+    /// CLI targets match a named outcome instead).
+    Requested,
+    /// Already a direct dependency in the project's `package.json`.
+    PreExisting,
+}
+
+impl TreeOrigin {
+    fn label(self) -> &'static str {
+        match self {
+            TreeOrigin::Transitive => "(transitive)",
+            TreeOrigin::Requested => "(from requirements)",
+            TreeOrigin::PreExisting => "(already in package.json)",
+        }
+    }
+
+    fn json_name(self) -> &'static str {
+        match self {
+            TreeOrigin::Transitive => "transitive",
+            TreeOrigin::Requested => "requested",
+            TreeOrigin::PreExisting => "pre-existing",
+        }
+    }
+}
+
 /// Verdict for one package the tree pass resolved beyond the named targets.
 #[derive(Debug)]
 pub struct TreeOutcome {
     pub name: String,
     pub version: String,
+    pub origin: TreeOrigin,
     pub verdict: VerdictStatus,
 }
 
@@ -464,17 +498,26 @@ fn run_tree_pass(
                 jobs.push(tree::TreePackage {
                     name: resolved.name.clone(),
                     version: resolved.version.clone(),
+                    requested: true,
                 });
             }
         }
     }
+
+    // npm leftovers that are direct deps of the project manifest are
+    // pre-existing, not transitive. pip carries `requested` instead.
+    let direct_deps = if manager == PackageManager::Npm {
+        tree::project_direct_deps()
+    } else {
+        Default::default()
+    };
 
     let cfg = opts
         .verdict
         .as_ref()
         .expect("tree pass requires verdict config");
     let results = verdict_pool(jobs, cfg, manager, opts.concurrency);
-    let transitive = apply_verdicts(manager, results, outcomes);
+    let transitive = apply_verdicts(manager, results, outcomes, &direct_deps);
     TreeReport::Full {
         resolved_count,
         transitive,
@@ -535,11 +578,14 @@ fn verdict_pool(
 }
 
 /// Assign pooled verdicts onto matching named outcomes (by normalized
-/// name + version) and return the unmatched leftovers — the transitive set.
+/// name + version) and return the unmatched leftovers — the tree findings.
+/// Each leftover carries its provenance: pip's `requested` flag, membership
+/// in the project manifest's direct deps (`direct_deps`), or transitive.
 fn apply_verdicts(
     manager: PackageManager,
     results: Vec<(tree::TreePackage, VerdictStatus)>,
     outcomes: &mut [TargetOutcome],
+    direct_deps: &std::collections::HashSet<String>,
 ) -> Vec<TreeOutcome> {
     let norm = |n: &str| manager.normalize_name(n);
     let mut transitive = Vec::new();
@@ -560,9 +606,17 @@ fn apply_verdicts(
             }
         }
         if !matched {
+            let origin = if pkg.requested {
+                TreeOrigin::Requested
+            } else if direct_deps.contains(&pkg.name) {
+                TreeOrigin::PreExisting
+            } else {
+                TreeOrigin::Transitive
+            };
             transitive.push(TreeOutcome {
                 name: pkg.name,
                 version: pkg.version,
+                origin,
                 verdict,
             });
         }
@@ -590,13 +644,14 @@ fn run_verdict_pass(
             TargetOutcome::Resolved { resolved, .. } => Some(tree::TreePackage {
                 name: resolved.name.clone(),
                 version: resolved.version.clone(),
+                requested: true,
             }),
             _ => None,
         })
         .collect();
 
     let results = verdict_pool(jobs, cfg, manager, opts.concurrency);
-    apply_verdicts(manager, results, outcomes);
+    apply_verdicts(manager, results, outcomes, &Default::default());
 }
 
 fn should_block_install(report: &PrecheckReport, opts: &PrecheckOptions) -> bool {
@@ -730,6 +785,38 @@ fn safe_version(matches: &[crate::vuln_api::VulnMatch]) -> Option<String> {
     }
 }
 
+/// Highest `fixed_version` the advisories advertise, by lenient semver.
+/// Unlike `safe_version` this is *not* a certification: matches without a
+/// fix are ignored, so the result may still be vulnerable to them. `None`
+/// only when no match advertises a fix (or no candidate parses).
+fn advertised_fix(matches: &[crate::vuln_api::VulnMatch]) -> Option<String> {
+    let mut fixes: Vec<&str> = matches
+        .iter()
+        .filter_map(|m| m.fixed_version.as_deref())
+        .collect();
+    fixes.sort_unstable();
+    fixes.dedup();
+    match fixes.as_slice() {
+        [] => None,
+        [only] => Some((*only).to_string()),
+        many => {
+            let mut best: Option<(semver::Version, &str)> = None;
+            for raw in many {
+                let Ok(v) =
+                    semver::Version::parse(&verify_deps::registry::normalize_for_semver(raw))
+                else {
+                    continue;
+                };
+                match &best {
+                    Some((cur, _)) if cur >= &v => {}
+                    _ => best = Some((v, raw)),
+                }
+            }
+            best.map(|(_, raw)| (*raw).to_string())
+        }
+    }
+}
+
 /// Per-match advisory lines plus the safe-version steer, shared by the
 /// named-target and transitive vulnerable render arms.
 fn print_vulnerable_matches(name: &str, matches: &[crate::vuln_api::VulnMatch]) {
@@ -778,18 +865,35 @@ fn print_text(report: &PrecheckReport) {
                 match &t.verdict {
                     VerdictStatus::Vulnerable(matches) => {
                         println!(
-                            "  ✗ {}@{} (transitive)  known vulnerable:",
-                            t.name, t.version
+                            "  ✗ {}@{} {}  known vulnerable:",
+                            t.name,
+                            t.version,
+                            t.origin.label()
                         );
                         print_vulnerable_matches(&t.name, matches);
+                        // A vulnerable dep the project already declares can be
+                        // bumped directly — point at the advertised fix.
+                        if t.origin == TreeOrigin::PreExisting {
+                            if let Some(fix) = advertised_fix(matches) {
+                                println!(
+                                    "      fix with: corgea {} install {}@{} (advertised fix)",
+                                    report.manager.binary_name(),
+                                    t.name,
+                                    fix
+                                );
+                            }
+                        }
                     }
                     VerdictStatus::Unverifiable(error) => {
                         println!(
-                            "  ⚠ {}@{} (transitive)  could not be verified: {}",
-                            t.name, t.version, error
+                            "  ⚠ {}@{} {}  could not be verified: {}",
+                            t.name,
+                            t.version,
+                            t.origin.label(),
+                            error
                         );
                     }
-                    // Clean / not-checked transitive entries stay quiet in text mode.
+                    // Clean / not-checked tree entries stay quiet in text mode.
                     VerdictStatus::Clean | VerdictStatus::NotChecked(_) => {}
                 }
             }
@@ -937,6 +1041,7 @@ fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
                 "transitive": transitive.iter().map(|o| json!({
                     "name": o.name,
                     "version": o.version,
+                    "origin": o.origin.json_name(),
                     "verdict": verdict_json(&o.verdict),
                 })).collect::<Vec<_>>(),
             }),
@@ -1159,6 +1264,7 @@ mod tests {
             transitive: vec![TreeOutcome {
                 name: "evildep".to_string(),
                 version: "0.4.2".to_string(),
+                origin: TreeOrigin::Transitive,
                 verdict: VerdictStatus::Vulnerable(vec![]),
             }],
         });
@@ -1260,6 +1366,7 @@ mod tests {
             .map(|n| tree::TreePackage {
                 name: n.to_string(),
                 version: "1.0.0".to_string(),
+                requested: false,
             })
             .collect();
 
@@ -1353,5 +1460,55 @@ mod tests {
     #[test]
     fn safe_version_empty_matches_is_none() {
         assert_eq!(safe_version(&[]), None);
+    }
+
+    #[test]
+    fn advertised_fix_ignores_matches_without_fix() {
+        // safe_version returns None here; the advertised fix still surfaces.
+        assert_eq!(
+            advertised_fix(&[vm("A-1", Some("2.0.0")), vm("A-2", None)]),
+            Some("2.0.0".to_string())
+        );
+        assert_eq!(advertised_fix(&[vm("A-1", None)]), None);
+        assert_eq!(advertised_fix(&[]), None);
+    }
+
+    #[test]
+    fn advertised_fix_picks_highest_by_semver() {
+        assert_eq!(
+            advertised_fix(&[vm("A-1", Some("1.2.0")), vm("A-2", Some("1.10.0"))]),
+            Some("1.10.0".to_string())
+        );
+    }
+
+    /// Leftover origin assignment: pip `requested` ⇒ Requested; manifest
+    /// direct dep ⇒ PreExisting; otherwise Transitive. Requested wins over
+    /// a direct-dep hit.
+    #[test]
+    fn apply_verdicts_assigns_origins() {
+        let pkg = |name: &str, requested: bool| tree::TreePackage {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            requested,
+        };
+        let results = vec![
+            (pkg("reqdep", true), VerdictStatus::Clean),
+            (pkg("predep", false), VerdictStatus::Clean),
+            (pkg("deepdep", false), VerdictStatus::Clean),
+        ];
+        let direct_deps = std::collections::HashSet::from(["predep".to_string()]);
+        let mut outcomes = [];
+        let mut tree = apply_verdicts(PackageManager::Npm, results, &mut outcomes, &direct_deps);
+        tree.sort_by(|a, b| a.name.cmp(&b.name));
+        let origins: Vec<(&str, TreeOrigin)> =
+            tree.iter().map(|t| (t.name.as_str(), t.origin)).collect();
+        assert_eq!(
+            origins,
+            vec![
+                ("deepdep", TreeOrigin::Transitive),
+                ("predep", TreeOrigin::PreExisting),
+                ("reqdep", TreeOrigin::Requested),
+            ]
+        );
     }
 }

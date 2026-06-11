@@ -12,6 +12,10 @@ use super::PackageManager;
 pub struct TreePackage {
     pub name: String,
     pub version: String,
+    /// pip report `"requested"`: the user named this package (CLI arg or
+    /// requirements file). Always false for npm — its lockfile has no
+    /// equivalent flag.
+    pub requested: bool,
 }
 
 /// Whether this manager's resolver has anything to resolve for the parsed
@@ -88,8 +92,39 @@ fn parse_pip_report(json: &str) -> Result<Vec<TreePackage>, String> {
             Ok(TreePackage {
                 name: field("name")?,
                 version: field("version")?,
+                requested: item
+                    .get("requested")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             })
         })
+        .collect()
+}
+
+/// Direct dependency names declared by the project's `package.json` in the
+/// current directory (the manifest `resolve_npm_tree` copies). Empty when
+/// the manifest is absent or unparsable — origin labeling then degrades to
+/// `(transitive)`.
+pub fn project_direct_deps() -> std::collections::HashSet<String> {
+    std::fs::read_to_string("package.json")
+        .map(|s| direct_deps_from_manifest(&s))
+        .unwrap_or_default()
+}
+
+fn direct_deps_from_manifest(json: &str) -> std::collections::HashSet<String> {
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Default::default();
+    };
+    let groups = [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ];
+    groups
+        .iter()
+        .filter_map(|g| manifest.get(g)?.as_object())
+        .flat_map(|deps| deps.keys().cloned())
         .collect()
 }
 
@@ -164,6 +199,7 @@ fn parse_npm_lockfile(json: &str) -> Result<Vec<TreePackage>, String> {
         out.push(TreePackage {
             name,
             version: version.to_string(),
+            requested: false,
         });
     }
     Ok(out)
@@ -193,14 +229,23 @@ mod tests {
             vec![
                 TreePackage {
                     name: "oldpkg".to_string(),
-                    version: "1.0.0".to_string()
+                    version: "1.0.0".to_string(),
+                    requested: true,
                 },
                 TreePackage {
                     name: "evildep".to_string(),
-                    version: "0.4.2".to_string()
+                    version: "0.4.2".to_string(),
+                    requested: false,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parse_pip_report_missing_requested_defaults_false() {
+        let json = r#"{"install":[{"metadata":{"name":"x","version":"1.0.0"}}]}"#;
+        let pkgs = parse_pip_report(json).expect("parse report without requested");
+        assert!(!pkgs[0].requested);
     }
 
     #[test]
@@ -241,29 +286,19 @@ mod tests {
     fn parse_npm_lockfile_ok() {
         let mut pkgs = parse_npm_lockfile(NPM_LOCK).expect("parse npm lock");
         pkgs.sort_by(|a, b| a.name.cmp(&b.name));
+        let pkg = |name: &str, version: &str| TreePackage {
+            name: name.to_string(),
+            version: version.to_string(),
+            requested: false,
+        };
         assert_eq!(
             pkgs,
             vec![
-                TreePackage {
-                    name: "@scope/pkg".to_string(),
-                    version: "9.0.1".to_string()
-                },
-                TreePackage {
-                    name: "b".to_string(),
-                    version: "2.3.4".to_string()
-                },
-                TreePackage {
-                    name: "evildep".to_string(),
-                    version: "0.4.2".to_string()
-                },
-                TreePackage {
-                    name: "localdep".to_string(),
-                    version: "0.0.1".to_string()
-                },
-                TreePackage {
-                    name: "oldpkg".to_string(),
-                    version: "1.0.0".to_string()
-                },
+                pkg("@scope/pkg", "9.0.1"),
+                pkg("b", "2.3.4"),
+                pkg("evildep", "0.4.2"),
+                pkg("localdep", "0.0.1"),
+                pkg("oldpkg", "1.0.0"),
             ]
         );
     }
@@ -289,5 +324,28 @@ mod tests {
             Some("@scope/pkg")
         );
         assert_eq!(name_from_lock_path("packages/foo"), None);
+    }
+
+    #[test]
+    fn direct_deps_from_manifest_unions_all_groups() {
+        let manifest = r#"{
+            "name": "proj",
+            "dependencies": {"a": "^1.0.0", "@scope/b": "2.x"},
+            "devDependencies": {"c": "*"},
+            "optionalDependencies": {"d": "1.2.3"},
+            "peerDependencies": {"e": ">=1"}
+        }"#;
+        let deps = direct_deps_from_manifest(manifest);
+        for name in ["a", "@scope/b", "c", "d", "e"] {
+            assert!(deps.contains(name), "missing {name}");
+        }
+        assert_eq!(deps.len(), 5);
+    }
+
+    #[test]
+    fn direct_deps_from_manifest_degrades_to_empty() {
+        assert!(direct_deps_from_manifest("not json").is_empty());
+        assert!(direct_deps_from_manifest(r#"{"name":"proj"}"#).is_empty());
+        assert!(direct_deps_from_manifest(r#"{"dependencies":[]}"#).is_empty());
     }
 }
