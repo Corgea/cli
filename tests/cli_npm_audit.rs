@@ -130,7 +130,13 @@ fn emit(path: &Path) -> String {
 ///   * `--package-lock-only` → writes `NPM_LOCK` to `./package-lock.json`
 ///     (cwd is the resolver's throwaway temp dir), exits 0 — the tree pass;
 ///   * anything else → records argv to `marker`, exits 0 — the real install.
-fn write_fake_npm(dir: &Path, marker: &Path, audit_marker: &Path, scenario: AuditScenario) {
+fn write_fake_npm(
+    dir: &Path,
+    marker: &Path,
+    audit_marker: &Path,
+    audit_pid: &Path,
+    scenario: AuditScenario,
+) {
     use std::os::unix::fs::PermissionsExt;
     let lock_payload = dir.join("npm-lock-payload.json");
     std::fs::write(&lock_payload, NPM_LOCK).expect("write lock payload");
@@ -145,7 +151,13 @@ fn write_fake_npm(dir: &Path, marker: &Path, audit_marker: &Path, scenario: Audi
             format!("{}; exit {code}", emit(&audit_payload))
         }
         AuditScenario::Broken => "exit 1".to_string(),
-        AuditScenario::Hang => "/bin/sleep 10; exit 0".to_string(),
+        // Record the PID, then `exec` so the sleep IS the audit child (a
+        // plain `/bin/sleep 10` would be a grandchild the gate's kill never
+        // reaches).
+        AuditScenario::Hang => format!(
+            "printf '%s' $$ > '{}'; exec /bin/sleep 10",
+            audit_pid.display()
+        ),
     };
     let script = format!(
         "#!/bin/sh\ncase \" $* \" in\n\
@@ -167,6 +179,7 @@ struct AuditHarness {
     cmd: Command,
     marker: PathBuf,
     audit_marker: PathBuf,
+    audit_pid: PathBuf,
     _home: TempDir,
     _bin: TempDir,
 }
@@ -177,7 +190,8 @@ impl AuditHarness {
         let bin = TempDir::new().expect("temp bin dir");
         let marker = bin.path().join("pm-argv.txt");
         let audit_marker = bin.path().join("audit-argv.txt");
-        write_fake_npm(bin.path(), &marker, &audit_marker, scenario);
+        let audit_pid = bin.path().join("audit-pid.txt");
+        write_fake_npm(bin.path(), &marker, &audit_marker, &audit_pid, scenario);
         let registry = spawn_registry_stub();
         let vuln_stub = vuln_api_stub::spawn_with_statuses(checks, HashMap::new());
         cmd.env("PATH", bin.path())
@@ -189,6 +203,7 @@ impl AuditHarness {
             cmd,
             marker,
             audit_marker,
+            audit_pid,
             _home: home,
             _bin: bin,
         }
@@ -311,7 +326,9 @@ fn audit_failure_is_a_silent_skip() {
 
 #[test]
 fn audit_hang_is_skipped_within_the_collect_window() {
-    // The fake audit sleeps 10s; the gate's recv_timeout(1s) must move on.
+    // The fake audit sleeps 10s; the gate's 1s collect window must move on —
+    // and must kill the audit child on its way out, not orphan it past the
+    // CLI's exit.
     let started = std::time::Instant::now();
     let mut h = AuditHarness::new(HashMap::new(), AuditScenario::Hang);
     let out = h
@@ -329,6 +346,17 @@ fn audit_hang_is_skipped_within_the_collect_window() {
         started.elapsed() < std::time::Duration::from_secs(8),
         "gate must not wait out the hung audit (took {:?})",
         started.elapsed()
+    );
+    let pid = std::fs::read_to_string(&h.audit_pid).expect("audit must have started");
+    let alive = Command::new("kill")
+        .args(["-0", pid.trim()])
+        .status()
+        .expect("run kill -0")
+        .success();
+    assert!(
+        !alive,
+        "hung audit child (pid {}) must be dead after the CLI exits",
+        pid.trim()
     );
 }
 

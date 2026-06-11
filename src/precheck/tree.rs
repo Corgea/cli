@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::PackageManager;
@@ -37,10 +37,41 @@ pub struct AuditSummary {
 }
 
 /// What `resolve_tree` hands back: the would-install set, plus (npm only)
-/// a receiver for the concurrent `npm audit` second opinion.
+/// a handle to the concurrent `npm audit` second opinion.
 pub struct TreeResolution {
     pub packages: Vec<TreePackage>,
-    pub audit: Option<mpsc::Receiver<AuditSummary>>,
+    pub audit: Option<AuditHandle>,
+}
+
+/// The in-flight `npm audit` second opinion: a receiver for the summary plus
+/// deterministic cleanup. The CLI exits the process as soon as the gate
+/// returns, which would strand the audit thread mid-poll and orphan the
+/// `npm audit` child — so `collect` owns reaping both before the gate moves
+/// on.
+pub struct AuditHandle {
+    rx: mpsc::Receiver<AuditSummary>,
+    /// The audit subprocess, shared with the polling thread. Emptied by
+    /// whichever side reaps it first.
+    child: Arc<Mutex<Option<std::process::Child>>>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl AuditHandle {
+    /// Wait up to `window` for the summary, then kill whatever is left of
+    /// the subprocess and join the thread. On the happy path the child has
+    /// already exited and the join is instant; a hung audit is killed now
+    /// rather than left running past the CLI's exit.
+    pub fn collect(self, window: Duration) -> Option<AuditSummary> {
+        let summary = self.rx.recv_timeout(window).ok();
+        if let Ok(mut slot) = self.child.lock() {
+            if let Some(mut child) = slot.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        let _ = self.thread.join();
+        summary
+    }
 }
 
 /// Whether this manager's resolver has anything to resolve for the parsed
@@ -227,15 +258,17 @@ const AUDIT_TOP_LIMIT: usize = 5;
 /// is cleaned up when the audit finishes. Any failure (spawn error, timeout,
 /// unparsable output) drops the sender — the receiver sees a disconnect and
 /// the gate silently skips the second opinion.
-fn spawn_audit(work: tempfile::TempDir, npm: PathBuf) -> mpsc::Receiver<AuditSummary> {
+fn spawn_audit(work: tempfile::TempDir, npm: PathBuf) -> AuditHandle {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        if let Some(summary) = run_audit(work.path(), &npm) {
+    let child = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&child);
+    let thread = std::thread::spawn(move || {
+        if let Some(summary) = run_audit(work.path(), &npm, &slot) {
             let _ = tx.send(summary);
         }
         drop(work);
     });
-    rx
+    AuditHandle { rx, child, thread }
 }
 
 /// `npm audit` exits 1 when it finds advisories — that's the success case,
@@ -243,10 +276,18 @@ fn spawn_audit(work: tempfile::TempDir, npm: PathBuf) -> mpsc::Receiver<AuditSum
 /// (not a pipe) so the deadline poll can't deadlock on a full pipe buffer.
 /// `--package-lock-only` because the work dir holds only manifests and the
 /// generated lockfile — never a `node_modules`.
-fn run_audit(work: &std::path::Path, npm: &std::path::Path) -> Option<AuditSummary> {
+///
+/// The subprocess lives in `slot`, shared with `AuditHandle::collect`: the
+/// poll relocks each iteration, and an empty slot means the collector
+/// already reaped the child — stop quietly.
+fn run_audit(
+    work: &std::path::Path,
+    npm: &std::path::Path,
+    slot: &Mutex<Option<std::process::Child>>,
+) -> Option<AuditSummary> {
     let stdout_path = work.join("corgea-npm-audit.json");
     let stdout_file = std::fs::File::create(&stdout_path).ok()?;
-    let mut child = Command::new(npm)
+    let child = Command::new(npm)
         .args(["audit", "--json", "--package-lock-only"])
         .current_dir(work)
         .stdin(Stdio::null())
@@ -254,12 +295,27 @@ fn run_audit(work: &std::path::Path, npm: &std::path::Path) -> Option<AuditSumma
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    *slot.lock().ok()? = Some(child);
     let deadline = Instant::now() + AUDIT_DEADLINE;
     loop {
+        let mut guard = slot.lock().ok()?;
+        let Some(child) = guard.as_mut() else {
+            return None; // collector reaped the child first
+        };
         match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(Some(_)) => {
+                // Exited on its own: clear the slot so the collector has
+                // nothing left to kill.
+                guard.take();
+                break;
+            }
+            Ok(None) if Instant::now() < deadline => {
+                drop(guard);
+                std::thread::sleep(Duration::from_millis(50));
+            }
             _ => {
+                let mut child = guard.take().expect("checked above");
+                drop(guard);
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;

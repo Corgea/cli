@@ -273,6 +273,44 @@ fn npm_preexisting_fix_hint_keeps_hedge_when_unverifiable() {
     );
 }
 
+/// PR #108 review regression: unverifiable tree findings block too, so the
+/// refusal may not blame the existing tree when a command-added transitive
+/// is part of the block — even if the only *vulnerable* finding is a
+/// pre-existing direct dep.
+#[test]
+fn preexisting_vulnerable_with_unverifiable_transitive_keeps_generic_refusal() {
+    const LOCK_WITH_NEWDEP: &str = r#"{"name":"proj","lockfileVersion":3,"packages":{
+      "":{"name":"proj","version":"1.0.0"},
+      "node_modules/oldpkg":{"version":"1.0.0"},
+      "node_modules/evildep":{"version":"0.4.2"},
+      "node_modules/newdep":{"version":"2.0.0"}}}"#;
+    let project = npm_project();
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("npm", "evildep", "0.4.2"),
+        vulnerable_body("npm", "evildep", "0.4.2", "null"),
+    );
+    let mut statuses = HashMap::new();
+    statuses.insert(key("npm", "newdep", "2.0.0"), 503u16);
+    let mut h = Harness::new_with_statuses("npm", checks, statuses, LOCK_WITH_NEWDEP);
+    let out = h
+        .cmd
+        .current_dir(project.path())
+        .args(["npm", "install", "oldpkg@1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1), "must block");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Refusing to run install. Pass --force to proceed despite findings."),
+        "the command-added unverifiable transitive keeps the generic refusal: {stderr}"
+    );
+    assert!(
+        !stderr.contains("your existing dependency tree"),
+        "existing-tree refusal must not fire when a command-added finding blocks: {stderr}"
+    );
+}
+
 #[test]
 fn npm_preexisting_without_fix_has_no_hint() {
     let project = npm_project();
