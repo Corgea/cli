@@ -2,6 +2,11 @@
 //! pattern — included via `mod common;` from each integration-test crate, so
 //! items unused by one consumer are `#[allow(dead_code)]`).
 
+use corgea::vuln_api_stub::PackageKey;
+#[cfg(unix)]
+use std::collections::HashMap;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -46,6 +51,43 @@ pub const OLDPKG_PYPI_JSON: &str = r#"{"info":{"name":"oldpkg"},"releases":{"1.0
 /// npm packument for `oldpkg` 1.0.0, published 2020 → never recent.
 #[allow(dead_code)]
 pub const OLDPKG_NPM_PACKUMENT: &str = r#"{"dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{}},"time":{"1.0.0":"2020-01-01T00:00:00Z"}}"#;
+
+#[allow(dead_code)]
+pub fn key(eco: &str, name: &str, ver: &str) -> PackageKey {
+    (eco.to_string(), name.to_string(), ver.to_string())
+}
+
+/// Single-match vulnerable verdict body for the vuln-api stub; `fixed: None`
+/// renders `"fixed_version":null`.
+#[allow(dead_code)]
+pub fn vulnerable_body(
+    ecosystem: &str,
+    name: &str,
+    version: &str,
+    advisory: &str,
+    fixed: Option<&str>,
+) -> String {
+    let fixed = fixed.map_or("null".to_string(), |f| format!(r#""{f}""#));
+    format!(
+        r#"{{"ecosystem":"{ecosystem}","package_name":"{name}","version":"{version}","is_vulnerable":true,
+        "matches":[{{"advisory_id":"{advisory}","severity_level":"critical","tier":1,
+                    "vulnerable_version_range":null,"fixed_version":{fixed}}}]}}"#
+    )
+}
+
+/// Pip `--report -` payload: `oldpkg` (named/requested) + `evildep`
+/// (transitive).
+#[allow(dead_code)]
+pub const TREE_REPORT: &str = r#"{"version":"1","pip_version":"24.0","install":[
+  {"metadata":{"name":"oldpkg","version":"1.0.0"},"requested":true},
+  {"metadata":{"name":"evildep","version":"0.4.2"},"requested":false}]}"#;
+
+/// npm lockfile-v3 fixture: named `oldpkg` 1.0.0 + transitive `evildep` 0.4.2.
+#[allow(dead_code)]
+pub const NPM_LOCK: &str = r#"{"name":"proj","lockfileVersion":3,"packages":{
+  "":{"name":"proj","version":"1.0.0"},
+  "node_modules/oldpkg":{"version":"1.0.0"},
+  "node_modules/evildep":{"version":"0.4.2"}}}"#;
 
 /// Spawn a one-response-per-connection HTTP stub on an ephemeral 127.0.0.1
 /// port; `route` maps a request path to `(status line, body)`. Returns the
@@ -92,6 +134,38 @@ where
         }
     });
     base_url
+}
+
+/// Registry stub serving `/pypi/oldpkg/json` (pypi) and `/oldpkg` (npm
+/// packument), both published 2020 → never recent. Everything else 404s.
+#[allow(dead_code)]
+pub fn spawn_oldpkg_registry_stub() -> String {
+    spawn_http_stub(|path| match path {
+        "/pypi/oldpkg/json" => ("200 OK", OLDPKG_PYPI_JSON.to_string()),
+        "/oldpkg" => ("200 OK", OLDPKG_NPM_PACKUMENT.to_string()),
+        _ => ("404 Not Found", NOT_FOUND_JSON.to_string()),
+    })
+}
+
+/// Registry stub serving `/pypi/<name>/json` for any single-segment name,
+/// always version 1.0.0 published 2020 → never recent. Everything else 404s.
+#[allow(dead_code)]
+pub fn spawn_wildcard_pypi_stub() -> String {
+    spawn_http_stub(|path| {
+        let name = path
+            .strip_prefix("/pypi/")
+            .and_then(|p| p.strip_suffix("/json"))
+            .filter(|n| !n.is_empty() && !n.contains('/'));
+        match name {
+            Some(name) => (
+                "200 OK",
+                format!(
+                    r#"{{"info":{{"name":"{name}"}},"releases":{{"1.0.0":[{{"upload_time_iso_8601":"2020-01-01T00:00:00Z"}}]}}}}"#
+                ),
+            ),
+            None => ("404 Not Found", NOT_FOUND_JSON.to_string()),
+        }
+    })
 }
 
 /// Write `script` as the executable `dir/binary`.
@@ -193,4 +267,95 @@ pub fn write_fake_tree_pm(
         marker = marker.display(),
     );
     write_script(dir, binary, &script);
+}
+
+/// `corgea` wired to the wildcard pypi registry stub, a report-less fake pip
+/// (recording its argv to a marker), and a vuln-api stub.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub struct PipHarness {
+    pub cmd: Command,
+    marker: PathBuf,
+    _home: TempDir,
+    _bin: TempDir,
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+impl PipHarness {
+    /// `token: None` exercises tokenless mode (no CORGEA_TOKEN set).
+    pub fn new(
+        checks: HashMap<PackageKey, String>,
+        statuses: HashMap<PackageKey, u16>,
+        token: Option<&str>,
+        pip_exit_code: i32,
+    ) -> Self {
+        let (mut cmd, home) = corgea_isolated();
+        let bin = TempDir::new().expect("temp bin dir");
+        let marker = bin.path().join("pm-argv.txt");
+        write_fake_pip_without_report(bin.path(), &marker, pip_exit_code);
+        let registry = spawn_wildcard_pypi_stub();
+        let vuln_stub = corgea::vuln_api_stub::spawn_with_statuses(checks, statuses);
+        cmd.env("PATH", bin.path())
+            .env("CORGEA_PYPI_REGISTRY", &registry)
+            .env("CORGEA_VULN_API_URL", &vuln_stub.base_url);
+        if let Some(t) = token {
+            cmd.env("CORGEA_TOKEN", t);
+        }
+        Self {
+            cmd,
+            marker,
+            _home: home,
+            _bin: bin,
+        }
+    }
+
+    pub fn recorded_argv(&self) -> Option<String> {
+        std::fs::read_to_string(&self.marker).ok()
+    }
+}
+
+/// `corgea` wired to the oldpkg registry stub, a tree-aware fake `binary`
+/// (`"pip"` or `"npm"`) answering the tree pass with `payload`, a vuln-api
+/// stub, and a token.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub struct TreeHarness {
+    pub cmd: Command,
+    marker: PathBuf,
+    _home: TempDir,
+    _bin: TempDir,
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+impl TreeHarness {
+    pub fn new(
+        binary: &str,
+        checks: HashMap<PackageKey, String>,
+        statuses: HashMap<PackageKey, u16>,
+        payload: &str,
+    ) -> Self {
+        let (mut cmd, home) = corgea_isolated();
+        let bin = TempDir::new().expect("temp bin dir");
+        let marker = bin.path().join("pm-argv.txt");
+        write_fake_tree_pm(bin.path(), binary, &marker, payload, 0);
+        let registry = spawn_oldpkg_registry_stub();
+        let vuln_stub = corgea::vuln_api_stub::spawn_with_statuses(checks, statuses);
+        cmd.env("PATH", bin.path())
+            .env("CORGEA_PYPI_REGISTRY", &registry)
+            .env("CORGEA_NPM_REGISTRY", &registry)
+            .env("CORGEA_VULN_API_URL", &vuln_stub.base_url)
+            .env("CORGEA_TOKEN", "test-token");
+        Self {
+            cmd,
+            marker,
+            _home: home,
+            _bin: bin,
+        }
+    }
+
+    pub fn recorded_argv(&self) -> Option<String> {
+        std::fs::read_to_string(&self.marker).ok()
+    }
 }

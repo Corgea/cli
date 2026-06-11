@@ -10,21 +10,10 @@
 
 mod common;
 
-use common::{
-    corgea_isolated, spawn_http_stub, write_fake_recorder, NOT_FOUND_JSON, OLDPKG_PYPI_JSON,
-};
+use common::{corgea_isolated, spawn_oldpkg_registry_stub, write_fake_recorder};
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
-
-/// Spawn a PyPI stub serving `/pypi/oldpkg/json` (published 2020-01-01,
-/// safely past the recency threshold). Anything else 404s.
-fn spawn_pypi_stub() -> String {
-    spawn_http_stub(|path| match path {
-        "/pypi/oldpkg/json" => ("200 OK", OLDPKG_PYPI_JSON.to_string()),
-        _ => ("404 Not Found", NOT_FOUND_JSON.to_string()),
-    })
-}
 
 /// Isolated `corgea` wired to the PyPI stub, with `PATH` set to a private
 /// temp dir containing only the named fake binaries.
@@ -43,7 +32,7 @@ impl FallbackHarness {
         for binary in binaries {
             write_fake_recorder(bin.path(), binary, &marker, 0);
         }
-        let registry = spawn_pypi_stub();
+        let registry = spawn_oldpkg_registry_stub();
         cmd.env("PATH", bin.path())
             .env("CORGEA_PYPI_REGISTRY", &registry);
         Self {

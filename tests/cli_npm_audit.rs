@@ -14,23 +14,13 @@
 mod common;
 
 use common::{
-    corgea_isolated, emit, spawn_http_stub, write_script, NOT_FOUND_JSON, OLDPKG_NPM_PACKUMENT,
+    corgea_isolated, emit, key, spawn_oldpkg_registry_stub, vulnerable_body, write_script, NPM_LOCK,
 };
 use corgea::vuln_api_stub::{self, PackageKey};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
-
-fn key(eco: &str, name: &str, ver: &str) -> PackageKey {
-    (eco.to_string(), name.to_string(), ver.to_string())
-}
-
-/// npm lockfile-v3 fixture: named `oldpkg` 1.0.0 + transitive `evildep` 0.4.2.
-const NPM_LOCK: &str = r#"{"name":"proj","lockfileVersion":3,"packages":{
-  "":{"name":"proj","version":"1.0.0"},
-  "node_modules/oldpkg":{"version":"1.0.0"},
-  "node_modules/evildep":{"version":"0.4.2"}}}"#;
 
 /// npm audit report v2 with two advisories: 1 critical + 1 high.
 const AUDIT_ADVISORIES: &str = r#"{"auditReportVersion":2,
@@ -45,13 +35,6 @@ const AUDIT_CLEAN: &str = r#"{"auditReportVersion":2,"vulnerabilities":{},
   "metadata":{"vulnerabilities":
     {"info":0,"low":0,"moderate":0,"high":0,"critical":0,"total":0}}}"#;
 
-fn vulnerable_evildep_body() -> String {
-    r#"{"ecosystem":"npm","package_name":"evildep","version":"0.4.2","is_vulnerable":true,
-        "matches":[{"advisory_id":"MAL-2024-0002","severity_level":"critical","tier":1,
-                    "vulnerable_version_range":null,"fixed_version":null}]}"#
-        .to_string()
-}
-
 /// How the fake npm behaves on its `audit --json` invocation.
 #[derive(Clone, Copy)]
 enum AuditScenario {
@@ -64,15 +47,6 @@ enum AuditScenario {
     Broken,
     /// Never answers — the gate's `recv_timeout` must move on without it.
     Hang,
-}
-
-/// Registry stub serving the `/oldpkg` npm packument, published 2020 →
-/// never recent. Everything else 404s.
-fn spawn_registry_stub() -> String {
-    spawn_http_stub(|path| match path {
-        "/oldpkg" => ("200 OK", OLDPKG_NPM_PACKUMENT.to_string()),
-        _ => ("404 Not Found", NOT_FOUND_JSON.to_string()),
-    })
 }
 
 /// Write an executable fake npm into `dir`:
@@ -141,7 +115,7 @@ impl AuditHarness {
         let audit_marker = bin.path().join("audit-argv.txt");
         let audit_pid = bin.path().join("audit-pid.txt");
         write_fake_npm(bin.path(), &marker, &audit_marker, &audit_pid, scenario);
-        let registry = spawn_registry_stub();
+        let registry = spawn_oldpkg_registry_stub();
         let vuln_stub = vuln_api_stub::spawn_with_statuses(checks, HashMap::new());
         cmd.env("PATH", bin.path())
             .env("CORGEA_NPM_REGISTRY", &registry)
@@ -315,7 +289,10 @@ fn audit_never_unblocks_a_vulnerable_verdict() {
     // findings. Block behaviour and exit code are the verdict's alone — the
     // audit note still prints as a supplementary signal.
     let mut checks = HashMap::new();
-    checks.insert(key("npm", "evildep", "0.4.2"), vulnerable_evildep_body());
+    checks.insert(
+        key("npm", "evildep", "0.4.2"),
+        vulnerable_body("npm", "evildep", "0.4.2", "MAL-2024-0002", None),
+    );
     let mut h = AuditHarness::new(checks, AuditScenario::Advisories);
     let out = h
         .cmd

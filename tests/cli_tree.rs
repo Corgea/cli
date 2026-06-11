@@ -12,137 +12,86 @@
 
 mod common;
 
-use common::{
-    corgea_isolated, spawn_http_stub, write_fake_tree_pm, NOT_FOUND_JSON, OLDPKG_NPM_PACKUMENT,
-    OLDPKG_PYPI_JSON, RESOLUTION_FAILS,
-};
-use corgea::vuln_api_stub::{self, PackageKey};
+use common::{key, vulnerable_body, TreeHarness, NPM_LOCK, RESOLUTION_FAILS, TREE_REPORT};
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::process::Command;
 use tempfile::TempDir;
 
-fn key(eco: &str, name: &str, ver: &str) -> PackageKey {
-    (eco.to_string(), name.to_string(), ver.to_string())
-}
-
-/// Pip `--report -` payload: `oldpkg` (named) + `evildep` (transitive).
-const TREE_REPORT: &str = r#"{"version":"1","pip_version":"24.0","install":[
-  {"metadata":{"name":"oldpkg","version":"1.0.0"},"requested":true},
-  {"metadata":{"name":"evildep","version":"0.4.2"},"requested":false}]}"#;
-
 fn vulnerable_evildep_body(ecosystem: &str) -> String {
-    format!(
-        r#"{{"ecosystem":"{ecosystem}","package_name":"evildep","version":"0.4.2","is_vulnerable":true,
-        "matches":[{{"advisory_id":"MAL-2024-0002","severity_level":"critical","tier":1,
-                    "vulnerable_version_range":null,"fixed_version":null}}]}}"#
-    )
+    vulnerable_body(ecosystem, "evildep", "0.4.2", "MAL-2024-0002", None)
 }
 
-/// Registry stub serving `/pypi/oldpkg/json` (pypi) and `/oldpkg` (npm
-/// packument), both published 2020 → never recent. Everything else 404s.
-fn spawn_pypi_stub() -> String {
-    spawn_http_stub(|path| match path {
-        "/pypi/oldpkg/json" => ("200 OK", OLDPKG_PYPI_JSON.to_string()),
-        "/oldpkg" => ("200 OK", OLDPKG_NPM_PACKUMENT.to_string()),
-        _ => ("404 Not Found", NOT_FOUND_JSON.to_string()),
-    })
-}
-
-/// npm lockfile-v3 fixture: named `oldpkg` 1.0.0 + transitive `evildep` 0.4.2.
-const NPM_LOCK: &str = r#"{"name":"proj","lockfileVersion":3,"packages":{
-  "":{"name":"proj","version":"1.0.0"},
-  "node_modules/oldpkg":{"version":"1.0.0"},
-  "node_modules/evildep":{"version":"0.4.2"}}}"#;
-
-/// `corgea` wired to the registry stub, a tree-aware fake pip, and a vuln-api
-/// stub.
-struct TreeHarness {
-    cmd: Command,
-    marker: PathBuf,
-    _home: TempDir,
-    _bin: TempDir,
-}
-
-impl TreeHarness {
-    /// Wires the registry + vuln-api stubs, token, and a fake `binary`
-    /// (`"pip"` or `"npm"`) into a private PATH dir. `payload` is the canned
-    /// tree-resolution output (pip report / npm lockfile), or
-    /// `RESOLUTION_FAILS` to simulate a failed resolution.
-    fn new(
-        binary: &str,
-        checks: HashMap<PackageKey, String>,
-        statuses: HashMap<PackageKey, u16>,
-        payload: &str,
-        exit_code: i32,
-    ) -> Self {
-        let (mut cmd, home) = corgea_isolated();
-        let bin = TempDir::new().expect("temp bin dir");
-        let marker = bin.path().join("pm-argv.txt");
-        write_fake_tree_pm(bin.path(), binary, &marker, payload, exit_code);
-        let registry = spawn_pypi_stub();
-        let vuln_stub = vuln_api_stub::spawn_with_statuses(checks, statuses);
-        cmd.env("PATH", bin.path())
-            .env("CORGEA_PYPI_REGISTRY", &registry)
-            .env("CORGEA_NPM_REGISTRY", &registry)
-            .env("CORGEA_VULN_API_URL", &vuln_stub.base_url)
-            .env("CORGEA_TOKEN", "test-token");
-        Self {
-            cmd,
-            marker,
-            _home: home,
-            _bin: bin,
+#[test]
+fn transitive_vulnerable_blocks_install() {
+    // Only the transitive `evildep` is flagged; the named `oldpkg` is clean.
+    let cases = [
+        (
+            "pip",
+            "pypi",
+            TREE_REPORT,
+            &["pip", "--concurrency", "2", "install", "oldpkg==1.0.0"][..],
+        ),
+        (
+            "npm",
+            "npm",
+            NPM_LOCK,
+            &["npm", "install", "oldpkg@1.0.0"][..],
+        ),
+    ];
+    for (binary, eco, payload, args) in cases {
+        let mut checks = HashMap::new();
+        checks.insert(key(eco, "evildep", "0.4.2"), vulnerable_evildep_body(eco));
+        let mut h = TreeHarness::new(binary, checks, HashMap::new(), payload);
+        let out = h.cmd.args(args).output().expect("run corgea");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{binary}: transitive vuln must block"
+        );
+        assert_eq!(
+            h.recorded_argv(),
+            None,
+            "{binary} must not run on a transitive vulnerable verdict"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for needle in ["evildep", "MAL-2024-0002", "(transitive)"] {
+            assert!(stdout.contains(needle), "{binary} stdout: {stdout}");
         }
     }
+}
 
-    fn recorded_argv(&self) -> Option<String> {
-        std::fs::read_to_string(&self.marker).ok()
+#[test]
+fn resolution_failure_falls_back_with_loud_warning() {
+    // The fake manager fails its tree invocation (pip: exits 2 on `--dry-run`,
+    // simulating an old pip with no `--report`; npm: exits 1 on
+    // `--package-lock-only`). Stub is all-clean, so the named-only fallback
+    // proceeds.
+    let cases = [
+        (
+            "pip",
+            &["pip", "install", "oldpkg==1.0.0"][..],
+            "install oldpkg==1.0.0",
+        ),
+        (
+            "npm",
+            &["npm", "install", "oldpkg@1.0.0"][..],
+            "install oldpkg@1.0.0",
+        ),
+    ];
+    for (binary, args, forwarded_argv) in cases {
+        let mut h = TreeHarness::new(binary, HashMap::new(), HashMap::new(), RESOLUTION_FAILS);
+        let out = h.cmd.args(args).output().expect("run corgea");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{binary}: clean named-only must proceed"
+        );
+        assert_eq!(h.recorded_argv().as_deref(), Some(forwarded_argv));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("transitive dependencies not checked"),
+            "{binary} stderr must carry the fallback warning: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
-}
-
-#[test]
-fn pip_transitive_vulnerable_blocks_install() {
-    // Only the transitive `evildep` is flagged; the named `oldpkg` is clean.
-    let mut checks = HashMap::new();
-    checks.insert(
-        key("pypi", "evildep", "0.4.2"),
-        vulnerable_evildep_body("pypi"),
-    );
-    let mut h = TreeHarness::new("pip", checks, HashMap::new(), TREE_REPORT, 0);
-    let out = h
-        .cmd
-        .args(["pip", "--concurrency", "2", "install", "oldpkg==1.0.0"])
-        .output()
-        .expect("run corgea");
-    assert_eq!(out.status.code(), Some(1), "transitive vuln must block");
-    assert_eq!(
-        h.recorded_argv(),
-        None,
-        "pip must not run on a transitive vulnerable verdict"
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("evildep"), "stdout: {stdout}");
-    assert!(stdout.contains("MAL-2024-0002"), "stdout: {stdout}");
-    assert!(stdout.contains("(transitive)"), "stdout: {stdout}");
-}
-
-#[test]
-fn pip_dry_run_failure_falls_back_with_loud_warning() {
-    // Fake pip exits 2 on `--dry-run` (simulates old pip with no `--report`).
-    // Stub is all-clean, so the named-only fallback proceeds.
-    let mut h = TreeHarness::new("pip", HashMap::new(), HashMap::new(), RESOLUTION_FAILS, 0);
-    let out = h
-        .cmd
-        .args(["pip", "install", "oldpkg==1.0.0"])
-        .output()
-        .expect("run corgea");
-    assert_eq!(out.status.code(), Some(0), "clean named-only must proceed");
-    assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg==1.0.0"));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("transitive dependencies not checked"),
-        "stderr must carry the fallback warning: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 #[test]
@@ -152,7 +101,7 @@ fn pip_json_carries_tree_object() {
         key("pypi", "evildep", "0.4.2"),
         vulnerable_evildep_body("pypi"),
     );
-    let mut h = TreeHarness::new("pip", checks, HashMap::new(), TREE_REPORT, 0);
+    let mut h = TreeHarness::new("pip", checks, HashMap::new(), TREE_REPORT);
     let out = h
         .cmd
         .args(["pip", "--json", "install", "oldpkg==1.0.0"])
@@ -174,7 +123,7 @@ fn pip_json_carries_tree_object() {
 #[test]
 fn pip_clean_tree_proceeds() {
     // Stub default-clean (no overrides), so every resolved package is clean.
-    let mut h = TreeHarness::new("pip", HashMap::new(), HashMap::new(), TREE_REPORT, 0);
+    let mut h = TreeHarness::new("pip", HashMap::new(), HashMap::new(), TREE_REPORT);
     let out = h
         .cmd
         .args(["pip", "install", "oldpkg==1.0.0"])
@@ -186,52 +135,6 @@ fn pip_clean_tree_proceeds() {
     assert!(
         stdout.contains("tree: 2 packages resolved"),
         "stdout: {stdout}"
-    );
-}
-
-#[test]
-fn npm_transitive_vulnerable_blocks_install() {
-    // The generated lockfile carries a transitive `evildep` 0.4.2 that the
-    // vuln stub flags; the named `oldpkg` is clean.
-    let mut checks = HashMap::new();
-    checks.insert(
-        key("npm", "evildep", "0.4.2"),
-        vulnerable_evildep_body("npm"),
-    );
-    let mut h = TreeHarness::new("npm", checks, HashMap::new(), NPM_LOCK, 0);
-    let out = h
-        .cmd
-        .args(["npm", "install", "oldpkg@1.0.0"])
-        .output()
-        .expect("run corgea");
-    assert_eq!(out.status.code(), Some(1), "transitive vuln must block");
-    assert_eq!(
-        h.recorded_argv(),
-        None,
-        "npm must not run on a transitive vulnerable verdict"
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("evildep"), "stdout: {stdout}");
-    assert!(stdout.contains("MAL-2024-0002"), "stdout: {stdout}");
-    assert!(stdout.contains("(transitive)"), "stdout: {stdout}");
-}
-
-#[test]
-fn npm_resolution_failure_falls_back_with_warning() {
-    // Fake npm exits 1 on `--package-lock-only`. Stub is all-clean, so the
-    // named-only fallback proceeds with a loud warning.
-    let mut h = TreeHarness::new("npm", HashMap::new(), HashMap::new(), RESOLUTION_FAILS, 0);
-    let out = h
-        .cmd
-        .args(["npm", "install", "oldpkg@1.0.0"])
-        .output()
-        .expect("run corgea");
-    assert_eq!(out.status.code(), Some(0), "clean named-only must proceed");
-    assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg@1.0.0"));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("transitive dependencies not checked"),
-        "stderr must carry the fallback warning: {}",
-        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -252,7 +155,7 @@ fn npm_does_not_touch_project_lockfile() {
         key("npm", "evildep", "0.4.2"),
         vulnerable_evildep_body("npm"),
     );
-    let mut h = TreeHarness::new("npm", checks, HashMap::new(), NPM_LOCK, 0);
+    let mut h = TreeHarness::new("npm", checks, HashMap::new(), NPM_LOCK);
     let out = h
         .cmd
         .current_dir(project.path())

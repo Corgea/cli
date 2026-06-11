@@ -16,8 +16,8 @@
 mod common;
 
 use common::{
-    corgea_isolated, spawn_http_stub, write_fake_recorder, write_fake_tree_pm, NOT_FOUND_JSON,
-    OLDPKG_NPM_PACKUMENT, RESOLUTION_FAILS,
+    corgea_isolated, key, spawn_oldpkg_registry_stub, vulnerable_body, write_fake_recorder,
+    write_fake_tree_pm, NPM_LOCK, RESOLUTION_FAILS,
 };
 use corgea::vuln_api_stub::{self, PackageKey};
 use std::collections::HashMap;
@@ -25,33 +25,10 @@ use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
-fn key(eco: &str, name: &str, ver: &str) -> PackageKey {
-    (eco.to_string(), name.to_string(), ver.to_string())
-}
-
-/// npm lockfile-v3 fixture the fake npm "resolves" from `package.json`:
-/// `oldpkg` 1.0.0 + `evildep` 0.4.2 — with zero specs, both are transitive.
-const NPM_LOCK: &str = r#"{"name":"proj","lockfileVersion":3,"packages":{
-  "":{"name":"proj","version":"1.0.0"},
-  "node_modules/oldpkg":{"version":"1.0.0"},
-  "node_modules/evildep":{"version":"0.4.2"}}}"#;
-
 const PACKAGE_JSON: &str = r#"{"name":"proj","version":"1.0.0","dependencies":{"oldpkg":"1.0.0"}}"#;
 
 fn vulnerable_evildep_body() -> String {
-    r#"{"ecosystem":"npm","package_name":"evildep","version":"0.4.2","is_vulnerable":true,
-        "matches":[{"advisory_id":"MAL-2024-0002","severity_level":"critical","tier":1,
-                    "vulnerable_version_range":null,"fixed_version":null}]}"#
-        .to_string()
-}
-
-/// Registry stub serving the `/oldpkg` npm packument, published 2020 → never
-/// recent. Everything else 404s.
-fn spawn_registry_stub() -> String {
-    spawn_http_stub(|path| match path {
-        "/oldpkg" => ("200 OK", OLDPKG_NPM_PACKUMENT.to_string()),
-        _ => ("404 Not Found", NOT_FOUND_JSON.to_string()),
-    })
+    vulnerable_body("npm", "evildep", "0.4.2", "MAL-2024-0002", None)
 }
 
 /// `corgea` wired to a fake package manager, the registry + vuln-api stubs,
@@ -83,7 +60,7 @@ impl BareHarness {
             Some(payload) => write_fake_tree_pm(bin.path(), "npm", &marker, payload, exit_code),
             None => write_fake_recorder(bin.path(), binary, &marker, exit_code),
         }
-        let registry = spawn_registry_stub();
+        let registry = spawn_oldpkg_registry_stub();
         let vuln_stub = vuln_api_stub::spawn_with_statuses(checks, HashMap::new());
         cmd.env("PATH", bin.path())
             .env("CORGEA_NPM_REGISTRY", &registry)
@@ -237,26 +214,29 @@ fn bare_npm_tokenless_passes_through() {
 }
 
 #[test]
-fn bare_yarn_install_prints_note_and_execs() {
-    let mut h = BareHarness::new("yarn", HashMap::new(), None, 7);
-    let out = h
-        .cmd
-        .args(["yarn", "install"])
-        .output()
-        .expect("run corgea");
-    assert_eq!(
-        out.status.code(),
-        Some(7),
-        "yarn's own exit code propagates"
-    );
-    assert_eq!(h.recorded_argv().as_deref(), Some("install"));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains(
-            "note: bare 'yarn install' is not gated (no safe dry-run) — dependencies install unchecked"
-        ),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+fn bare_ungated_managers_print_note_and_exec() {
+    // yarn's nonzero exit also proves the manager's own exit code propagates.
+    let cases = [
+        ("yarn", &["yarn", "install"][..], "install", 7),
+        ("pnpm", &["pnpm", "install"][..], "install", 0),
+        ("uv", &["uv", "add"][..], "add", 0),
+        ("uv", &["uv", "pip", "install"][..], "pip install", 0),
+    ];
+    for (binary, args, forwarded_argv, exit_code) in cases {
+        let mut h = BareHarness::new(binary, HashMap::new(), None, exit_code);
+        let out = h.cmd.args(args).output().expect("run corgea");
+        assert_eq!(out.status.code(), Some(exit_code), "{args:?}");
+        assert_eq!(h.recorded_argv().as_deref(), Some(forwarded_argv));
+        let note = format!(
+            "note: bare '{}' is not gated (no safe dry-run) — dependencies install unchecked",
+            args.join(" ")
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(&note),
+            "{args:?} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
@@ -271,50 +251,6 @@ fn bare_yarn_note_prints_without_token_too() {
     assert_eq!(out.status.code(), Some(0));
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("bare 'yarn install' is not gated"),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-#[test]
-fn bare_pnpm_install_prints_note() {
-    let mut h = BareHarness::new("pnpm", HashMap::new(), None, 0);
-    let out = h
-        .cmd
-        .args(["pnpm", "install"])
-        .output()
-        .expect("run corgea");
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(h.recorded_argv().as_deref(), Some("install"));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("bare 'pnpm install' is not gated"),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-#[test]
-fn bare_uv_add_and_pip_install_print_note() {
-    let mut h = BareHarness::new("uv", HashMap::new(), None, 0);
-    let out = h.cmd.args(["uv", "add"]).output().expect("run corgea");
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(h.recorded_argv().as_deref(), Some("add"));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("bare 'uv add' is not gated"),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let mut h = BareHarness::new("uv", HashMap::new(), None, 0);
-    let out = h
-        .cmd
-        .args(["uv", "pip", "install"])
-        .output()
-        .expect("run corgea");
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(h.recorded_argv().as_deref(), Some("pip install"));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("bare 'uv pip install' is not gated"),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );

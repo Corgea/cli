@@ -4,102 +4,29 @@
 //! proposal prints the rejection note instead; a failed re-check suppresses
 //! the steer quietly without moving counts or exit codes.
 //!
-//! Mirrors the `cli_verdict.rs` harness (inline PyPI stub published 2020 so
-//! recency never blocks, a fake pip recording its argv, the in-crate vuln-api
-//! stub, and a set token) — every block here is the verdict's doing.
+//! Uses the shared `common::PipHarness` (pypi stub published 2020 so recency
+//! never blocks, a fake pip recording its argv, the in-crate vuln-api stub,
+//! and a set token) — every block here is the verdict's doing.
 
 #![cfg(unix)]
 
 mod common;
 
-use common::{
-    corgea_isolated, spawn_http_stub, write_fake_pip_without_report, NOT_FOUND_JSON,
-    OLDPKG_PYPI_JSON,
-};
-use corgea::vuln_api_stub::{self, PackageKey};
+use common::{key, vulnerable_body, PipHarness};
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::process::Command;
-use tempfile::TempDir;
-
-fn key(eco: &str, name: &str, ver: &str) -> PackageKey {
-    (eco.to_string(), name.to_string(), ver.to_string())
-}
 
 fn fixed_body() -> String {
-    r#"{"ecosystem":"pypi","package_name":"oldpkg","version":"1.0.0","is_vulnerable":true,
-        "matches":[{"advisory_id":"MAL-2024-0001","severity_level":"critical","tier":1,
-                    "vulnerable_version_range":null,"fixed_version":"2.0.0"}]}"#
-        .to_string()
+    vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0"))
 }
 
 fn no_fix_body() -> String {
-    r#"{"ecosystem":"pypi","package_name":"oldpkg","version":"1.0.0","is_vulnerable":true,
-        "matches":[{"advisory_id":"MAL-2024-0002","severity_level":"critical","tier":1,
-                    "vulnerable_version_range":null,"fixed_version":null}]}"#
-        .to_string()
+    vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0002", None)
 }
 
 /// The advertised fix `oldpkg@2.0.0` is itself flagged — the steer re-check
 /// must reject it.
 fn flagged_fix_body() -> String {
-    r#"{"ecosystem":"pypi","package_name":"oldpkg","version":"2.0.0","is_vulnerable":true,
-        "matches":[{"advisory_id":"MAL-2024-0003","severity_level":"critical","tier":1,
-                    "vulnerable_version_range":null,"fixed_version":null}]}"#
-        .to_string()
-}
-
-/// Registry stub serving only `/pypi/oldpkg/json` (published 2020 → never
-/// recent). Everything else 404s.
-fn spawn_pypi_stub() -> String {
-    spawn_http_stub(|path| match path {
-        "/pypi/oldpkg/json" => ("200 OK", OLDPKG_PYPI_JSON.to_string()),
-        _ => ("404 Not Found", NOT_FOUND_JSON.to_string()),
-    })
-}
-
-/// `corgea` wired to the registry stub, a fake pip, and a vuln-api stub.
-struct RemediationHarness {
-    cmd: Command,
-    marker: PathBuf,
-    _home: TempDir,
-    _bin: TempDir,
-}
-
-impl RemediationHarness {
-    fn new(checks: HashMap<PackageKey, String>, token: Option<&str>, pip_exit_code: i32) -> Self {
-        Self::with_statuses(checks, HashMap::new(), token, pip_exit_code)
-    }
-
-    fn with_statuses(
-        checks: HashMap<PackageKey, String>,
-        statuses: HashMap<PackageKey, u16>,
-        token: Option<&str>,
-        pip_exit_code: i32,
-    ) -> Self {
-        let (mut cmd, home) = corgea_isolated();
-        let bin = TempDir::new().expect("temp bin dir");
-        let marker = bin.path().join("pm-argv.txt");
-        write_fake_pip_without_report(bin.path(), &marker, pip_exit_code);
-        let registry = spawn_pypi_stub();
-        let vuln_stub = vuln_api_stub::spawn_with_statuses(checks, statuses);
-        cmd.env("PATH", bin.path())
-            .env("CORGEA_PYPI_REGISTRY", &registry)
-            .env("CORGEA_VULN_API_URL", &vuln_stub.base_url);
-        if let Some(t) = token {
-            cmd.env("CORGEA_TOKEN", t);
-        }
-        Self {
-            cmd,
-            marker,
-            _home: home,
-            _bin: bin,
-        }
-    }
-
-    fn recorded_argv(&self) -> Option<String> {
-        std::fs::read_to_string(&self.marker).ok()
-    }
+    vulnerable_body("pypi", "oldpkg", "2.0.0", "MAL-2024-0003", None)
 }
 
 #[test]
@@ -108,7 +35,7 @@ fn fixed_match_blocks_and_names_safe_version() {
     // re-check, so the proposal verifies and the steer prints.
     let mut checks = HashMap::new();
     checks.insert(key("pypi", "oldpkg", "1.0.0"), fixed_body());
-    let mut h = RemediationHarness::new(checks, Some("test-token"), 0);
+    let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 0);
     let out = h
         .cmd
         .args(["pip", "install", "oldpkg==1.0.0"])
@@ -132,7 +59,7 @@ fn fixed_match_blocks_and_names_safe_version() {
 fn no_fix_match_reports_no_fixed_version_known() {
     let mut checks = HashMap::new();
     checks.insert(key("pypi", "oldpkg", "1.0.0"), no_fix_body());
-    let mut h = RemediationHarness::new(checks, Some("test-token"), 0);
+    let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 0);
     let out = h
         .cmd
         .args(["pip", "install", "oldpkg==1.0.0"])
@@ -159,7 +86,7 @@ fn no_fix_match_reports_no_fixed_version_known() {
 fn json_remediation_carries_safe_version() {
     let mut checks = HashMap::new();
     checks.insert(key("pypi", "oldpkg", "1.0.0"), fixed_body());
-    let mut h = RemediationHarness::new(checks, Some("test-token"), 0);
+    let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 0);
     let out = h
         .cmd
         .args(["pip", "--json", "install", "oldpkg==1.0.0"])
@@ -179,7 +106,7 @@ fn json_remediation_carries_safe_version() {
 fn json_remediation_null_when_no_fix() {
     let mut checks = HashMap::new();
     checks.insert(key("pypi", "oldpkg", "1.0.0"), no_fix_body());
-    let mut h = RemediationHarness::new(checks, Some("test-token"), 0);
+    let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 0);
     let out = h
         .cmd
         .args(["pip", "--json", "install", "oldpkg==1.0.0"])
@@ -207,7 +134,7 @@ fn rejected_fix_prints_rejection_instead_of_steer() {
     let mut checks = HashMap::new();
     checks.insert(key("pypi", "oldpkg", "1.0.0"), fixed_body());
     checks.insert(key("pypi", "oldpkg", "2.0.0"), flagged_fix_body());
-    let mut h = RemediationHarness::new(checks, Some("test-token"), 0);
+    let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 0);
     let out = h
         .cmd
         .args(["pip", "install", "oldpkg==1.0.0"])
@@ -238,7 +165,7 @@ fn unverified_fix_suppresses_steer_quietly() {
     checks.insert(key("pypi", "oldpkg", "1.0.0"), fixed_body());
     let mut statuses = HashMap::new();
     statuses.insert(key("pypi", "oldpkg", "2.0.0"), 503u16);
-    let mut h = RemediationHarness::with_statuses(checks, statuses, Some("test-token"), 0);
+    let mut h = PipHarness::new(checks, statuses, Some("test-token"), 0);
     let out = h
         .cmd
         .args(["pip", "install", "oldpkg==1.0.0"])
@@ -270,7 +197,7 @@ fn json_remediation_null_when_fix_rejected() {
     let mut checks = HashMap::new();
     checks.insert(key("pypi", "oldpkg", "1.0.0"), fixed_body());
     checks.insert(key("pypi", "oldpkg", "2.0.0"), flagged_fix_body());
-    let mut h = RemediationHarness::new(checks, Some("test-token"), 0);
+    let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 0);
     let out = h
         .cmd
         .args(["pip", "--json", "install", "oldpkg==1.0.0"])
