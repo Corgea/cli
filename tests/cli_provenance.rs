@@ -74,8 +74,8 @@ fn pip_requirements_finding_labeled_from_requirements() {
 fn npm_preexisting_direct_dep_labeled_with_fix_hint() {
     // `evildep` is already a direct dep in the project's package.json; the
     // finding gets the pre-existing label plus the fix-command hint. The
-    // steer re-check verified 1.2.2 clean (the stub defaults unknown
-    // versions to clean), so the hint drops the "(advertised fix)" hedge.
+    // fix 1.2.2 covers every advisory (`safe_version` is Some), so the hint
+    // drops the "(advertised fix)" hedge.
     let project = npm_project();
     let mut checks = HashMap::new();
     checks.insert(
@@ -103,18 +103,23 @@ fn npm_preexisting_direct_dep_labeled_with_fix_hint() {
 }
 
 #[test]
-fn npm_preexisting_fix_hint_keeps_hedge_when_unverifiable() {
-    // The steer re-check for 1.2.2 fails (503), so the bare steer line stays
-    // quiet and the fix-command hint keeps its "(advertised fix)" hedge.
+fn npm_preexisting_fix_hint_keeps_hedge_when_fix_is_partial() {
+    // One advisory advertises fix 1.2.2, the other has no fix: bumping is
+    // still the best move but doesn't clear everything, so the steer line
+    // stays quiet and the fix-command hint keeps its "(advertised fix)"
+    // hedge.
     let project = npm_project();
     let mut checks = HashMap::new();
     checks.insert(
         key("npm", "evildep", "0.4.2"),
-        vulnerable_body("npm", "evildep", "0.4.2", Some("1.2.2")),
+        r#"{"ecosystem":"npm","package_name":"evildep","version":"0.4.2","is_vulnerable":true,
+        "matches":[{"advisory_id":"MAL-2024-0002","severity_level":"critical","tier":1,
+                    "vulnerable_version_range":null,"fixed_version":"1.2.2"},
+                   {"advisory_id":"MAL-2024-0003","severity_level":"critical","tier":1,
+                    "vulnerable_version_range":null,"fixed_version":null}]}"#
+            .to_string(),
     );
-    let mut statuses = HashMap::new();
-    statuses.insert(key("npm", "evildep", "1.2.2"), 503u16);
-    let mut h = TreeHarness::new("npm", checks, statuses, NPM_LOCK);
+    let mut h = TreeHarness::new("npm", checks, HashMap::new(), NPM_LOCK);
     let out = h
         .cmd
         .current_dir(project.path())
@@ -125,11 +130,11 @@ fn npm_preexisting_fix_hint_keeps_hedge_when_unverifiable() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("fix with: corgea npm install evildep@1.2.2 (advertised fix)"),
-        "unverified fix hint must keep the hedge: {stdout}"
+        "partial fix hint must keep the hedge: {stdout}"
     );
     assert!(
         !stdout.contains("→ safe version"),
-        "an unverified steer must stay quiet: {stdout}"
+        "a partial fix must not print the steer: {stdout}"
     );
 }
 
