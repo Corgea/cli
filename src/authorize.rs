@@ -633,7 +633,16 @@ mod tests {
 
         assert!(!port_is_available(port));
         drop(listener);
-        assert!(port_is_available(port));
+        // The freed port returns to the OS ephemeral pool, where a parallel
+        // test's `bind(":0")` can snatch it before the re-check — so accept
+        // any of several freshly freed ports reading available. The chain is
+        // lazy: fresh ports are only reserved after a collision.
+        assert!(
+            std::iter::once(port)
+                .chain((0..4).map(|_| reserve_ephemeral_port()))
+                .any(port_is_available),
+            "five consecutive freed ports all read unavailable"
+        );
     }
 
     #[test]
