@@ -16,10 +16,13 @@ pub struct TreePackage {
 
 /// Whether this manager's resolver has anything to resolve for the parsed
 /// install. pip's dry-run also reads `-r` requirements files, so those make
-/// a pip install eligible even with no named targets.
+/// a pip install eligible even with no named targets. npm's lockfile
+/// resolution reads `package.json`, so a bare `npm install` is eligible
+/// whenever the working directory has one.
 pub fn covers_input(manager: PackageManager, parsed: &super::parse::ParsedInstall) -> bool {
     !parsed.targets.is_empty()
         || (manager == PackageManager::Pip && !parsed.requirements_files.is_empty())
+        || (manager == PackageManager::Npm && std::path::Path::new("package.json").exists())
 }
 
 /// `Ok(None)`: manager has no safe dry-run — named-only with warning.
