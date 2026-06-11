@@ -394,7 +394,7 @@ fn run_parsed_install(
     }
     if opts.verdict.is_none() {
         eprintln!(
-            "note: no Corgea token — vulnerability verdicts skipped (recency-only). Run `corgea login` for the full gate."
+            "warning: no Corgea token — known-vulnerable packages will NOT be blocked (recency-only). Run 'corgea login' for the full gate."
         );
     }
 
@@ -537,6 +537,10 @@ fn run_tree_pass(
     }
 }
 
+/// Above this many verdict jobs, print a stderr progress line so a big tree
+/// pass doesn't look hung.
+const VERDICT_PROGRESS_THRESHOLD: usize = 8;
+
 /// Bounded worker pool over the verdict jobs — owns client creation and the
 /// fail-closed policy: on client failure every job comes back `Unverifiable`.
 /// Plain work queue, no new crates; `reqwest::blocking::Client` is
@@ -560,6 +564,10 @@ fn verdict_pool(
                 .collect();
         }
     };
+
+    if jobs.len() > VERDICT_PROGRESS_THRESHOLD {
+        eprintln!("checking {} packages against Corgea vuln-api…", jobs.len());
+    }
 
     let ecosystem = manager.ecosystem();
     let workers = concurrency.clamp(1, 32).min(jobs.len().max(1));
@@ -917,6 +925,60 @@ fn summary_segment(total: usize, from_tree: usize, label: &str) -> String {
     }
 }
 
+/// More than this many unverifiable findings with the same error-prefix
+/// render as one collapsed line instead of one line per package.
+const UNVERIFIABLE_COLLAPSE_THRESHOLD: usize = 3;
+
+/// Group key for collapsing repeated unverifiable errors: the text before
+/// the first `(` — strips per-package detail (URLs, status codes) so one
+/// outage groups under one key.
+fn error_prefix(error: &str) -> &str {
+    match error.find('(') {
+        Some(i) => error[..i].trim_end(),
+        None => error,
+    }
+}
+
+/// Unverifiable error strings across transitive tree findings and named
+/// outcomes, in render order.
+fn unverifiable_errors(report: &PrecheckReport) -> Vec<&str> {
+    let mut errors = Vec::new();
+    if let Some(TreeReport::Full { transitive, .. }) = &report.tree {
+        for t in transitive {
+            if let VerdictStatus::Unverifiable(e) = &t.verdict {
+                errors.push(e.as_str());
+            }
+        }
+    }
+    for o in &report.outcomes {
+        if let TargetOutcome::Resolved {
+            verdict: VerdictStatus::Unverifiable(e),
+            ..
+        } = o
+        {
+            errors.push(e.as_str());
+        }
+    }
+    errors
+}
+
+/// `(prefix, count, first error)` groups of unverifiable findings large
+/// enough to collapse (> `UNVERIFIABLE_COLLAPSE_THRESHOLD` per prefix) —
+/// the vuln-api outage case, where every package fails the same way.
+/// Display-only: counts and exit codes never change.
+fn collapsed_unverifiable_groups(report: &PrecheckReport) -> Vec<(&str, usize, &str)> {
+    let mut groups: Vec<(&str, usize, &str)> = Vec::new();
+    for e in unverifiable_errors(report) {
+        let prefix = error_prefix(e);
+        match groups.iter_mut().find(|(p, _, _)| *p == prefix) {
+            Some((_, count, _)) => *count += 1,
+            None => groups.push((prefix, 1, e)),
+        }
+    }
+    groups.retain(|(_, count, _)| *count > UNVERIFIABLE_COLLAPSE_THRESHOLD);
+    groups
+}
+
 fn print_text(report: &PrecheckReport) {
     // Build the echoed command from non-empty parts: a bare gated install
     // (e.g. `npm install` with zero specs) has no args to append.
@@ -925,6 +987,14 @@ fn print_text(report: &PrecheckReport) {
         command.push(' ');
         command.push_str(&report.original_args.join(" "));
     }
+
+    let collapsed = collapsed_unverifiable_groups(report);
+    let is_collapsed = |error: &str| {
+        collapsed
+            .iter()
+            .any(|(prefix, _, _)| *prefix == error_prefix(error))
+    };
+
     println!(
         "Pre-checking `{}` (threshold {})",
         command,
@@ -968,10 +1038,12 @@ fn print_text(report: &PrecheckReport) {
                         print_vulnerable_matches(report, &t.name, matches);
                     }
                     VerdictStatus::Unverifiable(error) => {
-                        println!(
-                            "  ⚠ {}@{} (transitive)  could not be verified: {}",
-                            t.name, t.version, error
-                        );
+                        if !is_collapsed(error) {
+                            println!(
+                                "  ⚠ {}@{} (transitive)  could not be verified: {}",
+                                t.name, t.version, error
+                            );
+                        }
                     }
                     // Clean / not-checked transitive entries stay quiet in text mode.
                     VerdictStatus::Clean | VerdictStatus::NotChecked(_) => {}
@@ -982,6 +1054,13 @@ fn print_text(report: &PrecheckReport) {
             println!("  tree: transitive dependencies NOT checked ({reason})");
         }
         None => {}
+    }
+
+    // One line per collapsed outage group instead of one per package.
+    for (_, count, first_error) in &collapsed {
+        println!(
+            "  ⚠ {count} packages could not be verified (vuln-api unreachable: {first_error})"
+        );
     }
 
     for o in &report.outcomes {
@@ -1001,10 +1080,12 @@ fn print_text(report: &PrecheckReport) {
                     print_vulnerable_matches(report, &resolved.name, matches);
                 }
                 VerdictStatus::Unverifiable(error) => {
-                    println!(
-                        "  ⚠ {} → {}@{}  could not be verified: {}",
-                        target.display, resolved.name, resolved.version, error,
-                    );
+                    if !is_collapsed(error) {
+                        println!(
+                            "  ⚠ {} → {}@{}  could not be verified: {}",
+                            target.display, resolved.name, resolved.version, error,
+                        );
+                    }
                 }
                 VerdictStatus::Clean | VerdictStatus::NotChecked(_) => {
                     if *recent {
@@ -1660,5 +1741,58 @@ mod tests {
                 "spelling {spelling}"
             );
         }
+    }
+
+    #[test]
+    fn error_prefix_strips_parenthesized_detail() {
+        // The reqwest network-failure shape: per-package URL in parens.
+        assert_eq!(
+            error_prefix("Failed to send vuln-api request: error sending request for url (http://x/v1/packages/pypi/a/versions/1.0.0/check)"),
+            "Failed to send vuln-api request: error sending request for url"
+        );
+        assert_eq!(
+            error_prefix("vuln-api unavailable (HTTP 503)"),
+            "vuln-api unavailable"
+        );
+        assert_eq!(error_prefix("no parens here"), "no parens here");
+    }
+
+    /// Four unverifiable findings sharing a prefix collapse into one group
+    /// (named + transitive both count); three do not.
+    #[test]
+    fn collapsed_groups_require_more_than_threshold() {
+        let unverifiable = |name: &str| {
+            let mut o = resolved_outcome(name, "1.0.0", false);
+            set_verdict(
+                &mut o,
+                VerdictStatus::Unverifiable(format!("vuln-api unavailable (HTTP 503: {name})")),
+            );
+            o
+        };
+
+        let mut report = report_with(vec![
+            unverifiable("a"),
+            unverifiable("b"),
+            unverifiable("c"),
+        ]);
+        assert!(collapsed_unverifiable_groups(&report).is_empty());
+
+        report.tree = Some(TreeReport::Full {
+            resolved_count: 4,
+            transitive: vec![TreeOutcome {
+                name: "d".to_string(),
+                version: "1.0.0".to_string(),
+                verdict: VerdictStatus::Unverifiable(
+                    "vuln-api unavailable (HTTP 503: d)".to_string(),
+                ),
+            }],
+        });
+        let groups = collapsed_unverifiable_groups(&report);
+        assert_eq!(groups.len(), 1);
+        let (prefix, count, first) = groups[0];
+        assert_eq!(prefix, "vuln-api unavailable");
+        assert_eq!(count, 4);
+        // Render order is transitive-first, so the tree finding leads.
+        assert_eq!(first, "vuln-api unavailable (HTTP 503: d)");
     }
 }
