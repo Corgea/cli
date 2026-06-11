@@ -126,8 +126,11 @@ too: the full lockfile-resolved tree is verdicted, so a vulnerable lockfile bloc
 note when the tree pass doesn't cover them.
 
 Blocked findings steer to the fix: each advisory line shows `fixed in <version>` (or
-`no fixed version known`), and when every advisory on a package has a fix, a
-`→ safe version: <name>@<version>` line names the version to install instead.
+`no fixed version known`). When every advisory on a package has a fix, the gate
+re-checks that version against vuln-api before suggesting it: a clean re-check prints
+`→ safe version: <name>@<version>`; a flagged one prints `→ advertised fix <version>
+is also flagged — no safe version to suggest`; a failed re-check suppresses the
+suggestion quietly (it never changes counts or exit codes).
 
 With a token, the vuln check covers the **full would-install set**, not just the
 named targets: `pip` and `npm` resolve the complete tree (named + transitive) via a

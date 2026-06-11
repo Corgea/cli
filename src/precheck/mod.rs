@@ -16,6 +16,7 @@
 pub mod parse;
 pub mod tree;
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::process::Command;
 use std::time::Duration;
@@ -99,6 +100,19 @@ pub enum VerdictStatus {
     Unverifiable(String),
     /// Verdict never attempted (no token). Recency-only cover.
     NotChecked(String),
+}
+
+/// Result of re-verdicting a proposed `→ safe version` steer against
+/// vuln-api before it prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteerCheck {
+    /// vuln-api confirmed the proposed version is clean — print the steer.
+    Verified,
+    /// vuln-api flagged the proposed version too — print the rejection note.
+    Rejected,
+    /// The re-check failed (network/5xx/auth) — suppress the steer quietly.
+    /// Never feeds counts or the block decision.
+    Unverified,
 }
 
 /// Reason recorded on resolved targets when no token is configured.
@@ -200,6 +214,10 @@ pub struct PrecheckReport {
     pub threshold: Duration,
     /// `None` ⇒ recency-only mode, the tree pass never ran.
     pub tree: Option<TreeReport>,
+    /// Verification results for proposed safe-version steers, keyed by
+    /// (normalized name, proposed version). Populated by `verify_steers`;
+    /// consulted only at render time, never by the block predicate.
+    pub steers: HashMap<(String, String), SteerCheck>,
 }
 
 impl PrecheckReport {
@@ -380,14 +398,16 @@ fn run_parsed_install(
         );
     }
 
-    let report = PrecheckReport {
+    let mut report = PrecheckReport {
         manager,
         subcommand: subcommand_label.to_string(),
         original_args: rest.to_vec(),
         outcomes,
         threshold: opts.threshold,
         tree,
+        steers: HashMap::new(),
     };
+    verify_steers(&mut report, &opts);
 
     if opts.json {
         print_json(&report, &opts);
@@ -635,6 +655,68 @@ fn run_verdict_pass(
     apply_verdicts(manager, results, outcomes);
 }
 
+/// Re-verdict every proposed `→ safe version` steer before anything prints.
+/// Populates `report.steers` keyed by (normalized name, proposed version):
+/// `Clean` ⇒ `Verified`, flagged ⇒ `Rejected`, request failure ⇒ `Unverified`
+/// (suppressed quietly — never feeds counts or exit codes). Sends requests
+/// only when a token is configured and at least one vulnerable verdict
+/// proposed a steer; proposals dedup by normalized (name, version).
+fn verify_steers(report: &mut PrecheckReport, opts: &PrecheckOptions) {
+    let Some(cfg) = &opts.verdict else { return };
+    let manager = report.manager;
+
+    let mut proposals: Vec<(&str, &[crate::vuln_api::VulnMatch])> = Vec::new();
+    for o in &report.outcomes {
+        if let TargetOutcome::Resolved {
+            resolved,
+            verdict: VerdictStatus::Vulnerable(matches),
+            ..
+        } = o
+        {
+            proposals.push((&resolved.name, matches));
+        }
+    }
+    if let Some(TreeReport::Full { transitive, .. }) = &report.tree {
+        for t in transitive {
+            if let VerdictStatus::Vulnerable(matches) = &t.verdict {
+                proposals.push((&t.name, matches));
+            }
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut jobs: Vec<tree::TreePackage> = Vec::new();
+    for (name, matches) in proposals {
+        let Some(safe) = safe_version(matches) else {
+            continue;
+        };
+        if seen.insert((manager.normalize_name(name), safe.clone())) {
+            jobs.push(tree::TreePackage {
+                name: name.to_string(),
+                version: safe,
+            });
+        }
+    }
+    if jobs.is_empty() {
+        return;
+    }
+
+    let results = verdict_pool(jobs, cfg, manager, opts.concurrency);
+    report.steers = results
+        .into_iter()
+        .map(|(pkg, verdict)| {
+            let check = match verdict {
+                VerdictStatus::Clean => SteerCheck::Verified,
+                VerdictStatus::Vulnerable(_) => SteerCheck::Rejected,
+                VerdictStatus::Unverifiable(_) | VerdictStatus::NotChecked(_) => {
+                    SteerCheck::Unverified
+                }
+            };
+            ((manager.normalize_name(&pkg.name), pkg.version), check)
+        })
+        .collect();
+}
+
 fn should_block_install(report: &PrecheckReport, opts: &PrecheckOptions) -> bool {
     if opts.force {
         return false;
@@ -779,9 +861,31 @@ fn safe_version(matches: &[crate::vuln_api::VulnMatch]) -> Option<String> {
     }
 }
 
-/// Per-match advisory lines plus the safe-version steer, shared by the
-/// named-target and transitive vulnerable render arms.
-fn print_vulnerable_matches(name: &str, matches: &[crate::vuln_api::VulnMatch]) {
+/// The safe-version proposal for a vulnerable package, paired with its
+/// `verify_steers` re-check. `None` when no version can be proposed at all;
+/// a proposal absent from the steer map counts as `Unverified` so callers
+/// suppress it.
+fn steer_for(
+    report: &PrecheckReport,
+    name: &str,
+    matches: &[crate::vuln_api::VulnMatch],
+) -> Option<(String, SteerCheck)> {
+    let safe = safe_version(matches)?;
+    let check = report
+        .steers
+        .get(&(report.manager.normalize_name(name), safe.clone()))
+        .copied()
+        .unwrap_or(SteerCheck::Unverified);
+    Some((safe, check))
+}
+
+/// Per-match advisory lines plus the verified safe-version steer, shared by
+/// the named-target and transitive vulnerable render arms.
+fn print_vulnerable_matches(
+    report: &PrecheckReport,
+    name: &str,
+    matches: &[crate::vuln_api::VulnMatch],
+) {
     for m in matches {
         println!(
             "      {} ({}){}",
@@ -790,8 +894,14 @@ fn print_vulnerable_matches(name: &str, matches: &[crate::vuln_api::VulnMatch]) 
             fix_note(m)
         );
     }
-    if let Some(safe) = safe_version(matches) {
-        println!("      → safe version: {name}@{safe}");
+    match steer_for(report, name, matches) {
+        Some((safe, SteerCheck::Verified)) => {
+            println!("      → safe version: {name}@{safe}");
+        }
+        Some((safe, SteerCheck::Rejected)) => {
+            println!("      → advertised fix {safe} is also flagged — no safe version to suggest");
+        }
+        Some((_, SteerCheck::Unverified)) | None => {}
     }
 }
 
@@ -855,7 +965,7 @@ fn print_text(report: &PrecheckReport) {
                             "  ✗ {}@{} (transitive)  known vulnerable:",
                             t.name, t.version
                         );
-                        print_vulnerable_matches(&t.name, matches);
+                        print_vulnerable_matches(report, &t.name, matches);
                     }
                     VerdictStatus::Unverifiable(error) => {
                         println!(
@@ -888,7 +998,7 @@ fn print_text(report: &PrecheckReport) {
                         "  ✗ {} → {}@{}  known vulnerable:",
                         target.display, resolved.name, resolved.version,
                     );
-                    print_vulnerable_matches(&resolved.name, matches);
+                    print_vulnerable_matches(report, &resolved.name, matches);
                 }
                 VerdictStatus::Unverifiable(error) => {
                     println!(
@@ -929,15 +1039,21 @@ fn print_text(report: &PrecheckReport) {
 
 /// JSON shape for a single verdict. Shared by named outcomes and tree
 /// (transitive) outcomes so both render verdicts identically.
-fn verdict_json(verdict: &VerdictStatus) -> serde_json::Value {
+/// `remediation` carries the safe version only when its steer re-check
+/// came back `Verified`; rejected/unverified steers emit `null`.
+fn verdict_json(report: &PrecheckReport, name: &str, verdict: &VerdictStatus) -> serde_json::Value {
     use serde_json::json;
     match verdict {
         VerdictStatus::Clean => json!({ "status": "clean" }),
         VerdictStatus::Vulnerable(matches) => {
+            let remediation = match steer_for(report, name, matches) {
+                Some((safe, SteerCheck::Verified)) => Some(safe),
+                _ => None,
+            };
             json!({
                 "status": "vulnerable",
                 "matches": matches,
-                "remediation": safe_version(matches),
+                "remediation": remediation,
             })
         }
         VerdictStatus::Unverifiable(error) => {
@@ -962,7 +1078,7 @@ fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
                 recent,
                 verdict,
             } => {
-                let verdict_json = verdict_json(verdict);
+                let verdict_json = verdict_json(report, &resolved.name, verdict);
                 json!({
                     "status": if *recent { "recent" } else { "ok" },
                     "spec": target.display,
@@ -1011,7 +1127,7 @@ fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
                 "transitive": transitive.iter().map(|o| json!({
                     "name": o.name,
                     "version": o.version,
-                    "verdict": verdict_json(&o.verdict),
+                    "verdict": verdict_json(report, &o.name, &o.verdict),
                 })).collect::<Vec<_>>(),
             }),
             TreeReport::NamedOnly { reason } => json!({
@@ -1137,6 +1253,7 @@ mod tests {
             outcomes,
             threshold: Duration::from_secs(2 * 86400),
             tree: None,
+            steers: HashMap::new(),
         }
     }
 
@@ -1427,5 +1544,121 @@ mod tests {
     #[test]
     fn safe_version_empty_matches_is_none() {
         assert_eq!(safe_version(&[]), None);
+    }
+
+    fn vulnerable_outcome(name: &str, version: &str, fixed: Option<&str>) -> TargetOutcome {
+        let mut o = resolved_outcome(name, version, false);
+        set_verdict(&mut o, VerdictStatus::Vulnerable(vec![vm("A-1", fixed)]));
+        o
+    }
+
+    /// `verify_steers` re-verdicts each proposed fix, from named and
+    /// transitive findings alike: clean → Verified, flagged → Rejected,
+    /// 5xx → Unverified. Counts and the block predicate never move.
+    #[test]
+    fn verify_steers_maps_reverdicts() {
+        let key = |name: &str, ver: &str| ("pypi".to_string(), name.to_string(), ver.to_string());
+        let mut checks = HashMap::new();
+        checks.insert(
+            key("badfix", "3.0.0"),
+            r#"{"ecosystem":"pypi","package_name":"badfix","version":"3.0.0","is_vulnerable":true,
+                "matches":[{"advisory_id":"MAL-2024-0009","severity_level":"critical","tier":1,
+                            "vulnerable_version_range":null,"fixed_version":null}]}"#
+                .to_string(),
+        );
+        checks.insert(key("flaky", "4.0.0"), "{}".to_string());
+        let mut statuses = HashMap::new();
+        statuses.insert(key("flaky", "4.0.0"), 503u16);
+        let stub = crate::vuln_api_stub::spawn_with_statuses(checks, statuses);
+
+        let mut opts = stub_opts("http://127.0.0.1:9".to_string(), false);
+        opts.verdict = Some(VerdictConfig {
+            base_url: stub.base_url.clone(),
+            token: "test-token".to_string(),
+        });
+
+        // oldpkg's fix is unknown to the stub → default clean; badfix's fix is
+        // flagged; flaky's fix 503s. badfix arrives via the transitive arm.
+        let mut report = report_with(vec![
+            vulnerable_outcome("oldpkg", "1.0.0", Some("2.0.0")),
+            vulnerable_outcome("flaky", "1.0.0", Some("4.0.0")),
+        ]);
+        report.tree = Some(TreeReport::Full {
+            resolved_count: 3,
+            transitive: vec![TreeOutcome {
+                name: "badfix".to_string(),
+                version: "0.1.0".to_string(),
+                verdict: VerdictStatus::Vulnerable(vec![vm("A-2", Some("3.0.0"))]),
+            }],
+        });
+        verify_steers(&mut report, &opts);
+
+        let steer = |name: &str, ver: &str| {
+            report
+                .steers
+                .get(&(name.to_string(), ver.to_string()))
+                .copied()
+        };
+        assert_eq!(steer("oldpkg", "2.0.0"), Some(SteerCheck::Verified));
+        assert_eq!(steer("badfix", "3.0.0"), Some(SteerCheck::Rejected));
+        assert_eq!(steer("flaky", "4.0.0"), Some(SteerCheck::Unverified));
+
+        // Steer re-checks never feed counts or the block decision.
+        assert_eq!(report.vulnerable_count(), 3);
+        assert_eq!(report.unverifiable_count(), 0);
+    }
+
+    /// Tokenless mode never sends steer requests; `steer_for` treats a
+    /// missing map entry as Unverified.
+    #[test]
+    fn verify_steers_noop_without_token() {
+        let opts = stub_opts("http://127.0.0.1:9".to_string(), false);
+        let mut report = report_with(vec![vulnerable_outcome("oldpkg", "1.0.0", Some("2.0.0"))]);
+        verify_steers(&mut report, &opts);
+        assert!(report.steers.is_empty());
+        assert_eq!(
+            steer_for(&report, "oldpkg", &[vm("A-1", Some("2.0.0"))]),
+            Some(("2.0.0".to_string(), SteerCheck::Unverified))
+        );
+    }
+
+    /// No proposal (fix unknown) ⇒ no requests at all: with the vuln-api at a
+    /// dead address, an attempted request would land as Unverified.
+    #[test]
+    fn verify_steers_skips_requests_without_proposals() {
+        let mut opts = stub_opts("http://127.0.0.1:9".to_string(), false);
+        opts.verdict = Some(VerdictConfig {
+            base_url: "http://127.0.0.1:9".to_string(),
+            token: "test-token".to_string(),
+        });
+        let mut report = report_with(vec![vulnerable_outcome("oldpkg", "1.0.0", None)]);
+        verify_steers(&mut report, &opts);
+        assert!(report.steers.is_empty());
+    }
+
+    /// Proposals dedup by normalized (name, version): two pypi spellings of
+    /// the same package produce one steer entry, and `steer_for` resolves it
+    /// for either spelling.
+    #[test]
+    fn verify_steers_dedups_by_normalized_name() {
+        let stub = crate::vuln_api_stub::spawn_with_statuses(HashMap::new(), HashMap::new());
+        let mut opts = stub_opts("http://127.0.0.1:9".to_string(), false);
+        opts.verdict = Some(VerdictConfig {
+            base_url: stub.base_url.clone(),
+            token: "test-token".to_string(),
+        });
+        let mut report = report_with(vec![
+            vulnerable_outcome("Flask_Cors", "1.0.0", Some("2.0.0")),
+            vulnerable_outcome("flask-cors", "1.0.0", Some("2.0.0")),
+        ]);
+        verify_steers(&mut report, &opts);
+        assert_eq!(report.steers.len(), 1);
+        for spelling in ["Flask_Cors", "flask-cors"] {
+            assert_eq!(
+                steer_for(&report, spelling, &[vm("A-1", Some("2.0.0"))]),
+                Some(("2.0.0".to_string(), SteerCheck::Verified)),
+                "spelling {spelling}"
+            );
+        }
     }
 }
