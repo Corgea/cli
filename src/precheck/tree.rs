@@ -59,7 +59,7 @@ fn stderr_tail(output: &std::process::Output) -> String {
 fn resolve_pip_tree(binary: &str, install_args: &[String]) -> Result<Vec<TreePackage>, String> {
     // Same binary resolution as the exec path (pip → pip3 fallback) — the
     // tree pass must not silently degrade on pip3-only systems.
-    let resolved = super::resolve_binary(binary)?;
+    let resolved = super::exec::resolve_binary(binary)?;
     let output = Command::new(resolved)
         .arg("install")
         .args([
@@ -118,7 +118,7 @@ fn parse_pip_report(json: &str) -> Result<Vec<TreePackage>, String> {
 /// are already surfaced as skipped warnings. Index selection comes from
 /// uv's env/config; index flags on the wrapped command don't carry over.
 fn resolve_uv_tree(parsed: &super::parse::ParsedInstall) -> Result<Vec<TreePackage>, String> {
-    let uv = super::resolve_binary("uv")?;
+    let uv = super::exec::resolve_binary("uv")?;
     let mut input = String::new();
     for t in &parsed.targets {
         if !matches!(t.kind, super::TargetKind::Unverifiable { .. }) {
@@ -262,7 +262,7 @@ fn direct_deps_from_manifest(json: &str) -> std::collections::HashSet<String> {
 /// `--ignore-scripts` because npm has run lifecycle scripts under
 /// `--package-lock-only` before (npm/cli#2787).
 fn resolve_npm_tree(binary: &str, install_args: &[String]) -> Result<Vec<TreePackage>, String> {
-    let resolved = super::resolve_binary(binary)?;
+    let resolved = super::exec::resolve_binary(binary)?;
     let work = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
     for manifest in [
         "package.json",

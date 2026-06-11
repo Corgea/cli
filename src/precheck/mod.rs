@@ -17,9 +17,8 @@ pub mod parse;
 pub mod tree;
 
 mod detect;
+mod exec;
 
-use std::ffi::OsString;
-use std::process::Command;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -344,7 +343,7 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
     }
 
     if cmd.is_empty() {
-        return exec_command(manager.binary_name(), &[]);
+        return exec::exec_command(manager.binary_name(), &[]);
     }
 
     let subcommand = &cmd[0];
@@ -356,7 +355,7 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
     }
 
     if !manager.is_install_subcommand(subcommand) {
-        return exec_install_with_args(manager, subcommand, rest);
+        return exec::exec_install_with_args(manager, subcommand, rest);
     }
 
     let parsed = match parse::parse_install_args(manager, rest) {
@@ -382,7 +381,7 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
         subcommand,
         rest,
         parsed,
-        || exec_install_with_args(manager, subcommand, rest),
+        || exec::exec_install_with_args(manager, subcommand, rest),
         opts,
     )
 }
@@ -412,7 +411,7 @@ fn unsupported_pip_add_message(rest: &[String]) -> String {
 }
 
 fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
-    let exec = || exec_command("uv", cmd);
+    let exec = || exec::exec_command("uv", cmd);
 
     if matches!(cmd.first().map(String::as_str), Some("install" | "i")) {
         eprintln!("{}", unsupported_uv_install_message(&cmd[1..]));
@@ -1039,59 +1038,6 @@ fn verify_one(
             target: target.clone(),
             error: e,
         },
-    }
-}
-
-fn exec_install_with_args(manager: PackageManager, subcommand: &str, rest: &[String]) -> i32 {
-    let mut full = Vec::with_capacity(rest.len() + 1);
-    full.push(subcommand.to_string());
-    full.extend(rest.iter().cloned());
-    exec_command(manager.binary_name(), &full)
-}
-
-/// Resolve `binary` on PATH. On Windows this finds `.cmd` shims. pip is the
-/// one manager with a conventional alias, so a missing `pip` retries `pip3`.
-/// The error names the binary and any fallback tried.
-fn resolve_binary(binary: &str) -> Result<std::path::PathBuf, String> {
-    if let Ok(p) = which::which(binary) {
-        return Ok(p);
-    }
-    if binary == "pip" {
-        if let Ok(p) = which::which("pip3") {
-            return Ok(p);
-        }
-        return Err("error: 'pip' not found on PATH (also tried 'pip3')".to_string());
-    }
-    Err(format!("error: '{binary}' not found on PATH"))
-}
-
-fn exec_command(binary: &str, args: &[String]) -> i32 {
-    let resolved = match resolve_binary(binary) {
-        Ok(p) => p,
-        Err(msg) => {
-            eprintln!("{msg}");
-            return 127;
-        }
-    };
-
-    let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
-
-    match Command::new(&resolved).args(&os_args).status() {
-        Ok(status) => status.code().unwrap_or_else(|| {
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::ExitStatusExt;
-                if let Some(sig) = status.signal() {
-                    return 128 + sig;
-                }
-            }
-            1
-        }),
-        Err(e) => {
-            // Name the resolved path: it may be the pip3 fallback, not `binary`.
-            eprintln!("failed to exec {}: {}", resolved.display(), e);
-            1
-        }
     }
 }
 

@@ -196,7 +196,7 @@ fn pip_install_overrides_external_management(args: &[String]) -> bool {
 }
 
 fn pip_environment_is_externally_managed() -> bool {
-    let Ok(pip) = super::resolve_binary("pip") else {
+    let Ok(pip) = super::exec::resolve_binary("pip") else {
         return false;
     };
     // PEP 668 markers live in a system interpreter's stdlib; pip inside an
