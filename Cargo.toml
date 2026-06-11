@@ -9,6 +9,14 @@ edition = "2021"
 name = "corgea"
 path = "src/main.rs"
 
+[features]
+# Compiles the in-crate vuln-api test stub (`vuln_api_stub`). Enabled for all
+# test builds via the self dev-dependency below; never part of release builds.
+test-stub = []
+
+[dev-dependencies]
+corgea = { path = ".", features = ["test-stub"] }
+
 [dependencies]
 clap = { version = "4.4.13", features = ["derive"] }
 dirs = "5.0.1"

@@ -344,6 +344,7 @@ version = "1.8.8"
 dependencies = [
  "chrono",
  "clap",
+ "corgea",
  "dirs",
  "env_logger",
  "git2",
