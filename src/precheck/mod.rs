@@ -120,10 +120,6 @@ pub struct PrecheckOptions {
     /// Optional registry overrides, used by tests.
     pub npm_registry: Option<String>,
     pub pypi_registry: Option<String>,
-    /// Run the warn-only `npm audit` second opinion during the npm tree
-    /// pass. Cleared by `CORGEA_NO_NPM_AUDIT` (read in `main`, like the
-    /// registry overrides).
-    pub npm_audit: bool,
 }
 
 /// Each item the user (or a `-r` requirements file) asked us to install.
@@ -222,9 +218,6 @@ pub enum TreeReport {
         resolved_count: usize,
         /// Verdicts for resolved packages beyond the named targets.
         transitive: Vec<TreeOutcome>,
-        /// Warn-only `npm audit` second opinion (npm only; `None` when
-        /// unavailable, disabled, or failed). Never consulted for blocking.
-        audit: Option<tree::AuditSummary>,
     },
     /// Resolution unavailable or failed — only named targets were verified.
     NamedOnly { reason: String },
@@ -417,20 +410,6 @@ fn run_parsed_install(
             "warning: transitive dependencies not checked ({reason}); only named packages were verified."
         );
     }
-    // Warn-only npm audit second opinion: never blocks, never changes
-    // exit codes (`should_block_install` ignores it by design).
-    if let Some(TreeReport::Full {
-        audit: Some(audit), ..
-    }) = &tree
-    {
-        if audit.total > 0 {
-            eprintln!(
-                "note: npm audit reports {} advisories ({} high/critical) — supplementary signal, not blocking",
-                audit.total,
-                audit.high + audit.critical
-            );
-        }
-    }
     // The requirements note only matters when the tree pass did *not* cover
     // those files (fallback to named-only, or recency-only mode).
     if !matches!(&tree, Some(TreeReport::Full { .. })) {
@@ -561,11 +540,8 @@ fn run_tree_pass(
     outcomes: &mut [TargetOutcome],
     opts: &PrecheckOptions,
 ) -> TreeReport {
-    let tree::TreeResolution {
-        packages: set,
-        audit: audit_rx,
-    } = match tree::resolve_tree(manager, rest, opts.npm_audit) {
-        Ok(Some(resolution)) => resolution,
+    let set = match tree::resolve_tree(manager, rest) {
+        Ok(Some(set)) => set,
         Ok(None) => {
             run_verdict_pass(manager, outcomes, opts);
             return TreeReport::NamedOnly {
@@ -616,17 +592,10 @@ fn run_tree_pass(
         .as_ref()
         .expect("tree pass requires verdict config");
     let results = verdict_pool(jobs, cfg, manager, VERDICT_CONCURRENCY);
-    // Collect the warn-only npm audit second opinion only after the verdict
-    // pool so the two truly overlap. The wait is capped tight: this signal
-    // never changes the outcome, so a finished gate won't stall long for it —
-    // a slow audit is killed and skipped (collect also reaps the subprocess,
-    // so nothing outlives the CLI).
-    let audit = audit_rx.and_then(|handle| handle.collect(Duration::from_secs(1)));
     let transitive = apply_verdicts(manager, results, outcomes, &direct_deps);
     TreeReport::Full {
         resolved_count,
         transitive,
-        audit,
     }
 }
 
@@ -1214,23 +1183,6 @@ fn verdict_json(verdict: &VerdictStatus) -> serde_json::Value {
     }
 }
 
-/// JSON shape for the warn-only npm audit second opinion in the tree arm.
-fn npm_audit_json(audit: &tree::AuditSummary) -> serde_json::Value {
-    use serde_json::json;
-    json!({
-        "total": audit.total,
-        "critical": audit.critical,
-        "high": audit.high,
-        "moderate": audit.moderate,
-        "low": audit.low,
-        "info": audit.info,
-        "top": audit.top.iter().map(|(name, severity)| json!({
-            "name": name,
-            "severity": severity,
-        })).collect::<Vec<_>>(),
-    })
-}
-
 fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
     use serde_json::json;
     let outcomes: Vec<_> = report
@@ -1285,7 +1237,7 @@ fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
         "verdict_mode": if opts.verdict.is_some() { "full" } else { "recency-only" },
         "results": outcomes,
         "tree": report.tree.as_ref().map(|t| match t {
-            TreeReport::Full { resolved_count, transitive, audit } => json!({
+            TreeReport::Full { resolved_count, transitive } => json!({
                 "mode": "full",
                 "reason": serde_json::Value::Null,
                 "resolved_count": resolved_count,
@@ -1295,14 +1247,12 @@ fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
                     "origin": o.origin.json_name(),
                     "verdict": verdict_json(&o.verdict),
                 })).collect::<Vec<_>>(),
-                "npm_audit": audit.as_ref().map(npm_audit_json),
             }),
             TreeReport::NamedOnly { reason } => json!({
                 "mode": "named-only",
                 "reason": reason,
                 "resolved_count": 0,
                 "transitive": [],
-                "npm_audit": serde_json::Value::Null,
             }),
         }),
     });
@@ -1344,8 +1294,6 @@ mod tests {
             verdict: None,
             npm_registry: None,
             pypi_registry: Some("http://127.0.0.1:9".to_string()),
-            // Unit tests never want the real `npm audit` subprocess.
-            npm_audit: false,
         }
     }
 
@@ -1544,7 +1492,6 @@ mod tests {
                 origin: TreeOrigin::Transitive,
                 verdict: VerdictStatus::Vulnerable(vec![]),
             }],
-            audit: None,
         });
 
         assert_eq!(report.vulnerable_count(), 1);
@@ -1786,7 +1733,6 @@ mod tests {
                 ),
                 origin: TreeOrigin::Transitive,
             }],
-            audit: None,
         });
         let groups = collapsed_unverifiable_groups(&report);
         assert_eq!(groups.len(), 1);
@@ -1885,7 +1831,6 @@ mod tests {
             report.tree = Some(TreeReport::Full {
                 resolved_count: 1,
                 transitive: vec![tree_vulnerable(origin)],
-                audit: None,
             });
             assert_eq!(
                 refusal_blames_existing_tree(&report),
@@ -1924,7 +1869,6 @@ mod tests {
                         TreeOrigin::Transitive,
                     ),
                 ],
-                audit: None,
             })
         };
 

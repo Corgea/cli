@@ -4,10 +4,7 @@
 //! pip: `--only-binary :all:` prevents sdist builds (pypa/pip#13091).
 //! npm: `--ignore-scripts` guards npm/cli#2787.
 
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::process::Command;
 
 use super::PackageManager;
 
@@ -19,59 +16,6 @@ pub struct TreePackage {
     /// requirements file). Always false for npm — its lockfile has no
     /// equivalent flag.
     pub requested: bool,
-}
-
-/// Warn-only `npm audit` second opinion: counts from
-/// `metadata.vulnerabilities` plus the worst few advisories. Never blocks.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuditSummary {
-    pub total: u64,
-    pub critical: u64,
-    pub high: u64,
-    pub moderate: u64,
-    pub low: u64,
-    pub info: u64,
-    /// Worst advisories as `(package name, severity)`, capped at
-    /// `AUDIT_TOP_LIMIT`, severest first.
-    pub top: Vec<(String, String)>,
-}
-
-/// What `resolve_tree` hands back: the would-install set, plus (npm only)
-/// a handle to the concurrent `npm audit` second opinion.
-pub struct TreeResolution {
-    pub packages: Vec<TreePackage>,
-    pub audit: Option<AuditHandle>,
-}
-
-/// The in-flight `npm audit` second opinion: a receiver for the summary plus
-/// deterministic cleanup. The CLI exits the process as soon as the gate
-/// returns, which would strand the audit thread mid-poll and orphan the
-/// `npm audit` child — so `collect` owns reaping both before the gate moves
-/// on.
-pub struct AuditHandle {
-    rx: mpsc::Receiver<AuditSummary>,
-    /// The audit subprocess, shared with the polling thread. Emptied by
-    /// whichever side reaps it first.
-    child: Arc<Mutex<Option<std::process::Child>>>,
-    thread: std::thread::JoinHandle<()>,
-}
-
-impl AuditHandle {
-    /// Wait up to `window` for the summary, then kill whatever is left of
-    /// the subprocess and join the thread. On the happy path the child has
-    /// already exited and the join is instant; a hung audit is killed now
-    /// rather than left running past the CLI's exit.
-    pub fn collect(self, window: Duration) -> Option<AuditSummary> {
-        let summary = self.rx.recv_timeout(window).ok();
-        if let Ok(mut slot) = self.child.lock() {
-            if let Some(mut child) = slot.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-        let _ = self.thread.join();
-        summary
-    }
 }
 
 /// Whether this manager's resolver has anything to resolve for the parsed
@@ -90,20 +34,10 @@ pub fn covers_input(manager: PackageManager, parsed: &super::parse::ParsedInstal
 pub fn resolve_tree(
     manager: PackageManager,
     install_args: &[String],
-    run_audit: bool,
-) -> Result<Option<TreeResolution>, String> {
+) -> Result<Option<Vec<TreePackage>>, String> {
     match manager {
-        PackageManager::Pip => {
-            resolve_pip_tree(manager.binary_name(), install_args).map(|packages| {
-                Some(TreeResolution {
-                    packages,
-                    audit: None,
-                })
-            })
-        }
-        PackageManager::Npm => {
-            resolve_npm_tree(manager.binary_name(), install_args, run_audit).map(Some)
-        }
+        PackageManager::Pip => resolve_pip_tree(manager.binary_name(), install_args).map(Some),
+        PackageManager::Npm => resolve_npm_tree(manager.binary_name(), install_args).map(Some),
         // yarn/pnpm/uv have no safe dry-run for installs.
         _ => Ok(None),
     }
@@ -204,11 +138,7 @@ fn direct_deps_from_manifest(json: &str) -> std::collections::HashSet<String> {
 ///
 /// `--ignore-scripts` because npm has run lifecycle scripts under
 /// `--package-lock-only` before (npm/cli#2787).
-fn resolve_npm_tree(
-    binary: &str,
-    install_args: &[String],
-    run_audit: bool,
-) -> Result<TreeResolution, String> {
+fn resolve_npm_tree(binary: &str, install_args: &[String]) -> Result<Vec<TreePackage>, String> {
     let resolved = which::which(binary).map_err(|e| format!("{binary} not found on PATH: {e}"))?;
     let work = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
     for manifest in [
@@ -242,144 +172,7 @@ fn resolve_npm_tree(
     }
     let lock = std::fs::read_to_string(work.path().join("package-lock.json"))
         .map_err(|e| format!("read generated package-lock.json: {e}"))?;
-    let packages = parse_npm_lockfile(&lock)?;
-    let audit = run_audit.then(|| spawn_audit(work, resolved));
-    Ok(TreeResolution { packages, audit })
-}
-
-/// Kill the audit subprocess if it hasn't finished by then.
-const AUDIT_DEADLINE: Duration = Duration::from_secs(5);
-
-/// Cap on `AuditSummary::top` advisory entries.
-const AUDIT_TOP_LIMIT: usize = 5;
-
-/// Run `npm audit --json` in the dry-run temp dir, concurrent with the
-/// verdict pool. The thread owns `work` so the dir outlives the resolver and
-/// is cleaned up when the audit finishes. Any failure (spawn error, timeout,
-/// unparsable output) drops the sender — the receiver sees a disconnect and
-/// the gate silently skips the second opinion.
-fn spawn_audit(work: tempfile::TempDir, npm: PathBuf) -> AuditHandle {
-    let (tx, rx) = mpsc::channel();
-    let child = Arc::new(Mutex::new(None));
-    let slot = Arc::clone(&child);
-    let thread = std::thread::spawn(move || {
-        if let Some(summary) = run_audit(work.path(), &npm, &slot) {
-            let _ = tx.send(summary);
-        }
-        drop(work);
-    });
-    AuditHandle { rx, child, thread }
-}
-
-/// `npm audit` exits 1 when it finds advisories — that's the success case,
-/// so stdout is parsed regardless of exit code. Stdout goes through a file
-/// (not a pipe) so the deadline poll can't deadlock on a full pipe buffer.
-/// `--package-lock-only` because the work dir holds only manifests and the
-/// generated lockfile — never a `node_modules`.
-///
-/// The subprocess lives in `slot`, shared with `AuditHandle::collect`: the
-/// poll relocks each iteration, and an empty slot means the collector
-/// already reaped the child — stop quietly.
-fn run_audit(
-    work: &std::path::Path,
-    npm: &std::path::Path,
-    slot: &Mutex<Option<std::process::Child>>,
-) -> Option<AuditSummary> {
-    let stdout_path = work.join("corgea-npm-audit.json");
-    let stdout_file = std::fs::File::create(&stdout_path).ok()?;
-    let child = Command::new(npm)
-        .args(["audit", "--json", "--package-lock-only"])
-        .current_dir(work)
-        .stdin(Stdio::null())
-        .stdout(stdout_file)
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    *slot.lock().ok()? = Some(child);
-    let deadline = Instant::now() + AUDIT_DEADLINE;
-    loop {
-        let mut guard = slot.lock().ok()?;
-        let Some(child) = guard.as_mut() else {
-            return None; // collector reaped the child first
-        };
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                // Exited on its own: clear the slot so the collector has
-                // nothing left to kill.
-                guard.take();
-                break;
-            }
-            Ok(None) if Instant::now() < deadline => {
-                drop(guard);
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            _ => {
-                let mut child = guard.take().expect("checked above");
-                drop(guard);
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
-    parse_npm_audit(&std::fs::read_to_string(&stdout_path).ok()?)
-}
-
-/// Parse npm audit report v2 (npm 7+): counts from `metadata.vulnerabilities`,
-/// `top` from the `vulnerabilities` map, severest first.
-fn parse_npm_audit(json: &str) -> Option<AuditSummary> {
-    let report: serde_json::Value = serde_json::from_str(json).ok()?;
-    let counts = report.get("metadata")?.get("vulnerabilities")?;
-    let count = |k: &str| counts.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-    let (critical, high, moderate, low, info) = (
-        count("critical"),
-        count("high"),
-        count("moderate"),
-        count("low"),
-        count("info"),
-    );
-    let total = counts
-        .get("total")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(critical + high + moderate + low + info);
-    let mut top: Vec<(String, String)> = report
-        .get("vulnerabilities")
-        .and_then(|v| v.as_object())
-        .map(|vulns| {
-            vulns
-                .values()
-                .filter_map(|entry| {
-                    Some((
-                        entry.get("name")?.as_str()?.to_string(),
-                        entry.get("severity")?.as_str()?.to_string(),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    top.sort_by(|a, b| (severity_rank(&a.1), &a.0).cmp(&(severity_rank(&b.1), &b.0)));
-    top.truncate(AUDIT_TOP_LIMIT);
-    Some(AuditSummary {
-        total,
-        critical,
-        high,
-        moderate,
-        low,
-        info,
-        top,
-    })
-}
-
-/// Sort key for npm audit severities, severest first.
-fn severity_rank(severity: &str) -> u8 {
-    match severity {
-        "critical" => 0,
-        "high" => 1,
-        "moderate" => 2,
-        "low" => 3,
-        "info" => 4,
-        _ => 5,
-    }
+    parse_npm_lockfile(&lock)
 }
 
 fn parse_npm_lockfile(json: &str) -> Result<Vec<TreePackage>, String> {
@@ -513,69 +306,6 @@ mod tests {
     fn parse_npm_lockfile_missing_packages() {
         let err = parse_npm_lockfile(r#"{"lockfileVersion":1}"#).expect_err("no packages map");
         assert!(err.contains("no packages map"), "got: {err}");
-    }
-
-    // npm audit report v2 shape: per-package `vulnerabilities` map plus
-    // `metadata.vulnerabilities` counts.
-    const AUDIT_REPORT: &str = r#"{
-        "auditReportVersion": 2,
-        "vulnerabilities": {
-            "minimist": {"name": "minimist", "severity": "critical", "via": []},
-            "lodash": {"name": "lodash", "severity": "high", "via": []},
-            "ms": {"name": "ms", "severity": "moderate", "via": []}
-        },
-        "metadata": {"vulnerabilities":
-            {"info": 0, "low": 0, "moderate": 1, "high": 1, "critical": 1, "total": 3}}
-    }"#;
-
-    #[test]
-    fn parse_npm_audit_counts_and_top() {
-        let summary = parse_npm_audit(AUDIT_REPORT).expect("parse audit report");
-        assert_eq!(summary.total, 3);
-        assert_eq!(summary.critical, 1);
-        assert_eq!(summary.high, 1);
-        assert_eq!(summary.moderate, 1);
-        assert_eq!(summary.low, 0);
-        assert_eq!(summary.info, 0);
-        // Severest first: critical, high, moderate.
-        assert_eq!(
-            summary.top,
-            vec![
-                ("minimist".to_string(), "critical".to_string()),
-                ("lodash".to_string(), "high".to_string()),
-                ("ms".to_string(), "moderate".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_npm_audit_caps_top_entries() {
-        let entries: Vec<String> = (0..8)
-            .map(|i| format!(r#""p{i}": {{"name": "p{i}", "severity": "low"}}"#))
-            .collect();
-        let json = format!(
-            r#"{{"vulnerabilities": {{{}}},
-                "metadata": {{"vulnerabilities": {{"low": 8, "total": 8}}}}}}"#,
-            entries.join(",")
-        );
-        let summary = parse_npm_audit(&json).expect("parse audit report");
-        assert_eq!(summary.total, 8);
-        assert_eq!(summary.top.len(), AUDIT_TOP_LIMIT);
-    }
-
-    #[test]
-    fn parse_npm_audit_missing_total_sums_levels() {
-        let json = r#"{"vulnerabilities": {},
-            "metadata": {"vulnerabilities": {"high": 2, "low": 1}}}"#;
-        let summary = parse_npm_audit(json).expect("parse audit report");
-        assert_eq!(summary.total, 3);
-    }
-
-    #[test]
-    fn parse_npm_audit_rejects_garbage() {
-        assert_eq!(parse_npm_audit("not json"), None);
-        assert_eq!(parse_npm_audit("{}"), None);
-        assert_eq!(parse_npm_audit(r#"{"metadata": {}}"#), None);
     }
 
     #[test]

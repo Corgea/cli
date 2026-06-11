@@ -163,8 +163,7 @@ every advisory, or `null` when any advisory has no known fix.
 
 Recency gating needs no token; the vuln verdict uses the configured Corgea token when
 present. Overrides for testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`,
-`CORGEA_VULN_API_URL`; `CORGEA_NO_NPM_AUDIT=1` disables the warn-only `npm audit`
-second opinion.
+`CORGEA_VULN_API_URL`.
 
 #### Testing the gate
 

@@ -288,7 +288,6 @@ fn install_wrap_options(
         verdict,
         npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
         pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
-        npm_audit: utils::generic::get_env_var_if_exists("CORGEA_NO_NPM_AUDIT").is_none(),
     }
 }
 
