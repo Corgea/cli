@@ -1452,18 +1452,32 @@ mod tests {
         assert!(!PackageManager::Pip.is_install_subcommand("freeze"));
     }
 
-    fn stub_opts(pypi_registry: String, no_fail: bool) -> PrecheckOptions {
+    /// Baseline options: pypi registry at a dead address (a port that
+    /// refuses connections — these tests never dial it), no verdict config.
+    /// Override fields per test via struct update.
+    fn stub_opts() -> PrecheckOptions {
         PrecheckOptions {
             threshold: Duration::from_secs(2 * 86400),
-            no_fail,
+            no_fail: false,
             force: false,
             json: false,
             verdict: None,
             npm_registry: None,
-            pypi_registry: Some(pypi_registry),
+            pypi_registry: Some("http://127.0.0.1:9".to_string()),
             concurrency: 4,
             // Unit tests never want the real `npm audit` subprocess.
             npm_audit: false,
+        }
+    }
+
+    /// `stub_opts()` plus a verdict config pointing at `base_url`.
+    fn verdict_opts(base_url: &str) -> PrecheckOptions {
+        PrecheckOptions {
+            verdict: Some(VerdictConfig {
+                base_url: base_url.to_string(),
+                token: "test-token".to_string(),
+            }),
+            ..stub_opts()
         }
     }
 
@@ -1491,7 +1505,7 @@ mod tests {
     #[test]
     fn unverifiable_target_skips_and_proceeds() {
         // git+ spec → Skipped outcome, no registry hit, install proceeds.
-        let opts = stub_opts("http://127.0.0.1:9".to_string(), false);
+        let opts = stub_opts();
         let (code, exec_ran) = gate_pip_install(&["git+https://github.com/psf/requests.git"], opts);
         assert_eq!(code, 42);
         assert!(exec_ran);
@@ -1500,7 +1514,7 @@ mod tests {
     #[test]
     fn bare_install_passes_through_without_verification() {
         // Bare `pip install` (no targets) → straight exec, no registry hit.
-        let opts = stub_opts("http://127.0.0.1:9".to_string(), false);
+        let opts = stub_opts();
         let (code, exec_ran) = gate_pip_install(&[], opts);
         assert_eq!(code, 42);
         assert!(exec_ran);
@@ -1509,7 +1523,7 @@ mod tests {
     #[test]
     fn requirements_files_note_then_exec() {
         // `-r reqs.txt` alone → printed note, no verification, exec runs.
-        let opts = stub_opts("http://127.0.0.1:9".to_string(), false);
+        let opts = stub_opts();
         let (code, exec_ran) = gate_pip_install(&["-r", "reqs.txt"], opts);
         assert_eq!(code, 42);
         assert!(exec_ran);
@@ -1595,7 +1609,7 @@ mod tests {
         let opts = |no_fail: bool, force: bool| PrecheckOptions {
             no_fail,
             force,
-            ..stub_opts("http://127.0.0.1:9".to_string(), false)
+            ..stub_opts()
         };
 
         let clean = {
@@ -1658,7 +1672,7 @@ mod tests {
         assert_eq!(report.vulnerable_count(), 1);
         let opts = |force: bool| PrecheckOptions {
             force,
-            ..stub_opts("http://127.0.0.1:9".to_string(), false)
+            ..stub_opts()
         };
         assert!(should_block_install(&report, &opts(false)));
         assert!(!should_block_install(&report, &opts(true)));
@@ -1685,11 +1699,7 @@ mod tests {
         statuses.insert(key("flaky"), 503u16);
         let stub = crate::vuln_api_stub::spawn_with_statuses(checks, statuses);
 
-        let mut opts = stub_opts("http://127.0.0.1:9".to_string(), false);
-        opts.verdict = Some(VerdictConfig {
-            base_url: stub.base_url.clone(),
-            token: "test-token".to_string(),
-        });
+        let opts = verdict_opts(&stub.base_url);
 
         let mut outcomes = vec![
             resolved_outcome("evil", "1.0.0", false),
@@ -1713,7 +1723,7 @@ mod tests {
 
         // Without a VerdictConfig the pass is a no-op.
         let mut untouched = vec![resolved_outcome("evil", "1.0.0", false)];
-        let no_verdict = stub_opts("http://127.0.0.1:9".to_string(), false);
+        let no_verdict = stub_opts();
         run_verdict_pass(PackageManager::Pip, &mut untouched, &no_verdict);
         assert!(matches!(
             &untouched[0],
@@ -1873,11 +1883,7 @@ mod tests {
         statuses.insert(key("flaky", "4.0.0"), 503u16);
         let stub = crate::vuln_api_stub::spawn_with_statuses(checks, statuses);
 
-        let mut opts = stub_opts("http://127.0.0.1:9".to_string(), false);
-        opts.verdict = Some(VerdictConfig {
-            base_url: stub.base_url.clone(),
-            token: "test-token".to_string(),
-        });
+        let opts = verdict_opts(&stub.base_url);
 
         // oldpkg's fix is unknown to the stub → default clean; badfix's fix is
         // flagged; flaky's fix 503s. badfix arrives via the transitive arm.
@@ -1916,7 +1922,7 @@ mod tests {
     /// missing map entry as Unverified.
     #[test]
     fn verify_steers_noop_without_token() {
-        let opts = stub_opts("http://127.0.0.1:9".to_string(), false);
+        let opts = stub_opts();
         let mut report = report_with(vec![vulnerable_outcome("oldpkg", "1.0.0", Some("2.0.0"))]);
         verify_steers(&mut report, &opts);
         assert!(report.steers.is_empty());
@@ -1930,11 +1936,7 @@ mod tests {
     /// dead address, an attempted request would land as Unverified.
     #[test]
     fn verify_steers_skips_requests_without_proposals() {
-        let mut opts = stub_opts("http://127.0.0.1:9".to_string(), false);
-        opts.verdict = Some(VerdictConfig {
-            base_url: "http://127.0.0.1:9".to_string(),
-            token: "test-token".to_string(),
-        });
+        let opts = verdict_opts("http://127.0.0.1:9");
         let mut report = report_with(vec![vulnerable_outcome("oldpkg", "1.0.0", None)]);
         verify_steers(&mut report, &opts);
         assert!(report.steers.is_empty());
@@ -1946,11 +1948,7 @@ mod tests {
     #[test]
     fn verify_steers_dedups_by_normalized_name() {
         let stub = crate::vuln_api_stub::spawn_with_statuses(HashMap::new(), HashMap::new());
-        let mut opts = stub_opts("http://127.0.0.1:9".to_string(), false);
-        opts.verdict = Some(VerdictConfig {
-            base_url: stub.base_url.clone(),
-            token: "test-token".to_string(),
-        });
+        let opts = verdict_opts(&stub.base_url);
         let mut report = report_with(vec![
             vulnerable_outcome("Flask_Cors", "1.0.0", Some("2.0.0")),
             vulnerable_outcome("flask-cors", "1.0.0", Some("2.0.0")),

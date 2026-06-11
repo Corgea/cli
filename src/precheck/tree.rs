@@ -389,30 +389,26 @@ fn parse_npm_lockfile(json: &str) -> Result<Vec<TreePackage>, String> {
         .get("packages")
         .and_then(|v| v.as_object())
         .ok_or("package-lock.json has no packages map (npm < 7?)")?;
-    let mut out = Vec::new();
-    for (path, entry) in packages {
-        if path.is_empty() {
-            continue; // root project entry
-        }
-        if entry.get("link").and_then(|v| v.as_bool()) == Some(true) {
-            continue;
-        }
-        let name = entry
-            .get("name")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .or_else(|| name_from_lock_path(path));
-        let (Some(name), Some(version)) = (name, entry.get("version").and_then(|v| v.as_str()))
-        else {
-            continue;
-        };
-        out.push(TreePackage {
-            name,
-            version: version.to_string(),
-            requested: false,
-        });
-    }
-    Ok(out)
+    Ok(packages
+        .iter()
+        // Skip the root project entry ("") and symlinked (workspace) entries.
+        .filter(|(path, entry)| {
+            !path.is_empty() && entry.get("link").and_then(|v| v.as_bool()) != Some(true)
+        })
+        .filter_map(|(path, entry)| {
+            let name = entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or_else(|| name_from_lock_path(path))?;
+            let version = entry.get("version").and_then(|v| v.as_str())?;
+            Some(TreePackage {
+                name,
+                version: version.to_string(),
+                requested: false,
+            })
+        })
+        .collect())
 }
 
 /// Derive a package name from a lockfile path key like

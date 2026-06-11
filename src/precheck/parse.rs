@@ -35,12 +35,14 @@ fn build_parsed_install(
     positionals: PositionalSplit,
     parse_spec: fn(&str) -> InstallTarget,
 ) -> ParsedInstall {
-    let mut parsed = ParsedInstall::default();
-    for raw in &positionals.specs {
-        parsed.targets.push(parse_spec(raw));
+    ParsedInstall {
+        targets: positionals
+            .specs
+            .iter()
+            .map(|raw| parse_spec(raw))
+            .collect(),
+        requirements_files: positionals.requirements_files,
     }
-    parsed.requirements_files = positionals.requirements_files;
-    parsed
 }
 
 pub fn parse_install_args(
@@ -112,33 +114,34 @@ fn extract_node_positionals(args: &[String]) -> PositionalSplit {
             break;
         }
         if a.starts_with('-') {
-            // Flag. Skip the next token if it looks like a value.
-            if a.contains('=') {
-                // `--flag=value` already self-contained.
-                i += 1;
-                continue;
-            }
-            // Heuristic: peek at the next arg. If it doesn't look
-            // like a package spec (i.e. contains `://` or starts with
-            // `/` or `.`) skip it; otherwise leave it alone for the
-            // next iteration.
-            let next_is_value = args
-                .get(i + 1)
-                .map(|n| {
-                    !n.starts_with('-')
-                        && (n.contains("://")
-                            || n.starts_with('/')
-                            || n.starts_with("./")
-                            || n.starts_with('~'))
-                })
-                .unwrap_or(false);
-            i += if next_is_value { 2 } else { 1 };
+            i = skip_unknown_flag(args, i);
             continue;
         }
         out.specs.push(a.clone());
         i += 1;
     }
     out
+}
+
+/// Advance past an unknown flag at `i`. `--flag=value` is self-contained;
+/// otherwise peek at the next arg and skip it too if it doesn't look like
+/// a package spec (contains `://` or is path-like) — see the heuristic
+/// rationale on [`extract_node_positionals`].
+fn skip_unknown_flag(args: &[String], i: usize) -> usize {
+    if args[i].contains('=') {
+        return i + 1;
+    }
+    let next_is_value = args
+        .get(i + 1)
+        .map(|n| {
+            !n.starts_with('-')
+                && (n.contains("://")
+                    || n.starts_with('/')
+                    || n.starts_with("./")
+                    || n.starts_with('~'))
+        })
+        .unwrap_or(false);
+    i + if next_is_value { 2 } else { 1 }
 }
 
 /// pip's argument grammar is more structured than npm's: there are
@@ -192,23 +195,7 @@ fn extract_pip_positionals(args: &[String]) -> Result<PositionalSplit, String> {
             continue;
         }
         if a.starts_with('-') {
-            // Unknown flag — apply the same value-skipping heuristic
-            // as in node land.
-            if a.contains('=') {
-                i += 1;
-                continue;
-            }
-            let next_is_value = args
-                .get(i + 1)
-                .map(|n| {
-                    !n.starts_with('-')
-                        && (n.contains("://")
-                            || n.starts_with('/')
-                            || n.starts_with("./")
-                            || n.starts_with('~'))
-                })
-                .unwrap_or(false);
-            i += if next_is_value { 2 } else { 1 };
+            i = skip_unknown_flag(args, i);
             continue;
         }
         out.specs.push(a.clone());
@@ -225,33 +212,34 @@ pub(crate) fn parse_npm_spec(raw: &str) -> InstallTarget {
     let trimmed = raw.trim();
 
     let unverifiable_prefixes = [
-        "git+", "git:", "git@", "ssh://", "http://", "https://", "file:", "./", "../", "/", "~/",
+        "git+",
+        "git:",
+        "git@",
+        "ssh://",
+        "http://",
+        "https://",
+        "file:",
+        "./",
+        "../",
+        "/",
+        "~/",
+        "npm:",
+        "workspace:",
     ];
-    if unverifiable_prefixes.iter().any(|p| trimmed.starts_with(p)) {
-        return InstallTarget {
-            name: trimmed.to_string(),
-            display,
-            kind: TargetKind::Unverifiable {
-                reason: "spec is a URL/git/filesystem reference — registry verification skipped"
-                    .to_string(),
-            },
+    if let Some(p) = unverifiable_prefixes
+        .iter()
+        .find(|p| trimmed.starts_with(*p))
+    {
+        let reason = match *p {
+            "npm:" => "npm: aliased dependency — registry verification skipped",
+            "workspace:" => "workspace: dependency — registry verification skipped",
+            _ => "spec is a URL/git/filesystem reference — registry verification skipped",
         };
-    }
-    if trimmed.starts_with("npm:") {
         return InstallTarget {
             name: trimmed.to_string(),
             display,
             kind: TargetKind::Unverifiable {
-                reason: "npm: aliased dependency — registry verification skipped".to_string(),
-            },
-        };
-    }
-    if trimmed.starts_with("workspace:") {
-        return InstallTarget {
-            name: trimmed.to_string(),
-            display,
-            kind: TargetKind::Unverifiable {
-                reason: "workspace: dependency — registry verification skipped".to_string(),
+                reason: reason.to_string(),
             },
         };
     }
@@ -534,14 +522,13 @@ mod tests {
             parse_pypi_spec("requests[security]==2.31.0").name,
             "requests"
         );
-        assert_eq!(
-            parse_pypi_spec("requests==2.31.0; python_version >= \"3.7\"").name,
-            "requests"
+        let t = parse_pypi_spec("requests==2.31.0; python_version >= \"3.7\"");
+        assert_eq!(t.name, "requests");
+        assert!(
+            matches!(t.kind, TargetKind::Pypi(PypiSpec::Exact(ref v)) if v == "2.31.0"),
+            "env marker must not leak into the spec: {:?}",
+            t.kind
         );
-        match parse_pypi_spec("requests==2.31.0; python_version >= \"3.7\"").kind {
-            TargetKind::Pypi(PypiSpec::Exact(v)) => assert_eq!(v, "2.31.0"),
-            _ => panic!("expected exact spec"),
-        }
     }
 
     #[test]
