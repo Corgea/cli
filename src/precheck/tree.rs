@@ -328,10 +328,13 @@ fn parse_npm_lockfile(json: &str) -> Result<Vec<TreePackage>, String> {
 }
 
 /// Derive a package name from a lockfile path key like
-/// `node_modules/a/node_modules/@scope/pkg` → `@scope/pkg`.
+/// `node_modules/a/node_modules/@scope/pkg` → `@scope/pkg`. `None` for keys
+/// outside `node_modules/` (workspace stanzas carry an explicit `name`).
 fn name_from_lock_path(path: &str) -> Option<String> {
-    let idx = path.rfind("node_modules/")?;
-    let name = &path[idx + "node_modules/".len()..];
+    if !path.contains("node_modules/") {
+        return None;
+    }
+    let name = crate::deps::ecosystems::npm::package_name_from_lock_key(path);
     (!name.is_empty()).then(|| name.to_string())
 }
 

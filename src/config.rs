@@ -134,10 +134,7 @@ mod tests {
         env::remove_var("CORGEA_VULN_API_URL");
 
         // Default when the env var is unset.
-        assert_eq!(
-            test_config().get_vuln_api_url(),
-            "https://cve-worker-staging.corgea.workers.dev"
-        );
+        assert_eq!(test_config().get_vuln_api_url(), DEFAULT_VULN_API_URL);
 
         // Env var wins; whitespace and trailing slash trimmed.
         env::set_var("CORGEA_VULN_API_URL", " https://env.example.com/ ");
@@ -145,10 +142,7 @@ mod tests {
 
         // Empty / whitespace-only env var is treated as unset.
         env::set_var("CORGEA_VULN_API_URL", "   ");
-        assert_eq!(
-            test_config().get_vuln_api_url(),
-            "https://cve-worker-staging.corgea.workers.dev"
-        );
+        assert_eq!(test_config().get_vuln_api_url(), DEFAULT_VULN_API_URL);
         env::remove_var("CORGEA_VULN_API_URL");
     }
 }

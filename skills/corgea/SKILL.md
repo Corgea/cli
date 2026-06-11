@@ -157,7 +157,7 @@ corgea pip list                       # non-install subcommands pass straight th
 | `--force` | | Proceed despite all findings (vulnerable, unverifiable, recent). Findings still print. |
 | `--json` | | JSON report instead of text. Per-result `verdict` object + `verdict_mode` + `tree`. |
 
-`--json` adds `verdict_mode` (`"public"`, `"authenticated"`, or `"recency-only"`) and a
+`--json` adds `verdict_mode` (`"public"` or `"authenticated"`) and a
 `tree` object: `null` when no tree pass ran; otherwise `mode` is `"full"` (transitive
 checked) or `"named-only"` (with a `reason`), plus `resolved_count` and a `transitive[]`
 array of `{name, version, verdict}` for packages beyond the named targets. Vulnerable
@@ -172,10 +172,12 @@ testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`, `CORGEA_VULN_API_URL`.
 
 #### Testing the gate
 
-Staging vuln-api (`CORGEA_VULN_API_URL=https://cve-worker-staging.corgea.workers.dev`)
-serves deterministic verdicts for dogfooding. It runs in public mode by default;
-add `CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` if you need to exercise authenticated
-custom-URL behavior. Known-vulnerable targets:
+The staging vuln-api (`https://cve-worker-staging.corgea.workers.dev`) serves
+deterministic verdicts for dogfooding and is currently the default endpoint, so
+with `CORGEA_TOKEN` set it runs authenticated with no extra setup. The explicit
+`CORGEA_VULN_API_URL` + `CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` below keep
+that true even if the default endpoint moves (a custom URL is public-mode unless
+the opt-in is set). Known-vulnerable targets:
 
 | Ecosystem | Target | Verdict |
 |-----------|--------|---------|

@@ -386,26 +386,27 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
     )
 }
 
+/// `corgea <words…> <rest…>` — the suggested-command string used by the
+/// "Did you mean …" messages.
+fn corgea_cmd(words: &[&str], rest: &[String]) -> String {
+    let mut parts = vec!["corgea".to_string()];
+    parts.extend(words.iter().map(|w| w.to_string()));
+    parts.extend(rest.iter().cloned());
+    parts.join(" ")
+}
+
 pub fn pip3_alias_message(args: &[String]) -> Option<String> {
     let rest = args.strip_prefix(&["pip3".to_string()])?;
-    let mut parts = vec!["corgea".to_string(), "pip".to_string()];
-    parts.extend(rest.iter().cloned());
     Some(format!(
         "error: unknown package manager `pip3`.\nDid you mean `{}`?",
-        parts.join(" ")
+        corgea_cmd(&["pip"], rest)
     ))
 }
 
 fn unsupported_pip_add_message(rest: &[String]) -> String {
-    let mut parts = vec![
-        "corgea".to_string(),
-        "pip".to_string(),
-        "install".to_string(),
-    ];
-    parts.extend(rest.iter().cloned());
     format!(
         "error: pip does not support `add`.\nDid you mean `{}`?",
-        parts.join(" ")
+        corgea_cmd(&["pip", "install"], rest)
     )
 }
 
@@ -414,16 +415,7 @@ fn wrong_package_manager_message(
     rest: &[String],
     parsed: &parse::ParsedInstall,
 ) -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    wrong_package_manager_message_from(&cwd, manager, rest, parsed)
-}
-
-fn wrong_package_manager_message_from(
-    cwd: &Path,
-    manager: PackageManager,
-    rest: &[String],
-    parsed: &parse::ParsedInstall,
-) -> Option<String> {
+    let cwd = &std::env::current_dir().ok()?;
     let expected = match manager {
         PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => {
             let expected = detect_node_manager_from(cwd)?;
@@ -462,11 +454,8 @@ fn detect_node_manager_from(start: &Path) -> Option<PackageManager> {
 
 fn detect_node_manager_in_dir(dir: &Path) -> ProjectManagerDetection {
     match package_json_manager(dir) {
-        Some(ProjectManagerDetection::Found(manager)) => {
-            return ProjectManagerDetection::Found(manager);
-        }
-        Some(ProjectManagerDetection::Ambiguous) => return ProjectManagerDetection::Ambiguous,
-        Some(ProjectManagerDetection::None) | None => {}
+        ProjectManagerDetection::None => {}
+        found => return found,
     }
 
     let mut found = Vec::new();
@@ -480,8 +469,6 @@ fn detect_node_manager_in_dir(dir: &Path) -> ProjectManagerDetection {
         found.push(PackageManager::Npm);
     }
 
-    found.sort_by_key(|manager| manager.binary_name());
-    found.dedup();
     match found.as_slice() {
         [] => ProjectManagerDetection::None,
         [manager] => ProjectManagerDetection::Found(*manager),
@@ -489,17 +476,22 @@ fn detect_node_manager_in_dir(dir: &Path) -> ProjectManagerDetection {
     }
 }
 
-fn package_json_manager(dir: &Path) -> Option<ProjectManagerDetection> {
-    let raw = std::fs::read_to_string(dir.join("package.json")).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let Some(package_manager) = json.get("packageManager").and_then(|v| v.as_str()) else {
-        return Some(ProjectManagerDetection::None);
+/// `packageManager`-field detection. Missing/unparsable `package.json` and a
+/// missing field both fall through to lockfile detection (`None`).
+fn package_json_manager(dir: &Path) -> ProjectManagerDetection {
+    let json: Option<serde_json::Value> = std::fs::read_to_string(dir.join("package.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    let Some(package_manager) = json
+        .as_ref()
+        .and_then(|j| j.get("packageManager"))
+        .and_then(|v| v.as_str())
+    else {
+        return ProjectManagerDetection::None;
     };
-    Some(
-        parse_node_package_manager(package_manager)
-            .map(ProjectManagerDetection::Found)
-            .unwrap_or(ProjectManagerDetection::Ambiguous),
-    )
+    parse_node_package_manager(package_manager)
+        .map(ProjectManagerDetection::Found)
+        .unwrap_or(ProjectManagerDetection::Ambiguous)
 }
 
 fn parse_node_package_manager(raw: &str) -> Option<PackageManager> {
@@ -590,27 +582,19 @@ fn externally_managed_pip_message(
         return None;
     }
 
-    let mut retry = vec![
-        "corgea".to_string(),
-        "pip".to_string(),
-        "install".to_string(),
-    ];
-    retry.extend(rest.iter().cloned());
     Some(format!(
         "error: this Python environment is externally managed (PEP 668).\nCreate and activate a virtualenv, then retry `{}`.",
-        retry.join(" ")
+        corgea_cmd(&["pip", "install"], rest)
     ))
 }
 
 fn pip_install_overrides_external_management(args: &[String]) -> bool {
-    const VALUE_FLAGS: [&str; 3] = ["--target", "--prefix", "--root"];
-    args.iter().enumerate().any(|(i, arg)| {
+    const VALUE_FLAGS: [&str; 4] = ["-t", "--target", "--prefix", "--root"];
+    args.iter().any(|arg| {
         arg == "--break-system-packages"
             || VALUE_FLAGS
                 .iter()
                 .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
-            || matches!(arg.as_str(), "-t" | "--target" | "--prefix" | "--root")
-                && args.get(i + 1).is_some()
     })
 }
 
@@ -618,6 +602,13 @@ fn pip_environment_is_externally_managed() -> bool {
     let Ok(pip) = resolve_binary("pip") else {
         return false;
     };
+    // PEP 668 markers live in a system interpreter's stdlib; pip inside an
+    // active virtualenv can't be externally managed — skip the spawn.
+    if let Some(venv) = std::env::var_os("VIRTUAL_ENV") {
+        if pip.starts_with(&venv) {
+            return false;
+        }
+    }
     let Some(interpreter) = python_interpreter_from_shebang(&pip) else {
         return false;
     };
@@ -705,16 +696,9 @@ fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
 }
 
 fn unsupported_uv_install_message(rest: &[String]) -> String {
-    let mut parts = vec![
-        "corgea".to_string(),
-        "uv".to_string(),
-        "pip".to_string(),
-        "install".to_string(),
-    ];
-    parts.extend(rest.iter().cloned());
     format!(
         "error: uv does not support top-level `install`.\nDid you mean `{}`?",
-        parts.join(" ")
+        corgea_cmd(&["uv", "pip", "install"], rest)
     )
 }
 
@@ -775,15 +759,25 @@ fn run_uv_sync(cmd: &[String], opts: PrecheckOptions, exec: impl FnOnce() -> i32
         bare_install: true,
     };
 
+    report_and_exec(&report, &opts, exec)
+}
+
+/// Shared tail of every gated path: render the report, refuse (exit 1) when
+/// the block predicate fires, otherwise run the install.
+fn report_and_exec(
+    report: &PrecheckReport,
+    opts: &PrecheckOptions,
+    exec: impl FnOnce() -> i32,
+) -> i32 {
     if opts.json {
-        print_json(&report, &opts);
+        print_json(report, opts);
     } else {
-        print_text(&report);
+        print_text(report);
     }
-    warn_public_lookup_failures(&report, &opts);
-    if should_block_install(&report, &opts) {
+    warn_public_lookup_failures(report, opts);
+    if should_block_install(report, opts) {
         if !opts.json {
-            print_refusal(&report, &opts);
+            print_refusal(report, opts);
         }
         return 1;
     }
@@ -847,15 +841,24 @@ fn run_parsed_install(
         return exec();
     }
 
+    // The named-target registry lookups and the tree dry-run are independent
+    // network/subprocess work — overlap them; verdicts need both.
     let now = Utc::now();
-    let mut outcomes: Vec<_> = parsed
-        .targets
-        .iter()
-        .map(|target| verify_one(target, &opts, &now))
-        .collect();
+    let (mut outcomes, tree_resolution) = std::thread::scope(|s| {
+        let tree = tree_eligible.then(|| s.spawn(|| tree::resolve_tree(manager, rest, &parsed)));
+        let outcomes: Vec<_> = parsed
+            .targets
+            .iter()
+            .map(|target| verify_one(target, &opts, &now))
+            .collect();
+        (
+            outcomes,
+            tree.map(|handle| handle.join().expect("tree resolution thread panicked")),
+        )
+    });
 
-    let tree = if tree_eligible {
-        Some(run_tree_pass(manager, rest, &parsed, &mut outcomes, &opts))
+    let tree = if let Some(resolution) = tree_resolution {
+        Some(run_tree_pass(manager, resolution, &mut outcomes, &opts))
     } else {
         run_verdict_pass(manager, &mut outcomes, &opts);
         None
@@ -892,21 +895,7 @@ fn run_parsed_install(
         bare_install,
     };
 
-    if opts.json {
-        print_json(&report, &opts);
-    } else {
-        print_text(&report);
-    }
-    warn_public_lookup_failures(&report, &opts);
-
-    if should_block_install(&report, &opts) {
-        if !opts.json {
-            print_refusal(&report, &opts);
-        }
-        return 1;
-    }
-
-    exec()
+    report_and_exec(&report, &opts, exec)
 }
 
 /// One honest stderr line when a zero-spec install can't be gated:
@@ -1000,18 +989,17 @@ fn requirements_note(parsed: &parse::ParsedInstall) {
     );
 }
 
-/// Resolve the full would-install set and verdict it. On any resolution
-/// failure, fall back to the named-only verdict pass; the caller renders the
-/// loud warning from the returned `NamedOnly` reason. Only called when
-/// `opts.verdict.is_some()`.
+/// Verdict the resolved would-install set (`tree::resolve_tree`'s result).
+/// On any resolution failure, fall back to the named-only verdict pass; the
+/// caller renders the loud warning from the returned `NamedOnly` reason.
+/// Only called when `opts.verdict.is_some()`.
 fn run_tree_pass(
     manager: PackageManager,
-    rest: &[String],
-    parsed: &parse::ParsedInstall,
+    resolution: Result<Option<Vec<tree::TreePackage>>, String>,
     outcomes: &mut [TargetOutcome],
     opts: &PrecheckOptions,
 ) -> TreeReport {
-    let set = match tree::resolve_tree(manager, rest, parsed) {
+    let set = match resolution {
         Ok(Some(set)) => set,
         Ok(None) => {
             run_verdict_pass(manager, outcomes, opts);
@@ -1215,7 +1203,11 @@ fn run_verdict_pass(
         .collect();
 
     let results = verdict_pool(jobs, cfg, manager, VERDICT_CONCURRENCY);
-    apply_verdicts(manager, results, outcomes, &Default::default());
+    let leftovers = apply_verdicts(manager, results, outcomes, &Default::default());
+    debug_assert!(
+        leftovers.is_empty(),
+        "named verdict pass left tree leftovers"
+    );
 }
 
 fn authenticated_verdict(opts: &PrecheckOptions) -> bool {

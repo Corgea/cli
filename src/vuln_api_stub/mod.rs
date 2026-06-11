@@ -54,6 +54,58 @@ pub fn spawn_with_retry_once(
     }
 }
 
+/// Vuln-api stub that records raw requests and answers every package check
+/// with a clean verdict (echoing the eco/name/version from the path). Used
+/// to assert auth-header behavior, both in-crate and from the CLI.
+pub fn spawn_capturing_vuln_api_stub() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::sync::{Arc, Mutex};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind capture stub");
+    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_in_stub = Arc::clone(&requests);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let buf = read_http_request(&mut stream);
+            let req = String::from_utf8_lossy(&buf).into_owned();
+            requests_in_stub.lock().unwrap().push(req.clone());
+            let path = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("");
+            let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+            let (eco, name, ver) = if parts.len() >= 7 {
+                (parts[2], parts[3], parts[5])
+            } else {
+                ("pypi", "unknown", "0.0.0")
+            };
+            let name = urlencoding::decode(name).unwrap_or_default();
+            let ver = urlencoding::decode(ver).unwrap_or_default();
+            let body = default_clean_response(eco, &name, &ver);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (base_url, requests)
+}
+
+/// The value of header `name` in a raw captured HTTP request, if present.
+pub fn header_value(request: &str, name: &str) -> Option<String> {
+    request
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim().to_string())
+}
+
 /// Read one HTTP request's bytes (through the header terminator) off `stream`.
 pub fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4096);

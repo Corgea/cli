@@ -22,15 +22,15 @@ fn user_agent() -> String {
     format!("corgea-cli/{} (deps)", env!("CARGO_PKG_VERSION"))
 }
 
-fn http_client() -> Result<&'static reqwest::blocking::Client, String> {
+fn http_client() -> &'static reqwest::blocking::Client {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-    Ok(CLIENT.get_or_init(|| {
+    CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .user_agent(user_agent())
             .build()
             .expect("registry http client")
-    }))
+    })
 }
 
 /// URL-encode an npm package name. Scoped names contain `@` and `/`,
@@ -81,9 +81,6 @@ fn parse_iso8601(raw: &str) -> Result<DateTime<Utc>, String> {
     Err(format!("unrecognised timestamp format: {}", raw))
 }
 
-// Resolution helpers (npm + PyPI). Inserted before the tests module
-// in registry.rs.
-
 /// What the user typed after `pkg@` in an install command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NpmSpec {
@@ -133,7 +130,7 @@ pub fn npm_resolve(
         .trim_end_matches('/');
     let url = format!("{}/{}", base, encode_npm_name(name));
 
-    let client = http_client()?;
+    let client = http_client();
     let resp = client
         .get(&url)
         .header("Accept", "application/json")
@@ -224,13 +221,10 @@ pub fn npm_resolve(
     })
 }
 
-/// Pick the highest semver-compatible version that satisfies `range`.
-/// Pre-releases are excluded unless the range itself references a
-/// pre-release (matches npm's behaviour).
 /// Translate an npm-style version range (`>=1.0.0 <2.0.0`,
 /// `1.x`, `>=1.0.0`) to a `semver::VersionReq`. The Rust crate uses
 /// `,` as the AND separator, npm uses whitespace, so we normalise
-/// before parsing.
+/// before parsing. npm's `||` OR syntax is unsupported — best-effort skipped.
 fn parse_npm_range(range: &str) -> Option<semver::VersionReq> {
     if let Ok(req) = semver::VersionReq::parse(range) {
         return Some(req);
@@ -239,13 +233,12 @@ fn parse_npm_range(range: &str) -> Option<semver::VersionReq> {
     semver::VersionReq::parse(&normalised).ok()
 }
 
+/// Pick the highest published version that satisfies `range`. Pre-releases
+/// are excluded unless the range itself references one (matches npm).
 fn npm_pick_highest_matching(
     versions: &std::collections::BTreeMap<String, serde::de::IgnoredAny>,
     range: &str,
 ) -> Option<String> {
-    // npm separates predicates with spaces (`>=1.0.0 <2.0.0`); the
-    // Rust `semver` crate uses commas. Try both. We don't support
-    // npm's `||` OR syntax here — those are best-effort skipped.
     let req = parse_npm_range(range)?;
     let range_has_prerelease = range.contains('-');
 
@@ -306,7 +299,7 @@ pub fn pypi_resolve(
         .trim_end_matches('/');
     let url = format!("{}/pypi/{}/json", base, urlencoding::encode(name));
 
-    let client = http_client()?;
+    let client = http_client();
     let resp = client
         .get(&url)
         .header("Accept", "application/json")

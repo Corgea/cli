@@ -132,62 +132,6 @@ where
     base_url
 }
 
-/// Vuln-api stub that records raw requests and answers every package check
-/// with a clean verdict. Used to assert auth-header behavior from the CLI.
-#[allow(dead_code)]
-pub fn spawn_capturing_vuln_api_stub() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-    use std::io::Write;
-    use std::net::TcpListener;
-    use std::sync::{Arc, Mutex};
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind capture stub");
-    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let requests_in_stub = Arc::clone(&requests);
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let buf = corgea::vuln_api_stub::read_http_request(&mut stream);
-            let req = String::from_utf8_lossy(&buf).into_owned();
-            requests_in_stub.lock().unwrap().push(req.clone());
-            let path = req
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .unwrap_or("");
-            let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-            let (eco, name, ver) = if parts.len() >= 7 {
-                (parts[2], parts[3], parts[5])
-            } else {
-                ("pypi", "unknown", "0.0.0")
-            };
-            let name = urlencoding::decode(name).unwrap_or_default();
-            let ver = urlencoding::decode(ver).unwrap_or_default();
-            let body = format!(
-                r#"{{"ecosystem":"{eco}","package_name":"{name}","version":"{ver}","is_vulnerable":false,"matches":[]}}"#
-            );
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes());
-        }
-    });
-    (base_url, requests)
-}
-
-#[allow(dead_code)]
-pub fn header_value(request: &str, name: &str) -> Option<String> {
-    request
-        .lines()
-        .skip(1)
-        .take_while(|line| !line.trim().is_empty())
-        .filter_map(|line| line.split_once(':'))
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.trim().to_string())
-}
-
 /// Registry stub serving `/pypi/oldpkg/json` (pypi) and `/oldpkg` (npm
 /// packument), both published 2020 → never recent. Everything else 404s.
 #[allow(dead_code)]
@@ -262,25 +206,6 @@ pub fn write_fake_recorder(
     write_script(dir, binary, &script);
 }
 
-/// Write an executable fake `pip` that simulates an old pip with no
-/// `--report`: the tree dry-run exits 2 *without* touching the marker, so
-/// tests exercise the named-only fallback path. Any other invocation
-/// records its argv to `marker` and exits `exit_code`.
-#[cfg(unix)]
-#[allow(dead_code)]
-pub fn write_fake_pip_without_report(
-    dir: &std::path::Path,
-    marker: &std::path::Path,
-    exit_code: i32,
-) {
-    let script = format!(
-        "#!/bin/sh\ncase \" $* \" in *\" --dry-run \"*) exit 2;; esac\nprintf '%s' \"$*\" > '{}'\nexit {}\n",
-        marker.display(),
-        exit_code
-    );
-    write_script(dir, "pip", &script);
-}
-
 /// Sentinel payload that makes a tree-aware fake manager exit non-zero on
 /// its tree (resolution) invocation, forcing the named-only fallback.
 #[allow(dead_code)]
@@ -346,7 +271,9 @@ impl PipHarness {
         let (mut cmd, home) = corgea_isolated();
         let bin = TempDir::new().expect("temp bin dir");
         let marker = bin.path().join("pm-argv.txt");
-        write_fake_pip_without_report(bin.path(), &marker, pip_exit_code);
+        // RESOLUTION_FAILS models an old pip with no `--report`: the tree
+        // dry-run exits 2, so these tests exercise the named-only fallback.
+        write_fake_tree_pm(bin.path(), "pip", &marker, RESOLUTION_FAILS, pip_exit_code);
         let registry = spawn_wildcard_pypi_stub();
         let vuln_stub = corgea::vuln_api_stub::spawn_with_statuses(checks, statuses);
         cmd.env("PATH", bin.path())

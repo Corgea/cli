@@ -66,14 +66,20 @@ pub fn http_client() -> Result<reqwest::blocking::Client, String> {
 }
 
 /// Whether `token` looks like a JWT (three non-empty dot-separated parts).
-/// Decides the auth header shape here and in the binary crate's `utils/api.rs`.
 pub fn is_jwt(token: &str) -> bool {
     let parts: Vec<&str> = token.splitn(4, '.').collect();
     parts.len() == 3 && parts.iter().all(|p| !p.is_empty())
 }
 
-fn normalize_base_url(base_url: &str) -> String {
-    base_url.trim_end_matches('/').to_string()
+/// The auth header for a Corgea token: JWT → `Authorization: Bearer`,
+/// otherwise the opaque `CORGEA-TOKEN` header. The one definition of the
+/// header shape, shared with the binary crate's `utils/api.rs`.
+pub fn auth_header(token: &str) -> (&'static str, String) {
+    if is_jwt(token) {
+        ("Authorization", format!("Bearer {token}"))
+    } else {
+        ("CORGEA-TOKEN", token.to_string())
+    }
 }
 
 /// Encode package name for the vuln-api path segment.
@@ -100,11 +106,8 @@ fn build_json_get(
         .header("Accept", "application/json")
         .header("CORGEA-SOURCE", "cli");
     if let Some(token) = token {
-        if is_jwt(token) {
-            req = req.header("Authorization", format!("Bearer {}", token));
-        } else {
-            req = req.header("CORGEA-TOKEN", token);
-        }
+        let (name, value) = auth_header(token);
+        req = req.header(name, value);
     }
     req
 }
@@ -113,7 +116,7 @@ fn build_json_get(
 /// a non-empty (trailing-slash-normalized) base URL. Returns the normalized
 /// base so callers don't re-derive it.
 fn validated_base(base_url: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let base = normalize_base_url(base_url);
+    let base = base_url.trim_end_matches('/').to_string();
     if base.is_empty() {
         return Err("vuln-api base URL is empty".into());
     }
@@ -309,42 +312,15 @@ mod tests {
         )
     }
 
-    fn header_value(request: &str, name: &str) -> Option<String> {
-        request
-            .lines()
-            .skip(1)
-            .take_while(|line| !line.trim().is_empty())
-            .filter_map(|line| line.split_once(':'))
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.trim().to_string())
-    }
+    use crate::vuln_api_stub::{header_value, spawn_capturing_vuln_api_stub};
 
     fn captured_request(auth_token: Option<&str>) -> String {
-        use std::io::Write;
-        use std::net::TcpListener;
-        use std::sync::mpsc;
-
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind capture stub");
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept request");
-            let buf = crate::vuln_api_stub::read_http_request(&mut stream);
-            let request = String::from_utf8_lossy(&buf).into_owned();
-            tx.send(request).expect("send captured request");
-            let body = r#"{"ecosystem":"npm","package_name":"lodash","version":"4.17.20","is_vulnerable":false,"matches":[]}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-        });
-
+        let (base_url, requests) = spawn_capturing_vuln_api_stub();
         let client = http_client().expect("test client");
         check_package_version(&client, &base_url, auth_token, "npm", "lodash", "4.17.20")
             .expect("captured request should succeed");
-        rx.recv().expect("captured request")
+        let requests = requests.lock().unwrap();
+        requests[0].clone()
     }
 
     #[test]
@@ -533,11 +509,12 @@ mod tests {
     }
 
     #[test]
-    fn normalize_base_url_strips_trailing_slash() {
+    fn validated_base_strips_trailing_slash() {
         assert_eq!(
-            normalize_base_url("http://localhost:8080/"),
+            validated_base("http://localhost:8080/").unwrap(),
             "http://localhost:8080"
         );
+        assert!(validated_base("").is_err());
     }
 
     #[test]

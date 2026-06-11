@@ -11,12 +11,13 @@
 mod common;
 
 use common::{corgea_isolated, spawn_oldpkg_registry_stub, write_fake_recorder};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
-/// Isolated `corgea` wired to the PyPI stub, with `PATH` set to a private
-/// temp dir containing only the named fake binaries.
+/// Isolated `corgea` wired to the PyPI and vuln-api stubs, with `PATH` set
+/// to a private temp dir containing only the named fake binaries.
 struct FallbackHarness {
     cmd: Command,
     marker: PathBuf,
@@ -33,8 +34,10 @@ impl FallbackHarness {
             write_fake_recorder(bin.path(), binary, &marker, 0);
         }
         let registry = spawn_oldpkg_registry_stub();
+        let vuln_stub = corgea::vuln_api_stub::spawn_with_statuses(HashMap::new(), HashMap::new());
         cmd.env("PATH", bin.path())
-            .env("CORGEA_PYPI_REGISTRY", &registry);
+            .env("CORGEA_PYPI_REGISTRY", &registry)
+            .env("CORGEA_VULN_API_URL", &vuln_stub.base_url);
         Self {
             cmd,
             marker,

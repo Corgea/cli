@@ -11,7 +11,8 @@
 
 mod common;
 
-use common::{header_value, key, spawn_capturing_vuln_api_stub, vulnerable_body, PipHarness};
+use common::{key, vulnerable_body, PipHarness};
+use corgea::vuln_api_stub::{header_value, spawn_capturing_vuln_api_stub};
 use std::collections::HashMap;
 
 fn vulnerable_oldpkg_body() -> String {

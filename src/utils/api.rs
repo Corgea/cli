@@ -1,6 +1,6 @@
 use crate::log::debug;
 use crate::utils;
-use corgea::vuln_api::is_jwt;
+use corgea::vuln_api::auth_header;
 use reqwest::header::HeaderMap;
 use reqwest::StatusCode;
 use reqwest::{
@@ -25,14 +25,8 @@ fn get_source() -> String {
 
 fn auth_headers(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    if is_jwt(token) {
-        headers.insert(
-            "Authorization",
-            format!("Bearer {}", token).parse().unwrap(),
-        );
-    } else {
-        headers.insert("CORGEA-TOKEN", token.parse().unwrap());
-    }
+    let (name, value) = auth_header(token);
+    headers.insert(name, value.parse().unwrap());
     headers.insert("CORGEA-SOURCE", get_source().parse().unwrap());
     headers
 }

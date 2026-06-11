@@ -272,19 +272,14 @@ fn install_wrap_options(
 ) -> corgea::precheck::PrecheckOptions {
     let token = config.get_token();
     let token = token.trim();
-    let custom_vuln_api_url = utils::generic::get_env_var_if_exists("CORGEA_VULN_API_URL")
-        .map(|url| {
-            url.trim()
-                .trim_end_matches('/')
-                .ne(config::DEFAULT_VULN_API_URL)
-        })
-        .unwrap_or(false);
+    let base_url = config.get_vuln_api_url();
+    let custom_vuln_api_url = base_url != config::DEFAULT_VULN_API_URL;
     let send_token_to_custom =
         utils::generic::get_env_var_if_exists("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL")
             .is_some_and(|v| v.trim() == "1");
     let mode = select_verdict_mode(token, custom_vuln_api_url, send_token_to_custom);
     let verdict = Some(corgea::precheck::VerdictConfig {
-        base_url: config.get_vuln_api_url(),
+        base_url,
         mode,
         public_login_hint: token.is_empty(),
     });
