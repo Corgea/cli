@@ -9,10 +9,6 @@ edition = "2021"
 name = "corgea"
 path = "src/main.rs"
 
-[[bin]]
-name = "vuln-api-stub"
-path = "src/bin/vuln-api-stub.rs"
-
 [dependencies]
 clap = { version = "4.4.13", features = ["derive"] }
 dirs = "5.0.1"

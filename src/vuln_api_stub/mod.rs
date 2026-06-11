@@ -1,65 +1,31 @@
-mod fixtures;
-
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-pub use fixtures::load_from_file;
-
 pub type PackageKey = (String, String, String);
 
 const NOT_FOUND_BODY: &str = r#"{"error":"not found"}"#;
-
-/// Loaded fixture data for the vuln-api stub server.
-#[derive(Debug, Clone, Default)]
-pub struct StubFixtures {
-    pub package_checks: HashMap<PackageKey, String>,
-    pub status_overrides: HashMap<PackageKey, u16>,
-}
 
 pub struct VulnApiStub {
     pub base_url: String,
     _handle: thread::JoinHandle<()>,
 }
 
-impl VulnApiStub {
-    /// Block until the stub server thread exits (normally never, unless the listener fails).
-    pub fn block(self) {
-        let _ = self._handle.join();
-    }
-}
-
-/// Minimal TCP vuln-api stub for CLI integration tests and e2e dogfood.
+/// Minimal TCP vuln-api stub for CLI integration tests. Binds an ephemeral
+/// 127.0.0.1 port; unknown packages get a synthesized clean 200.
 pub fn spawn_with_statuses(
-    fixtures: HashMap<PackageKey, String>,
+    package_checks: HashMap<PackageKey, String>,
     status_overrides: HashMap<PackageKey, u16>,
 ) -> VulnApiStub {
-    spawn_on_port(
-        StubFixtures {
-            package_checks: fixtures,
-            status_overrides,
-        },
-        0,
-    )
-}
-
-/// Bind stub on `port` (`0` = ephemeral). Returns base URL `http://127.0.0.1:{port}`.
-pub fn spawn_on_port(fixtures: StubFixtures, port: u16) -> VulnApiStub {
-    let addr = if port == 0 {
-        "127.0.0.1:0".to_string()
-    } else {
-        format!("127.0.0.1:{port}")
-    };
-    let listener = TcpListener::bind(&addr).unwrap_or_else(|e| panic!("bind stub on {addr}: {e}"));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
     let bound_port = listener.local_addr().expect("stub local_addr").port();
     let base_url = format!("http://127.0.0.1:{bound_port}");
 
-    let package_checks = Arc::new(fixtures.package_checks);
-    let status_overrides = Arc::new(fixtures.status_overrides);
+    let package_checks = Arc::new(package_checks);
+    let status_overrides = Arc::new(status_overrides);
 
     let handle = thread::spawn(move || {
         for stream in listener.incoming() {
@@ -76,12 +42,6 @@ pub fn spawn_on_port(fixtures: StubFixtures, port: u16) -> VulnApiStub {
         base_url,
         _handle: handle,
     }
-}
-
-pub fn spawn_from_file(path: &Path) -> VulnApiStub {
-    let fixtures =
-        load_from_file(path).unwrap_or_else(|e| panic!("load stub fixtures {path:?}: {e}"));
-    spawn_on_port(fixtures, 0)
 }
 
 fn handle_connection(
@@ -219,27 +179,5 @@ mod tests {
         );
         assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
         assert!(resp.contains(r#""is_vulnerable":false"#), "resp: {resp}");
-    }
-
-    #[test]
-    fn fixture_file_loading() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("fixtures.json");
-        std::fs::write(
-            &path,
-            r#"{
-              "package_checks": {
-                "npm/left-pad/1.0.0": {"ecosystem":"npm","package_name":"left-pad","version":"1.0.0","is_vulnerable":true,"matches":[]}
-              }
-            }"#,
-        )
-        .unwrap();
-        let stub = spawn_from_file(&path);
-
-        let resp = get(
-            &stub.base_url,
-            "/v1/packages/npm/left-pad/versions/1.0.0/check",
-        );
-        assert!(resp.contains(r#""is_vulnerable":true"#), "resp: {resp}");
     }
 }
