@@ -12,7 +12,9 @@
 
 mod common;
 
-use common::{key, vulnerable_body, TreeHarness, NPM_LOCK, RESOLUTION_FAILS, TREE_REPORT};
+use common::{
+    key, vulnerable_body, TreeHarness, NPM_LOCK, RESOLUTION_FAILS, TREE_REPORT, UV_COMPILED,
+};
 use std::collections::HashMap;
 use tempfile::TempDir;
 
@@ -35,6 +37,12 @@ fn transitive_vulnerable_blocks_install() {
             "npm",
             NPM_LOCK,
             &["npm", "install", "oldpkg@1.0.0"][..],
+        ),
+        (
+            "uv",
+            "pypi",
+            UV_COMPILED,
+            &["uv", "pip", "install", "oldpkg==1.0.0"][..],
         ),
     ];
     for (binary, eco, payload, args) in cases {
@@ -60,6 +68,66 @@ fn transitive_vulnerable_blocks_install() {
 }
 
 #[test]
+fn uv_requirements_file_install_is_tree_gated() {
+    // `uv pip install -r requirements.txt` names no targets — the gate must
+    // still resolve the full set via `uv pip compile` and block on the
+    // vulnerable pin instead of exec'ing unchecked.
+    let cwd = TempDir::new().expect("temp cwd");
+    std::fs::write(cwd.path().join("requirements.txt"), "oldpkg==1.0.0\n")
+        .expect("write requirements.txt");
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("pypi", "evildep", "0.4.2"),
+        vulnerable_evildep_body("pypi"),
+    );
+    let mut h = TreeHarness::new("uv", checks, HashMap::new(), UV_COMPILED);
+    let out = h
+        .cmd
+        .current_dir(cwd.path())
+        .args(["uv", "pip", "install", "-r", "requirements.txt"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1), "transitive vuln must block");
+    assert_eq!(h.recorded_argv(), None, "uv must not run when blocked");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for needle in ["evildep", "MAL-2024-0002", "(transitive)"] {
+        assert!(stdout.contains(needle), "stdout: {stdout}");
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("not gated"),
+        "gated uv requirements install must not print the bare note: {stderr}"
+    );
+}
+
+#[test]
+fn tree_pass_runs_via_pip3_when_pip_is_absent() {
+    // Only `pip3` exists on PATH (common Linux/macOS). The tree pass must
+    // use the same pip → pip3 fallback as the exec path instead of silently
+    // degrading to named-only — the transitive `evildep` must still block.
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("pypi", "evildep", "0.4.2"),
+        vulnerable_evildep_body("pypi"),
+    );
+    let mut h = TreeHarness::new("pip3", checks, HashMap::new(), TREE_REPORT);
+    let out = h
+        .cmd
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1), "transitive vuln must block");
+    assert_eq!(h.recorded_argv(), None);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("transitive dependencies not checked"),
+        "tree pass must not degrade with only pip3 on PATH: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("evildep"), "stdout: {stdout}");
+}
+
+#[test]
 fn resolution_failure_falls_back_with_loud_warning() {
     // The fake manager fails its tree invocation (pip: exits 2 on `--dry-run`,
     // simulating an old pip with no `--report`; npm: exits 1 on
@@ -75,6 +143,11 @@ fn resolution_failure_falls_back_with_loud_warning() {
             "npm",
             &["npm", "install", "oldpkg@1.0.0"][..],
             "install oldpkg@1.0.0",
+        ),
+        (
+            "uv",
+            &["uv", "pip", "install", "oldpkg==1.0.0"][..],
+            "pip install oldpkg==1.0.0",
         ),
     ];
     for (binary, args, forwarded_argv) in cases {

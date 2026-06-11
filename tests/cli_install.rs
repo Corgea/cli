@@ -196,8 +196,8 @@ fn pip_json_reports_fresh_pin_as_recent() {
 #[test]
 fn pip_resolution_error_prints_error_but_install_proceeds() {
     // `nosuchpkg` hits the stub's 404 route → an error outcome, which
-    // warns but never blocks in the baseline (fail-closed is a later
-    // chunk) — the install must still run.
+    // warns but does not block in tokenless mode (tokened mode fails
+    // closed — see cli_verdict.rs) — the install must still run.
     let mut h = WrapperHarness::new("pip", "CORGEA_PYPI_REGISTRY", 0);
     let out = h
         .cmd

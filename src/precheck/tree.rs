@@ -19,13 +19,14 @@ pub struct TreePackage {
 }
 
 /// Whether this manager's resolver has anything to resolve for the parsed
-/// install. pip's dry-run also reads `-r` requirements files, so those make
-/// a pip install eligible even with no named targets. npm's lockfile
-/// resolution reads `package.json`, so a bare `npm install` is eligible
-/// whenever the working directory has one.
+/// install. pip's dry-run and uv's compile also read `-r` requirements
+/// files, so those make an install eligible even with no named targets.
+/// npm's lockfile resolution reads `package.json`, so a bare `npm install`
+/// is eligible whenever the working directory has one.
 pub fn covers_input(manager: PackageManager, parsed: &super::parse::ParsedInstall) -> bool {
     !parsed.targets.is_empty()
-        || (manager == PackageManager::Pip && !parsed.requirements_files.is_empty())
+        || (matches!(manager, PackageManager::Pip | PackageManager::Uv)
+            && !parsed.requirements_files.is_empty())
         || (manager == PackageManager::Npm && std::path::Path::new("package.json").exists())
 }
 
@@ -34,12 +35,14 @@ pub fn covers_input(manager: PackageManager, parsed: &super::parse::ParsedInstal
 pub fn resolve_tree(
     manager: PackageManager,
     install_args: &[String],
+    parsed: &super::parse::ParsedInstall,
 ) -> Result<Option<Vec<TreePackage>>, String> {
     match manager {
         PackageManager::Pip => resolve_pip_tree(manager.binary_name(), install_args).map(Some),
         PackageManager::Npm => resolve_npm_tree(manager.binary_name(), install_args).map(Some),
-        // yarn/pnpm/uv have no safe dry-run for installs.
-        _ => Ok(None),
+        PackageManager::Uv => resolve_uv_tree(parsed).map(Some),
+        // yarn/pnpm have no safe dry-run for installs.
+        PackageManager::Yarn | PackageManager::Pnpm => Ok(None),
     }
 }
 
@@ -54,7 +57,9 @@ fn stderr_tail(output: &std::process::Output) -> String {
 }
 
 fn resolve_pip_tree(binary: &str, install_args: &[String]) -> Result<Vec<TreePackage>, String> {
-    let resolved = which::which(binary).map_err(|e| format!("{binary} not found on PATH: {e}"))?;
+    // Same binary resolution as the exec path (pip → pip3 fallback) — the
+    // tree pass must not silently degrade on pip3-only systems.
+    let resolved = super::resolve_binary(binary)?;
     let output = Command::new(resolved)
         .arg("install")
         .args([
@@ -104,6 +109,124 @@ fn parse_pip_report(json: &str) -> Result<Vec<TreePackage>, String> {
         .collect()
 }
 
+/// Resolve uv's would-install set with `uv pip compile` — uv's own
+/// resolver, run without executing package code (`--only-binary :all:`
+/// blocks sdist builds, mirroring the pip dry-run guard). Compile takes
+/// requirements files rather than bare specs, so named registry specs and
+/// absolutized `-r` includes are written to a temp `.in` file.
+/// Unverifiable targets (URL / git / editable / path) are excluded — they
+/// are already surfaced as skipped warnings. Index selection comes from
+/// uv's env/config; index flags on the wrapped command don't carry over.
+fn resolve_uv_tree(parsed: &super::parse::ParsedInstall) -> Result<Vec<TreePackage>, String> {
+    let uv = super::resolve_binary("uv")?;
+    let mut input = String::new();
+    for t in &parsed.targets {
+        if !matches!(t.kind, super::TargetKind::Unverifiable { .. }) {
+            input.push_str(&t.display);
+            input.push('\n');
+        }
+    }
+    for f in &parsed.requirements_files {
+        let abs = std::fs::canonicalize(f).map_err(|e| format!("read {}: {e}", f.display()))?;
+        input.push_str(&format!("-r {}\n", abs.display()));
+    }
+    if input.is_empty() {
+        return Err("nothing uv pip compile can resolve (all targets are URL/path refs)".into());
+    }
+
+    let work = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
+    let in_file = work.path().join("corgea-gate.in");
+    std::fs::write(&in_file, &input).map_err(|e| format!("write compile input: {e}"))?;
+    let output = Command::new(&uv)
+        .args([
+            "pip",
+            "compile",
+            "--only-binary",
+            ":all:",
+            "--no-header",
+            "--no-annotate",
+            "--quiet",
+        ])
+        .arg(&in_file)
+        .output()
+        .map_err(|e| format!("run uv pip compile: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("uv pip compile failed: {}", stderr_tail(&output)));
+    }
+    parse_compiled_requirements(
+        &String::from_utf8_lossy(&output.stdout),
+        &requested_names(parsed),
+    )
+}
+
+/// Normalized names the user asked for — named CLI targets plus entries of
+/// `-r` files — so tree findings label "(from requirements)" like pip's
+/// `requested` report flag. Best-effort line parse; anything unparsed just
+/// labels "(transitive)".
+fn requested_names(parsed: &super::parse::ParsedInstall) -> std::collections::HashSet<String> {
+    let norm = |n: &str| PackageManager::Uv.normalize_name(n);
+    let mut out: std::collections::HashSet<String> = parsed
+        .targets
+        .iter()
+        .filter(|t| !matches!(t.kind, super::TargetKind::Unverifiable { .. }))
+        .map(|t| norm(&t.name))
+        .collect();
+    for f in &parsed.requirements_files {
+        let Ok(content) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with(['#', '-']) || line.contains("://") {
+                continue;
+            }
+            let name: String = line
+                .chars()
+                .take_while(|c| !matches!(c, '[' | '<' | '>' | '=' | '!' | '~' | ';' | ' '))
+                .collect();
+            if !name.is_empty() {
+                out.insert(norm(&name));
+            }
+        }
+    }
+    out
+}
+
+/// Parse `uv pip compile` stdout (requirements.txt-format `name==version`
+/// pins) into the would-install set. Any line that isn't a pin is an error —
+/// silently skipping could hide part of the tree.
+fn parse_compiled_requirements(
+    out: &str,
+    requested: &std::collections::HashSet<String>,
+) -> Result<Vec<TreePackage>, String> {
+    let mut pkgs = Vec::new();
+    for line in out.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(['#', '-']) {
+            continue;
+        }
+        // Strip env markers and trailing comments: `pkg==1.0 ; marker  # via`.
+        let line = line.split(';').next().unwrap_or(line).trim();
+        let line = line.split(" #").next().unwrap_or(line).trim();
+        let Some((name, version)) = line.split_once("==") else {
+            return Err(format!(
+                "unexpected line in uv pip compile output: '{line}'"
+            ));
+        };
+        // Strip extras: `celery[redis]==5.3.4`.
+        let name = name.split('[').next().unwrap_or(name).trim().to_string();
+        pkgs.push(TreePackage {
+            requested: requested.contains(&PackageManager::Uv.normalize_name(&name)),
+            name,
+            version: version.trim().to_string(),
+        });
+    }
+    if pkgs.is_empty() {
+        return Err("uv pip compile produced no packages".to_string());
+    }
+    Ok(pkgs)
+}
+
 /// Direct dependency names declared by the project's `package.json` in the
 /// current directory (the manifest `resolve_npm_tree` copies). Empty when
 /// the manifest is absent or unparsable — origin labeling then degrades to
@@ -139,7 +262,7 @@ fn direct_deps_from_manifest(json: &str) -> std::collections::HashSet<String> {
 /// `--ignore-scripts` because npm has run lifecycle scripts under
 /// `--package-lock-only` before (npm/cli#2787).
 fn resolve_npm_tree(binary: &str, install_args: &[String]) -> Result<Vec<TreePackage>, String> {
-    let resolved = which::which(binary).map_err(|e| format!("{binary} not found on PATH: {e}"))?;
+    let resolved = super::resolve_binary(binary)?;
     let work = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
     for manifest in [
         "package.json",
@@ -264,6 +387,68 @@ mod tests {
     fn parse_pip_report_non_json() {
         let err = parse_pip_report("not json").expect_err("non-json");
         assert!(err.contains("parse pip report"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_compiled_requirements_pins_extras_and_markers() {
+        let requested = std::collections::HashSet::from(["flask-cors".to_string()]);
+        let out = "Flask_Cors==4.0.0\ncelery[redis]==5.3.4\nwerkzeug==3.1.8 ; python_version >= \"3.9\"\n\n# comment\n--index-url https://example.com\n";
+        let pkgs = parse_compiled_requirements(out, &requested).expect("parse pins");
+        assert_eq!(
+            pkgs,
+            vec![
+                TreePackage {
+                    name: "Flask_Cors".to_string(),
+                    version: "4.0.0".to_string(),
+                    requested: true,
+                },
+                TreePackage {
+                    name: "celery".to_string(),
+                    version: "5.3.4".to_string(),
+                    requested: false,
+                },
+                TreePackage {
+                    name: "werkzeug".to_string(),
+                    version: "3.1.8".to_string(),
+                    requested: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_compiled_requirements_rejects_non_pins() {
+        let none = std::collections::HashSet::new();
+        let err = parse_compiled_requirements("flask>=2.0\n", &none).expect_err("not a pin");
+        assert!(err.contains("unexpected line"), "got: {err}");
+        let err = parse_compiled_requirements("", &none).expect_err("empty");
+        assert!(err.contains("no packages"), "got: {err}");
+    }
+
+    #[test]
+    fn requested_names_unions_targets_and_requirements_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let req = dir.path().join("requirements.txt");
+        std::fs::write(
+            &req,
+            "# comment\nFlask_Cors==4.0.0\nrequests[security]>=2.0 ; python_version >= \"3.9\"\n-r other.txt\nhttps://example.com/pkg.whl\n",
+        )
+        .expect("write requirements");
+        let parsed = super::super::parse::ParsedInstall {
+            targets: vec![super::super::InstallTarget {
+                name: "celery".to_string(),
+                display: "celery==5.3.4".to_string(),
+                kind: super::super::TargetKind::Pypi(
+                    crate::verify_deps::registry::PypiSpec::Exact("5.3.4".to_string()),
+                ),
+            }],
+            requirements_files: vec![req],
+        };
+        let names = requested_names(&parsed);
+        for name in ["celery", "flask-cors", "requests"] {
+            assert!(names.contains(name), "missing {name}: {names:?}");
+        }
+        assert_eq!(names.len(), 3);
     }
 
     // lockfile-v3 with: root entry (skipped), a plain dep, a nested dep,

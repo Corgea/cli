@@ -28,7 +28,10 @@ pub fn parse_pip_install_args(args: &[String]) -> Result<ParsedInstall, String> 
 
 /// `uv add` argument list (everything after `add`).
 pub fn parse_pypi_positionals_args(args: &[String]) -> ParsedInstall {
-    build_parsed_install(extract_node_positionals(args), parse_pypi_spec)
+    build_parsed_install(
+        extract_node_positionals(PackageManager::Uv, args),
+        parse_pypi_spec,
+    )
 }
 
 fn build_parsed_install(
@@ -52,7 +55,7 @@ pub fn parse_install_args(
     match manager {
         PackageManager::Pip => parse_pip_install_args(args),
         PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => Ok(
-            build_parsed_install(extract_node_positionals(args), parse_npm_spec),
+            build_parsed_install(extract_node_positionals(manager, args), parse_npm_spec),
         ),
         PackageManager::Uv => unreachable!("uv uses classify_uv_command"),
     }
@@ -62,8 +65,15 @@ pub fn parse_install_args(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UvCommand<'a> {
     Passthrough,
-    PipInstall { install_args: &'a [String] },
-    Add { add_args: &'a [String] },
+    PipInstall {
+        install_args: &'a [String],
+    },
+    Add {
+        add_args: &'a [String],
+    },
+    /// `uv sync` — installs the locked project environment; gated from
+    /// `uv.lock`. (`uv lock` stays passthrough: it installs nothing.)
+    Sync,
 }
 
 pub fn classify_uv_command(cmd: &[String]) -> UvCommand<'_> {
@@ -76,6 +86,7 @@ pub fn classify_uv_command(cmd: &[String]) -> UvCommand<'_> {
         Some("add") => UvCommand::Add {
             add_args: &cmd[1..],
         },
+        Some("sync") => UvCommand::Sync,
         _ => UvCommand::Passthrough,
     }
 }
@@ -86,22 +97,51 @@ struct PositionalSplit {
     requirements_files: Vec<PathBuf>,
 }
 
-/// Strip flags from a npm/yarn/pnpm install argument list, returning
-/// only the positional package specs.
+/// Known install flags that take a separate value argument, per manager.
+/// The fallback heuristic in [`skip_unknown_flag`] only skips URL/path-like
+/// values, so a bare-word value (`-w my-workspace`) would otherwise parse —
+/// and get verified or blocked — as a package spec. Not exhaustive; the
+/// heuristic still backstops anything unlisted. The same letter can differ
+/// by manager: npm's `-w <name>` takes a value, while pnpm's `-w`
+/// (workspace-root) and yarn's `-W` are boolean.
+fn takes_value(manager: PackageManager, flag: &str) -> bool {
+    match manager {
+        PackageManager::Npm => matches!(
+            flag,
+            "-w" | "--workspace"
+                | "--prefix"
+                | "--registry"
+                | "--tag"
+                | "--omit"
+                | "--include"
+                | "--loglevel"
+        ),
+        PackageManager::Pnpm => matches!(
+            flag,
+            "-C" | "--dir" | "--filter" | "--registry" | "--reporter" | "--loglevel"
+        ),
+        PackageManager::Yarn => matches!(
+            flag,
+            "--registry" | "--modules-folder" | "--cache-folder" | "--mutex" | "--network-timeout"
+        ),
+        PackageManager::Uv => matches!(
+            flag,
+            "--group" | "--extra" | "--index" | "--tag" | "--branch" | "--rev" | "--package"
+        ),
+        PackageManager::Pip => false,
+    }
+}
+
+/// Strip flags from a npm/yarn/pnpm (or `uv add`) install argument list,
+/// returning only the positional package specs.
 ///
 /// We treat anything starting with `-` as a flag. Boolean flags (`-D`,
 /// `--save-dev`, `--no-save`, ...) are dropped on their own. Flags
 /// that take a value can be written as either `--flag=value` or
-/// `--flag value`; we handle both by skipping the next token if it
-/// looks like a value (doesn't start with `-` and contains `:` or `/`
-/// or starts with a digit, suggesting a URL / path / port / version).
-///
-/// We deliberately avoid maintaining an exhaustive flag whitelist —
-/// real-world install commands are too varied. The heuristic above
-/// is correct for the common cases (`--registry url`, `--prefix path`,
-/// `-w pkgname`, etc.) and conservatively skips occasional ambiguous
-/// values (no spec we'd want to verify ever starts with `:` or `/`).
-fn extract_node_positionals(args: &[String]) -> PositionalSplit {
+/// `--flag value`; known value-taking flags ([`takes_value`]) skip the
+/// next token outright, anything else skips it only if it looks like a
+/// value (a URL / path), never like a package spec.
+fn extract_node_positionals(manager: PackageManager, args: &[String]) -> PositionalSplit {
     let mut out = PositionalSplit::default();
     let mut i = 0;
     while i < args.len() {
@@ -114,6 +154,10 @@ fn extract_node_positionals(args: &[String]) -> PositionalSplit {
             break;
         }
         if a.starts_with('-') {
+            if !a.contains('=') && takes_value(manager, a) {
+                i += 2;
+                continue;
+            }
             i = skip_unknown_flag(args, i);
             continue;
         }
@@ -403,7 +447,7 @@ mod tests {
             "https://example.com/registry".to_string(),
             "lodash@^4.0.0".to_string(),
         ];
-        let p = extract_node_positionals(&args);
+        let p = extract_node_positionals(PackageManager::Npm, &args);
         assert_eq!(
             p.specs,
             vec![
@@ -415,6 +459,58 @@ mod tests {
     }
 
     #[test]
+    fn npm_workspace_flag_value_is_not_a_spec() {
+        // npm's `-w <name>` / `--workspace <name>` take a bare-word value;
+        // it must never be verified (or blocked) as a package spec.
+        for flag in ["-w", "--workspace"] {
+            let args = vec![
+                flag.to_string(),
+                "my-workspace".to_string(),
+                "lodash".to_string(),
+            ];
+            let p = extract_node_positionals(PackageManager::Npm, &args);
+            assert_eq!(p.specs, vec!["lodash".to_string()], "flag {flag}");
+        }
+        // `--workspace=name` is self-contained.
+        let args = vec!["--workspace=my-workspace".to_string(), "lodash".to_string()];
+        let p = extract_node_positionals(PackageManager::Npm, &args);
+        assert_eq!(p.specs, vec!["lodash".to_string()]);
+    }
+
+    #[test]
+    fn pnpm_and_yarn_boolean_workspace_flags_keep_the_spec() {
+        // pnpm's `-w` (--workspace-root) and yarn's `-W` are boolean —
+        // the next token is the package being installed.
+        let args = vec!["-w".to_string(), "lodash".to_string()];
+        let p = extract_node_positionals(PackageManager::Pnpm, &args);
+        assert_eq!(p.specs, vec!["lodash".to_string()]);
+
+        let args = vec!["-W".to_string(), "lodash".to_string()];
+        let p = extract_node_positionals(PackageManager::Yarn, &args);
+        assert_eq!(p.specs, vec!["lodash".to_string()]);
+
+        // pnpm's `--filter <selector>` does take a value.
+        let args = vec![
+            "--filter".to_string(),
+            "my-app".to_string(),
+            "lodash".to_string(),
+        ];
+        let p = extract_node_positionals(PackageManager::Pnpm, &args);
+        assert_eq!(p.specs, vec!["lodash".to_string()]);
+    }
+
+    #[test]
+    fn uv_add_group_flag_value_is_not_a_spec() {
+        let args = vec![
+            "--group".to_string(),
+            "dev".to_string(),
+            "requests".to_string(),
+        ];
+        let p = extract_node_positionals(PackageManager::Uv, &args);
+        assert_eq!(p.specs, vec!["requests".to_string()]);
+    }
+
+    #[test]
     fn extracts_npm_positionals_after_double_dash() {
         let args = vec![
             "--save-dev".to_string(),
@@ -422,7 +518,7 @@ mod tests {
             "axios".to_string(),
             "--this-is-positional-now".to_string(),
         ];
-        let p = extract_node_positionals(&args);
+        let p = extract_node_positionals(PackageManager::Npm, &args);
         assert_eq!(
             p.specs,
             vec!["axios".to_string(), "--this-is-positional-now".to_string()]
@@ -570,7 +666,7 @@ mod tests {
         ));
         assert_eq!(
             classify_uv_command(&["sync".to_string(), "--extra".to_string(), "dev".to_string()]),
-            UvCommand::Passthrough
+            UvCommand::Sync
         );
         assert_eq!(
             classify_uv_command(&["run".to_string(), "pytest".to_string()]),

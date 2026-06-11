@@ -89,6 +89,11 @@ pub const NPM_LOCK: &str = r#"{"name":"proj","lockfileVersion":3,"packages":{
   "node_modules/oldpkg":{"version":"1.0.0"},
   "node_modules/evildep":{"version":"0.4.2"}}}"#;
 
+/// `uv pip compile` stdout: `oldpkg` + transitive `evildep`, same shape as
+/// `TREE_REPORT` / `NPM_LOCK`.
+#[allow(dead_code)]
+pub const UV_COMPILED: &str = "oldpkg==1.0.0\nevildep==0.4.2\n";
+
 /// Spawn a one-response-per-connection HTTP stub on an ephemeral 127.0.0.1
 /// port; `route` maps a request path to `(status line, body)`. Returns the
 /// base URL. `Connection: close` is load-bearing — without it reqwest pools
@@ -226,11 +231,11 @@ pub const RESOLUTION_FAILS: &str = "RESOLUTION_FAILS";
 
 /// Write an executable tree-aware fake package manager into `dir`. An
 /// invocation carrying the manager's tree flag emits `payload` (stdout for
-/// pip's `--dry-run --report -`, `./package-lock.json` for npm's
-/// `--package-lock-only`, whose cwd is the resolver's throwaway temp dir)
-/// and exits 0 — the tree pass; if `payload` is `RESOLUTION_FAILS` it exits
-/// non-zero instead, emitting nothing. Any other invocation records its
-/// argv to `marker` and exits `exit_code`.
+/// pip's `--dry-run --report -` and uv's `pip compile`,
+/// `./package-lock.json` for npm's `--package-lock-only`, whose cwd is the
+/// resolver's throwaway temp dir) and exits 0 — the tree pass; if `payload`
+/// is `RESOLUTION_FAILS` it exits non-zero instead, emitting nothing. Any
+/// other invocation records its argv to `marker` and exits `exit_code`.
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn write_fake_tree_pm(
@@ -241,8 +246,9 @@ pub fn write_fake_tree_pm(
     exit_code: i32,
 ) {
     let (tree_flag, redirect, fail_exit) = match binary {
-        "pip" => ("--dry-run", "", 2),
+        "pip" | "pip3" => ("--dry-run", "", 2),
         "npm" => ("--package-lock-only", " > package-lock.json", 1),
+        "uv" => ("compile", "", 1),
         other => panic!("unsupported fake manager {other}"),
     };
     let tree_branch = if payload == RESOLUTION_FAILS {

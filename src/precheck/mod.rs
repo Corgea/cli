@@ -179,6 +179,8 @@ pub enum TreeOrigin {
     Requested,
     /// Already a direct dependency in the project's `package.json`.
     PreExisting,
+    /// Pinned by the project's lockfile (`uv sync` from `uv.lock`).
+    Locked,
 }
 
 impl TreeOrigin {
@@ -187,6 +189,7 @@ impl TreeOrigin {
             TreeOrigin::Transitive => "(transitive)",
             TreeOrigin::Requested => "(from requirements)",
             TreeOrigin::PreExisting => "(already in package.json)",
+            TreeOrigin::Locked => "(locked)",
         }
     }
 
@@ -195,6 +198,7 @@ impl TreeOrigin {
             TreeOrigin::Transitive => "transitive",
             TreeOrigin::Requested => "requested",
             TreeOrigin::PreExisting => "pre-existing",
+            TreeOrigin::Locked => "locked",
         }
     }
 }
@@ -367,7 +371,112 @@ fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
             exec,
             opts,
         ),
+        parse::UvCommand::Sync => run_uv_sync(cmd, opts, exec),
     }
+}
+
+/// Gate `uv sync` from the project's `uv.lock`. The lockfile is the full
+/// locked universe (all groups/extras) — a superset of what sync installs,
+/// conservative in the blocking direction; a stale lock that sync would
+/// re-resolve is gated as written. Recency isn't checked (locked versions
+/// aren't newly chosen by this command); the verdict pass is the gate. We
+/// never run `uv lock` ourselves — locking can build sdists, which would
+/// execute package code before any verdict.
+fn run_uv_sync(cmd: &[String], opts: PrecheckOptions, exec: impl FnOnce() -> i32) -> i32 {
+    let Some(cfg) = &opts.verdict else {
+        // Tokenless mode has no verdict to gate with.
+        return exec();
+    };
+    let lock = match std::fs::read_to_string("uv.lock") {
+        Ok(content) => content,
+        Err(_) => {
+            eprintln!(
+                "note: no uv.lock here — 'uv sync' is not gated; dependencies install unchecked (run 'uv lock' first to enable the gate)"
+            );
+            return exec();
+        }
+    };
+    let jobs = match parse_uv_lock(&lock) {
+        Ok(jobs) => jobs,
+        Err(e) if opts.force => {
+            eprintln!("warning: cannot verify 'uv sync' ({e}); proceeding under --force");
+            return exec();
+        }
+        Err(e) => {
+            eprintln!("error: cannot verify 'uv sync': {e} (pass --force to proceed unchecked)");
+            return 1;
+        }
+    };
+
+    let resolved_count = jobs.len();
+    let results = verdict_pool(jobs, cfg, PackageManager::Uv, VERDICT_CONCURRENCY);
+    let transitive = results
+        .into_iter()
+        .map(|(pkg, verdict)| TreeOutcome {
+            name: pkg.name,
+            version: pkg.version,
+            origin: TreeOrigin::Locked,
+            verdict,
+        })
+        .collect();
+    let report = PrecheckReport {
+        manager: PackageManager::Uv,
+        subcommand: "sync".to_string(),
+        original_args: cmd[1..].to_vec(),
+        outcomes: Vec::new(),
+        threshold: opts.threshold,
+        tree: Some(TreeReport::Full {
+            resolved_count,
+            transitive,
+        }),
+        bare_install: true,
+    };
+
+    if opts.json {
+        print_json(&report, &opts);
+    } else {
+        print_text(&report);
+    }
+    if should_block_install(&report, &opts) {
+        if !opts.json {
+            print_refusal(&report);
+        }
+        return 1;
+    }
+    exec()
+}
+
+/// Packages from `uv.lock` that `uv sync` installs from an index. Local
+/// stanzas (the project itself and path deps: editable / virtual /
+/// directory / path sources) carry no registry identity and are skipped.
+fn parse_uv_lock(content: &str) -> Result<Vec<tree::TreePackage>, String> {
+    #[derive(serde::Deserialize)]
+    struct Lock {
+        #[serde(default)]
+        package: Vec<Pkg>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Pkg {
+        name: String,
+        version: Option<String>,
+        #[serde(default)]
+        source: std::collections::BTreeMap<String, toml::Value>,
+    }
+    const LOCAL_SOURCES: [&str; 4] = ["editable", "virtual", "directory", "path"];
+
+    let lock: Lock = toml::from_str(content).map_err(|e| format!("parse uv.lock: {e}"))?;
+    Ok(lock
+        .package
+        .into_iter()
+        .filter(|p| !LOCAL_SOURCES.iter().any(|k| p.source.contains_key(*k)))
+        .filter_map(|p| {
+            Some(tree::TreePackage {
+                name: p.name,
+                version: p.version?,
+                requested: false,
+            })
+        })
+        .collect())
 }
 
 /// Post-parse verification shared by npm/yarn/pnpm/pip and uv install paths.
@@ -385,7 +494,11 @@ fn run_parsed_install(
     let bare_install = parsed.targets.is_empty() && parsed.requirements_files.is_empty();
 
     if parsed.targets.is_empty() && !tree_eligible {
-        bare_install_note(manager, subcommand_label);
+        // Only a truly bare install gets the bare note — a tokenless
+        // `-r requirements.txt` install is covered by `requirements_note`.
+        if bare_install {
+            bare_install_note(manager, subcommand_label);
+        }
         requirements_note(&parsed);
         return exec();
     }
@@ -398,7 +511,7 @@ fn run_parsed_install(
         .collect();
 
     let tree = if tree_eligible {
-        Some(run_tree_pass(manager, rest, &mut outcomes, &opts))
+        Some(run_tree_pass(manager, rest, &parsed, &mut outcomes, &opts))
     } else {
         run_verdict_pass(manager, &mut outcomes, &opts); // no-op tokenless
         None
@@ -474,7 +587,10 @@ fn print_refusal(report: &PrecheckReport) {
         eprintln!(
             "Refusing to run install: your existing dependency tree has known-vulnerable packages (none were added by this command). Fix them or pass --force."
         );
-    } else if report.vulnerable_count() > 0 || report.unverifiable_count() > 0 {
+    } else if report.vulnerable_count() > 0
+        || report.unverifiable_count() > 0
+        || report.error_count() > 0
+    {
         eprintln!("Refusing to run install. Pass --force to proceed despite findings.");
     } else {
         eprintln!("Refusing to run install. Pass --no-fail to proceed anyway.");
@@ -507,7 +623,8 @@ fn refusal_blames_existing_tree(report: &PrecheckReport) -> bool {
             )
         })
         .all(|t| match t.origin {
-            TreeOrigin::PreExisting => true,
+            // A locked pin predates the sync command that installs it.
+            TreeOrigin::PreExisting | TreeOrigin::Locked => true,
             TreeOrigin::Requested => false,
             TreeOrigin::Transitive => report.bare_install,
         })
@@ -537,10 +654,11 @@ fn requirements_note(parsed: &parse::ParsedInstall) {
 fn run_tree_pass(
     manager: PackageManager,
     rest: &[String],
+    parsed: &parse::ParsedInstall,
     outcomes: &mut [TargetOutcome],
     opts: &PrecheckOptions,
 ) -> TreeReport {
-    let set = match tree::resolve_tree(manager, rest) {
+    let set = match tree::resolve_tree(manager, rest, parsed) {
         Ok(Some(set)) => set,
         Ok(None) => {
             run_verdict_pass(manager, outcomes, opts);
@@ -644,12 +762,15 @@ fn verdict_pool(
                 let Some(job) = queue.lock().unwrap().pop_front() else {
                     break;
                 };
+                // vuln-api advisories are keyed by canonical names; an
+                // alternate spelling (PEP 503: `Flask_Cors` ≡ `flask-cors`)
+                // would miss and read as clean.
                 let verdict = match crate::vuln_api::check_package_version(
                     &client,
                     &cfg.base_url,
                     &cfg.token,
                     ecosystem,
-                    &job.name,
+                    &manager.normalize_name(&job.name),
                     &job.version,
                 ) {
                     Ok(resp) if resp.is_vulnerable => VerdictStatus::Vulnerable(resp.matches),
@@ -748,8 +869,12 @@ fn should_block_install(report: &PrecheckReport, opts: &PrecheckOptions) -> bool
     if opts.force {
         return false;
     }
+    // A resolution error means no verdict was obtained for that target, so
+    // in tokened mode it fails closed like `Unverifiable` — otherwise a
+    // registry outage silently bypasses the gate.
     report.vulnerable_count() > 0
         || report.unverifiable_count() > 0
+        || (opts.verdict.is_some() && report.error_count() > 0)
         || (!opts.no_fail && report.recent_count() > 0)
 }
 
@@ -1280,6 +1405,38 @@ mod tests {
 
         assert!(PackageManager::Pip.is_install_subcommand("install"));
         assert!(!PackageManager::Pip.is_install_subcommand("freeze"));
+    }
+
+    #[test]
+    fn parse_uv_lock_keeps_index_packages_and_skips_local_sources() {
+        let lock = r#"
+version = 1
+
+[[package]]
+name = "proj"
+version = "0.1.0"
+source = { editable = "." }
+
+[[package]]
+name = "evildep"
+version = "0.4.2"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "gitdep"
+version = "1.2.3"
+source = { git = "https://example.com/repo?rev=abc#abc" }
+"#;
+        let pkgs = parse_uv_lock(lock).expect("parse uv.lock");
+        let names: Vec<&str> = pkgs.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["evildep", "gitdep"]);
+        assert_eq!(pkgs[0].version, "0.4.2");
+    }
+
+    #[test]
+    fn parse_uv_lock_rejects_invalid_toml() {
+        let err = parse_uv_lock("not = [valid").expect_err("invalid toml");
+        assert!(err.contains("parse uv.lock"), "got: {err}");
     }
 
     /// Baseline options: pypi registry at a dead address (a port that

@@ -44,6 +44,31 @@ fn vulnerable_pin_blocks_without_running_install() {
 }
 
 #[test]
+fn alternate_pypi_spelling_hits_canonical_verdict() {
+    // Advisories are keyed by the PEP 503 canonical name; `Flask_Cors`
+    // must query (and block on) the `flask-cors` verdict.
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("pypi", "flask-cors", "1.0.0"),
+        vulnerable_body("pypi", "flask-cors", "1.0.0", "GHSA-TEST-0001", None),
+    );
+    let mut h = PipHarness::new(checks, HashMap::new(), Some("test-token"), 0);
+    let out = h
+        .cmd
+        .args(["pip", "install", "Flask_Cors==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "alternate spelling must not bypass the gate"
+    );
+    assert_eq!(h.recorded_argv(), None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("GHSA-TEST-0001"), "stdout: {stdout}");
+}
+
+#[test]
 fn force_overrides_vulnerable_block_and_propagates_exit_code() {
     let mut checks = HashMap::new();
     checks.insert(key("pypi", "oldpkg", "1.0.0"), vulnerable_oldpkg_body());
@@ -63,6 +88,31 @@ fn force_overrides_vulnerable_block_and_propagates_exit_code() {
     assert!(
         stdout.contains("MAL-2024-0001"),
         "findings must still print under --force: {stdout}"
+    );
+}
+
+#[test]
+fn resolution_error_fails_closed_with_token() {
+    // The wildcard registry stub only knows version 1.0.0, so `==2.0.0`
+    // is a resolution error: no verdict was obtained, and with a token
+    // that must block — otherwise a registry outage bypasses the gate.
+    let mut h = PipHarness::new(HashMap::new(), HashMap::new(), Some("test-token"), 0);
+    let out = h
+        .cmd
+        .args(["pip", "install", "nosuchpkg==2.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a resolution error must fail closed in tokened mode"
+    );
+    assert_eq!(h.recorded_argv(), None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("1 errors"), "stdout: {stdout}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--force"),
+        "block message must name --force"
     );
 }
 
