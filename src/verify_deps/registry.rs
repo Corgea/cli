@@ -450,26 +450,21 @@ fn pypi_resolve_specifier(candidates: &[(String, DateTime<Utc>)], spec: &str) ->
     let parts: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
     let mut requirements: Vec<(&'static str, semver::Version)> = Vec::new();
 
+    // Longest prefixes first so `>=` never matches as `>`.
+    const OPERATORS: &[(&str, &str)] = &[
+        ("===", "=="),
+        ("==", "=="),
+        (">=", ">="),
+        ("<=", "<="),
+        ("!=", "!="),
+        ("~=", "~="),
+        (">", ">"),
+        ("<", "<"),
+    ];
     for p in &parts {
-        let (op, val): (&str, &str) = if let Some(v) = p.strip_prefix("===") {
-            ("==", v.trim())
-        } else if let Some(v) = p.strip_prefix("==") {
-            ("==", v.trim())
-        } else if let Some(v) = p.strip_prefix(">=") {
-            (">=", v.trim())
-        } else if let Some(v) = p.strip_prefix("<=") {
-            ("<=", v.trim())
-        } else if let Some(v) = p.strip_prefix("!=") {
-            ("!=", v.trim())
-        } else if let Some(v) = p.strip_prefix("~=") {
-            ("~=", v.trim())
-        } else if let Some(v) = p.strip_prefix(">") {
-            (">", v.trim())
-        } else if let Some(v) = p.strip_prefix("<") {
-            ("<", v.trim())
-        } else {
-            return None;
-        };
+        let (op, val) = OPERATORS
+            .iter()
+            .find_map(|(prefix, op)| p.strip_prefix(prefix).map(|v| (*op, v.trim())))?;
         let v = semver::Version::parse(&normalize_for_semver(val)).ok()?;
         requirements.push((op, v));
     }

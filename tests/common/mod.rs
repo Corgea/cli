@@ -98,7 +98,7 @@ pub fn spawn_http_stub<F>(route: F) -> String
 where
     F: Fn(&str) -> (&'static str, String) + Send + 'static,
 {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
@@ -106,17 +106,7 @@ where
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
-            let mut buf = Vec::with_capacity(4096);
-            let mut chunk = [0u8; 1024];
-            while let Ok(n) = stream.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
+            let buf = corgea::vuln_api_stub::read_http_request(&mut stream);
             let req = String::from_utf8_lossy(&buf);
             let path = req
                 .lines()
