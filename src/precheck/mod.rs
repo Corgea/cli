@@ -234,6 +234,9 @@ pub enum TreeReport {
         resolved_count: usize,
         /// Verdicts for resolved packages beyond the named targets.
         transitive: Vec<TreeOutcome>,
+        /// Warn-only `npm audit` second opinion (npm only; `None` when
+        /// unavailable, disabled, or failed). Never consulted for blocking.
+        audit: Option<tree::AuditSummary>,
     },
     /// Resolution unavailable or failed — only named targets were verified.
     NamedOnly { reason: String },
@@ -421,6 +424,20 @@ fn run_parsed_install(
             "warning: transitive dependencies not checked ({reason}); only named packages were verified."
         );
     }
+    // Warn-only npm audit second opinion: never blocks, never changes
+    // exit codes (`should_block_install` ignores it by design).
+    if let Some(TreeReport::Full {
+        audit: Some(audit), ..
+    }) = &tree
+    {
+        if audit.total > 0 {
+            eprintln!(
+                "note: npm audit reports {} advisories ({} high/critical) — supplementary signal, not blocking",
+                audit.total,
+                audit.high + audit.critical
+            );
+        }
+    }
     // The requirements note only matters when the tree pass did *not* cover
     // those files (fallback to named-only, or recency-only mode).
     if !matches!(&tree, Some(TreeReport::Full { .. })) {
@@ -521,8 +538,11 @@ fn run_tree_pass(
     outcomes: &mut [TargetOutcome],
     opts: &PrecheckOptions,
 ) -> TreeReport {
-    let set = match tree::resolve_tree(manager, rest) {
-        Ok(Some(set)) => set,
+    let tree::TreeResolution {
+        packages: set,
+        audit: audit_rx,
+    } = match tree::resolve_tree(manager, rest) {
+        Ok(Some(resolution)) => resolution,
         Ok(None) => {
             run_verdict_pass(manager, outcomes, opts);
             return TreeReport::NamedOnly {
@@ -573,10 +593,15 @@ fn run_tree_pass(
         .as_ref()
         .expect("tree pass requires verdict config");
     let results = verdict_pool(jobs, cfg, manager, opts.concurrency);
+    // Collect the warn-only npm audit second opinion only after the verdict
+    // pool so the two truly overlap; any failure (timeout, disconnected
+    // sender) is a silent skip.
+    let audit = audit_rx.and_then(|rx| rx.recv_timeout(Duration::from_secs(2)).ok());
     let transitive = apply_verdicts(manager, results, outcomes, &direct_deps);
     TreeReport::Full {
         resolved_count,
         transitive,
+        audit,
     }
 }
 
@@ -1111,6 +1136,7 @@ fn print_text(report: &PrecheckReport) {
         Some(TreeReport::Full {
             resolved_count,
             transitive,
+            ..
         }) => {
             println!(
                 "  tree: {} packages resolved, {} transitive checked",
@@ -1252,6 +1278,23 @@ fn verdict_json(report: &PrecheckReport, name: &str, verdict: &VerdictStatus) ->
     }
 }
 
+/// JSON shape for the warn-only npm audit second opinion in the tree arm.
+fn npm_audit_json(audit: &tree::AuditSummary) -> serde_json::Value {
+    use serde_json::json;
+    json!({
+        "total": audit.total,
+        "critical": audit.critical,
+        "high": audit.high,
+        "moderate": audit.moderate,
+        "low": audit.low,
+        "info": audit.info,
+        "top": audit.top.iter().map(|(name, severity)| json!({
+            "name": name,
+            "severity": severity,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
     use serde_json::json;
     let outcomes: Vec<_> = report
@@ -1307,7 +1350,7 @@ fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
         "verdict_mode": if opts.verdict.is_some() { "full" } else { "recency-only" },
         "results": outcomes,
         "tree": report.tree.as_ref().map(|t| match t {
-            TreeReport::Full { resolved_count, transitive } => json!({
+            TreeReport::Full { resolved_count, transitive, audit } => json!({
                 "mode": "full",
                 "reason": serde_json::Value::Null,
                 "resolved_count": resolved_count,
@@ -1317,12 +1360,14 @@ fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
                     "origin": o.origin.json_name(),
                     "verdict": verdict_json(report, &o.name, &o.verdict),
                 })).collect::<Vec<_>>(),
+                "npm_audit": audit.as_ref().map(npm_audit_json),
             }),
             TreeReport::NamedOnly { reason } => json!({
                 "mode": "named-only",
                 "reason": reason,
                 "resolved_count": 0,
                 "transitive": [],
+                "npm_audit": serde_json::Value::Null,
             }),
         }),
     });
@@ -1541,6 +1586,7 @@ mod tests {
                 origin: TreeOrigin::Transitive,
                 verdict: VerdictStatus::Vulnerable(vec![]),
             }],
+            audit: None,
         });
 
         assert_eq!(report.vulnerable_count(), 1);
@@ -1781,6 +1827,7 @@ mod tests {
                 verdict: VerdictStatus::Vulnerable(vec![vm("A-2", Some("3.0.0"))]),
                 origin: TreeOrigin::Transitive,
             }],
+            audit: None,
         });
         verify_steers(&mut report, &opts);
 
@@ -1897,6 +1944,7 @@ mod tests {
                 ),
                 origin: TreeOrigin::Transitive,
             }],
+            audit: None,
         });
         let groups = collapsed_unverifiable_groups(&report);
         assert_eq!(groups.len(), 1);
