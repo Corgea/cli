@@ -17,6 +17,7 @@ pub mod parse;
 pub mod tree;
 
 use std::ffi::OsString;
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -78,13 +79,41 @@ impl PackageManager {
     }
 }
 
+/// Auth and failure policy for the vuln-api verdict pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerdictMode {
+    /// No auth header; vuln-api lookup errors warn and fail open.
+    Public,
+    /// Auth header sent; vuln-api lookup errors fail closed.
+    Authenticated { token: String },
+}
+
+impl VerdictMode {
+    fn auth_token(&self) -> Option<&str> {
+        match self {
+            VerdictMode::Public => None,
+            VerdictMode::Authenticated { token } => Some(token.as_str()),
+        }
+    }
+
+    fn is_authenticated(&self) -> bool {
+        matches!(self, VerdictMode::Authenticated { .. })
+    }
+
+    fn is_public(&self) -> bool {
+        matches!(self, VerdictMode::Public)
+    }
+}
+
 /// Connection details for the vuln-api verdict pass.
-/// `None` in `PrecheckOptions.verdict` ⇒ tokenless mode: verdicts are
-/// skipped and the gate degrades to recency-only cover.
+/// Public mode is still a verdict pass: known vulnerable/malicious verdicts
+/// block, while lookup errors warn and continue.
 #[derive(Debug, Clone)]
 pub struct VerdictConfig {
     pub base_url: String,
-    pub token: String,
+    pub mode: VerdictMode,
+    /// Print the tokenless public-mode hint after a check is attempted.
+    pub public_login_hint: bool,
 }
 
 /// Threat verdict for one resolved target.
@@ -95,15 +124,15 @@ pub enum VerdictStatus {
     /// vuln-api answered: known vulnerable or malicious — blocks.
     Vulnerable(Vec<crate::vuln_api::VulnMatch>),
     /// The verdict could not be obtained (network/5xx/auth/integrity).
-    /// Blocks fail-closed.
+    /// Blocks only in authenticated mode.
     Unverifiable(String),
-    /// Verdict never attempted (no token). Recency-only cover; the
-    /// constant reason (`NO_TOKEN_REASON`) is attached at render time.
+    /// Verdict never attempted. The constant reason (`NO_VERDICT_REASON`)
+    /// is attached at render time.
     NotChecked,
 }
 
-/// Reason recorded on resolved targets when no token is configured.
-const NO_TOKEN_REASON: &str = "no Corgea token; vulnerability verdict skipped";
+/// Reason recorded on resolved targets when no verdict pass ran.
+const NO_VERDICT_REASON: &str = "vulnerability verdict not checked";
 
 #[derive(Debug, Clone)]
 pub struct PrecheckOptions {
@@ -114,8 +143,9 @@ pub struct PrecheckOptions {
     /// unverifiable) and run the install anyway.
     pub force: bool,
     pub json: bool,
-    /// `Some` ⇒ run the vuln-api verdict pass against this endpoint;
-    /// `None` ⇒ tokenless recency-only mode.
+    /// `Some` ⇒ run the vuln-api verdict pass against this endpoint.
+    /// `None` is retained for tests and direct library callers that want
+    /// recency-only behavior.
     pub verdict: Option<VerdictConfig>,
     /// Optional registry overrides, used by tests.
     pub npm_registry: Option<String>,
@@ -213,7 +243,7 @@ pub struct TreeOutcome {
 }
 
 /// Result of the tree pass. `PrecheckReport.tree` is `None` when the pass
-/// never ran (recency-only / tokenless mode).
+/// never ran (named-only managers, or verdicts disabled).
 #[derive(Debug)]
 pub enum TreeReport {
     /// The full would-install set was resolved and verdicted.
@@ -234,7 +264,7 @@ pub struct PrecheckReport {
     pub original_args: Vec<String>,
     pub outcomes: Vec<TargetOutcome>,
     pub threshold: Duration,
-    /// `None` ⇒ recency-only mode, the tree pass never ran.
+    /// `None` ⇒ no tree pass ran.
     pub tree: Option<TreeReport>,
     /// True when the command named nothing — no CLI targets and no
     /// requirements files — so everything the tree pass resolved predates
@@ -319,6 +349,11 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
     let subcommand = &cmd[0];
     let rest = &cmd[1..];
 
+    if manager == PackageManager::Pip && subcommand == "add" {
+        eprintln!("{}", unsupported_pip_add_message(rest));
+        return 1;
+    }
+
     if !manager.is_install_subcommand(subcommand) {
         return exec_install_with_args(manager, subcommand, rest);
     }
@@ -331,6 +366,16 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
         }
     };
 
+    if let Some(message) = wrong_package_manager_message(manager, rest, &parsed) {
+        eprintln!("{message}");
+        return 1;
+    }
+
+    if let Some(message) = externally_managed_pip_message(manager, rest, &parsed) {
+        eprintln!("{message}");
+        return 1;
+    }
+
     run_parsed_install(
         manager,
         subcommand,
@@ -341,8 +386,290 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
     )
 }
 
+pub fn pip3_alias_message(args: &[String]) -> Option<String> {
+    let rest = args.strip_prefix(&["pip3".to_string()])?;
+    let mut parts = vec!["corgea".to_string(), "pip".to_string()];
+    parts.extend(rest.iter().cloned());
+    Some(format!(
+        "error: unknown package manager `pip3`.\nDid you mean `{}`?",
+        parts.join(" ")
+    ))
+}
+
+fn unsupported_pip_add_message(rest: &[String]) -> String {
+    let mut parts = vec![
+        "corgea".to_string(),
+        "pip".to_string(),
+        "install".to_string(),
+    ];
+    parts.extend(rest.iter().cloned());
+    format!(
+        "error: pip does not support `add`.\nDid you mean `{}`?",
+        parts.join(" ")
+    )
+}
+
+fn wrong_package_manager_message(
+    manager: PackageManager,
+    rest: &[String],
+    parsed: &parse::ParsedInstall,
+) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    wrong_package_manager_message_from(&cwd, manager, rest, parsed)
+}
+
+fn wrong_package_manager_message_from(
+    cwd: &Path,
+    manager: PackageManager,
+    rest: &[String],
+    parsed: &parse::ParsedInstall,
+) -> Option<String> {
+    let expected = match manager {
+        PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => {
+            let expected = detect_node_manager_from(cwd)?;
+            (expected != manager).then_some(expected)?
+        }
+        PackageManager::Pip if detect_uv_project_from(cwd) => PackageManager::Uv,
+        PackageManager::Uv if detect_pip_project_from(cwd) => PackageManager::Pip,
+        _ => return None,
+    };
+
+    let suggestion = suggested_install_command(expected, rest, parsed);
+    Some(format!(
+        "error: this project appears to use {}, but you ran {}.\nDid you mean `{suggestion}`?",
+        expected.binary_name(),
+        manager.binary_name()
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectManagerDetection {
+    None,
+    Ambiguous,
+    Found(PackageManager),
+}
+
+fn detect_node_manager_from(start: &Path) -> Option<PackageManager> {
+    for dir in start.ancestors() {
+        match detect_node_manager_in_dir(dir) {
+            ProjectManagerDetection::Found(manager) => return Some(manager),
+            ProjectManagerDetection::Ambiguous => return None,
+            ProjectManagerDetection::None => {}
+        }
+    }
+    None
+}
+
+fn detect_node_manager_in_dir(dir: &Path) -> ProjectManagerDetection {
+    match package_json_manager(dir) {
+        Some(ProjectManagerDetection::Found(manager)) => {
+            return ProjectManagerDetection::Found(manager);
+        }
+        Some(ProjectManagerDetection::Ambiguous) => return ProjectManagerDetection::Ambiguous,
+        Some(ProjectManagerDetection::None) | None => {}
+    }
+
+    let mut found = Vec::new();
+    if dir.join("pnpm-lock.yaml").is_file() {
+        found.push(PackageManager::Pnpm);
+    }
+    if dir.join("yarn.lock").is_file() {
+        found.push(PackageManager::Yarn);
+    }
+    if dir.join("package-lock.json").is_file() || dir.join("npm-shrinkwrap.json").is_file() {
+        found.push(PackageManager::Npm);
+    }
+
+    found.sort_by_key(|manager| manager.binary_name());
+    found.dedup();
+    match found.as_slice() {
+        [] => ProjectManagerDetection::None,
+        [manager] => ProjectManagerDetection::Found(*manager),
+        _ => ProjectManagerDetection::Ambiguous,
+    }
+}
+
+fn package_json_manager(dir: &Path) -> Option<ProjectManagerDetection> {
+    let raw = std::fs::read_to_string(dir.join("package.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let Some(package_manager) = json.get("packageManager").and_then(|v| v.as_str()) else {
+        return Some(ProjectManagerDetection::None);
+    };
+    Some(
+        parse_node_package_manager(package_manager)
+            .map(ProjectManagerDetection::Found)
+            .unwrap_or(ProjectManagerDetection::Ambiguous),
+    )
+}
+
+fn parse_node_package_manager(raw: &str) -> Option<PackageManager> {
+    let name = raw.trim().split('@').next().unwrap_or("").trim();
+    match name {
+        "npm" => Some(PackageManager::Npm),
+        "yarn" => Some(PackageManager::Yarn),
+        "pnpm" => Some(PackageManager::Pnpm),
+        _ => None,
+    }
+}
+
+fn detect_uv_project_from(start: &Path) -> bool {
+    start.ancestors().any(|dir| dir.join("uv.lock").is_file())
+}
+
+fn detect_pip_project_from(start: &Path) -> bool {
+    start
+        .ancestors()
+        .take_while(|dir| !dir.join("pyproject.toml").is_file() && !dir.join("uv.lock").is_file())
+        .any(has_requirements_file)
+}
+
+fn has_requirements_file(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        entry.path().is_file()
+            && ((name.starts_with("requirements")
+                && (name.ends_with(".txt") || name.ends_with(".in")))
+                || name.ends_with("-requirements.txt"))
+    })
+}
+
+fn suggested_install_command(
+    expected: PackageManager,
+    rest: &[String],
+    parsed: &parse::ParsedInstall,
+) -> String {
+    let mut parts = vec!["corgea".to_string(), expected.binary_name().to_string()];
+    match expected {
+        PackageManager::Npm => parts.push("install".to_string()),
+        PackageManager::Yarn | PackageManager::Pnpm => {
+            if parsed.targets.is_empty() && parsed.requirements_files.is_empty() {
+                parts.push("install".to_string());
+            } else {
+                parts.push("add".to_string());
+            }
+        }
+        PackageManager::Uv => {
+            if is_plain_pip_target_install(rest, parsed) {
+                parts.push("add".to_string());
+                parts.extend(parsed.targets.iter().map(|target| target.display.clone()));
+                return parts.join(" ");
+            }
+            parts.push("pip".to_string());
+            parts.push("install".to_string());
+        }
+        PackageManager::Pip => parts.push("install".to_string()),
+    }
+    parts.extend(rest.iter().cloned());
+    parts.join(" ")
+}
+
+fn is_plain_pip_target_install(rest: &[String], parsed: &parse::ParsedInstall) -> bool {
+    !parsed.targets.is_empty()
+        && parsed.requirements_files.is_empty()
+        && rest.len() == parsed.targets.len()
+        && rest
+            .iter()
+            .zip(&parsed.targets)
+            .all(|(arg, target)| arg == &target.display)
+}
+
+fn externally_managed_pip_message(
+    manager: PackageManager,
+    rest: &[String],
+    parsed: &parse::ParsedInstall,
+) -> Option<String> {
+    if manager != PackageManager::Pip
+        || (parsed.targets.is_empty() && parsed.requirements_files.is_empty())
+        || pip_install_overrides_external_management(rest)
+        || !pip_environment_is_externally_managed()
+    {
+        return None;
+    }
+
+    let mut retry = vec![
+        "corgea".to_string(),
+        "pip".to_string(),
+        "install".to_string(),
+    ];
+    retry.extend(rest.iter().cloned());
+    Some(format!(
+        "error: this Python environment is externally managed (PEP 668).\nCreate and activate a virtualenv, then retry `{}`.",
+        retry.join(" ")
+    ))
+}
+
+fn pip_install_overrides_external_management(args: &[String]) -> bool {
+    const VALUE_FLAGS: [&str; 3] = ["--target", "--prefix", "--root"];
+    args.iter().enumerate().any(|(i, arg)| {
+        arg == "--break-system-packages"
+            || VALUE_FLAGS
+                .iter()
+                .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
+            || matches!(arg.as_str(), "-t" | "--target" | "--prefix" | "--root")
+                && args.get(i + 1).is_some()
+    })
+}
+
+fn pip_environment_is_externally_managed() -> bool {
+    let Ok(pip) = resolve_binary("pip") else {
+        return false;
+    };
+    let Some(interpreter) = python_interpreter_from_shebang(&pip) else {
+        return false;
+    };
+
+    let mut command = Command::new(&interpreter[0]);
+    command.args(&interpreter[1..]);
+    let Ok(output) = command.arg("-c").arg(EXTERNALLY_MANAGED_PYTHON).output() else {
+        return false;
+    };
+    output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1"
+}
+
+const EXTERNALLY_MANAGED_PYTHON: &str = r#"
+import pathlib
+import sysconfig
+
+paths = []
+for key in ("stdlib", "platstdlib"):
+    path = sysconfig.get_path(key)
+    if path and path not in paths:
+        paths.append(path)
+
+print("1" if any((pathlib.Path(path) / "EXTERNALLY-MANAGED").is_file() for path in paths) else "0")
+"#;
+
+fn python_interpreter_from_shebang(path: &Path) -> Option<Vec<OsString>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let first = content.lines().next()?.strip_prefix("#!")?.trim();
+    let mut parts: Vec<&str> = first.split_whitespace().collect();
+    if parts.is_empty() {
+        return None;
+    }
+    if parts[0].ends_with("/env") || parts[0] == "env" {
+        parts.remove(0);
+        if parts.first() == Some(&"-S") {
+            parts.remove(0);
+        }
+    }
+    let executable = parts.first()?;
+    if !executable.contains("python") {
+        return None;
+    }
+    Some(parts.iter().map(OsString::from).collect())
+}
+
 fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
     let exec = || exec_command("uv", cmd);
+
+    if matches!(cmd.first().map(String::as_str), Some("install" | "i")) {
+        eprintln!("{}", unsupported_uv_install_message(&cmd[1..]));
+        return 1;
+    }
 
     match parse::classify_uv_command(cmd) {
         parse::UvCommand::Passthrough => exec(),
@@ -363,16 +690,32 @@ fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
                 opts,
             )
         }
-        parse::UvCommand::Add { add_args } => run_parsed_install(
-            PackageManager::Uv,
-            "add",
-            add_args,
-            parse::parse_pypi_positionals_args(add_args),
-            exec,
-            opts,
-        ),
+        parse::UvCommand::Add { add_args } => {
+            let parsed = parse::parse_pypi_positionals_args(add_args);
+            if let Some(message) =
+                wrong_package_manager_message(PackageManager::Uv, add_args, &parsed)
+            {
+                eprintln!("{message}");
+                return 1;
+            }
+            run_parsed_install(PackageManager::Uv, "add", add_args, parsed, exec, opts)
+        }
         parse::UvCommand::Sync => run_uv_sync(cmd, opts, exec),
     }
+}
+
+fn unsupported_uv_install_message(rest: &[String]) -> String {
+    let mut parts = vec![
+        "corgea".to_string(),
+        "uv".to_string(),
+        "pip".to_string(),
+        "install".to_string(),
+    ];
+    parts.extend(rest.iter().cloned());
+    format!(
+        "error: uv does not support top-level `install`.\nDid you mean `{}`?",
+        parts.join(" ")
+    )
 }
 
 /// Gate `uv sync` from the project's `uv.lock`. The lockfile is the full
@@ -384,7 +727,7 @@ fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
 /// execute package code before any verdict.
 fn run_uv_sync(cmd: &[String], opts: PrecheckOptions, exec: impl FnOnce() -> i32) -> i32 {
     let Some(cfg) = &opts.verdict else {
-        // Tokenless mode has no verdict to gate with.
+        // Direct callers may still disable verdicts completely.
         return exec();
     };
     let lock = match std::fs::read_to_string("uv.lock") {
@@ -437,9 +780,10 @@ fn run_uv_sync(cmd: &[String], opts: PrecheckOptions, exec: impl FnOnce() -> i32
     } else {
         print_text(&report);
     }
+    warn_public_lookup_failures(&report, &opts);
     if should_block_install(&report, &opts) {
         if !opts.json {
-            print_refusal(&report);
+            print_refusal(&report, &opts);
         }
         return 1;
     }
@@ -494,8 +838,8 @@ fn run_parsed_install(
     let bare_install = parsed.targets.is_empty() && parsed.requirements_files.is_empty();
 
     if parsed.targets.is_empty() && !tree_eligible {
-        // Only a truly bare install gets the bare note — a tokenless
-        // `-r requirements.txt` install is covered by `requirements_note`.
+        // Only a truly bare install gets the bare note. A `-r requirements.txt`
+        // install is covered by `requirements_note`.
         if bare_install {
             bare_install_note(manager, subcommand_label);
         }
@@ -513,7 +857,7 @@ fn run_parsed_install(
     let tree = if tree_eligible {
         Some(run_tree_pass(manager, rest, &parsed, &mut outcomes, &opts))
     } else {
-        run_verdict_pass(manager, &mut outcomes, &opts); // no-op tokenless
+        run_verdict_pass(manager, &mut outcomes, &opts);
         None
     };
 
@@ -524,13 +868,17 @@ fn run_parsed_install(
         );
     }
     // The requirements note only matters when the tree pass did *not* cover
-    // those files (fallback to named-only, or recency-only mode).
+    // those files (fallback to named-only, or verdicts disabled).
     if !matches!(&tree, Some(TreeReport::Full { .. })) {
         requirements_note(&parsed);
     }
-    if opts.verdict.is_none() {
+    if opts
+        .verdict
+        .as_ref()
+        .is_some_and(|cfg| cfg.mode.is_public() && cfg.public_login_hint)
+    {
         eprintln!(
-            "warning: no Corgea token — known-vulnerable packages will NOT be blocked (recency-only). Run 'corgea login' for the full gate."
+            "warning: using public CVE checks; login enables authenticated enforcement and private Corgea intelligence."
         );
     }
 
@@ -549,10 +897,11 @@ fn run_parsed_install(
     } else {
         print_text(&report);
     }
+    warn_public_lookup_failures(&report, &opts);
 
     if should_block_install(&report, &opts) {
         if !opts.json {
-            print_refusal(&report);
+            print_refusal(&report, &opts);
         }
         return 1;
     }
@@ -582,14 +931,14 @@ fn bare_install_note(manager: PackageManager, subcommand_label: &str) {
 /// entirely the existing tree's doing, so say that instead of implying the
 /// package the user typed is at fault. Messaging only; the block decision
 /// stays with `should_block_install`.
-fn print_refusal(report: &PrecheckReport) {
-    if refusal_blames_existing_tree(report) {
+fn print_refusal(report: &PrecheckReport, opts: &PrecheckOptions) {
+    if refusal_blames_existing_tree(report, opts) {
         eprintln!(
             "Refusing to run install: your existing dependency tree has known-vulnerable packages (none were added by this command). Fix them or pass --force."
         );
     } else if report.vulnerable_count() > 0
-        || report.unverifiable_count() > 0
-        || report.error_count() > 0
+        || (authenticated_verdict(opts) && report.unverifiable_count() > 0)
+        || (authenticated_verdict(opts) && report.error_count() > 0)
     {
         eprintln!("Refusing to run install. Pass --force to proceed despite findings.");
     } else {
@@ -606,8 +955,14 @@ fn print_refusal(report: &PrecheckReport) {
 /// that names targets or requirements files is being pulled in by them
 /// right now. Only a truly bare install (`report.bare_install`) or
 /// manifest-declared `PreExisting` findings may blame the existing tree.
-fn refusal_blames_existing_tree(report: &PrecheckReport) -> bool {
-    let named_findings = report.named_vulnerable_count() + report.named_unverifiable_count();
+fn refusal_blames_existing_tree(report: &PrecheckReport, opts: &PrecheckOptions) -> bool {
+    let fail_closed = authenticated_verdict(opts);
+    let named_findings = report.named_vulnerable_count()
+        + if fail_closed {
+            report.named_unverifiable_count()
+        } else {
+            0
+        };
     if report.vulnerable_count() == 0 || named_findings > 0 {
         return false;
     }
@@ -617,10 +972,8 @@ fn refusal_blames_existing_tree(report: &PrecheckReport) -> bool {
     transitive
         .iter()
         .filter(|t| {
-            matches!(
-                t.verdict,
-                VerdictStatus::Vulnerable(_) | VerdictStatus::Unverifiable(_)
-            )
+            matches!(t.verdict, VerdictStatus::Vulnerable(_))
+                || (fail_closed && matches!(t.verdict, VerdictStatus::Unverifiable(_)))
         })
         .all(|t| match t.origin {
             // A locked pin predates the sync command that installs it.
@@ -724,8 +1077,9 @@ const VERDICT_PROGRESS_THRESHOLD: usize = 8;
 /// Max parallel vuln-api verdict requests.
 const VERDICT_CONCURRENCY: usize = 8;
 
-/// Bounded worker pool over the verdict jobs — owns client creation and the
-/// fail-closed policy: on client failure every job comes back `Unverifiable`.
+/// Bounded worker pool over the verdict jobs. On client/request failure every
+/// job comes back `Unverifiable`; `should_block_install` decides whether that
+/// fails closed for the selected mode.
 /// Plain work queue, no new crates; `reqwest::blocking::Client` is
 /// `Send + Sync`. Result order is not preserved; callers match results back
 /// by `(name, version)`.
@@ -768,7 +1122,7 @@ fn verdict_pool(
                 let verdict = match crate::vuln_api::check_package_version(
                     &client,
                     &cfg.base_url,
-                    &cfg.token,
+                    cfg.mode.auth_token(),
                     ecosystem,
                     &manager.normalize_name(&job.name),
                     &job.version,
@@ -836,10 +1190,9 @@ fn apply_verdicts(
 }
 
 /// Vuln-api verdict pass over resolved targets, run through the bounded
-/// worker pool. No-op without a `VerdictConfig` (tokenless mode — `verify_one`
-/// already marked every resolved target `NotChecked`). Any client/call failure
-/// is fail-closed: the target becomes `Unverifiable`, which blocks unless
-/// `--force`.
+/// worker pool. No-op without a `VerdictConfig` (direct recency-only callers).
+/// Any client/call failure becomes `Unverifiable`; authenticated mode blocks
+/// on that and public mode warns but continues.
 fn run_verdict_pass(
     manager: PackageManager,
     outcomes: &mut [TargetOutcome],
@@ -865,16 +1218,35 @@ fn run_verdict_pass(
     apply_verdicts(manager, results, outcomes, &Default::default());
 }
 
+fn authenticated_verdict(opts: &PrecheckOptions) -> bool {
+    opts.verdict
+        .as_ref()
+        .is_some_and(|cfg| cfg.mode.is_authenticated())
+}
+
+fn public_verdict(opts: &PrecheckOptions) -> bool {
+    opts.verdict
+        .as_ref()
+        .is_some_and(|cfg| cfg.mode.is_public())
+}
+
+fn warn_public_lookup_failures(report: &PrecheckReport, opts: &PrecheckOptions) {
+    if public_verdict(opts) && report.unverifiable_count() > 0 {
+        eprintln!("warning: CVE check unavailable; continuing because public mode is fail-open.");
+    }
+}
+
 fn should_block_install(report: &PrecheckReport, opts: &PrecheckOptions) -> bool {
     if opts.force {
         return false;
     }
     // A resolution error means no verdict was obtained for that target, so
-    // in tokened mode it fails closed like `Unverifiable` — otherwise a
+    // in authenticated mode it fails closed like `Unverifiable` — otherwise a
     // registry outage silently bypasses the gate.
+    let fail_closed = authenticated_verdict(opts);
     report.vulnerable_count() > 0
-        || report.unverifiable_count() > 0
-        || (opts.verdict.is_some() && report.error_count() > 0)
+        || (fail_closed && report.unverifiable_count() > 0)
+        || (fail_closed && report.error_count() > 0)
         || (!opts.no_fail && report.recent_count() > 0)
 }
 
@@ -1303,13 +1675,18 @@ fn verdict_json(verdict: &VerdictStatus) -> serde_json::Value {
             json!({ "status": "unverifiable", "error": error })
         }
         VerdictStatus::NotChecked => {
-            json!({ "status": "not_checked", "reason": NO_TOKEN_REASON })
+            json!({ "status": "not_checked", "reason": NO_VERDICT_REASON })
         }
     }
 }
 
 fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
     use serde_json::json;
+    let verdict_mode = match opts.verdict.as_ref().map(|cfg| &cfg.mode) {
+        Some(VerdictMode::Public) => "public",
+        Some(VerdictMode::Authenticated { .. }) => "authenticated",
+        None => "recency-only",
+    };
     let outcomes: Vec<_> = report
         .outcomes
         .iter()
@@ -1359,7 +1736,7 @@ fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
             "skipped": report.skipped_count(),
             "errors": report.error_count(),
         },
-        "verdict_mode": if opts.verdict.is_some() { "full" } else { "recency-only" },
+        "verdict_mode": verdict_mode,
         "results": outcomes,
         "tree": report.tree.as_ref().map(|t| match t {
             TreeReport::Full { resolved_count, transitive } => json!({
@@ -1459,7 +1836,10 @@ source = { git = "https://example.com/repo?rev=abc#abc" }
         PrecheckOptions {
             verdict: Some(VerdictConfig {
                 base_url: base_url.to_string(),
-                token: "test-token".to_string(),
+                mode: VerdictMode::Authenticated {
+                    token: "test-token".to_string(),
+                },
+                public_login_hint: false,
             }),
             ..stub_opts()
         }
@@ -1584,17 +1964,39 @@ source = { git = "https://example.com/repo?rev=abc#abc" }
         assert_eq!(PackageManager::Npm.normalize_name("Left_Pad"), "Left_Pad");
     }
 
-    /// Full predicate matrix: force ⇒ never block; vulnerable and
-    /// unverifiable block regardless of --no-fail; recency keeps its
-    /// task-2 --no-fail demotion.
-    #[test]
-    fn block_predicate_matrix() {
-        let opts = |no_fail: bool, force: bool| PrecheckOptions {
+    fn public_opts(no_fail: bool, force: bool) -> PrecheckOptions {
+        PrecheckOptions {
             no_fail,
             force,
+            verdict: Some(VerdictConfig {
+                base_url: "http://127.0.0.1:9".to_string(),
+                mode: VerdictMode::Public,
+                public_login_hint: true,
+            }),
             ..stub_opts()
-        };
+        }
+    }
 
+    fn authenticated_opts(no_fail: bool, force: bool) -> PrecheckOptions {
+        PrecheckOptions {
+            no_fail,
+            force,
+            verdict: Some(VerdictConfig {
+                base_url: "http://127.0.0.1:9".to_string(),
+                mode: VerdictMode::Authenticated {
+                    token: "test-token".to_string(),
+                },
+                public_login_hint: false,
+            }),
+            ..stub_opts()
+        }
+    }
+
+    /// Predicate matrix: force ⇒ never block; vulnerable blocks in every
+    /// verdict mode; unverifiable/error findings block only in authenticated
+    /// mode; recency keeps its task-2 --no-fail demotion.
+    #[test]
+    fn block_predicate_matrix() {
         let clean = {
             let mut o = resolved_outcome("pkg", "1.0.0", false);
             set_verdict(&mut o, VerdictStatus::Clean);
@@ -1611,25 +2013,59 @@ source = { git = "https://example.com/repo?rev=abc#abc" }
             set_verdict(&mut o, VerdictStatus::Unverifiable("503".to_string()));
             report_with(vec![o])
         };
+        let resolution_error = report_with(vec![TargetOutcome::Error {
+            target: InstallTarget {
+                name: "pkg".to_string(),
+                display: "pkg==1.0.0".to_string(),
+                kind: TargetKind::Unverifiable {
+                    reason: "test".to_string(),
+                },
+            },
+            error: "registry unavailable".to_string(),
+        }]);
 
-        assert!(!should_block_install(&clean, &opts(false, false)));
-        assert!(should_block_install(&recent, &opts(false, false)));
-        assert!(!should_block_install(&recent, &opts(true, false)));
-        assert!(should_block_install(&vulnerable, &opts(false, false)));
+        assert!(!should_block_install(&clean, &public_opts(false, false)));
+        assert!(should_block_install(&recent, &public_opts(false, false)));
+        assert!(!should_block_install(&recent, &public_opts(true, false)));
+        assert!(should_block_install(
+            &vulnerable,
+            &public_opts(false, false)
+        ));
         assert!(
-            should_block_install(&vulnerable, &opts(true, false)),
+            should_block_install(&vulnerable, &public_opts(true, false)),
             "--no-fail must not waive a vulnerable block"
         );
         assert!(
-            should_block_install(&unverifiable, &opts(true, false)),
-            "--no-fail must not waive an unverifiable block"
+            !should_block_install(&unverifiable, &public_opts(false, false)),
+            "public mode must fail open on lookup errors"
         );
-        for report in [&clean, &recent, &vulnerable, &unverifiable] {
+        assert!(
+            should_block_install(&unverifiable, &authenticated_opts(true, false)),
+            "authenticated mode must fail closed on lookup errors"
+        );
+        assert!(
+            !should_block_install(&resolution_error, &public_opts(false, false)),
+            "public mode must fail open when no verdict can be obtained"
+        );
+        assert!(
+            should_block_install(&resolution_error, &authenticated_opts(false, false)),
+            "authenticated mode must fail closed when no verdict can be obtained"
+        );
+        for report in [
+            &clean,
+            &recent,
+            &vulnerable,
+            &unverifiable,
+            &resolution_error,
+        ] {
             assert!(
-                !should_block_install(report, &opts(false, true)),
+                !should_block_install(report, &public_opts(false, true)),
                 "--force must never block"
             );
-            assert!(!should_block_install(report, &opts(true, true)));
+            assert!(!should_block_install(
+                report,
+                &authenticated_opts(true, true)
+            ));
         }
     }
 
@@ -1736,7 +2172,10 @@ source = { git = "https://example.com/repo?rev=abc#abc" }
 
         let cfg = VerdictConfig {
             base_url: stub.base_url.clone(),
-            token: "test-token".to_string(),
+            mode: VerdictMode::Authenticated {
+                token: "test-token".to_string(),
+            },
+            public_login_hint: false,
         };
 
         let jobs: Vec<tree::TreePackage> = ["a", "b", "evil", "c", "d", "e"]
@@ -1838,12 +2277,6 @@ source = { git = "https://example.com/repo?rev=abc#abc" }
     #[test]
     fn safe_version_empty_matches_is_none() {
         assert_eq!(safe_version(&[]), None);
-    }
-
-    fn vulnerable_outcome(name: &str, version: &str, fixed: Option<&str>) -> TargetOutcome {
-        let mut o = resolved_outcome(name, version, false);
-        set_verdict(&mut o, VerdictStatus::Vulnerable(vec![vm("A-1", fixed)]));
-        o
     }
 
     #[test]
@@ -1990,7 +2423,7 @@ source = { git = "https://example.com/repo?rev=abc#abc" }
                 transitive: vec![tree_vulnerable(origin)],
             });
             assert_eq!(
-                refusal_blames_existing_tree(&report),
+                refusal_blames_existing_tree(&report, &authenticated_opts(false, false)),
                 blames_tree,
                 "origin {origin:?}, with_named {with_named}, bare {bare_install}"
             );
@@ -2033,13 +2466,23 @@ source = { git = "https://example.com/repo?rev=abc#abc" }
         // command, so "none were added by this command" would lie.
         let mut report = report_with(vec![resolved_outcome("cleanpkg", "1.0.0", false)]);
         report.tree = mixed_tree();
-        assert!(!refusal_blames_existing_tree(&report));
+        assert!(!refusal_blames_existing_tree(
+            &report,
+            &authenticated_opts(false, false)
+        ));
+        assert!(refusal_blames_existing_tree(
+            &report,
+            &public_opts(false, false)
+        ));
 
         // Bare install: nothing named, everything resolved predates the
         // command — the mixed findings still blame the existing tree.
         let mut report = report_with(vec![]);
         report.bare_install = true;
         report.tree = mixed_tree();
-        assert!(refusal_blames_existing_tree(&report));
+        assert!(refusal_blames_existing_tree(
+            &report,
+            &authenticated_opts(false, false)
+        ));
     }
 }

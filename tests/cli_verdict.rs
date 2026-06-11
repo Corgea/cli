@@ -1,5 +1,5 @@
 //! Hermetic e2e tests for the install-gate vuln-api verdict
-//! (`corgea pip install …` with a token + `CORGEA_VULN_API_URL` stub).
+//! (`corgea pip install …` with public/authenticated `CORGEA_VULN_API_URL` stubs).
 //!
 //! Composes the `cli_install.rs` harness pattern (fake package manager on a
 //! private PATH + local pypi registry stub) with the in-crate vuln-api stub —
@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{key, vulnerable_body, PipHarness};
+use common::{header_value, key, spawn_capturing_vuln_api_stub, vulnerable_body, PipHarness};
 use std::collections::HashMap;
 
 fn vulnerable_oldpkg_body() -> String {
@@ -92,11 +92,12 @@ fn force_overrides_vulnerable_block_and_propagates_exit_code() {
 }
 
 #[test]
-fn resolution_error_fails_closed_with_token() {
+fn resolution_error_fails_closed_when_authenticated() {
     // The wildcard registry stub only knows version 1.0.0, so `==2.0.0`
-    // is a resolution error: no verdict was obtained, and with a token
-    // that must block — otherwise a registry outage bypasses the gate.
+    // is a resolution error: no verdict was obtained, and authenticated
+    // mode must block — otherwise a registry outage bypasses the gate.
     let mut h = PipHarness::new(HashMap::new(), HashMap::new(), Some("test-token"), 0);
+    h.cmd.env("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL", "1");
     let out = h
         .cmd
         .args(["pip", "install", "nosuchpkg==2.0.0"])
@@ -105,7 +106,7 @@ fn resolution_error_fails_closed_with_token() {
     assert_eq!(
         out.status.code(),
         Some(1),
-        "a resolution error must fail closed in tokened mode"
+        "a resolution error must fail closed in authenticated mode"
     );
     assert_eq!(h.recorded_argv(), None);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -121,6 +122,7 @@ fn verdict_503_fails_closed() {
     let mut statuses = HashMap::new();
     statuses.insert(key("pypi", "oldpkg", "1.0.0"), 503u16);
     let mut h = PipHarness::new(HashMap::new(), statuses, Some("test-token"), 0);
+    h.cmd.env("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL", "1");
     let out = h
         .cmd
         .args(["pip", "install", "oldpkg==1.0.0"])
@@ -129,7 +131,7 @@ fn verdict_503_fails_closed() {
     assert_eq!(
         out.status.code(),
         Some(1),
-        "unverifiable must block (fail-closed)"
+        "authenticated unverifiable must block (fail-closed)"
     );
     assert_eq!(h.recorded_argv(), None);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -137,8 +139,8 @@ fn verdict_503_fails_closed() {
 }
 
 #[test]
-fn tokenless_degrades_to_recency_only_with_login_prompt() {
-    // Stub would flag oldpkg, but with no token it must never be consulted.
+fn tokenless_public_check_blocks_vulnerable_pin() {
+    // No token still runs public CVE checks and blocks a vulnerable verdict.
     let mut checks = HashMap::new();
     checks.insert(key("pypi", "oldpkg", "1.0.0"), vulnerable_oldpkg_body());
     let mut h = PipHarness::new(checks, HashMap::new(), None, 0);
@@ -149,18 +151,43 @@ fn tokenless_degrades_to_recency_only_with_login_prompt() {
         .expect("run corgea");
     assert_eq!(
         out.status.code(),
+        Some(1),
+        "public CVE checks must block vulnerable packages"
+    );
+    assert_eq!(h.recorded_argv(), None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("MAL-2024-0001"), "stdout: {stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("using public CVE checks"),
+        "tokenless mode must disclose public CVE checks: {stderr}"
+    );
+    assert!(
+        stderr.contains("authenticated enforcement")
+            && stderr.contains("private Corgea intelligence"),
+        "tokenless warning must name the authenticated benefit: {stderr}"
+    );
+}
+
+#[test]
+fn tokenless_vuln_api_outage_warns_but_installs() {
+    let mut h = PipHarness::new(HashMap::new(), HashMap::new(), None, 0);
+    h.cmd.env("CORGEA_VULN_API_URL", "http://127.0.0.1:1");
+    let out = h
+        .cmd
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(
+        out.status.code(),
         Some(0),
-        "old + unchecked package must install"
+        "public lookup outage must fail open"
     );
     assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg==1.0.0"));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("corgea login"),
-        "tokenless mode must prompt for login: {stderr}"
-    );
-    assert!(
-        stderr.contains("warning: no Corgea token") && stderr.contains("will NOT be blocked"),
-        "tokenless warning must state the consequence: {stderr}"
+        stderr.contains("CVE check unavailable; continuing because public mode is fail-open"),
+        "stderr: {stderr}"
     );
 }
 
@@ -200,6 +227,7 @@ fn outage_noise_collapses_above_three_unverifiable() {
     // one collapsed line; counts and fail-closed exit code unchanged.
     let mut h = PipHarness::new(HashMap::new(), HashMap::new(), Some("test-token"), 0);
     h.cmd.env("CORGEA_VULN_API_URL", "http://127.0.0.1:1");
+    h.cmd.env("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL", "1");
     let out = h
         .cmd
         .args([
@@ -231,6 +259,7 @@ fn outage_noise_collapses_above_three_unverifiable() {
     // Three findings stay per-line — no collapse at the threshold.
     let mut h = PipHarness::new(HashMap::new(), HashMap::new(), Some("test-token"), 0);
     h.cmd.env("CORGEA_VULN_API_URL", "http://127.0.0.1:1");
+    h.cmd.env("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL", "1");
     let out = h
         .cmd
         .args([
@@ -269,7 +298,7 @@ fn json_carries_verdict_object_and_mode() {
     assert_eq!(h.recorded_argv(), None);
     let parsed: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
-    assert_eq!(parsed["verdict_mode"], "full");
+    assert_eq!(parsed["verdict_mode"], "public");
     assert_eq!(parsed["results"][0]["verdict"]["status"], "vulnerable");
     assert_eq!(
         parsed["results"][0]["verdict"]["matches"][0]["advisory_id"],
@@ -280,4 +309,43 @@ fn json_carries_verdict_object_and_mode() {
         "2.0.0"
     );
     assert_eq!(parsed["summary"]["vulnerable"], 1);
+}
+
+#[test]
+fn custom_vuln_api_url_with_token_does_not_send_token_by_default() {
+    let (base_url, requests) = spawn_capturing_vuln_api_stub();
+    let mut h = PipHarness::new(HashMap::new(), HashMap::new(), Some("opaque-token"), 0);
+    h.cmd.env("CORGEA_VULN_API_URL", &base_url);
+    let out = h
+        .cmd
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    let captured = requests.lock().unwrap();
+    let request = captured.first().expect("one vuln-api request");
+    assert!(header_value(request, "Authorization").is_none());
+    assert!(header_value(request, "CORGEA-TOKEN").is_none());
+}
+
+#[test]
+fn custom_vuln_api_url_sends_token_only_with_opt_in() {
+    let (base_url, requests) = spawn_capturing_vuln_api_stub();
+    let mut h = PipHarness::new(HashMap::new(), HashMap::new(), Some("opaque-token"), 0);
+    h.cmd
+        .env("CORGEA_VULN_API_URL", &base_url)
+        .env("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL", "1");
+    let out = h
+        .cmd
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    let captured = requests.lock().unwrap();
+    let request = captured.first().expect("one vuln-api request");
+    assert_eq!(
+        header_value(request, "CORGEA-TOKEN").as_deref(),
+        Some("opaque-token")
+    );
+    assert!(header_value(request, "Authorization").is_none());
 }

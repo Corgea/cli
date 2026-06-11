@@ -86,33 +86,33 @@ fn encode_package_name(ecosystem: &str, name: &str) -> String {
     }
 }
 
-/// Build an authed JSON GET: the standard `Accept` / `CORGEA-SOURCE` headers
-/// plus the per-call auth header (JWT → `Authorization: Bearer`, otherwise
-/// `CORGEA-TOKEN`). The single place auth is attached, shared by every route.
-fn build_authed_get(
+/// Build a JSON GET: the standard `Accept` / `CORGEA-SOURCE` headers plus,
+/// when present, the per-call auth header (JWT → `Authorization: Bearer`,
+/// otherwise `CORGEA-TOKEN`). The single place auth is attached, shared by
+/// every route.
+fn build_json_get(
     client: &reqwest::blocking::Client,
     url: &str,
-    token: &str,
+    token: Option<&str>,
 ) -> reqwest::blocking::RequestBuilder {
     let mut req = client
         .get(url)
         .header("Accept", "application/json")
         .header("CORGEA-SOURCE", "cli");
-    if is_jwt(token) {
-        req = req.header("Authorization", format!("Bearer {}", token));
-    } else {
-        req = req.header("CORGEA-TOKEN", token);
+    if let Some(token) = token {
+        if is_jwt(token) {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        } else {
+            req = req.header("CORGEA-TOKEN", token);
+        }
     }
     req
 }
 
 /// Validate the per-call preconditions shared by every vuln-api request:
-/// a non-empty token and a non-empty (trailing-slash-normalized) base URL.
-/// Returns the normalized base so callers don't re-derive it.
-fn validated_base(token: &str, base_url: &str) -> Result<String, Box<dyn std::error::Error>> {
-    if token.is_empty() {
-        return Err("missing Corgea token for vuln-api request".into());
-    }
+/// a non-empty (trailing-slash-normalized) base URL. Returns the normalized
+/// base so callers don't re-derive it.
+fn validated_base(base_url: &str) -> Result<String, Box<dyn std::error::Error>> {
     let base = normalize_base_url(base_url);
     if base.is_empty() {
         return Err("vuln-api base URL is empty".into());
@@ -163,16 +163,16 @@ fn retry_after_seconds(response: &reqwest::blocking::Response) -> u64 {
 fn send_package_check_with_429_retry(
     client: &reqwest::blocking::Client,
     url: &str,
-    token: &str,
+    token: Option<&str>,
 ) -> Result<reqwest::blocking::Response, Box<dyn std::error::Error>> {
-    let response = build_authed_get(client, url, token)
+    let response = build_json_get(client, url, token)
         .send()
         .map_err(|e| format!("Failed to send vuln-api request: {}", e))?;
 
     if response.status().as_u16() == 429 {
         let wait = retry_after_seconds(&response);
         std::thread::sleep(Duration::from_secs(wait));
-        return build_authed_get(client, url, token)
+        return build_json_get(client, url, token)
             .send()
             .map_err(|e| format!("Failed to send vuln-api request: {}", e).into());
     }
@@ -182,12 +182,12 @@ fn send_package_check_with_429_retry(
 pub fn check_package_version(
     client: &reqwest::blocking::Client,
     base_url: &str,
-    token: &str,
+    token: Option<&str>,
     ecosystem: &str,
     name: &str,
     version: &str,
 ) -> Result<VulnCheckResponse, Box<dyn std::error::Error>> {
-    let base = validated_base(token, base_url)?;
+    let base = validated_base(base_url)?;
     let encoded_name = encode_package_name(ecosystem, name);
     let encoded_version = urlencoding::encode(version);
     let url = format!(
@@ -202,9 +202,12 @@ pub fn check_package_version(
     let status = response.status();
     match status.as_u16() {
         401 => {
-            return Err(
-                "vuln-api rejected the Corgea token (run `corgea login` to refresh)".into(),
-            );
+            if token.is_some() {
+                return Err(
+                    "vuln-api rejected the Corgea token (run `corgea login` to refresh)".into(),
+                );
+            }
+            return Err("vuln-api requires authentication".into());
         }
         403 => {
             return Err("vuln-api access denied (check your Corgea plan/permissions)".into());
@@ -299,11 +302,76 @@ mod tests {
         check_package_version(
             &client,
             &stub.base_url,
-            "test-token",
+            Some("test-token"),
             "npm",
             "lodash",
             "4.17.20",
         )
+    }
+
+    fn header_value(request: &str, name: &str) -> Option<String> {
+        request
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.trim().is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim().to_string())
+    }
+
+    fn captured_request(auth_token: Option<&str>) -> String {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind capture stub");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let buf = crate::vuln_api_stub::read_http_request(&mut stream);
+            let request = String::from_utf8_lossy(&buf).into_owned();
+            tx.send(request).expect("send captured request");
+            let body = r#"{"ecosystem":"npm","package_name":"lodash","version":"4.17.20","is_vulnerable":false,"matches":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let client = http_client().expect("test client");
+        check_package_version(&client, &base_url, auth_token, "npm", "lodash", "4.17.20")
+            .expect("captured request should succeed");
+        rx.recv().expect("captured request")
+    }
+
+    #[test]
+    fn public_check_sends_no_auth_headers() {
+        let request = captured_request(None);
+        assert!(header_value(&request, "Authorization").is_none());
+        assert!(header_value(&request, "CORGEA-TOKEN").is_none());
+    }
+
+    #[test]
+    fn jwt_auth_sends_authorization_bearer() {
+        let request = captured_request(Some("aaa.bbb.ccc"));
+        assert_eq!(
+            header_value(&request, "Authorization").as_deref(),
+            Some("Bearer aaa.bbb.ccc")
+        );
+        assert!(header_value(&request, "CORGEA-TOKEN").is_none());
+    }
+
+    #[test]
+    fn opaque_auth_sends_corgea_token() {
+        let request = captured_request(Some("opaque-token"));
+        assert_eq!(
+            header_value(&request, "CORGEA-TOKEN").as_deref(),
+            Some("opaque-token")
+        );
+        assert!(header_value(&request, "Authorization").is_none());
     }
 
     #[test]
@@ -361,7 +429,7 @@ mod tests {
         let resp = check_package_version(
             &client,
             &stub.base_url,
-            "test-token",
+            Some("test-token"),
             "npm",
             "lodash",
             "4.17.20",

@@ -158,6 +158,7 @@ fn preexisting_vulnerable_with_unverifiable_transitive_keeps_generic_refusal() {
     let mut statuses = HashMap::new();
     statuses.insert(key("npm", "newdep", "2.0.0"), 503u16);
     let mut h = TreeHarness::new("npm", checks, statuses, LOCK_WITH_NEWDEP);
+    h.cmd.env("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL", "1");
     let out = h
         .cmd
         .current_dir(project.path())

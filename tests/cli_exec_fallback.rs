@@ -97,6 +97,32 @@ fn pip_missing_both_pip_and_pip3_exits_127_with_message() {
 }
 
 #[test]
+fn pip3_top_level_command_prints_pip_wrapper_suggestion() {
+    let mut h = FallbackHarness::new(&["pip3"]);
+    let out = h
+        .cmd
+        .args(["pip3", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None, "pip3 must not run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error: unknown package manager `pip3`."),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Did you mean `corgea pip install oldpkg==1.0.0`?"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).is_empty(),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
 fn npm_missing_binary_error_names_binary_without_fallback() {
     let mut h = FallbackHarness::new(&[]);
     let out = h.cmd.args(["npm", "list"]).output().expect("run corgea");

@@ -24,6 +24,7 @@ pub fn corgea_isolated() -> (Command, TempDir) {
         .env_remove("CORGEA_NPM_REGISTRY")
         .env_remove("CORGEA_PYPI_REGISTRY")
         .env_remove("CORGEA_VULN_API_URL")
+        .env_remove("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL")
         .env_remove("AI_AGENT")
         .env_remove("CODEX_SANDBOX")
         .env_remove("CLAUDECODE")
@@ -129,6 +130,62 @@ where
         }
     });
     base_url
+}
+
+/// Vuln-api stub that records raw requests and answers every package check
+/// with a clean verdict. Used to assert auth-header behavior from the CLI.
+#[allow(dead_code)]
+pub fn spawn_capturing_vuln_api_stub() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind capture stub");
+    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_in_stub = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let buf = corgea::vuln_api_stub::read_http_request(&mut stream);
+            let req = String::from_utf8_lossy(&buf).into_owned();
+            requests_in_stub.lock().unwrap().push(req.clone());
+            let path = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("");
+            let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+            let (eco, name, ver) = if parts.len() >= 7 {
+                (parts[2], parts[3], parts[5])
+            } else {
+                ("pypi", "unknown", "0.0.0")
+            };
+            let name = urlencoding::decode(name).unwrap_or_default();
+            let ver = urlencoding::decode(ver).unwrap_or_default();
+            let body = format!(
+                r#"{{"ecosystem":"{eco}","package_name":"{name}","version":"{ver}","is_vulnerable":false,"matches":[]}}"#
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (base_url, requests)
+}
+
+#[allow(dead_code)]
+pub fn header_value(request: &str, name: &str) -> Option<String> {
+    request
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim().to_string())
 }
 
 /// Registry stub serving `/pypi/oldpkg/json` (pypi) and `/oldpkg` (npm
@@ -279,7 +336,7 @@ pub struct PipHarness {
 #[cfg(unix)]
 #[allow(dead_code)]
 impl PipHarness {
-    /// `token: None` exercises tokenless mode (no CORGEA_TOKEN set).
+    /// `token: None` exercises public mode (no CORGEA_TOKEN set).
     pub fn new(
         checks: HashMap<PackageKey, String>,
         statuses: HashMap<PackageKey, u16>,

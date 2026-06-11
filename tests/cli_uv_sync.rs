@@ -1,8 +1,8 @@
 //! Hermetic e2e tests for the `corgea uv sync` gate.
 //!
-//! With a token, `uv sync` is gated from the project's `uv.lock`: every
+//! `uv sync` is gated from the project's `uv.lock`: every
 //! index-sourced pin is verdicted against the vuln-api stub before uv runs.
-//! Without a lockfile (or without a token) it execs behind an honest note.
+//! Without a lockfile it execs behind an honest note.
 //! Harness: fake `uv` argv recorder on a private PATH + in-crate vuln-api
 //! stub + throwaway project dir as cwd. No registry stub — the sync gate
 //! does no recency resolution.
@@ -171,13 +171,18 @@ fn uv_sync_malformed_lockfile_fails_closed() {
 }
 
 #[test]
-fn uv_sync_tokenless_passes_through() {
+fn uv_sync_tokenless_runs_public_lock_check() {
     let mut h = SyncHarness::new(HashMap::new()).with_uv_lock(UV_LOCK);
     h.cmd.env_remove("CORGEA_TOKEN");
     let out = h.cmd.args(["uv", "sync"]).output().expect("run corgea");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(h.recorded_argv().as_deref(), Some("sync"));
-    assert!(!String::from_utf8_lossy(&out.stdout).contains("Pre-checking"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Pre-checking"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("tree: 1 packages resolved"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]

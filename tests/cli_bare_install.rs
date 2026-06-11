@@ -1,6 +1,6 @@
 //! Hermetic e2e tests for zero-spec ("bare") installs.
 //!
-//! With a token and a `package.json`, bare `npm install` is gated like any
+//! With a `package.json`, bare `npm install` is gated like any
 //! other install: the tree pass resolves the full lockfile set and verdicts
 //! every package, so a vulnerable lockfile blocks (exit 1, `--force` escape).
 //! Bare yarn/pnpm/uv installs have no safe dry-run — they exec unchecked
@@ -202,15 +202,19 @@ fn bare_npm_without_package_json_passes_through() {
 }
 
 #[test]
-fn bare_npm_tokenless_passes_through() {
-    // package.json present but no token → recency-only mode has no tree pass;
-    // bare install execs untouched.
+fn bare_npm_tokenless_runs_public_tree_check() {
+    // package.json present but no token → public mode still verdicts the tree.
     let mut h = BareHarness::new("npm", HashMap::new(), Some(NPM_LOCK), 0).with_package_json();
     h.cmd.env_remove("CORGEA_TOKEN");
     let out = h.cmd.args(["npm", "install"]).output().expect("run corgea");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(h.recorded_argv().as_deref(), Some("install"));
-    assert!(!String::from_utf8_lossy(&out.stdout).contains("Pre-checking"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Pre-checking"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("tree: 2 packages resolved"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]

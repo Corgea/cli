@@ -21,7 +21,8 @@ pip install corgea-cli
 You can get the latest binaries for your OS from https://github.com/Corgea/cli/releases.
 
 ### Setup
-Once the binary is installed, login with your token from the Corgea app.
+Once the binary is installed, login with your token from the Corgea app to enable
+authenticated enforcement and private Corgea intelligence.
 ```
 corgea login <token>
 ```
@@ -49,6 +50,19 @@ corgea deps policy init --exist-ok     # write starter policy, or keep existing 
 `corgea deps` defaults to `--format agent` when an agent environment is detected (`AI_AGENT`, `CODEX_SANDBOX`, `CLAUDECODE`, and related agent variables). Use `--format human` to force the normal terminal output.
 
 See [Dependency Scanning (CLI)](https://docs.corgea.app/cli/deps) for the full flag and exit-code reference.
+
+## Install Wrappers
+
+`corgea pip|npm|yarn|pnpm|uv <args...>` runs package-manager install commands
+through Corgea's install gate. Baseline CVE checks need no token: known vulnerable
+or malicious package versions block, while vuln-api lookup outages warn and
+continue in public fail-open mode.
+
+Logging in enables authenticated enforcement against the default Corgea vuln-api,
+including fail-closed behavior for lookup failures and any private Corgea
+intelligence. A custom `CORGEA_VULN_API_URL` is public by default, even when
+`CORGEA_TOKEN` exists. Set `CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` to send
+the token to a custom URL and make lookup failures fail closed.
 
 ## Development Setup
 

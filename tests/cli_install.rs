@@ -14,9 +14,10 @@
 mod common;
 
 use common::{
-    corgea_isolated, spawn_http_stub, write_fake_recorder, NOT_FOUND_JSON, OLDPKG_NPM_PACKUMENT,
-    OLDPKG_PYPI_JSON,
+    corgea_isolated, spawn_http_stub, write_fake_recorder, write_fake_tree_pm, write_script,
+    NOT_FOUND_JSON, OLDPKG_NPM_PACKUMENT, OLDPKG_PYPI_JSON, RESOLUTION_FAILS,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -70,6 +71,7 @@ struct WrapperHarness {
     registry_hits: Arc<AtomicUsize>,
     _home: TempDir,
     _bin: TempDir,
+    _vuln_stub: corgea::vuln_api_stub::VulnApiStub,
 }
 
 impl WrapperHarness {
@@ -79,15 +81,50 @@ impl WrapperHarness {
         let (mut cmd, home) = corgea_isolated();
         let bin = TempDir::new().expect("temp bin dir");
         let marker = bin.path().join("pm-argv.txt");
-        write_fake_recorder(bin.path(), binary, &marker, pm_exit_code);
+        match binary {
+            "npm" | "pip" => {
+                write_fake_tree_pm(bin.path(), binary, &marker, RESOLUTION_FAILS, pm_exit_code)
+            }
+            _ => write_fake_recorder(bin.path(), binary, &marker, pm_exit_code),
+        }
         let (base_url, registry_hits) = spawn_registry_stub();
-        cmd.env("PATH", bin.path()).env(registry_env, &base_url);
+        let vuln_stub = corgea::vuln_api_stub::spawn_with_statuses(HashMap::new(), HashMap::new());
+        cmd.env("PATH", bin.path())
+            .env(registry_env, &base_url)
+            .env("CORGEA_VULN_API_URL", &vuln_stub.base_url);
         Self {
             cmd,
             marker,
             registry_hits,
             _home: home,
             _bin: bin,
+            _vuln_stub: vuln_stub,
+        }
+    }
+
+    fn new_externally_managed_pip() -> Self {
+        let (mut cmd, home) = corgea_isolated();
+        let bin = TempDir::new().expect("temp bin dir");
+        let marker = bin.path().join("pm-argv.txt");
+        let fake_python = bin.path().join("python-managed");
+        let python_script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then printf '1\\n'; exit 0; fi\nprintf '%s' \"$*\" > '{}'\nexit 0\n",
+            marker.display()
+        );
+        write_script(bin.path(), "python-managed", &python_script);
+        write_script(bin.path(), "pip", &format!("#!{}\n", fake_python.display()));
+        let (base_url, registry_hits) = spawn_registry_stub();
+        let vuln_stub = corgea::vuln_api_stub::spawn_with_statuses(HashMap::new(), HashMap::new());
+        cmd.env("PATH", bin.path())
+            .env("CORGEA_PYPI_REGISTRY", &base_url)
+            .env("CORGEA_VULN_API_URL", &vuln_stub.base_url);
+        Self {
+            cmd,
+            marker,
+            registry_hits,
+            _home: home,
+            _bin: bin,
+            _vuln_stub: vuln_stub,
         }
     }
 
@@ -177,6 +214,67 @@ fn pip_non_install_subcommand_passes_through_without_registry_hit() {
 }
 
 #[test]
+fn pip_add_blocks_with_install_suggestion_without_running_pip() {
+    let mut h = WrapperHarness::new("pip", "CORGEA_PYPI_REGISTRY", 0);
+    let out = h
+        .cmd
+        .args(["pip", "add", "oldpkg"])
+        .output()
+        .expect("failed to run corgea");
+
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None, "pip must not run");
+    assert_eq!(
+        h.registry_hits.load(Ordering::SeqCst),
+        0,
+        "invalid pip command must not touch the registry"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error: pip does not support `add`."),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Did you mean `corgea pip install oldpkg`?"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn externally_managed_pip_blocks_before_registry_checks() {
+    let mut h = WrapperHarness::new_externally_managed_pip();
+    let out = h
+        .cmd
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("failed to run corgea");
+
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None, "pip must not run");
+    assert_eq!(
+        h.registry_hits.load(Ordering::SeqCst),
+        0,
+        "externally-managed preflight must run before registry checks"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).is_empty(),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error: this Python environment is externally managed (PEP 668)."),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Create and activate a virtualenv, then retry `corgea pip install oldpkg==1.0.0`."
+        ),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn pip_json_reports_fresh_pin_as_recent() {
     let mut h = WrapperHarness::new("pip", "CORGEA_PYPI_REGISTRY", 0);
     let out = h
@@ -196,7 +294,7 @@ fn pip_json_reports_fresh_pin_as_recent() {
 #[test]
 fn pip_resolution_error_prints_error_but_install_proceeds() {
     // `nosuchpkg` hits the stub's 404 route → an error outcome, which
-    // warns but does not block in tokenless mode (tokened mode fails
+    // warns but does not block in public mode (authenticated mode fails
     // closed — see cli_verdict.rs) — the install must still run.
     let mut h = WrapperHarness::new("pip", "CORGEA_PYPI_REGISTRY", 0);
     let out = h
@@ -277,6 +375,249 @@ fn npm_old_pin_runs_install_with_forwarded_args() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg@1.0.0"));
+}
+
+#[test]
+fn npm_in_pnpm_lock_project_blocks_with_pnpm_add_suggestion() {
+    let mut h = WrapperHarness::new("npm", "CORGEA_NPM_REGISTRY", 0);
+    let project = TempDir::new().expect("project dir");
+    std::fs::write(project.path().join("package.json"), r#"{"name":"proj"}"#)
+        .expect("write package.json");
+    std::fs::write(
+        project.path().join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    )
+    .expect("write pnpm lock");
+
+    let out = h
+        .cmd
+        .current_dir(project.path())
+        .args(["npm", "i", "oldpkg"])
+        .output()
+        .expect("failed to run corgea");
+
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None, "npm must not run");
+    assert_eq!(
+        h.registry_hits.load(Ordering::SeqCst),
+        0,
+        "wrong-manager guard must run before registry checks"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error: this project appears to use pnpm, but you ran npm."),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Did you mean `corgea pnpm add oldpkg`?"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn package_manager_field_beats_missing_lockfile_for_node_guard() {
+    let mut h = WrapperHarness::new("npm", "CORGEA_NPM_REGISTRY", 0);
+    let project = TempDir::new().expect("project dir");
+    std::fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"proj","packageManager":"pnpm@9.12.0"}"#,
+    )
+    .expect("write package.json");
+
+    let out = h
+        .cmd
+        .current_dir(project.path())
+        .args(["npm", "install", "oldpkg"])
+        .output()
+        .expect("failed to run corgea");
+
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None, "npm must not run");
+    assert_eq!(h.registry_hits.load(Ordering::SeqCst), 0);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Did you mean `corgea pnpm add oldpkg`?"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn conflicting_node_lockfiles_do_not_block_as_wrong_manager() {
+    let mut h = WrapperHarness::new("npm", "CORGEA_NPM_REGISTRY", 0);
+    let project = TempDir::new().expect("project dir");
+    std::fs::write(project.path().join("package.json"), r#"{"name":"proj"}"#)
+        .expect("write package.json");
+    std::fs::write(project.path().join("package-lock.json"), "{}").expect("write npm lock");
+    std::fs::write(
+        project.path().join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    )
+    .expect("write pnpm lock");
+
+    let out = h
+        .cmd
+        .current_dir(project.path())
+        .args(["npm", "install", "oldpkg@1.0.0"])
+        .output()
+        .expect("failed to run corgea");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg@1.0.0"));
+    assert!(
+        h.registry_hits.load(Ordering::SeqCst) >= 1,
+        "the normal install gate should still run"
+    );
+}
+
+#[test]
+fn pip_in_uv_lock_project_blocks_with_uv_add_suggestion() {
+    let mut h = WrapperHarness::new("pip", "CORGEA_PYPI_REGISTRY", 0);
+    let project = TempDir::new().expect("project dir");
+    std::fs::write(project.path().join("uv.lock"), "version = 1\n").expect("write uv lock");
+
+    let out = h
+        .cmd
+        .current_dir(project.path())
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("failed to run corgea");
+
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None, "pip must not run");
+    assert_eq!(h.registry_hits.load(Ordering::SeqCst), 0);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error: this project appears to use uv, but you ran pip."),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Did you mean `corgea uv add oldpkg==1.0.0`?"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn pip_requirements_in_uv_project_suggests_uv_pip_install() {
+    let mut h = WrapperHarness::new("pip", "CORGEA_PYPI_REGISTRY", 0);
+    let project = TempDir::new().expect("project dir");
+    std::fs::write(project.path().join("uv.lock"), "version = 1\n").expect("write uv lock");
+    std::fs::write(project.path().join("requirements.txt"), "oldpkg==1.0.0\n")
+        .expect("write requirements");
+
+    let out = h
+        .cmd
+        .current_dir(project.path())
+        .args(["pip", "install", "-r", "requirements.txt"])
+        .output()
+        .expect("failed to run corgea");
+
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None, "pip must not run");
+    assert_eq!(h.registry_hits.load(Ordering::SeqCst), 0);
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("Did you mean `corgea uv pip install -r requirements.txt`?"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn uv_add_in_requirements_project_blocks_with_pip_install_suggestion() {
+    let mut h = WrapperHarness::new("uv", "CORGEA_PYPI_REGISTRY", 0);
+    let project = TempDir::new().expect("project dir");
+    std::fs::write(project.path().join("requirements.txt"), "oldpkg==1.0.0\n")
+        .expect("write requirements");
+
+    let out = h
+        .cmd
+        .current_dir(project.path())
+        .args(["uv", "add", "oldpkg"])
+        .output()
+        .expect("failed to run corgea");
+
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None, "uv must not run");
+    assert_eq!(
+        h.registry_hits.load(Ordering::SeqCst),
+        0,
+        "wrong-manager guard must run before registry checks"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error: this project appears to use pip, but you ran uv."),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Did you mean `corgea pip install oldpkg`?"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn uv_install_blocks_with_uv_pip_install_suggestion_without_running_uv() {
+    let mut h = WrapperHarness::new("uv", "CORGEA_PYPI_REGISTRY", 0);
+    let out = h
+        .cmd
+        .args(["uv", "install", "oldpkg"])
+        .output()
+        .expect("failed to run corgea");
+
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None, "uv must not run");
+    assert_eq!(
+        h.registry_hits.load(Ordering::SeqCst),
+        0,
+        "invalid uv command must not touch the registry"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error: uv does not support top-level `install`."),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Did you mean `corgea uv pip install oldpkg`?"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn uv_add_in_pyproject_with_requirements_does_not_guess_pip() {
+    let mut h = WrapperHarness::new("uv", "CORGEA_PYPI_REGISTRY", 0);
+    let project = TempDir::new().expect("project dir");
+    std::fs::write(
+        project.path().join("pyproject.toml"),
+        "[project]\nname = \"proj\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("write pyproject");
+    std::fs::write(project.path().join("requirements.txt"), "oldpkg==1.0.0\n")
+        .expect("write requirements");
+
+    let out = h
+        .cmd
+        .current_dir(project.path())
+        .args(["uv", "add", "oldpkg"])
+        .output()
+        .expect("failed to run corgea");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.recorded_argv().as_deref(), Some("add oldpkg"));
+    assert!(
+        h.registry_hits.load(Ordering::SeqCst) >= 1,
+        "the normal uv add gate should still run"
+    );
 }
 
 #[test]

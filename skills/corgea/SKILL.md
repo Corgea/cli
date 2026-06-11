@@ -113,28 +113,30 @@ Installs a pre-commit hook running `corgea scan blast --only-uncommitted`. Bypas
 
 Run a package manager through Corgea's install gate. Install commands with named
 targets are resolved against the public registry first, then gated twice: a version
-published within `--threshold` (default `2d`) blocks (exit 1), and — when a Corgea
-token is configured — each resolved version is checked against Corgea's vuln-api;
-known-vulnerable or malicious versions block, and a verdict that cannot be obtained
-(network/5xx/auth errors) also blocks (fail-closed). Without a token the vuln check
-is skipped (recency-only) and stderr suggests `corgea login`. Everything else passes
-through with the package manager's own exit code. Git/URL/path specs are noted, never
-blocked. With a token, bare `npm install` (zero specs, `package.json` present) is gated
-too: the full lockfile-resolved tree is verdicted, so a vulnerable lockfile blocks. Bare
-`yarn`/`pnpm`/`uv` installs have no safe dry-run; they run unchecked after a stderr note
-(`note: bare '<pm> <sub>' is not gated …`). `-r requirements.txt` files get a printed
-note when the tree pass doesn't cover them.
+published within `--threshold` (default `2d`) blocks (exit 1), and each resolved
+version is checked against Corgea's vuln-api. Baseline public CVE checks need no
+token: known-vulnerable or malicious versions block, but vuln-api lookup outages
+warn and continue because public mode is fail-open. A Corgea token on the default
+vuln-api enables authenticated enforcement and private Corgea intelligence; in
+that mode, verdict lookup failures also block (fail-closed). Everything else
+passes through with the package manager's own exit code. Git/URL/path specs are
+noted, never blocked. Bare `npm install` (zero specs, `package.json` present) is
+gated too: the full lockfile-resolved tree is verdicted, so a vulnerable lockfile
+blocks. Bare `yarn`/`pnpm`/`uv` installs have no safe dry-run; they run unchecked
+after a stderr note (`note: bare '<pm> <sub>' is not gated …`). `-r requirements.txt`
+files get a printed note when the tree pass doesn't cover them.
 
 Blocked findings steer to the fix: each advisory line shows `fixed in <version>` (or
 `no fixed version known`). When every advisory on a package has a fix, the gate
 prints `→ safe version: <name>@<version>` — the highest fix covering every advisory.
 
-With a token, the vuln check covers the **full would-install set**, not just the
-named targets: `pip` and `npm` resolve the complete tree (named + transitive) via a
-safe dry-run (`pip install --dry-run …`; an isolated `npm install --package-lock-only`
-in a temp dir, never touching your lockfile) and verdict every package, so a flagged
-**transitive** dependency blocks the install too. `yarn`, `pnpm`, and `uv` have no safe
-dry-run, so they verify the named targets only and print
+The vuln check covers the **full would-install set** where the manager has a safe
+resolver, not just the named targets: `pip` and `npm` resolve the complete tree
+(named + transitive) via a safe dry-run (`pip install --dry-run …`; an isolated
+`npm install --package-lock-only` in a temp dir, never touching your lockfile) and
+verdict every package, so a flagged **transitive** dependency blocks the install
+too. `yarn`, `pnpm`, and `uv` have no safe dry-run, so they verify the named targets
+only and print
 `warning: transitive dependencies not checked (…); only named packages were verified.`
 The same warning is emitted (and the gate falls back to named-only) whenever a pip/npm
 dry-run fails. Verdict requests run in a bounded pool (8 parallel).
@@ -151,25 +153,29 @@ corgea pip list                       # non-install subcommands pass straight th
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--threshold` | `-t` | Recency threshold (`2d`, `12h`). Younger resolved versions block. |
-| `--no-fail` | | Demote a recency block to a warning. Does NOT bypass vulnerable/unverifiable blocks. |
+| `--no-fail` | | Demote a recency block to a warning. Does NOT bypass vulnerable blocks or authenticated unverifiable blocks. |
 | `--force` | | Proceed despite all findings (vulnerable, unverifiable, recent). Findings still print. |
 | `--json` | | JSON report instead of text. Per-result `verdict` object + `verdict_mode` + `tree`. |
 
-`--json` adds a `tree` object: `null` in recency-only mode; otherwise `mode` is `"full"`
-(transitive checked) or `"named-only"` (with a `reason`), plus `resolved_count` and a
-`transitive[]` array of `{name, version, verdict}` for packages beyond the named targets.
-Vulnerable `verdict` objects carry a `remediation` field: the safe version covering
-every advisory, or `null` when any advisory has no known fix.
+`--json` adds `verdict_mode` (`"public"`, `"authenticated"`, or `"recency-only"`) and a
+`tree` object: `null` when no tree pass ran; otherwise `mode` is `"full"` (transitive
+checked) or `"named-only"` (with a `reason`), plus `resolved_count` and a `transitive[]`
+array of `{name, version, verdict}` for packages beyond the named targets. Vulnerable
+`verdict` objects carry a `remediation` field: the safe version covering every advisory,
+or `null` when any advisory has no known fix.
 
-Recency gating needs no token; the vuln verdict uses the configured Corgea token when
-present. Overrides for testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`,
-`CORGEA_VULN_API_URL`.
+Recency gating and baseline CVE checks need no token. The default vuln-api uses
+`CORGEA_TOKEN` when present. A custom `CORGEA_VULN_API_URL` is public by default, even
+when `CORGEA_TOKEN` exists; set `CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` to send
+the token to that custom URL and make lookup failures fail closed. Overrides for
+testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`, `CORGEA_VULN_API_URL`.
 
 #### Testing the gate
 
 Staging vuln-api (`CORGEA_VULN_API_URL=https://cve-worker-staging.corgea.workers.dev`)
-serves deterministic verdicts for dogfooding. It ignores auth — any non-empty
-`CORGEA_TOKEN` value enables full-gate mode. Known-vulnerable targets:
+serves deterministic verdicts for dogfooding. It runs in public mode by default;
+add `CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` if you need to exercise authenticated
+custom-URL behavior. Known-vulnerable targets:
 
 | Ecosystem | Target | Verdict |
 |-----------|--------|---------|
@@ -183,6 +189,7 @@ Verify the gate end-to-end:
 ```bash
 CORGEA_TOKEN=dogfood-dummy \
 CORGEA_VULN_API_URL=https://cve-worker-staging.corgea.workers.dev \
+CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1 \
 corgea npm install axios@0.21.0
 ```
 

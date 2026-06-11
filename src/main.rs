@@ -272,14 +272,22 @@ fn install_wrap_options(
 ) -> corgea::precheck::PrecheckOptions {
     let token = config.get_token();
     let token = token.trim();
-    let verdict = if token.is_empty() {
-        None
-    } else {
-        Some(corgea::precheck::VerdictConfig {
-            base_url: config.get_vuln_api_url(),
-            token: token.to_string(),
+    let custom_vuln_api_url = utils::generic::get_env_var_if_exists("CORGEA_VULN_API_URL")
+        .map(|url| {
+            url.trim()
+                .trim_end_matches('/')
+                .ne(config::DEFAULT_VULN_API_URL)
         })
-    };
+        .unwrap_or(false);
+    let send_token_to_custom =
+        utils::generic::get_env_var_if_exists("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL")
+            .is_some_and(|v| v.trim() == "1");
+    let mode = select_verdict_mode(token, custom_vuln_api_url, send_token_to_custom);
+    let verdict = Some(corgea::precheck::VerdictConfig {
+        base_url: config.get_vuln_api_url(),
+        mode,
+        public_login_hint: token.is_empty(),
+    });
     corgea::precheck::PrecheckOptions {
         threshold: args.threshold,
         no_fail: args.no_fail,
@@ -288,6 +296,20 @@ fn install_wrap_options(
         verdict,
         npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
         pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
+    }
+}
+
+fn select_verdict_mode(
+    token: &str,
+    custom_vuln_api_url: bool,
+    send_token_to_custom: bool,
+) -> corgea::precheck::VerdictMode {
+    if !token.is_empty() && (!custom_vuln_api_url || send_token_to_custom) {
+        corgea::precheck::VerdictMode::Authenticated {
+            token: token.to_string(),
+        }
+    } else {
+        corgea::precheck::VerdictMode::Public
     }
 }
 
@@ -584,9 +606,9 @@ fn main() {
             // Offline: no token / network. Exit code propagates fail-on policy.
             std::process::exit(i32::from(corgea::deps::run::run(command.clone())));
         }
-        // Install wrappers: no hard auth gate — the recency check is offline,
-        // and a token (when present) additionally enables the vuln-api verdict.
-        // Tokenless degrades to recency-only with a login prompt.
+        // Install wrappers: no hard auth gate. Public CVE checks run without a
+        // token; a token on the default service enables authenticated fail-closed
+        // enforcement.
         Some(Commands::Npm(args)) => {
             run_install_wrap_command(corgea::precheck::PackageManager::Npm, args, &corgea_config)
         }
@@ -603,6 +625,10 @@ fn main() {
             run_install_wrap_command(corgea::precheck::PackageManager::Uv, args, &corgea_config)
         }
         None => {
+            if let Some(message) = corgea::precheck::pip3_alias_message(&cli.args) {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }
             utils::terminal::show_welcome_message();
             let _ = Cli::command().print_help();
             println!();
@@ -620,5 +646,28 @@ mod tests {
         assert_eq!(default_log_level(0), "info");
         assert_eq!(default_log_level(2), "info"); // only ==1 means debug
         assert_eq!(default_log_level(-1), "info");
+    }
+
+    #[test]
+    fn verdict_mode_selection_matrix() {
+        use corgea::precheck::VerdictMode;
+
+        assert_eq!(
+            select_verdict_mode("token", false, false),
+            VerdictMode::Authenticated {
+                token: "token".to_string()
+            }
+        );
+        assert_eq!(select_verdict_mode("", false, false), VerdictMode::Public);
+        assert_eq!(
+            select_verdict_mode("token", true, false),
+            VerdictMode::Public
+        );
+        assert_eq!(
+            select_verdict_mode("token", true, true),
+            VerdictMode::Authenticated {
+                token: "token".to_string()
+            }
+        );
     }
 }

@@ -1,5 +1,5 @@
 //! Hermetic e2e tests for the full-tree resolution pass
-//! (`corgea pip install …` with a token + `CORGEA_VULN_API_URL` stub).
+//! (`corgea pip install …` with a `CORGEA_VULN_API_URL` stub).
 //!
 //! Composes the `cli_verdict.rs` harness pattern (fake pip on a private PATH +
 //! local pypi registry stub + in-crate vuln-api stub) with a dry-run-aware
