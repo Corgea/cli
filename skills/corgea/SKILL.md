@@ -162,6 +162,44 @@ Recency gating needs no token; the vuln verdict uses the configured Corgea token
 present. Overrides for testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`,
 `CORGEA_VULN_API_URL`.
 
+#### Testing the gate
+
+Staging vuln-api (`CORGEA_VULN_API_URL=https://cve-worker-staging.corgea.workers.dev`)
+serves deterministic verdicts for dogfooding. It ignores auth — any non-empty
+`CORGEA_TOKEN` value enables full-gate mode. Known-vulnerable targets:
+
+| Ecosystem | Target | Verdict |
+|-----------|--------|---------|
+| npm | `axios@0.21.0` | vulnerable — fixed in 0.21.2 |
+| npm | `minimist@0.0.8` | vulnerable — fixed in 1.2.2 |
+| npm | `node-fetch@2.6.0` | vulnerable — fixed in 2.6.7 |
+| PyPI | `mezzanine==6.0.0` | vulnerable — no fixed version known |
+
+Verify the gate end-to-end:
+
+```bash
+CORGEA_TOKEN=dogfood-dummy \
+CORGEA_VULN_API_URL=https://cve-worker-staging.corgea.workers.dev \
+corgea npm install axios@0.21.0
+```
+
+Expected output (exit code 1; nothing is installed):
+
+```
+Pre-checking `npm install axios@0.21.0` (threshold 2d)
+  1 ok, 0 recent, 1 vulnerable, 0 unverifiable, 0 skipped, 0 errors
+  tree: 2 packages resolved, 1 transitive checked
+  ✗ axios@0.21.0 → axios@0.21.0  known vulnerable:
+      CVE-2021-3749 (high) — fixed in 0.21.2
+      CVE-2020-28168 (medium) — fixed in 0.21.1
+      → safe version: axios@0.21.2
+Refusing to run install. Pass --force to proceed despite findings.
+```
+
+Caveat: the staging PyPI seed covers recent CVEs only. Decade-old classics
+(`pyyaml==5.1`, `django==2.2`) return clean **by design** — a clean verdict on
+those does not mean the gate is broken.
+
 <!-- BEGIN GENERATED CORGEA DEPS SKILL -->
 ### Deps — `corgea deps <command>`
 
