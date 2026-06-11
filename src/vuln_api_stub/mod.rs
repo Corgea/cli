@@ -18,7 +18,6 @@ const NOT_FOUND_BODY: &str = r#"{"error":"not found"}"#;
 #[derive(Debug, Clone, Default)]
 pub struct StubFixtures {
     pub package_checks: HashMap<PackageKey, String>,
-    pub advisories: HashMap<String, String>,
     pub status_overrides: HashMap<PackageKey, u16>,
 }
 
@@ -35,10 +34,6 @@ impl VulnApiStub {
 }
 
 /// Minimal TCP vuln-api stub for CLI integration tests and e2e dogfood.
-pub fn spawn(fixtures: HashMap<PackageKey, String>) -> VulnApiStub {
-    spawn_with_statuses(fixtures, HashMap::new())
-}
-
 pub fn spawn_with_statuses(
     fixtures: HashMap<PackageKey, String>,
     status_overrides: HashMap<PackageKey, u16>,
@@ -46,7 +41,6 @@ pub fn spawn_with_statuses(
     spawn_on_port(
         StubFixtures {
             package_checks: fixtures,
-            advisories: HashMap::new(),
             status_overrides,
         },
         0,
@@ -65,7 +59,6 @@ pub fn spawn_on_port(fixtures: StubFixtures, port: u16) -> VulnApiStub {
     let base_url = format!("http://127.0.0.1:{bound_port}");
 
     let package_checks = Arc::new(fixtures.package_checks);
-    let advisories = Arc::new(fixtures.advisories);
     let status_overrides = Arc::new(fixtures.status_overrides);
 
     let handle = thread::spawn(move || {
@@ -73,7 +66,7 @@ pub fn spawn_on_port(fixtures: StubFixtures, port: u16) -> VulnApiStub {
             let Ok(mut stream) = stream else {
                 continue;
             };
-            handle_connection(&mut stream, &package_checks, &advisories, &status_overrides);
+            handle_connection(&mut stream, &package_checks, &status_overrides);
         }
     });
 
@@ -94,7 +87,6 @@ pub fn spawn_from_file(path: &Path) -> VulnApiStub {
 fn handle_connection(
     stream: &mut std::net::TcpStream,
     package_checks: &Arc<HashMap<PackageKey, String>>,
-    advisories: &Arc<HashMap<String, String>>,
     status_overrides: &Arc<HashMap<PackageKey, u16>>,
 ) {
     let mut buf = Vec::with_capacity(4096);
@@ -136,14 +128,6 @@ fn handle_connection(
                     .unwrap_or_else(|| default_clean_response(&key.0, &key.1, &key.2));
                 let status = status_overrides.get(&key).copied().unwrap_or(200);
                 (status, body)
-            } else if parts.len() >= 3 && parts[0] == "v1" && parts[1] == "advisories" {
-                let id = urlencoding::decode(parts[2])
-                    .unwrap_or_default()
-                    .into_owned();
-                match advisories.get(&id) {
-                    Some(body) => (200, body.clone()),
-                    None => (404, NOT_FOUND_BODY.to_string()),
-                }
             } else {
                 (404, NOT_FOUND_BODY.to_string())
             }
@@ -238,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn advisory_route_and_fixture_file_loading() {
+    fn fixture_file_loading() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("fixtures.json");
         std::fs::write(
@@ -246,8 +230,7 @@ mod tests {
             r#"{
               "package_checks": {
                 "npm/left-pad/1.0.0": {"ecosystem":"npm","package_name":"left-pad","version":"1.0.0","is_vulnerable":true,"matches":[]}
-              },
-              "advisories": {"MAL-2024-0001": {"id":"MAL-2024-0001"}}
+              }
             }"#,
         )
         .unwrap();
@@ -258,10 +241,5 @@ mod tests {
             "/v1/packages/npm/left-pad/versions/1.0.0/check",
         );
         assert!(resp.contains(r#""is_vulnerable":true"#), "resp: {resp}");
-
-        let resp = get(&stub.base_url, "/v1/advisories/MAL-2024-0001");
-        assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
-        let resp = get(&stub.base_url, "/v1/advisories/NOPE");
-        assert!(resp.starts_with("HTTP/1.1 404"), "resp: {resp}");
     }
 }

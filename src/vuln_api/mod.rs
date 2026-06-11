@@ -42,41 +42,6 @@ pub struct VulnMatch {
     pub fixed_version: Option<String>,
 }
 
-/// Subset of `GET /v1/advisories/:id` we consume.
-///
-/// Field-name notes (kept stable for callers, but mapped to the real
-/// server shape via `#[serde(rename = …)]`):
-///
-/// * `advisory_id` ← server's `id`
-/// * `title` ← server's `summary`
-/// * `severity_level` ← server's `severity`
-/// * `url` ← server's `source_url`
-/// * `tier` is `Option<u8>` because the server may emit `null`
-///   (see `VULNERABILITY_SERVICE.md` §5).
-///
-/// The server also returns many fields we don't currently use
-/// (`alias`, `severity_badge`, `tier_score`, `details`, `llm_summary`,
-/// `packages`, `cwes`, `raw`, …). `serde` ignores unknown fields by
-/// default; we add them here only when a caller needs them. No
-/// top-level `remediation` field exists on the server — do not add one
-/// (server's `llm_summary` is a 1-2 sentence developer summary, not
-/// remediation guidance, and the semantics differ).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AdvisoryResponse {
-    #[serde(rename = "id")]
-    pub advisory_id: String,
-    #[serde(default)]
-    pub aliases: Vec<String>,
-    #[serde(default, rename = "summary")]
-    pub title: Option<String>,
-    #[serde(default, rename = "severity")]
-    pub severity_level: Option<String>,
-    #[serde(default)]
-    pub tier: Option<u8>,
-    #[serde(default, rename = "source_url")]
-    pub url: Option<String>,
-}
-
 fn user_agent() -> String {
     format!("corgea-cli/{} (vuln-api)", env!("CARGO_PKG_VERSION"))
 }
@@ -305,66 +270,6 @@ pub fn check_package_version(
     Ok(parsed)
 }
 
-pub fn get_advisory(
-    client: &reqwest::blocking::Client,
-    base_url: &str,
-    token: &str,
-    advisory_id: &str,
-) -> Result<AdvisoryResponse, Box<dyn std::error::Error>> {
-    let base = validated_base(token, base_url)?;
-    let encoded_id = urlencoding::encode(advisory_id);
-    let url = format!("{}/v1/advisories/{}", base, encoded_id);
-
-    debug(&format!(
-        "Sending vuln-api advisory request to URL: {}",
-        url
-    ));
-
-    let response = build_authed_get(client, &url, token)
-        .send()
-        .map_err(|e| format!("Failed to send vuln-api advisory request: {}", e))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let suffix = error_body_suffix(response);
-        return Err(format!(
-            "vuln-api advisory lookup failed: HTTP {}{}",
-            status.as_u16(),
-            suffix
-        )
-        .into());
-    }
-
-    let response_text = response.text()?;
-    let parsed: AdvisoryResponse = serde_json::from_str(&response_text).map_err(|e| {
-        debug(&format!(
-            "Failed to parse vuln-api advisory response: {}. Body: {}",
-            e, response_text
-        ));
-        format!("Failed to parse vuln-api advisory response: {}", e)
-    })?;
-
-    // Identity guard: refuse a response that names a different advisory
-    // than we asked about. The server is allowed to be silent on
-    // identity (empty advisory_id), but if it answers it must match
-    // either the canonical id or one of the aliases.
-    if !parsed.advisory_id.is_empty()
-        && !parsed.advisory_id.eq_ignore_ascii_case(advisory_id)
-        && !parsed
-            .aliases
-            .iter()
-            .any(|a| a.eq_ignore_ascii_case(advisory_id))
-    {
-        return Err(format!(
-            "vuln-api response advisory_id '{}' does not match request '{}'",
-            parsed.advisory_id, advisory_id
-        )
-        .into());
-    }
-
-    Ok(parsed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,19 +304,15 @@ mod tests {
 
     /// Keys in `retry_after_keys`: first hit → 429 + Retry-After: 1, second hit →
     /// response from `responses` (or clean 200 fallback).
-    /// `advisory_responses` keys advisory id → (status, body) for the
-    /// `/v1/advisories/:id` route. Empty map = route returns 404.
     fn spawn_package_check_stub_with_retry_keys(
         responses: KeyedResponses,
         retry_after_keys: KeyedResponses,
-        advisory_responses: HashMap<String, (u16, String)>,
     ) -> PackageCheckStub {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
         let port = listener.local_addr().unwrap().port();
         let base_url = format!("http://127.0.0.1:{}", port);
         let responses = Arc::new(Mutex::new(responses));
         let retry_after_keys = Arc::new(Mutex::new(retry_after_keys));
-        let advisory_responses = Arc::new(Mutex::new(advisory_responses));
         let hit_counts: Arc<Mutex<HashMap<CheckKey, u32>>> = Arc::new(Mutex::new(HashMap::new()));
 
         let handle = thread::spawn(move || {
@@ -472,17 +373,6 @@ mod tests {
                                 .unwrap_or((200, r#"{"is_vulnerable":false,"matches":[]}"#.into()));
                             (code, status_text(code), body, String::new())
                         }
-                    } else if parts.len() >= 3 && parts[0] == "v1" && parts[1] == "advisories" {
-                        let id = urlencoding::decode(parts[2])
-                            .unwrap_or_default()
-                            .into_owned();
-                        let (code, body) = advisory_responses
-                            .lock()
-                            .unwrap()
-                            .get(&id)
-                            .cloned()
-                            .unwrap_or((404, r#"{"error":"not found"}"#.into()));
-                        (code, status_text(code), body, String::new())
                     } else {
                         (
                             404,
@@ -525,8 +415,7 @@ mod tests {
             ("npm".into(), "lodash".into(), "4.17.20".into()),
             (status_code, body.to_string()),
         );
-        let stub =
-            spawn_package_check_stub_with_retry_keys(responses, HashMap::new(), HashMap::new());
+        let stub = spawn_package_check_stub_with_retry_keys(responses, HashMap::new());
         check_package_version(
             &client,
             &stub.base_url,
@@ -589,11 +478,7 @@ mod tests {
             ("npm".into(), "lodash".into(), "4.17.20".into()),
             (200, vulnerable_body.to_string()),
         );
-        let stub = spawn_package_check_stub_with_retry_keys(
-            HashMap::new(),
-            retry_after_keys,
-            HashMap::new(),
-        );
+        let stub = spawn_package_check_stub_with_retry_keys(HashMap::new(), retry_after_keys);
         let resp = check_package_version(
             &client,
             &stub.base_url,
@@ -635,31 +520,6 @@ mod tests {
         assert!(
             msg.trim_end().ends_with("418"),
             "expected message to end at status code; got: {:?}",
-            msg
-        );
-    }
-
-    #[test]
-    fn get_advisory_non_success_includes_body_snippet() {
-        let client = http_client().expect("test client");
-        let mut advisories = HashMap::new();
-        advisories.insert(
-            "GHSA-deploy-gap".to_string(),
-            (400, r#"{"error":"Invalid url"}"#.to_string()),
-        );
-        let stub =
-            spawn_package_check_stub_with_retry_keys(HashMap::new(), HashMap::new(), advisories);
-        let err = get_advisory(&client, &stub.base_url, "test-token", "GHSA-deploy-gap")
-            .expect_err("400 should fail");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("advisory lookup failed: HTTP 400"),
-            "got: {}",
-            msg
-        );
-        assert!(
-            msg.contains("Invalid url"),
-            "expected body snippet in advisory error; got: {}",
             msg
         );
     }
@@ -741,59 +601,6 @@ mod tests {
         assert!(!is_jwt("a..c"));
     }
 
-    #[test]
-    fn deserialize_advisory_response_real_server_shape() {
-        // Mirrors the worker's emitted payload (cve_worker/src/worker.js):
-        // server emits `id` (not `advisory_id`) and `source_url` (not `url`),
-        // plus many fields we ignore. No top-level `remediation` exists.
-        let body = r#"{
-            "id": "GHSA-xxxx-yyyy-zzzz",
-            "source": "ghsa",
-            "source_url": "https://github.com/advisories/GHSA-xxxx-yyyy-zzzz",
-            "alias": "CVE-2026-12345",
-            "aliases": ["CVE-2026-12345"],
-            "ecosystem": "npm",
-            "summary": "Prototype pollution in lodash",
-            "severity": "HIGH",
-            "severity_badge": "HIGH",
-            "tier": 1,
-            "tier_score": 74.5,
-            "llm_summary": "Short developer-facing summary.",
-            "packages": [],
-            "cwes": []
-        }"#;
-        let parsed: AdvisoryResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.advisory_id, "GHSA-xxxx-yyyy-zzzz");
-        assert_eq!(parsed.aliases, vec!["CVE-2026-12345".to_string()]);
-        assert_eq!(parsed.tier, Some(1));
-        assert_eq!(parsed.severity_level.as_deref(), Some("HIGH"));
-        assert_eq!(
-            parsed.title.as_deref(),
-            Some("Prototype pollution in lodash")
-        );
-        assert_eq!(
-            parsed.url.as_deref(),
-            Some("https://github.com/advisories/GHSA-xxxx-yyyy-zzzz")
-        );
-    }
-
-    #[test]
-    fn deserialize_advisory_response_tier_null_and_missing_source_url() {
-        // Server emits `tier: null` for unscored advisories
-        // (VULNERABILITY_SERVICE.md §5). `source_url` may also be absent.
-        let body = r#"{
-            "id": "GHSA-only-id",
-            "tier": null
-        }"#;
-        let parsed: AdvisoryResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.advisory_id, "GHSA-only-id");
-        assert!(parsed.tier.is_none());
-        assert!(parsed.aliases.is_empty());
-        assert!(parsed.title.is_none());
-        assert!(parsed.severity_level.is_none());
-        assert!(parsed.url.is_none());
-    }
-
     // Fixture-based deserialization tests — committed JSON under tests/fixtures/vuln_api/,
     // built to the authoritative server serialization (vuln-api/cve_worker/src/worker.js).
     macro_rules! fixture {
@@ -852,22 +659,5 @@ mod tests {
         assert!(m.advisory_id.starts_with("MAL-"));
         assert!(m.vulnerable_version_range.is_none());
         assert!(m.fixed_version.is_none());
-    }
-
-    #[test]
-    fn fixture_advisory_detail_reconciles_server_fields() {
-        // AdvisoryResponse reconciliation: server `severity`/`summary` map to
-        // severity_level/title via #[serde(rename)].
-        let parsed: AdvisoryResponse =
-            serde_json::from_str(fixture!("advisory_detail.json")).unwrap();
-        assert_eq!(parsed.advisory_id, "GHSA-xxxx-yyyy-zzzz");
-        assert_eq!(parsed.aliases, vec!["CVE-2026-12345".to_string()]);
-        assert_eq!(parsed.tier, Some(1));
-        assert_eq!(parsed.severity_level.as_deref(), Some("HIGH"));
-        assert_eq!(parsed.title.as_deref(), Some("SQL injection in django"));
-        assert_eq!(
-            parsed.url.as_deref(),
-            Some("https://github.com/advisories/GHSA-xxxx-yyyy-zzzz")
-        );
     }
 }

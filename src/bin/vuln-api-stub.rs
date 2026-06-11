@@ -10,7 +10,7 @@ use std::path::PathBuf;
     about = "Minimal TCP stub for vuln-api package-check routes"
 )]
 struct Args {
-    /// JSON fixture file (`package_checks` + optional `advisories`).
+    /// JSON fixture file (`package_checks`).
     #[arg(long)]
     fixtures: PathBuf,
 

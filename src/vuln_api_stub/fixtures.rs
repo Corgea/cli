@@ -9,8 +9,6 @@ use std::path::Path;
 struct FixtureFile {
     #[serde(default)]
     package_checks: HashMap<String, Value>,
-    #[serde(default)]
-    advisories: HashMap<String, Value>,
 }
 
 /// Load stub fixtures from JSON. Keys in `package_checks` use `{ecosystem}/{name}/{version}`.
@@ -25,14 +23,8 @@ pub fn load_from_file(path: &Path) -> Result<StubFixtures, Box<dyn std::error::E
         package_checks.insert((eco, name, ver), body);
     }
 
-    let mut advisories = HashMap::new();
-    for (id, value) in file.advisories {
-        advisories.insert(id, serde_json::to_string(&value)?);
-    }
-
     Ok(StubFixtures {
         package_checks,
-        advisories,
         status_overrides: HashMap::new(),
     })
 }
