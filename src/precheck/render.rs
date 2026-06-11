@@ -38,8 +38,8 @@ pub(super) fn print_refusal(report: &PrecheckReport, opts: &PrecheckOptions) {
             "Refusing to run install: your existing dependency tree has known-vulnerable packages (none were added by this command). Fix them or pass --force."
         );
     } else if report.vulnerable_count() > 0
-        || (super::authenticated_verdict(opts) && report.unverifiable_count() > 0)
-        || (super::authenticated_verdict(opts) && report.error_count() > 0)
+        || (super::verdict::authenticated_verdict(opts) && report.unverifiable_count() > 0)
+        || (super::verdict::authenticated_verdict(opts) && report.error_count() > 0)
     {
         eprintln!("Refusing to run install. Pass --force to proceed despite findings.");
     } else {
@@ -57,7 +57,7 @@ pub(super) fn print_refusal(report: &PrecheckReport, opts: &PrecheckOptions) {
 /// right now. Only a truly bare install (`report.bare_install`) or
 /// manifest-declared `PreExisting` findings may blame the existing tree.
 fn refusal_blames_existing_tree(report: &PrecheckReport, opts: &PrecheckOptions) -> bool {
-    let fail_closed = super::authenticated_verdict(opts);
+    let fail_closed = super::verdict::authenticated_verdict(opts);
     let named_findings = report.named_vulnerable_count()
         + if fail_closed {
             report.named_unverifiable_count()
@@ -102,7 +102,7 @@ pub(super) fn requirements_note(parsed: &parse::ParsedInstall) {
 }
 
 pub(super) fn warn_public_lookup_failures(report: &PrecheckReport, opts: &PrecheckOptions) {
-    if super::public_verdict(opts) && report.unverifiable_count() > 0 {
+    if super::verdict::public_verdict(opts) && report.unverifiable_count() > 0 {
         eprintln!("warning: CVE check unavailable; continuing because public mode is fail-open.");
     }
 }
