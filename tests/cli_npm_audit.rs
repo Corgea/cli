@@ -311,7 +311,7 @@ fn audit_failure_is_a_silent_skip() {
 
 #[test]
 fn audit_hang_is_skipped_within_the_collect_window() {
-    // The fake audit sleeps 10s; the gate's recv_timeout(2s) must move on.
+    // The fake audit sleeps 10s; the gate's recv_timeout(1s) must move on.
     let started = std::time::Instant::now();
     let mut h = AuditHarness::new(HashMap::new(), AuditScenario::Hang);
     let out = h

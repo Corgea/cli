@@ -135,6 +135,10 @@ pub struct PrecheckOptions {
     pub pypi_registry: Option<String>,
     /// Max parallel vuln-api verdict requests; `verdict_pool` clamps to 1..=32.
     pub concurrency: usize,
+    /// Run the warn-only `npm audit` second opinion during the npm tree
+    /// pass. Cleared by `CORGEA_NO_NPM_AUDIT` (read in `main`, like the
+    /// registry overrides).
+    pub npm_audit: bool,
 }
 
 /// Each item the user (or a `-r` requirements file) asked us to install.
@@ -499,8 +503,7 @@ fn bare_install_note(manager: PackageManager, subcommand_label: &str) {
 /// package the user typed is at fault. Messaging only; the block decision
 /// stays with `should_block_install`.
 fn print_refusal(report: &PrecheckReport) {
-    let named_findings = report.named_vulnerable_count() + report.named_unverifiable_count();
-    if report.vulnerable_count() > 0 && named_findings == 0 {
+    if refusal_blames_existing_tree(report) {
         eprintln!(
             "Refusing to run install: your existing dependency tree has known-vulnerable packages (none were added by this command). Fix them or pass --force."
         );
@@ -509,6 +512,32 @@ fn print_refusal(report: &PrecheckReport) {
     } else {
         eprintln!("Refusing to run install. Pass --no-fail to proceed anyway.");
     }
+}
+
+/// True when the block is entirely the existing tree's doing: vulnerable
+/// findings exist, none sit on a named target (or block as unverifiable
+/// there), and every vulnerable tree finding genuinely predates this
+/// command. A `Requested` finding (pip `-r`) is added by this command and
+/// renders as `(from requirements)`; a `Transitive` finding on an install
+/// *with* named targets is being pulled in by them right now. Only a bare
+/// install (no named targets) or manifest-declared `PreExisting` findings
+/// may blame the existing tree.
+fn refusal_blames_existing_tree(report: &PrecheckReport) -> bool {
+    let named_findings = report.named_vulnerable_count() + report.named_unverifiable_count();
+    if report.vulnerable_count() == 0 || named_findings > 0 {
+        return false;
+    }
+    let Some(TreeReport::Full { transitive, .. }) = &report.tree else {
+        return false;
+    };
+    transitive
+        .iter()
+        .filter(|t| matches!(t.verdict, VerdictStatus::Vulnerable(_)))
+        .all(|t| match t.origin {
+            TreeOrigin::PreExisting => true,
+            TreeOrigin::Requested => false,
+            TreeOrigin::Transitive => report.outcomes.is_empty(),
+        })
 }
 
 /// Print the "requirements files are not recency-checked" note when the
@@ -541,7 +570,7 @@ fn run_tree_pass(
     let tree::TreeResolution {
         packages: set,
         audit: audit_rx,
-    } = match tree::resolve_tree(manager, rest) {
+    } = match tree::resolve_tree(manager, rest, opts.npm_audit) {
         Ok(Some(resolution)) => resolution,
         Ok(None) => {
             run_verdict_pass(manager, outcomes, opts);
@@ -594,9 +623,10 @@ fn run_tree_pass(
         .expect("tree pass requires verdict config");
     let results = verdict_pool(jobs, cfg, manager, opts.concurrency);
     // Collect the warn-only npm audit second opinion only after the verdict
-    // pool so the two truly overlap; any failure (timeout, disconnected
-    // sender) is a silent skip.
-    let audit = audit_rx.and_then(|rx| rx.recv_timeout(Duration::from_secs(2)).ok());
+    // pool so the two truly overlap. The wait is capped tight: this signal
+    // never changes the outcome, so a finished gate won't stall long for it —
+    // a slow audit (or any failure) is a silent skip.
+    let audit = audit_rx.and_then(|rx| rx.recv_timeout(Duration::from_secs(1)).ok());
     let transitive = apply_verdicts(manager, results, outcomes, &direct_deps);
     TreeReport::Full {
         resolved_count,
@@ -921,16 +951,12 @@ fn fix_note(m: &crate::vuln_api::VulnMatch) -> String {
     }
 }
 
-/// The one version certified to clear every match. Requires every match to
-/// carry a `fixed_version`: a single distinct value is returned as-is;
-/// several distinct values pick the highest by lenient semver. Any match
-/// without a fix — or an unparsable candidate among several — means no
-/// version can be certified, so `None`.
-fn safe_version(matches: &[crate::vuln_api::VulnMatch]) -> Option<String> {
-    let mut fixes: Vec<&str> = matches
-        .iter()
-        .map(|m| m.fixed_version.as_deref())
-        .collect::<Option<_>>()?;
+/// Highest of `fixes` after sort/dedup: a single distinct value is returned
+/// as-is (no parsing — preserves odd-but-unambiguous forms); several distinct
+/// values compare by lenient semver. With `all_must_parse`, one unparsable
+/// candidate among several poisons the answer (`None`); otherwise unparsable
+/// candidates are skipped.
+fn highest_fix(mut fixes: Vec<&str>, all_must_parse: bool) -> Option<String> {
     fixes.sort_unstable();
     fixes.dedup();
     match fixes.as_slice() {
@@ -939,8 +965,13 @@ fn safe_version(matches: &[crate::vuln_api::VulnMatch]) -> Option<String> {
         many => {
             let mut best: Option<(semver::Version, &str)> = None;
             for raw in many {
-                let v = semver::Version::parse(&verify_deps::registry::normalize_for_semver(raw))
-                    .ok()?;
+                let v =
+                    match semver::Version::parse(&verify_deps::registry::normalize_for_semver(raw))
+                    {
+                        Ok(v) => v,
+                        Err(_) if all_must_parse => return None,
+                        Err(_) => continue,
+                    };
                 match &best {
                     Some((cur, _)) if cur >= &v => {}
                     _ => best = Some((v, raw)),
@@ -949,6 +980,17 @@ fn safe_version(matches: &[crate::vuln_api::VulnMatch]) -> Option<String> {
             best.map(|(_, raw)| (*raw).to_string())
         }
     }
+}
+
+/// The one version certified to clear every match. Requires every match to
+/// carry a `fixed_version`; any match without one — or an unparsable
+/// candidate among several — means no version can be certified, so `None`.
+fn safe_version(matches: &[crate::vuln_api::VulnMatch]) -> Option<String> {
+    let fixes: Vec<&str> = matches
+        .iter()
+        .map(|m| m.fixed_version.as_deref())
+        .collect::<Option<_>>()?;
+    highest_fix(fixes, true)
 }
 
 /// The safe-version proposal for a vulnerable package, paired with its
@@ -974,31 +1016,11 @@ fn steer_for(
 /// fix are ignored, so the result may still be vulnerable to them. `None`
 /// only when no match advertises a fix (or no candidate parses).
 fn advertised_fix(matches: &[crate::vuln_api::VulnMatch]) -> Option<String> {
-    let mut fixes: Vec<&str> = matches
+    let fixes: Vec<&str> = matches
         .iter()
         .filter_map(|m| m.fixed_version.as_deref())
         .collect();
-    fixes.sort_unstable();
-    fixes.dedup();
-    match fixes.as_slice() {
-        [] => None,
-        [only] => Some((*only).to_string()),
-        many => {
-            let mut best: Option<(semver::Version, &str)> = None;
-            for raw in many {
-                let Ok(v) =
-                    semver::Version::parse(&verify_deps::registry::normalize_for_semver(raw))
-                else {
-                    continue;
-                };
-                match &best {
-                    Some((cur, _)) if cur >= &v => {}
-                    _ => best = Some((v, raw)),
-                }
-            }
-            best.map(|(_, raw)| (*raw).to_string())
-        }
-    }
+    highest_fix(fixes, false)
 }
 
 /// Per-match advisory lines plus the verified safe-version steer, shared by
@@ -1027,13 +1049,13 @@ fn print_vulnerable_matches(
     }
 }
 
-/// One summary-line segment, e.g. `"2 vulnerable (2 from existing tree)"`.
+/// One summary-line segment, e.g. `"2 vulnerable (2 from resolved tree)"`.
 /// The parenthetical separates findings the resolved tree carried in from
 /// findings on the targets this command names; omitted when the tree
 /// contributed none.
 fn summary_segment(total: usize, from_tree: usize, label: &str) -> String {
     if from_tree > 0 {
-        format!("{total} {label} ({from_tree} from existing tree)")
+        format!("{total} {label} ({from_tree} from resolved tree)")
     } else {
         format!("{total} {label}")
     }
@@ -1154,15 +1176,30 @@ fn print_text(report: &PrecheckReport) {
                         );
                         print_vulnerable_matches(report, &t.name, matches);
                         // A vulnerable dep the project already declares can be
-                        // bumped directly — point at the advertised fix.
+                        // bumped directly — point at the fix as a command. The
+                        // caveat follows the steer check above: a Verified
+                        // steer certified this same version (when `safe_version`
+                        // is `Some` it equals `advertised_fix`), a Rejected one
+                        // already said the fix is flagged, so only an
+                        // unverified proposal keeps the "(advertised fix)"
+                        // hedge.
                         if t.origin == TreeOrigin::PreExisting {
                             if let Some(fix) = advertised_fix(matches) {
-                                println!(
-                                    "      fix with: corgea {} install {}@{} (advertised fix)",
-                                    report.manager.binary_name(),
-                                    t.name,
-                                    fix
-                                );
+                                match steer_for(report, &t.name, matches) {
+                                    Some((_, SteerCheck::Rejected)) => {}
+                                    Some((_, SteerCheck::Verified)) => println!(
+                                        "      fix with: corgea {} install {}@{}",
+                                        report.manager.binary_name(),
+                                        t.name,
+                                        fix
+                                    ),
+                                    Some((_, SteerCheck::Unverified)) | None => println!(
+                                        "      fix with: corgea {} install {}@{} (advertised fix)",
+                                        report.manager.binary_name(),
+                                        t.name,
+                                        fix
+                                    ),
+                                }
                             }
                         }
                     }
@@ -1407,6 +1444,8 @@ mod tests {
             npm_registry: None,
             pypi_registry: Some(pypi_registry),
             concurrency: 4,
+            // Unit tests never want the real `npm audit` subprocess.
+            npm_audit: false,
         }
     }
 
@@ -2003,5 +2042,47 @@ mod tests {
                 ("reqdep", TreeOrigin::Requested),
             ]
         );
+    }
+
+    /// The existing-tree refusal fires only when every vulnerable finding
+    /// predates the command: a `Requested` finding (pip `-r`) is added by
+    /// this command, and a `Transitive` finding on an install *with* named
+    /// targets is being pulled in by them right now. On a bare install
+    /// (no named targets) everything resolved is the existing tree's.
+    #[test]
+    fn refusal_blame_respects_finding_origin() {
+        let tree_vulnerable = |origin| TreeOutcome {
+            name: "dep".to_string(),
+            version: "1.0.0".to_string(),
+            verdict: VerdictStatus::Vulnerable(vec![vm("A-1", None)]),
+            origin,
+        };
+        // (origin, named targets present, expected)
+        let cases = [
+            (TreeOrigin::PreExisting, false, true),
+            (TreeOrigin::PreExisting, true, true),
+            (TreeOrigin::Transitive, false, true),
+            (TreeOrigin::Transitive, true, false),
+            (TreeOrigin::Requested, false, false),
+            (TreeOrigin::Requested, true, false),
+        ];
+        for (origin, with_named, blames_tree) in cases {
+            let outcomes = if with_named {
+                vec![resolved_outcome("cleanpkg", "1.0.0", false)]
+            } else {
+                vec![]
+            };
+            let mut report = report_with(outcomes);
+            report.tree = Some(TreeReport::Full {
+                resolved_count: 1,
+                transitive: vec![tree_vulnerable(origin)],
+                audit: None,
+            });
+            assert_eq!(
+                refusal_blames_existing_tree(&report),
+                blames_tree,
+                "origin {origin:?}, with_named {with_named}"
+            );
+        }
     }
 }

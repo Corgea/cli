@@ -1,7 +1,9 @@
-//! Hermetic e2e tests for refusal-message context: when every vulnerable
-//! finding sits in the resolved tree beyond the named targets, the refusal
-//! must say the existing tree is the problem; a finding on a named target
-//! keeps the generic refusal.
+//! Hermetic e2e tests for refusal-message context: the refusal blames the
+//! existing tree only when every vulnerable finding predates the command
+//! (bare installs, or manifest-declared pre-existing deps — see
+//! `cli_bare_install.rs` for the positive case). A finding on a named
+//! target, or a transitive finding the named targets pull in, keeps the
+//! generic refusal.
 //!
 //! Same harness as `cli_tree.rs`, pip-only: a fake pip on a private PATH
 //! answers the `--dry-run --report -` tree pass with a canned report, a local
@@ -152,8 +154,10 @@ impl Harness {
 }
 
 #[test]
-fn transitive_only_vulnerable_gets_existing_tree_refusal() {
+fn named_install_with_transitive_vulnerable_keeps_generic_refusal() {
     // Only the transitive `evildep` is flagged; the named `oldpkg` is clean.
+    // `evildep` is being pulled in *by this command*, so the existing-tree
+    // refusal ("none were added by this command") would lie.
     let mut checks = HashMap::new();
     checks.insert(
         key("pypi", "evildep", "0.4.2"),
@@ -166,16 +170,16 @@ fn transitive_only_vulnerable_gets_existing_tree_refusal() {
     assert!(!h.pip_ran(), "pip must not run on a blocked install");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains(TREE_REFUSAL),
-        "stderr must carry the existing-tree refusal: {stderr}"
+        stderr.contains(GENERIC_REFUSAL),
+        "a transitive dep of a named target keeps the generic refusal: {stderr}"
     );
     assert!(
-        !stderr.contains(GENERIC_REFUSAL),
-        "generic refusal must be replaced, not appended: {stderr}"
+        !stderr.contains(TREE_REFUSAL),
+        "existing-tree refusal must not fire for command-added transitives: {stderr}"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("1 vulnerable (1 from existing tree)"),
+        stdout.contains("1 vulnerable (1 from resolved tree)"),
         "summary must attribute the finding to the tree: {stdout}"
     );
 }
@@ -204,7 +208,7 @@ fn named_vulnerable_keeps_generic_refusal() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        !stdout.contains("from existing tree"),
+        !stdout.contains("from resolved tree"),
         "summary must not attribute a named finding to the tree: {stdout}"
     );
 }

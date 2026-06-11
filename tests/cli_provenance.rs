@@ -144,12 +144,21 @@ struct Harness {
 
 impl Harness {
     fn new(binary: &str, checks: HashMap<PackageKey, String>, payload: &str) -> Self {
+        Self::new_with_statuses(binary, checks, HashMap::new(), payload)
+    }
+
+    fn new_with_statuses(
+        binary: &str,
+        checks: HashMap<PackageKey, String>,
+        statuses: HashMap<PackageKey, u16>,
+        payload: &str,
+    ) -> Self {
         let (mut cmd, home) = corgea_isolated();
         let bin = TempDir::new().expect("temp bin dir");
         let marker = bin.path().join("pm-argv.txt");
         write_fake_pm(bin.path(), &marker, binary, payload);
         let registry = spawn_registry_stub();
-        let vuln_stub = vuln_api_stub::spawn_with_statuses(checks, HashMap::new());
+        let vuln_stub = vuln_api_stub::spawn_with_statuses(checks, statuses);
         cmd.env("PATH", bin.path())
             .env("CORGEA_PYPI_REGISTRY", &registry)
             .env("CORGEA_NPM_REGISTRY", &registry)
@@ -204,7 +213,9 @@ fn pip_requirements_finding_labeled_from_requirements() {
 #[test]
 fn npm_preexisting_direct_dep_labeled_with_fix_hint() {
     // `evildep` is already a direct dep in the project's package.json; the
-    // finding gets the pre-existing label plus the advertised-fix hint.
+    // finding gets the pre-existing label plus the fix-command hint. The
+    // steer re-check verified 1.2.2 clean (the stub defaults unknown
+    // versions to clean), so the hint drops the "(advertised fix)" hedge.
     let project = npm_project();
     let mut checks = HashMap::new();
     checks.insert(
@@ -226,8 +237,39 @@ fn npm_preexisting_direct_dep_labeled_with_fix_hint() {
         "stdout: {stdout}"
     );
     assert!(
+        stdout.contains("fix with: corgea npm install evildep@1.2.2\n"),
+        "verified fix hint must print without the advertised-fix hedge: {stdout}"
+    );
+}
+
+#[test]
+fn npm_preexisting_fix_hint_keeps_hedge_when_unverifiable() {
+    // The steer re-check for 1.2.2 fails (503), so the bare steer line stays
+    // quiet and the fix-command hint keeps its "(advertised fix)" hedge.
+    let project = npm_project();
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("npm", "evildep", "0.4.2"),
+        vulnerable_body("npm", "evildep", "0.4.2", r#""1.2.2""#),
+    );
+    let mut statuses = HashMap::new();
+    statuses.insert(key("npm", "evildep", "1.2.2"), 503u16);
+    let mut h = Harness::new_with_statuses("npm", checks, statuses, NPM_LOCK);
+    let out = h
+        .cmd
+        .current_dir(project.path())
+        .args(["npm", "install", "oldpkg@1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1), "pre-existing vuln must block");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
         stdout.contains("fix with: corgea npm install evildep@1.2.2 (advertised fix)"),
-        "stdout: {stdout}"
+        "unverified fix hint must keep the hedge: {stdout}"
+    );
+    assert!(
+        !stdout.contains("→ safe version"),
+        "an unverified steer must stay quiet: {stdout}"
     );
 }
 

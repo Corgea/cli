@@ -211,6 +211,12 @@ fn bare_npm_install_vulnerable_lockfile_blocks() {
         !stderr.contains("not gated"),
         "gated bare npm must not print the ungated note: {stderr}"
     );
+    // A bare install names no targets, so everything resolved is the
+    // existing tree's — the refusal must say so.
+    assert!(
+        stderr.contains("your existing dependency tree has known-vulnerable packages"),
+        "bare install blames the existing tree: {stderr}"
+    );
 }
 
 #[test]

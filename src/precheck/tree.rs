@@ -59,6 +59,7 @@ pub fn covers_input(manager: PackageManager, parsed: &super::parse::ParsedInstal
 pub fn resolve_tree(
     manager: PackageManager,
     install_args: &[String],
+    run_audit: bool,
 ) -> Result<Option<TreeResolution>, String> {
     match manager {
         PackageManager::Pip => {
@@ -69,7 +70,9 @@ pub fn resolve_tree(
                 })
             })
         }
-        PackageManager::Npm => resolve_npm_tree(manager.binary_name(), install_args).map(Some),
+        PackageManager::Npm => {
+            resolve_npm_tree(manager.binary_name(), install_args, run_audit).map(Some)
+        }
         // yarn/pnpm/uv have no safe dry-run for installs.
         _ => Ok(None),
     }
@@ -170,7 +173,11 @@ fn direct_deps_from_manifest(json: &str) -> std::collections::HashSet<String> {
 ///
 /// `--ignore-scripts` because npm has run lifecycle scripts under
 /// `--package-lock-only` before (npm/cli#2787).
-fn resolve_npm_tree(binary: &str, install_args: &[String]) -> Result<TreeResolution, String> {
+fn resolve_npm_tree(
+    binary: &str,
+    install_args: &[String],
+    run_audit: bool,
+) -> Result<TreeResolution, String> {
     let resolved = which::which(binary).map_err(|e| format!("{binary} not found on PATH: {e}"))?;
     let work = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
     for manifest in [
@@ -205,14 +212,8 @@ fn resolve_npm_tree(binary: &str, install_args: &[String]) -> Result<TreeResolut
     let lock = std::fs::read_to_string(work.path().join("package-lock.json"))
         .map_err(|e| format!("read generated package-lock.json: {e}"))?;
     let packages = parse_npm_lockfile(&lock)?;
-    let audit = (!audit_disabled()).then(|| spawn_audit(work, resolved));
+    let audit = run_audit.then(|| spawn_audit(work, resolved));
     Ok(TreeResolution { packages, audit })
-}
-
-/// `CORGEA_NO_NPM_AUDIT=1` (any non-blank value) disables the warn-only
-/// `npm audit` second opinion.
-fn audit_disabled() -> bool {
-    std::env::var("CORGEA_NO_NPM_AUDIT").is_ok_and(|v| !v.trim().is_empty())
 }
 
 /// Kill the audit subprocess if it hasn't finished by then.
