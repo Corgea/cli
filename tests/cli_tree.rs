@@ -12,14 +12,14 @@
 
 mod common;
 
-use common::corgea_isolated;
+use common::{
+    corgea_isolated, spawn_http_stub, write_fake_tree_pm, NOT_FOUND_JSON, OLDPKG_NPM_PACKUMENT,
+    OLDPKG_PYPI_JSON, RESOLUTION_FAILS,
+};
 use corgea::vuln_api_stub::{self, PackageKey};
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread;
 use tempfile::TempDir;
 
 fn key(eco: &str, name: &str, ver: &str) -> PackageKey {
@@ -42,93 +42,11 @@ fn vulnerable_evildep_body(ecosystem: &str) -> String {
 /// Registry stub serving `/pypi/oldpkg/json` (pypi) and `/oldpkg` (npm
 /// packument), both published 2020 → never recent. Everything else 404s.
 fn spawn_pypi_stub() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
-    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut buf = Vec::with_capacity(4096);
-            let mut chunk = [0u8; 1024];
-            while let Ok(n) = stream.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let req = String::from_utf8_lossy(&buf);
-            let path = req
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .unwrap_or("")
-                .to_string();
-
-            let (status, body) = match path.as_str() {
-                "/pypi/oldpkg/json" => (
-                    "200 OK",
-                    r#"{"info":{"name":"oldpkg"},"releases":{"1.0.0":[{"upload_time_iso_8601":"2020-01-01T00:00:00Z"}]}}"#.to_string(),
-                ),
-                "/oldpkg" => (
-                    "200 OK",
-                    r#"{"dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{}},"time":{"1.0.0":"2020-01-01T00:00:00Z"}}"#.to_string(),
-                ),
-                _ => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
-            };
-            let response = format!(
-                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                status,
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes());
-        }
-    });
-    base_url
-}
-
-/// Sentinel payload that makes the fake manager exit non-zero on its tree
-/// (resolution) invocation, forcing the named-only fallback.
-const RESOLUTION_FAILS: &str = "RESOLUTION_FAILS";
-
-/// Write an executable fake package manager into `dir`. On an invocation
-/// whose argv contains `tree_flag` it emits `payload` (to stdout for pip's
-/// `--dry-run --report -`, into `./package-lock.json` for npm's
-/// `--package-lock-only`, whose cwd is the resolver's throwaway temp dir) and
-/// exits 0 — the tree pass; if `payload` is `RESOLUTION_FAILS` it exits
-/// non-zero instead, emitting nothing. Any other invocation records its argv
-/// to `marker` and exits `exit_code`.
-///
-/// The payload is read from a sibling file via shell builtins so it works
-/// under the test's locked-down `PATH` (which has no `cat`); the
-/// `|| [ -n "$line" ]` guard keeps the final line when the payload file has
-/// no trailing newline.
-fn write_fake_pm(dir: &Path, marker: &Path, binary: &str, payload: &str, exit_code: i32) {
-    use std::os::unix::fs::PermissionsExt;
-    let (tree_flag, redirect, fail_exit) = match binary {
-        "pip" => ("--dry-run", "", 2),
-        "npm" => ("--package-lock-only", " > package-lock.json", 1),
-        other => panic!("unsupported fake manager {other}"),
-    };
-    let tree_branch = if payload == RESOLUTION_FAILS {
-        format!("exit {fail_exit}")
-    } else {
-        let payload_path = dir.join(format!("{binary}-tree-payload.json"));
-        std::fs::write(&payload_path, payload).expect("write fake pm payload");
-        format!(
-            "while IFS= read -r line || [ -n \"$line\" ]; do printf '%s\\n' \"$line\"; done < '{}'{redirect}; exit 0",
-            payload_path.display()
-        )
-    };
-    let script = format!(
-        "#!/bin/sh\ncase \" $* \" in *\" {tree_flag} \"*) {tree_branch};; esac\nprintf '%s' \"$*\" > '{marker}'\nexit {exit_code}\n",
-        marker = marker.display(),
-    );
-    let path = dir.join(binary);
-    std::fs::write(&path, script).expect("write fake pm");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod fake pm");
+    spawn_http_stub(|path| match path {
+        "/pypi/oldpkg/json" => ("200 OK", OLDPKG_PYPI_JSON.to_string()),
+        "/oldpkg" => ("200 OK", OLDPKG_NPM_PACKUMENT.to_string()),
+        _ => ("404 Not Found", NOT_FOUND_JSON.to_string()),
+    })
 }
 
 /// npm lockfile-v3 fixture: named `oldpkg` 1.0.0 + transitive `evildep` 0.4.2.
@@ -161,7 +79,7 @@ impl TreeHarness {
         let (mut cmd, home) = corgea_isolated();
         let bin = TempDir::new().expect("temp bin dir");
         let marker = bin.path().join("pm-argv.txt");
-        write_fake_pm(bin.path(), &marker, binary, payload, exit_code);
+        write_fake_tree_pm(bin.path(), binary, &marker, payload, exit_code);
         let registry = spawn_pypi_stub();
         let vuln_stub = vuln_api_stub::spawn_with_statuses(checks, statuses);
         cmd.env("PATH", bin.path())

@@ -109,7 +109,9 @@ fn handle_connection(
     let _ = stream.write_all(response.as_bytes());
 }
 
-fn status_text(status_code: u16) -> &'static str {
+/// Reason phrase for a stub status line. Shared with the in-crate test
+/// stubs so the mapping lives once.
+pub fn status_text(status_code: u16) -> &'static str {
     match status_code {
         404 => "Not Found",
         401 => "Unauthorized",

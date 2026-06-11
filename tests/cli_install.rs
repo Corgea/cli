@@ -13,14 +13,14 @@
 
 mod common;
 
-use common::corgea_isolated;
-use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use common::{
+    corgea_isolated, spawn_http_stub, write_fake_recorder, NOT_FOUND_JSON, OLDPKG_NPM_PACKUMENT,
+    OLDPKG_PYPI_JSON,
+};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread;
 use tempfile::TempDir;
 
 /// Spawn a registry stub serving both the PyPI and npm routes the
@@ -34,85 +34,32 @@ use tempfile::TempDir;
 ///   * `/freshpkg`           — npm metadata, published one hour ago
 ///   * anything else         — 404
 fn spawn_registry_stub() -> (String, Arc<AtomicUsize>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
-    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let hits = Arc::new(AtomicUsize::new(0));
-    let hits_in_thread = Arc::clone(&hits);
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            hits_in_thread.fetch_add(1, Ordering::SeqCst);
-            let mut buf = Vec::with_capacity(4096);
-            let mut chunk = [0u8; 1024];
-            while let Ok(n) = stream.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let req = String::from_utf8_lossy(&buf);
-            let path = req
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .unwrap_or("")
-                .to_string();
-
-            let fresh_ts = (chrono::Utc::now() - chrono::Duration::hours(1))
-                .format("%Y-%m-%dT%H:%M:%SZ")
-                .to_string();
-            let (status, body) = match path.as_str() {
-                "/pypi/oldpkg/json" => (
-                    "200 OK",
-                    r#"{"info":{"name":"oldpkg"},"releases":{"1.0.0":[{"upload_time_iso_8601":"2020-01-01T00:00:00Z"}]}}"#.to_string(),
+    let hits_in_stub = Arc::clone(&hits);
+    let base_url = spawn_http_stub(move |path| {
+        hits_in_stub.fetch_add(1, Ordering::SeqCst);
+        let fresh_ts = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        match path {
+            "/pypi/oldpkg/json" => ("200 OK", OLDPKG_PYPI_JSON.to_string()),
+            "/pypi/freshpkg/json" => (
+                "200 OK",
+                format!(
+                    r#"{{"info":{{"name":"freshpkg"}},"releases":{{"9.9.9":[{{"upload_time_iso_8601":"{fresh_ts}"}}]}}}}"#,
                 ),
-                "/pypi/freshpkg/json" => (
-                    "200 OK",
-                    format!(
-                        r#"{{"info":{{"name":"freshpkg"}},"releases":{{"9.9.9":[{{"upload_time_iso_8601":"{fresh_ts}"}}]}}}}"#,
-                    ),
+            ),
+            "/oldpkg" => ("200 OK", OLDPKG_NPM_PACKUMENT.to_string()),
+            "/freshpkg" => (
+                "200 OK",
+                format!(
+                    r#"{{"dist-tags":{{"latest":"9.9.9"}},"versions":{{"9.9.9":{{}}}},"time":{{"9.9.9":"{fresh_ts}"}}}}"#,
                 ),
-                "/oldpkg" => (
-                    "200 OK",
-                    r#"{"dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{}},"time":{"1.0.0":"2020-01-01T00:00:00Z"}}"#.to_string(),
-                ),
-                "/freshpkg" => (
-                    "200 OK",
-                    format!(
-                        r#"{{"dist-tags":{{"latest":"9.9.9"}},"versions":{{"9.9.9":{{}}}},"time":{{"9.9.9":"{fresh_ts}"}}}}"#,
-                    ),
-                ),
-                _ => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
-            };
-            let response = format!(
-                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                status,
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes());
+            ),
+            _ => ("404 Not Found", NOT_FOUND_JSON.to_string()),
         }
     });
     (base_url, hits)
-}
-
-/// Write an executable fake package manager named `binary` into `dir`.
-/// It records its argv to `marker` and exits with `exit_code` — proving
-/// both "the install ran (with these args)" and exit-code forwarding.
-fn write_fake_package_manager(dir: &Path, binary: &str, marker: &Path, exit_code: i32) {
-    use std::os::unix::fs::PermissionsExt;
-    let script = format!(
-        "#!/bin/sh\nprintf '%s' \"$*\" > '{}'\nexit {}\n",
-        marker.display(),
-        exit_code
-    );
-    let path = dir.join(binary);
-    std::fs::write(&path, script).expect("write fake package manager");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod fake package manager");
 }
 
 /// A ready-to-run wrapper invocation: isolated `corgea` command with the
@@ -132,7 +79,7 @@ impl WrapperHarness {
         let (mut cmd, home) = corgea_isolated();
         let bin = TempDir::new().expect("temp bin dir");
         let marker = bin.path().join("pm-argv.txt");
-        write_fake_package_manager(bin.path(), binary, &marker, pm_exit_code);
+        write_fake_recorder(bin.path(), binary, &marker, pm_exit_code);
         let (base_url, registry_hits) = spawn_registry_stub();
         cmd.env("PATH", bin.path()).env(registry_env, &base_url);
         Self {

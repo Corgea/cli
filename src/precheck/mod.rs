@@ -98,8 +98,9 @@ pub enum VerdictStatus {
     /// The verdict could not be obtained (network/5xx/auth/integrity).
     /// Blocks fail-closed.
     Unverifiable(String),
-    /// Verdict never attempted (no token). Recency-only cover.
-    NotChecked(String),
+    /// Verdict never attempted (no token). Recency-only cover; the
+    /// constant reason (`NO_TOKEN_REASON`) is attached at render time.
+    NotChecked,
 }
 
 /// Result of re-verdicting a proposed `→ safe version` steer against
@@ -165,13 +166,12 @@ pub enum TargetKind {
 /// Outcome of resolving + verifying a single target.
 #[derive(Debug, Clone)]
 pub enum TargetOutcome {
-    /// Resolved cleanly. `recent` is true when the version was
-    /// published within the threshold (the blocking condition).
+    /// Resolved cleanly. The blocking recency condition is derived from
+    /// `age` against the report's threshold (`PrecheckReport::is_recent`).
     Resolved {
         target: InstallTarget,
         resolved: crate::verify_deps::registry::ResolvedPackage,
         age: Duration,
-        recent: bool,
         verdict: VerdictStatus,
     },
     /// We deliberately couldn't verify this target (URL / git / etc.).
@@ -271,11 +271,16 @@ impl PrecheckReport {
     fn count(&self, pred: impl Fn(&TargetOutcome) -> bool) -> usize {
         self.outcomes.iter().filter(|o| pred(o)).count()
     }
+    /// True when this age is within the recency threshold (the blocking
+    /// condition). The single definition of "recent".
+    fn is_recent(&self, age: Duration) -> bool {
+        age < self.threshold
+    }
     pub fn ok_count(&self) -> usize {
-        self.count(|o| matches!(o, TargetOutcome::Resolved { recent: false, .. }))
+        self.count(|o| matches!(o, TargetOutcome::Resolved { age, .. } if !self.is_recent(*age)))
     }
     pub fn recent_count(&self) -> usize {
-        self.count(|o| matches!(o, TargetOutcome::Resolved { recent: true, .. }))
+        self.count(|o| matches!(o, TargetOutcome::Resolved { age, .. } if self.is_recent(*age)))
     }
     pub fn vulnerable_count(&self) -> usize {
         self.named_vulnerable_count() + self.tree_vulnerable_count()
@@ -413,13 +418,10 @@ fn run_parsed_install(
     }
 
     let now = Utc::now();
-    let threshold =
-        chrono::Duration::from_std(opts.threshold).expect("threshold validated before run_install");
-
     let mut outcomes: Vec<_> = parsed
         .targets
         .iter()
-        .map(|target| verify_one(target, &opts, &now, threshold))
+        .map(|target| verify_one(target, &opts, &now))
         .collect();
 
     let tree = if tree_eligible {
@@ -722,24 +724,28 @@ fn apply_verdicts(
     direct_deps: &std::collections::HashSet<String>,
 ) -> Vec<TreeOutcome> {
     let norm = |n: &str| manager.normalize_name(n);
+    // Index named outcomes by (normalized name, version) so matching the
+    // pooled results stays linear on big trees.
+    let mut named: std::collections::HashMap<(String, String), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, o) in outcomes.iter().enumerate() {
+        if let TargetOutcome::Resolved { resolved, .. } = o {
+            named
+                .entry((norm(&resolved.name), resolved.version.clone()))
+                .or_default()
+                .push(i);
+        }
+    }
+
     let mut transitive = Vec::new();
     for (pkg, verdict) in results {
-        let key = (norm(&pkg.name), pkg.version.clone());
-        let mut matched = false;
-        for o in outcomes.iter_mut() {
-            if let TargetOutcome::Resolved {
-                resolved,
-                verdict: v,
-                ..
-            } = o
-            {
-                if (norm(&resolved.name), resolved.version.clone()) == key {
+        if let Some(indices) = named.get(&(norm(&pkg.name), pkg.version.clone())) {
+            for &i in indices {
+                if let TargetOutcome::Resolved { verdict: v, .. } = &mut outcomes[i] {
                     *v = verdict.clone();
-                    matched = true;
                 }
             }
-        }
-        if !matched {
+        } else {
             let origin = if pkg.requested {
                 TreeOrigin::Requested
             } else if direct_deps.contains(&pkg.name) {
@@ -843,7 +849,7 @@ fn verify_steers(report: &mut PrecheckReport, opts: &PrecheckOptions) {
             let check = match verdict {
                 VerdictStatus::Clean => SteerCheck::Verified,
                 VerdictStatus::Vulnerable(_) => SteerCheck::Rejected,
-                VerdictStatus::Unverifiable(_) | VerdictStatus::NotChecked(_) => {
+                VerdictStatus::Unverifiable(_) | VerdictStatus::NotChecked => {
                     SteerCheck::Unverified
                 }
             };
@@ -865,7 +871,6 @@ fn verify_one(
     target: &InstallTarget,
     opts: &PrecheckOptions,
     now: &chrono::DateTime<chrono::Utc>,
-    threshold: chrono::Duration,
 ) -> TargetOutcome {
     use crate::verify_deps::registry;
 
@@ -886,16 +891,16 @@ fn verify_one(
 
     match resolved {
         Ok(resolved) => {
-            let age_chrono = now.signed_duration_since(resolved.published_at);
-            let age = age_chrono
+            // Future publish dates clamp to zero — maximally recent.
+            let age = now
+                .signed_duration_since(resolved.published_at)
                 .to_std()
                 .unwrap_or_else(|_| Duration::from_secs(0));
             TargetOutcome::Resolved {
                 target: target.clone(),
                 resolved,
                 age,
-                recent: age_chrono < threshold,
-                verdict: VerdictStatus::NotChecked(NO_TOKEN_REASON.to_string()),
+                verdict: VerdictStatus::NotChecked,
             }
         }
         Err(e) => TargetOutcome::Error {
@@ -1230,7 +1235,7 @@ fn print_text(report: &PrecheckReport) {
                         }
                     }
                     // Clean / not-checked tree entries stay quiet in text mode.
-                    VerdictStatus::Clean | VerdictStatus::NotChecked(_) => {}
+                    VerdictStatus::Clean | VerdictStatus::NotChecked => {}
                 }
             }
         }
@@ -1253,7 +1258,6 @@ fn print_text(report: &PrecheckReport) {
                 target,
                 resolved,
                 age,
-                recent,
                 verdict,
             } => match verdict {
                 VerdictStatus::Vulnerable(matches) => {
@@ -1271,8 +1275,8 @@ fn print_text(report: &PrecheckReport) {
                         );
                     }
                 }
-                VerdictStatus::Clean | VerdictStatus::NotChecked(_) => {
-                    if *recent {
+                VerdictStatus::Clean | VerdictStatus::NotChecked => {
+                    if report.is_recent(*age) {
                         println!(
                             "  ⚠ {} → {}@{}  published {} ago at {} (within threshold)",
                             target.display,
@@ -1324,8 +1328,8 @@ fn verdict_json(report: &PrecheckReport, name: &str, verdict: &VerdictStatus) ->
         VerdictStatus::Unverifiable(error) => {
             json!({ "status": "unverifiable", "error": error })
         }
-        VerdictStatus::NotChecked(reason) => {
-            json!({ "status": "not_checked", "reason": reason })
+        VerdictStatus::NotChecked => {
+            json!({ "status": "not_checked", "reason": NO_TOKEN_REASON })
         }
     }
 }
@@ -1357,12 +1361,11 @@ fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
                 target,
                 resolved,
                 age,
-                recent,
                 verdict,
             } => {
                 let verdict_json = verdict_json(report, &resolved.name, verdict);
                 json!({
-                    "status": if *recent { "recent" } else { "ok" },
+                    "status": if report.is_recent(*age) { "recent" } else { "ok" },
                     "spec": target.display,
                     "name": resolved.name,
                     "resolved_version": resolved.version,
@@ -1513,6 +1516,13 @@ mod tests {
     }
 
     fn resolved_outcome(name: &str, version: &str, recent: bool) -> TargetOutcome {
+        // Recency derives from age vs `report_with`'s 2-day threshold:
+        // one hour ⇒ recent, a year ⇒ not.
+        let age = if recent {
+            Duration::from_secs(3600)
+        } else {
+            Duration::from_secs(365 * 86400)
+        };
         TargetOutcome::Resolved {
             target: InstallTarget {
                 name: name.to_string(),
@@ -1524,11 +1534,10 @@ mod tests {
             resolved: crate::verify_deps::registry::ResolvedPackage {
                 name: name.to_string(),
                 version: version.to_string(),
-                published_at: Utc::now() - chrono::Duration::days(365),
+                published_at: Utc::now() - chrono::Duration::from_std(age).unwrap(),
             },
-            age: Duration::from_secs(365 * 86400),
-            recent,
-            verdict: VerdictStatus::NotChecked(NO_TOKEN_REASON.to_string()),
+            age,
+            verdict: VerdictStatus::NotChecked,
         }
     }
 
@@ -1709,7 +1718,7 @@ mod tests {
         assert!(matches!(
             &untouched[0],
             TargetOutcome::Resolved {
-                verdict: VerdictStatus::NotChecked(_),
+                verdict: VerdictStatus::NotChecked,
                 ..
             }
         ));

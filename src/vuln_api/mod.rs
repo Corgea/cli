@@ -12,6 +12,7 @@
 //! token (no global state).
 
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::log::debug;
@@ -46,13 +47,22 @@ fn user_agent() -> String {
     format!("corgea-cli/{} (vuln-api)", env!("CARGO_PKG_VERSION"))
 }
 
+/// Build (once) and clone the shared vuln-api client. A blocking reqwest
+/// client owns a runtime thread, and a gate makes up to three verdict
+/// passes (tree, named-only, steers) — cache it like `registry.rs` does.
+/// `Client` clones share the same pool, so the clone is cheap.
 pub fn http_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .user_agent(user_agent())
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| format!("failed to build vuln-api http client: {}", e))
+    static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .user_agent(user_agent())
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| format!("failed to build vuln-api http client: {}", e))
+        })
+        .clone()
 }
 
 fn is_jwt(token: &str) -> bool {
@@ -65,15 +75,10 @@ fn normalize_base_url(base_url: &str) -> String {
 }
 
 /// Encode package name for the vuln-api path segment.
-/// npm scoped names: `@scope/pkg` → `@scope%2fpkg` (mirrors registry.rs).
+/// npm scoped names: `@scope/pkg` → `@scope%2fpkg`.
 fn encode_package_name(ecosystem: &str, name: &str) -> String {
     if ecosystem.eq_ignore_ascii_case("npm") {
-        if let Some(stripped) = name.strip_prefix('@') {
-            if let Some((scope, pkg)) = stripped.split_once('/') {
-                return format!("@{}%2f{}", scope, pkg);
-            }
-        }
-        name.to_string()
+        crate::verify_deps::registry::encode_npm_name(name)
     } else {
         urlencoding::encode(name).into_owned()
     }
@@ -285,17 +290,7 @@ mod tests {
     /// Maps a request key to a canned `(status, body)` response.
     type KeyedResponses = HashMap<CheckKey, (u16, String)>;
 
-    /// Reason phrase for the stub's status line.
-    fn status_text(code: u16) -> &'static str {
-        match code {
-            401 => "Unauthorized",
-            403 => "Forbidden",
-            404 => "Not Found",
-            429 => "Too Many Requests",
-            500..=599 => "Internal Server Error",
-            _ => "Error",
-        }
-    }
+    use crate::vuln_api_stub::status_text;
 
     struct PackageCheckStub {
         base_url: String,

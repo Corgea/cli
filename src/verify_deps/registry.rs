@@ -35,7 +35,8 @@ fn http_client() -> Result<&'static reqwest::blocking::Client, String> {
 
 /// URL-encode an npm package name. Scoped names contain `@` and `/`,
 /// the latter must be encoded as `%2f` for the package metadata URL.
-fn encode_npm_name(name: &str) -> String {
+/// Also used by `vuln_api` for its npm path segments.
+pub(crate) fn encode_npm_name(name: &str) -> String {
     if let Some(stripped) = name.strip_prefix('@') {
         if let Some((scope, pkg)) = stripped.split_once('/') {
             return format!("@{}%2f{}", scope, pkg);

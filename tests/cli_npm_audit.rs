@@ -13,14 +13,13 @@
 
 mod common;
 
-use common::corgea_isolated;
+use common::{
+    corgea_isolated, emit, spawn_http_stub, write_script, NOT_FOUND_JSON, OLDPKG_NPM_PACKUMENT,
+};
 use corgea::vuln_api_stub::{self, PackageKey};
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread;
 use tempfile::TempDir;
 
 fn key(eco: &str, name: &str, ver: &str) -> PackageKey {
@@ -70,57 +69,10 @@ enum AuditScenario {
 /// Registry stub serving the `/oldpkg` npm packument, published 2020 →
 /// never recent. Everything else 404s.
 fn spawn_registry_stub() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
-    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut buf = Vec::with_capacity(4096);
-            let mut chunk = [0u8; 1024];
-            while let Ok(n) = stream.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let req = String::from_utf8_lossy(&buf);
-            let path = req
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .unwrap_or("");
-
-            let (status, body) = if path == "/oldpkg" {
-                (
-                    "200 OK",
-                    r#"{"dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{}},"time":{"1.0.0":"2020-01-01T00:00:00Z"}}"#,
-                )
-            } else {
-                ("404 Not Found", r#"{"message":"not found"}"#)
-            };
-            let response = format!(
-                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                status,
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes());
-        }
-    });
-    base_url
-}
-
-/// Shell loop that emits `path` line by line — works under the locked-down
-/// test PATH (no `cat`); the `|| [ -n "$line" ]` guard keeps a final line
-/// with no trailing newline.
-fn emit(path: &Path) -> String {
-    format!(
-        "while IFS= read -r line || [ -n \"$line\" ]; do printf '%s\\n' \"$line\"; done < '{}'",
-        path.display()
-    )
+    spawn_http_stub(|path| match path {
+        "/oldpkg" => ("200 OK", OLDPKG_NPM_PACKUMENT.to_string()),
+        _ => ("404 Not Found", NOT_FOUND_JSON.to_string()),
+    })
 }
 
 /// Write an executable fake npm into `dir`:
@@ -137,7 +89,6 @@ fn write_fake_npm(
     audit_pid: &Path,
     scenario: AuditScenario,
 ) {
-    use std::os::unix::fs::PermissionsExt;
     let lock_payload = dir.join("npm-lock-payload.json");
     std::fs::write(&lock_payload, NPM_LOCK).expect("write lock payload");
     let audit_branch = match scenario {
@@ -168,9 +119,7 @@ fn write_fake_npm(
         audit_marker = audit_marker.display(),
         marker = marker.display(),
     );
-    let path = dir.join("npm");
-    std::fs::write(&path, script).expect("write fake npm");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    write_script(dir, "npm", &script);
 }
 
 /// `corgea` wired to the registry stub, an audit-aware fake npm, and a

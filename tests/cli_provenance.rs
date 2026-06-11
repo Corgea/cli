@@ -13,14 +13,14 @@
 
 mod common;
 
-use common::corgea_isolated;
+use common::{
+    corgea_isolated, spawn_http_stub, write_fake_tree_pm, NOT_FOUND_JSON, OLDPKG_NPM_PACKUMENT,
+    OLDPKG_PYPI_JSON,
+};
 use corgea::vuln_api_stub::{self, PackageKey};
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
-use std::thread;
 use tempfile::TempDir;
 
 fn key(eco: &str, name: &str, ver: &str) -> PackageKey {
@@ -62,75 +62,11 @@ const PROJECT_MANIFEST: &str =
 /// Registry stub serving `/pypi/oldpkg/json` (pypi) and `/oldpkg` (npm
 /// packument), both published 2020 → never recent. Everything else 404s.
 fn spawn_registry_stub() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
-    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut buf = Vec::with_capacity(4096);
-            let mut chunk = [0u8; 1024];
-            while let Ok(n) = stream.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let req = String::from_utf8_lossy(&buf);
-            let path = req
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .unwrap_or("")
-                .to_string();
-
-            let (status, body) = match path.as_str() {
-                "/pypi/oldpkg/json" => (
-                    "200 OK",
-                    r#"{"info":{"name":"oldpkg"},"releases":{"1.0.0":[{"upload_time_iso_8601":"2020-01-01T00:00:00Z"}]}}"#.to_string(),
-                ),
-                "/oldpkg" => (
-                    "200 OK",
-                    r#"{"dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{}},"time":{"1.0.0":"2020-01-01T00:00:00Z"}}"#.to_string(),
-                ),
-                _ => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
-            };
-            let response = format!(
-                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                status,
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes());
-        }
-    });
-    base_url
-}
-
-/// Write an executable fake package manager into `dir`. The tree-resolution
-/// invocation (pip `--dry-run` / npm `--package-lock-only`) emits `payload`
-/// (stdout for pip, `./package-lock.json` for npm) and exits 0; any other
-/// invocation records its argv to `marker` and exits 0. The payload is read
-/// via shell builtins because the locked-down test `PATH` has no `cat`.
-fn write_fake_pm(dir: &Path, marker: &Path, binary: &str, payload: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    let (tree_flag, redirect) = match binary {
-        "pip" => ("--dry-run", ""),
-        "npm" => ("--package-lock-only", " > package-lock.json"),
-        other => panic!("unsupported fake manager {other}"),
-    };
-    let payload_path = dir.join(format!("{binary}-tree-payload.json"));
-    std::fs::write(&payload_path, payload).expect("write fake pm payload");
-    let script = format!(
-        "#!/bin/sh\ncase \" $* \" in *\" {tree_flag} \"*) while IFS= read -r line || [ -n \"$line\" ]; do printf '%s\\n' \"$line\"; done < '{payload}'{redirect}; exit 0;; esac\nprintf '%s' \"$*\" > '{marker}'\nexit 0\n",
-        payload = payload_path.display(),
-        marker = marker.display(),
-    );
-    let path = dir.join(binary);
-    std::fs::write(&path, script).expect("write fake pm");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod fake pm");
+    spawn_http_stub(|path| match path {
+        "/pypi/oldpkg/json" => ("200 OK", OLDPKG_PYPI_JSON.to_string()),
+        "/oldpkg" => ("200 OK", OLDPKG_NPM_PACKUMENT.to_string()),
+        _ => ("404 Not Found", NOT_FOUND_JSON.to_string()),
+    })
 }
 
 /// `corgea` wired to the registry stub, a tree-aware fake manager, and a
@@ -156,7 +92,7 @@ impl Harness {
         let (mut cmd, home) = corgea_isolated();
         let bin = TempDir::new().expect("temp bin dir");
         let marker = bin.path().join("pm-argv.txt");
-        write_fake_pm(bin.path(), &marker, binary, payload);
+        write_fake_tree_pm(bin.path(), binary, &marker, payload, 0);
         let registry = spawn_registry_stub();
         let vuln_stub = vuln_api_stub::spawn_with_statuses(checks, statuses);
         cmd.env("PATH", bin.path())

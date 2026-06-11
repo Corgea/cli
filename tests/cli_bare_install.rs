@@ -15,14 +15,14 @@
 
 mod common;
 
-use common::corgea_isolated;
+use common::{
+    corgea_isolated, spawn_http_stub, write_fake_recorder, write_fake_tree_pm, NOT_FOUND_JSON,
+    OLDPKG_NPM_PACKUMENT, RESOLUTION_FAILS,
+};
 use corgea::vuln_api_stub::{self, PackageKey};
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
-use std::thread;
 use tempfile::TempDir;
 
 fn key(eco: &str, name: &str, ver: &str) -> PackageKey {
@@ -48,90 +48,10 @@ fn vulnerable_evildep_body() -> String {
 /// Registry stub serving the `/oldpkg` npm packument, published 2020 → never
 /// recent. Everything else 404s.
 fn spawn_registry_stub() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
-    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut buf = Vec::with_capacity(4096);
-            let mut chunk = [0u8; 1024];
-            while let Ok(n) = stream.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let req = String::from_utf8_lossy(&buf);
-            let path = req
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .unwrap_or("");
-            let (status, body) = if path == "/oldpkg" {
-                (
-                    "200 OK",
-                    r#"{"dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{}},"time":{"1.0.0":"2020-01-01T00:00:00Z"}}"#,
-                )
-            } else {
-                ("404 Not Found", r#"{"message":"not found"}"#)
-            };
-            let response = format!(
-                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                status,
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes());
-        }
-    });
-    base_url
-}
-
-/// Sentinel payload: the fake npm exits non-zero on its tree (resolution)
-/// invocation, forcing the named-only fallback.
-const RESOLUTION_FAILS: &str = "RESOLUTION_FAILS";
-
-/// Tree-aware fake npm (same scheme as `cli_tree.rs`): an invocation carrying
-/// `--package-lock-only` writes `payload` to `./package-lock.json` (the
-/// resolver's throwaway temp dir) and exits 0, or exits 1 when `payload` is
-/// `RESOLUTION_FAILS`. Any other invocation records its argv to `marker` and
-/// exits `exit_code`. Payload is emitted via shell builtins — the locked-down
-/// PATH has no `cat`.
-fn write_fake_npm(dir: &Path, marker: &Path, payload: &str, exit_code: i32) {
-    use std::os::unix::fs::PermissionsExt;
-    let tree_branch = if payload == RESOLUTION_FAILS {
-        "exit 1".to_string()
-    } else {
-        let payload_path = dir.join("npm-tree-payload.json");
-        std::fs::write(&payload_path, payload).expect("write fake npm payload");
-        format!(
-            "while IFS= read -r line || [ -n \"$line\" ]; do printf '%s\\n' \"$line\"; done < '{}' > package-lock.json; exit 0",
-            payload_path.display()
-        )
-    };
-    let script = format!(
-        "#!/bin/sh\ncase \" $* \" in *\" --package-lock-only \"*) {tree_branch};; esac\nprintf '%s' \"$*\" > '{marker}'\nexit {exit_code}\n",
-        marker = marker.display(),
-    );
-    let path = dir.join("npm");
-    std::fs::write(&path, script).expect("write fake npm");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-}
-
-/// Plain recorder for managers with no tree pass (yarn/pnpm/uv): record argv
-/// to `marker`, exit `exit_code`.
-fn write_fake_recorder(dir: &Path, marker: &Path, binary: &str, exit_code: i32) {
-    use std::os::unix::fs::PermissionsExt;
-    let script = format!(
-        "#!/bin/sh\nprintf '%s' \"$*\" > '{marker}'\nexit {exit_code}\n",
-        marker = marker.display(),
-    );
-    let path = dir.join(binary);
-    std::fs::write(&path, script).expect("write fake pm");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    spawn_http_stub(|path| match path {
+        "/oldpkg" => ("200 OK", OLDPKG_NPM_PACKUMENT.to_string()),
+        _ => ("404 Not Found", NOT_FOUND_JSON.to_string()),
+    })
 }
 
 /// `corgea` wired to a fake package manager, the registry + vuln-api stubs,
@@ -160,8 +80,8 @@ impl BareHarness {
         let project = TempDir::new().expect("project dir");
         let marker = bin.path().join("pm-argv.txt");
         match npm_payload {
-            Some(payload) => write_fake_npm(bin.path(), &marker, payload, exit_code),
-            None => write_fake_recorder(bin.path(), &marker, binary, exit_code),
+            Some(payload) => write_fake_tree_pm(bin.path(), "npm", &marker, payload, exit_code),
+            None => write_fake_recorder(bin.path(), binary, &marker, exit_code),
         }
         let registry = spawn_registry_stub();
         let vuln_stub = vuln_api_stub::spawn_with_statuses(checks, HashMap::new());
