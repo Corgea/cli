@@ -105,6 +105,49 @@ fn npm_ci_unparsable_lockfile_force_proceeds() {
 }
 
 #[test]
+fn npm_ci_root_redirect_refuses_without_force() {
+    // `npm ci --prefix ../other` installs a different project's lockfile than
+    // the CWD one we'd verdict — fail closed rather than pass on the wrong
+    // project.
+    let mut h = GateHarness::new()
+        .fake_recorder("npm", 0)
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .with_project_file("package-lock.json", NPM_LOCK)
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "ci", "--prefix", "/tmp/other-project"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1), "root-redirect ci must refuse");
+    assert_eq!(h.recorded_argv(), None, "npm must not run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--prefix") && stderr.contains("redirected project"),
+        "stderr: {stderr}"
+    );
+
+    // --force bypasses.
+    let mut h = GateHarness::new()
+        .fake_recorder("npm", 0)
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .with_project_file("package-lock.json", NPM_LOCK)
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "--force", "ci", "--prefix", "/tmp/other-project"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0), "--force proceeds");
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("ci --prefix /tmp/other-project")
+    );
+}
+
+#[test]
 fn npm_ci_without_lockfile_execs() {
     // npm ci errors on its own without a lockfile; nothing to gate.
     let mut h = GateHarness::new()

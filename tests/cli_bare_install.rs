@@ -132,6 +132,55 @@ fn bare_npm_without_package_json_passes_through() {
 }
 
 #[test]
+fn bare_npm_install_root_redirect_refuses_without_force() {
+    // A bare `npm install --prefix <other>` installs another project's whole
+    // tree; the gate can't resolve that from the CWD and nothing named
+    // verifies it — fail closed unless --force.
+    let mut h = GateHarness::new()
+        .fake_tree_pm("npm", NPM_LOCK, 0)
+        .oldpkg_registry()
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "install", "--prefix", "/tmp/other-project"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1), "bare root-redirect must refuse");
+    assert_eq!(h.recorded_argv(), None, "npm must not run");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("redirects the project root"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // --force bypasses.
+    let mut h = GateHarness::new()
+        .fake_tree_pm("npm", NPM_LOCK, 0)
+        .oldpkg_registry()
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .build();
+    let out = h
+        .cmd
+        .args([
+            "npm",
+            "--force",
+            "install",
+            "--prefix",
+            "/tmp/other-project",
+        ])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0), "--force proceeds");
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("install --prefix /tmp/other-project")
+    );
+}
+
+#[test]
 fn bare_npm_install_from_subdirectory_is_gated() {
     // npm walks ancestors to find the project; the gate must too, or a
     // bare install from <project>/src would install the whole (vulnerable)

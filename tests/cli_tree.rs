@@ -12,9 +12,45 @@
 
 mod common;
 
-use common::{key, tree_harness, vulnerable_body, NPM_LOCK, RESOLUTION_FAILS, TREE_REPORT};
+use common::{
+    key, tree_harness, vulnerable_body, GateHarness, NPM_LOCK, RESOLUTION_FAILS, TREE_REPORT,
+};
 use std::collections::HashMap;
 use tempfile::TempDir;
+
+#[test]
+fn pip_only_binary_guard_wins_over_user_no_binary() {
+    // SECURITY: the non-execution guard `--only-binary :all:` must land AFTER
+    // the user's args (pip format-control is last-wins), so a user
+    // `--no-binary :all:` can't re-enable sdist builds during the report step.
+    // The fake pip records its dry-run argv to the marker on the --dry-run
+    // branch and no-ops the real install, so `recorded_argv()` is the dry-run.
+    let mut h = GateHarness::new()
+        .script_with_paths("pip", |_, marker| {
+            format!(
+                "#!/bin/sh\ncase \" $* \" in *\" --dry-run \"*) printf '%s' \"$*\" > '{}'; printf '{{\"install\":[{{\"metadata\":{{\"name\":\"oldpkg\",\"version\":\"1.0.0\"}},\"requested\":true}}]}}'; exit 0;; esac\nexit 0\n",
+                marker.display()
+            )
+        })
+        .oldpkg_registry()
+        .vuln_checks(HashMap::new())
+        .build();
+    let out = h
+        .cmd
+        .args(["pip", "install", "--no-binary", ":all:", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0), "clean tree proceeds");
+    let argv = h.recorded_argv().expect("dry-run argv recorded");
+    assert!(
+        argv.contains("--no-binary :all:"),
+        "user flag must be forwarded: {argv}"
+    );
+    assert!(
+        argv.trim_end().ends_with("--only-binary :all:"),
+        "the guard must be appended LAST so it wins: {argv}"
+    );
+}
 
 fn vulnerable_evildep_body(ecosystem: &str) -> String {
     vulnerable_body(ecosystem, "evildep", "0.4.2", "MAL-2024-0002", None)

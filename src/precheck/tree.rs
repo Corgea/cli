@@ -44,6 +44,21 @@ pub(super) fn npm_project_root() -> Option<std::path::PathBuf> {
     Some(find_up("package.json")?.parent()?.to_path_buf())
 }
 
+/// The npm flag that redirects the project root (`--prefix`, `-C`, `-g`,
+/// `--global`, `--location`), if present. The gate can't safely resolve or
+/// verify the redirected project from a throwaway copy of the CWD, so the
+/// callers fail closed (bare install / `npm ci`) or degrade to named-only.
+pub(super) fn npm_root_redirect_flag(args: &[String]) -> Option<String> {
+    const ROOT_REDIRECT_FLAGS: [&str; 5] = ["--prefix", "-C", "--global", "-g", "--location"];
+    args.iter()
+        .find(|a| {
+            ROOT_REDIRECT_FLAGS
+                .iter()
+                .any(|f| a.as_str() == *f || a.starts_with(&format!("{f}=")))
+        })
+        .cloned()
+}
+
 /// `Err(reason)`: the dry-run failed — the caller falls back to named-only
 /// and its warning carries `reason`.
 pub fn resolve_tree(
@@ -70,17 +85,16 @@ fn resolve_pip_tree(binary: &str, install_args: &[String]) -> Result<Vec<TreePac
     // Same binary resolution as the exec path (pip → pip3 fallback) — the
     // tree pass must not silently degrade on pip3-only systems.
     let resolved = super::exec::resolve_binary(binary)?;
+    // The non-execution guard `--only-binary :all:` is appended AFTER the
+    // user's args: pip's format-control flags are last-wins per package, so a
+    // user `--no-binary :all:` / `--only-binary :none:` placed in install_args
+    // must not re-enable sdist builds (which would run package code during the
+    // report step, violating this file's safety invariant).
     let output = Command::new(resolved)
         .arg("install")
-        .args([
-            "--dry-run",
-            "--quiet",
-            "--report",
-            "-",
-            "--only-binary",
-            ":all:",
-        ])
+        .args(["--dry-run", "--quiet", "--report", "-"])
         .args(install_args)
+        .args(["--only-binary", ":all:"])
         .output()
         .map_err(|e| format!("run pip dry-run: {e}"))?;
     if !output.status.success() {
@@ -158,12 +172,7 @@ fn resolve_npm_tree(binary: &str, install_args: &[String]) -> Result<Vec<TreePac
     // Flags that redirect npm's project root would defeat the throwaway-dir
     // isolation below (`--prefix` overrides `current_dir`, so the dry run
     // would write the USER'S package-lock.json) — degrade to named-only.
-    const ROOT_REDIRECT_FLAGS: [&str; 5] = ["--prefix", "-C", "--global", "-g", "--location"];
-    if let Some(flag) = install_args.iter().find(|a| {
-        ROOT_REDIRECT_FLAGS
-            .iter()
-            .any(|f| a.as_str() == *f || a.starts_with(&format!("{f}=")))
-    }) {
+    if let Some(flag) = npm_root_redirect_flag(install_args) {
         return Err(format!(
             "'{flag}' redirects npm's project root; lockfile resolution skipped"
         ));
@@ -207,38 +216,83 @@ fn resolve_npm_tree(binary: &str, install_args: &[String]) -> Result<Vec<TreePac
             stderr_tail(&output)
         ));
     }
-    let lock = std::fs::read_to_string(work.path().join("package-lock.json"))
-        .map_err(|e| format!("read generated package-lock.json: {e}"))?;
+    // npm gives `npm-shrinkwrap.json` precedence over `package-lock.json`,
+    // so read whichever it actually produced/used, preferring the shrinkwrap.
+    let lock_path = ["npm-shrinkwrap.json", "package-lock.json"]
+        .iter()
+        .map(|n| work.path().join(n))
+        .find(|p| p.is_file())
+        .ok_or("npm produced no lockfile to verify")?;
+    let lock = std::fs::read_to_string(&lock_path)
+        .map_err(|e| format!("read generated {}: {e}", lock_path.display()))?;
     parse_npm_lockfile(&lock)
 }
 
 pub(super) fn parse_npm_lockfile(json: &str) -> Result<Vec<TreePackage>, String> {
     let lock: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("parse package-lock.json: {e}"))?;
-    let packages = lock
-        .get("packages")
-        .and_then(|v| v.as_object())
-        .ok_or("package-lock.json has no packages map (npm < 7?)")?;
-    Ok(packages
-        .iter()
-        // Skip the root project entry ("") and symlinked (workspace) entries.
-        .filter(|(path, entry)| {
-            !path.is_empty() && entry.get("link").and_then(|v| v.as_bool()) != Some(true)
-        })
-        .filter_map(|(path, entry)| {
-            let name = entry
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .or_else(|| name_from_lock_path(path))?;
-            let version = entry.get("version").and_then(|v| v.as_str())?;
-            Some(TreePackage {
-                name,
+    // lockfileVersion 2/3 carries the `packages` map; v1 only has the
+    // `dependencies` tree, which npm still understands — support both so a
+    // v1 project isn't forced to bypass the gate with `--force`.
+    if let Some(packages) = lock.get("packages").and_then(|v| v.as_object()) {
+        Ok(packages
+            .iter()
+            // Only `node_modules/...` entries are registry-installed deps.
+            // Skip the root project (""), symlinked workspaces (`link: true`),
+            // and workspace SOURCE stanzas (`packages/foo`, `apps/bar`) — those
+            // are local packages with no registry identity, so sending them to
+            // the public vuln-api would falsely block a monorepo install when a
+            // public package shares the name@version.
+            .filter(|(path, entry)| {
+                path.contains("node_modules/")
+                    && entry.get("link").and_then(|v| v.as_bool()) != Some(true)
+            })
+            .filter_map(|(path, entry)| {
+                let name = entry
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| name_from_lock_path(path))?;
+                let version = entry.get("version").and_then(|v| v.as_str())?;
+                Some(TreePackage {
+                    name,
+                    version: version.to_string(),
+                    requested: false,
+                })
+            })
+            .collect())
+    } else if let Some(deps) = lock.get("dependencies").and_then(|v| v.as_object()) {
+        let mut out = Vec::new();
+        collect_v1_dependencies(deps, &mut out);
+        Ok(out)
+    } else {
+        Err("package-lock.json has neither a packages map nor a dependencies tree".to_string())
+    }
+}
+
+/// Recursively collect `name@version` from a lockfileVersion 1
+/// `dependencies` tree. Nested `dependencies` are deduped by the caller's
+/// pool; local/link entries (`"link": true`) carry no registry identity and
+/// are skipped.
+fn collect_v1_dependencies(
+    deps: &serde_json::Map<String, serde_json::Value>,
+    out: &mut Vec<TreePackage>,
+) {
+    for (name, entry) in deps {
+        if entry.get("link").and_then(|v| v.as_bool()) == Some(true) {
+            continue;
+        }
+        if let Some(version) = entry.get("version").and_then(|v| v.as_str()) {
+            out.push(TreePackage {
+                name: name.clone(),
                 version: version.to_string(),
                 requested: false,
-            })
-        })
-        .collect())
+            });
+        }
+        if let Some(nested) = entry.get("dependencies").and_then(|v| v.as_object()) {
+            collect_v1_dependencies(nested, out);
+        }
+    }
 }
 
 /// Derive a package name from a lockfile path key like
@@ -321,31 +375,63 @@ mod tests {
         }
     }"#;
 
+    fn pkg(name: &str, version: &str) -> TreePackage {
+        TreePackage {
+            name: name.to_string(),
+            version: version.to_string(),
+            requested: false,
+        }
+    }
+
     #[test]
     fn parse_npm_lockfile_ok() {
         let mut pkgs = parse_npm_lockfile(NPM_LOCK).expect("parse npm lock");
         pkgs.sort_by(|a, b| a.name.cmp(&b.name));
-        let pkg = |name: &str, version: &str| TreePackage {
-            name: name.to_string(),
-            version: version.to_string(),
-            requested: false,
-        };
+        // The workspace SOURCE stanza `packages/localdep` is a local package,
+        // not a registry dep — it must NOT be verdicted, only the four
+        // node_modules/ entries are.
         assert_eq!(
             pkgs,
             vec![
                 pkg("@scope/pkg", "9.0.1"),
                 pkg("b", "2.3.4"),
                 pkg("evildep", "0.4.2"),
-                pkg("localdep", "0.0.1"),
                 pkg("oldpkg", "1.0.0"),
             ]
         );
     }
 
     #[test]
-    fn parse_npm_lockfile_missing_packages() {
-        let err = parse_npm_lockfile(r#"{"lockfileVersion":1}"#).expect_err("no packages map");
-        assert!(err.contains("no packages map"), "got: {err}");
+    fn parse_npm_lockfile_v1_dependencies_tree() {
+        // lockfileVersion 1 has no `packages` map — npm still understands it,
+        // so the gate must too (recursing into nested `dependencies`), and
+        // skip `link` entries.
+        const V1: &str = r#"{
+            "name": "proj", "lockfileVersion": 1,
+            "dependencies": {
+                "oldpkg": {"version": "1.0.0"},
+                "evildep": {"version": "0.4.2", "dependencies": {
+                    "deepdep": {"version": "3.2.1"}
+                }},
+                "locallink": {"version": "file:../local", "link": true}
+            }
+        }"#;
+        let mut pkgs = parse_npm_lockfile(V1).expect("parse v1 lock");
+        pkgs.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(
+            pkgs,
+            vec![
+                pkg("deepdep", "3.2.1"),
+                pkg("evildep", "0.4.2"),
+                pkg("oldpkg", "1.0.0"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_npm_lockfile_neither_schema_is_error() {
+        let err = parse_npm_lockfile(r#"{"lockfileVersion":1}"#).expect_err("no deps");
+        assert!(err.contains("neither a packages map"), "got: {err}");
     }
 
     #[test]
