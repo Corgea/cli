@@ -1,66 +1,60 @@
-//! Verdict pass: bounded vuln-api worker pool, registry resolution, and the
+//! Verdict pass: bounded vuln-api worker pool, result matching, and the
 //! single block predicate (`block_reason`).
 
 use std::time::Duration;
 
 use super::{
-    InstallTarget, PackageManager, PrecheckOptions, PrecheckReport, TargetKind, TargetOutcome,
-    VerdictStatus,
+    tree, InstallTarget, PackageManager, PrecheckOptions, PrecheckReport, TargetKind,
+    TargetOutcome, TreeOrigin, TreeOutcome, TreeReport, VerdictConfig, VerdictStatus,
 };
+
+/// Above this many verdict jobs, print a stderr progress line so a big tree
+/// pass doesn't look hung.
+const VERDICT_PROGRESS_THRESHOLD: usize = 8;
 
 /// Max parallel vuln-api / registry requests.
 const VERDICT_CONCURRENCY: usize = 8;
 
-/// Vuln-api verdict pass over resolved targets, run through the bounded
-/// worker pool. No-op without a `VerdictConfig` (recency-only callers).
-/// Any client/call failure becomes `Unverifiable`, which warns but never
-/// blocks: public lookups fail open.
-pub(super) fn run_verdict_pass(
+/// Bounded worker pool over the verdict jobs. On client/request failure every
+/// job comes back `Unverifiable`, which warns but never blocks: public
+/// lookups fail open. Order is preserved: result `i` belongs to job `i`.
+pub(super) fn verdict_pool(
+    jobs: Vec<tree::TreePackage>,
+    cfg: &VerdictConfig,
     manager: PackageManager,
-    outcomes: &mut [TargetOutcome],
-    opts: &PrecheckOptions,
-) {
-    let Some(cfg) = &opts.verdict else { return };
+) -> Vec<(tree::TreePackage, VerdictStatus)> {
+    let client = match crate::vuln_api::http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            return jobs
+                .into_iter()
+                .map(|j| (j, VerdictStatus::Unverifiable(e.clone())))
+                .collect();
+        }
+    };
 
-    let jobs: Vec<(usize, String, String)> = outcomes
-        .iter()
-        .enumerate()
-        .filter_map(|(i, o)| match o {
-            TargetOutcome::Resolved { resolved, .. } => {
-                Some((i, resolved.name.clone(), resolved.version.clone()))
-            }
-            _ => None,
-        })
-        .collect();
-    if jobs.is_empty() {
-        return;
+    if jobs.len() > VERDICT_PROGRESS_THRESHOLD {
+        eprintln!("checking {} packages against Corgea vuln-api…", jobs.len());
     }
 
-    let client = crate::vuln_api::http_client();
     let ecosystem = manager.ecosystem();
-    let verdicts = pooled_map(&jobs, VERDICT_CONCURRENCY, |(_, name, version)| {
-        let client = match &client {
-            Ok(c) => c,
-            Err(e) => return VerdictStatus::Unverifiable(e.clone()),
-        };
-        match crate::vuln_api::check_package_version(
-            client,
-            &cfg.base_url,
-            ecosystem,
-            name,
-            version,
-        ) {
-            Ok(resp) if resp.is_vulnerable => VerdictStatus::Vulnerable(resp.matches),
-            Ok(_) => VerdictStatus::Clean,
-            Err(e) => VerdictStatus::Unverifiable(e.to_string()),
-        }
-    });
-
-    for ((i, _, _), v) in jobs.into_iter().zip(verdicts) {
-        if let TargetOutcome::Resolved { verdict, .. } = &mut outcomes[i] {
-            *verdict = v;
-        }
-    }
+    let verdicts =
+        pooled_map(
+            &jobs,
+            VERDICT_CONCURRENCY,
+            |job| match crate::vuln_api::check_package_version(
+                &client,
+                &cfg.base_url,
+                ecosystem,
+                &job.name,
+                &job.version,
+            ) {
+                Ok(resp) if resp.is_vulnerable => VerdictStatus::Vulnerable(resp.matches),
+                Ok(_) => VerdictStatus::Clean,
+                Err(e) => VerdictStatus::Unverifiable(e.to_string()),
+            },
+        );
+    jobs.into_iter().zip(verdicts).collect()
 }
 
 /// Order-preserving bounded worker pool: `results[i]` is `f(&items[i])`.
@@ -99,11 +93,65 @@ fn pooled_map<T: Sync, R: Send>(
         .collect()
 }
 
+/// Assign pooled verdicts onto matching named outcomes (by normalized
+/// name + version) and return the unmatched leftovers — the tree findings.
+/// Each leftover carries its provenance: pip's `requested` flag, membership
+/// in the project manifest's direct deps (`direct_deps`), or transitive.
+pub(super) fn apply_verdicts(
+    manager: PackageManager,
+    results: Vec<(tree::TreePackage, VerdictStatus)>,
+    outcomes: &mut [TargetOutcome],
+    direct_deps: &std::collections::HashSet<String>,
+) -> Vec<TreeOutcome> {
+    let norm = |n: &str| manager.normalize_name(n);
+    // Index named outcomes by (normalized name, version) so matching the
+    // pooled results stays linear on big trees.
+    let mut named: std::collections::HashMap<(String, String), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, o) in outcomes.iter().enumerate() {
+        if let TargetOutcome::Resolved { resolved, .. } = o {
+            named
+                .entry((norm(&resolved.name), resolved.version.clone()))
+                .or_default()
+                .push(i);
+        }
+    }
+
+    let mut transitive = Vec::new();
+    for (pkg, verdict) in results {
+        if let Some(indices) = named.get(&(norm(&pkg.name), pkg.version.clone())) {
+            for &i in indices {
+                if let TargetOutcome::Resolved { verdict: v, .. } = &mut outcomes[i] {
+                    *v = verdict.clone();
+                }
+            }
+        } else {
+            let origin = if pkg.requested {
+                TreeOrigin::Requested
+            } else if direct_deps.contains(&pkg.name) {
+                TreeOrigin::PreExisting
+            } else {
+                TreeOrigin::Transitive
+            };
+            transitive.push(TreeOutcome {
+                name: pkg.name,
+                version: pkg.version,
+                origin,
+                verdict,
+            });
+        }
+    }
+    transitive
+}
+
 /// Why the gate refuses to run the install. The single owner of both the
 /// block decision and the escape hatch the refusal advertises —
 /// `render::print_refusal` only maps variants to text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BlockReason {
+    /// Every blocking finding predates this command (existing tree only).
+    /// `--force` is the escape.
+    ExistingTree,
     /// Vulnerable findings. `--force` is the escape.
     Findings,
     /// Only the recency threshold fired. `--no-fail` is the escape.
@@ -115,12 +163,44 @@ pub(super) fn block_reason(report: &PrecheckReport, opts: &PrecheckOptions) -> O
         return None;
     }
     if report.verdicts().any(|v| v.blocks()) {
-        return Some(BlockReason::Findings);
+        return Some(if blames_existing_tree(report) {
+            BlockReason::ExistingTree
+        } else {
+            BlockReason::Findings
+        });
     }
     if !opts.no_fail && report.recent_count() > 0 {
         return Some(BlockReason::RecencyOnly);
     }
     None
+}
+
+/// True when the block is entirely the existing tree's doing: vulnerable
+/// findings exist, no named target blocks, and every *blocking* tree
+/// finding (`VerdictStatus::blocks`, same predicate `block_reason` refuses
+/// on) genuinely predates this command. A `Requested` finding (pip `-r`)
+/// is added by this command and renders as `(from requirements)`; a
+/// `Transitive` finding on any install that names targets or requirements
+/// files is being pulled in by them right now. Only a truly bare install
+/// (`report.bare_install`) or manifest-declared `PreExisting` findings may
+/// blame the existing tree.
+fn blames_existing_tree(report: &PrecheckReport) -> bool {
+    let named_blocks = report.named_verdicts().any(|v| v.blocks());
+    if report.vulnerable_count() == 0 || named_blocks {
+        return false;
+    }
+    let Some(TreeReport::Full { transitive, .. }) = &report.tree else {
+        return false;
+    };
+    transitive
+        .iter()
+        .filter(|t| t.verdict.blocks())
+        .all(|t| match t.origin {
+            // A locked pin predates the `npm ci` that installs it.
+            TreeOrigin::PreExisting | TreeOrigin::Locked => true,
+            TreeOrigin::Requested => false,
+            TreeOrigin::Transitive => report.bare_install,
+        })
 }
 
 /// Resolve every named target against its registry through the bounded
@@ -186,7 +266,10 @@ fn verify_one(
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
-    use super::super::{InstallTarget, PackageManager, TargetKind, TargetOutcome, VerdictStatus};
+    use super::super::{
+        run_verdict_pass, InstallTarget, PackageManager, TargetKind, TargetOutcome, TreeOrigin,
+        TreeOutcome, TreeReport, VerdictStatus,
+    };
     use super::*;
 
     fn should_block_install(report: &PrecheckReport, opts: &PrecheckOptions) -> bool {
@@ -259,6 +342,100 @@ mod tests {
         }
     }
 
+    /// A clean named outcome plus a vulnerable transitive tree finding must
+    /// roll into the block counts: `vulnerable_count() == 1`,
+    /// `should_block_install` true without `--force`, false with it.
+    #[test]
+    fn tree_findings_extend_block_counts() {
+        let mut named = resolved_outcome("pkg", "1.0.0", false);
+        set_verdict(&mut named, VerdictStatus::Clean);
+        let mut report = report_with(vec![named]);
+        report.tree = Some(TreeReport::Full {
+            resolved_count: 2,
+            transitive: vec![TreeOutcome {
+                name: "evildep".to_string(),
+                version: "0.4.2".to_string(),
+                origin: TreeOrigin::Transitive,
+                verdict: VerdictStatus::Vulnerable(vec![]),
+            }],
+        });
+
+        assert_eq!(report.vulnerable_count(), 1);
+        let opts = |force: bool| PrecheckOptions {
+            force,
+            ..stub_opts()
+        };
+        assert!(should_block_install(&report, &opts(false)));
+        assert!(!should_block_install(&report, &opts(true)));
+    }
+
+    /// The existing-tree refusal fires only when every vulnerable finding
+    /// predates the command: a `Requested` finding (pip `-r`) is added by
+    /// this command, and a `Transitive` finding is being pulled in right
+    /// now unless the install is truly bare. `bare_install` is the explicit
+    /// discriminator — a requirements-only install also has no named
+    /// outcomes, but its resolved set is the command's doing.
+    #[test]
+    fn refusal_blame_respects_finding_origin() {
+        let tree_vulnerable = |origin| TreeOutcome {
+            name: "dep".to_string(),
+            version: "1.0.0".to_string(),
+            verdict: VerdictStatus::Vulnerable(vec![vm("A-1", None)]),
+            origin,
+        };
+        // (origin, named outcomes present, bare_install, expected).
+        // (origin, named=false, bare=false) is the requirements-only shape.
+        let cases = [
+            (TreeOrigin::PreExisting, false, true, true),
+            (TreeOrigin::PreExisting, false, false, true),
+            (TreeOrigin::PreExisting, true, false, true),
+            (TreeOrigin::Locked, false, true, true),
+            (TreeOrigin::Transitive, false, true, true),
+            (TreeOrigin::Transitive, false, false, false),
+            (TreeOrigin::Transitive, true, false, false),
+            (TreeOrigin::Requested, false, true, false),
+            (TreeOrigin::Requested, false, false, false),
+            (TreeOrigin::Requested, true, false, false),
+        ];
+        for (origin, with_named, bare_install, blames_tree) in cases {
+            let outcomes = if with_named {
+                vec![resolved_outcome("cleanpkg", "1.0.0", false)]
+            } else {
+                vec![]
+            };
+            let mut report = report_with(outcomes);
+            report.bare_install = bare_install;
+            report.tree = Some(TreeReport::Full {
+                resolved_count: 1,
+                transitive: vec![tree_vulnerable(origin)],
+            });
+            assert_eq!(
+                blames_existing_tree(&report),
+                blames_tree,
+                "origin {origin:?}, with_named {with_named}, bare {bare_install}"
+            );
+        }
+    }
+
+    /// A vulnerable NAMED target must never blame the existing tree, even
+    /// when a pre-existing tree finding is also vulnerable.
+    #[test]
+    fn refusal_blame_requires_clean_named_targets() {
+        let mut named = resolved_outcome("badpkg", "1.0.0", false);
+        set_verdict(&mut named, VerdictStatus::Vulnerable(vec![vm("A-1", None)]));
+        let mut report = report_with(vec![named]);
+        report.tree = Some(TreeReport::Full {
+            resolved_count: 2,
+            transitive: vec![TreeOutcome {
+                name: "stickydep".to_string(),
+                version: "1.0.0".to_string(),
+                verdict: VerdictStatus::Vulnerable(vec![vm("A-2", None)]),
+                origin: TreeOrigin::PreExisting,
+            }],
+        });
+        assert!(!blames_existing_tree(&report));
+    }
+
     /// Verdict pass against an in-process stub: vulnerable body → Vulnerable
     /// with matches; 503 override → Unverifiable; no VerdictConfig → outcomes
     /// keep NotChecked.
@@ -312,6 +489,53 @@ mod tests {
         ));
     }
 
+    /// The pool must verdict every job exactly once and return the flagged
+    /// job `Vulnerable` with the rest `Clean`.
+    #[test]
+    fn verdict_pool_returns_all_results() {
+        use std::collections::HashMap;
+
+        let mut checks = HashMap::new();
+        checks.insert(
+            crate::vuln_api_stub::key("pypi", "evil", "1.0.0"),
+            crate::vuln_api_stub::vulnerable_body("pypi", "evil", "1.0.0", "MAL-2024-0001", None),
+        );
+        let stub = crate::vuln_api_stub::spawn_with_statuses(checks, HashMap::new());
+
+        let cfg = VerdictConfig {
+            base_url: stub.base_url.clone(),
+        };
+
+        let jobs: Vec<tree::TreePackage> = ["a", "b", "evil", "c", "d", "e"]
+            .iter()
+            .map(|n| tree::TreePackage {
+                name: n.to_string(),
+                version: "1.0.0".to_string(),
+                requested: false,
+            })
+            .collect();
+
+        let results = verdict_pool(jobs, &cfg, PackageManager::Pip);
+        assert_eq!(results.len(), 6, "all jobs verdicted");
+        let flagged = results
+            .iter()
+            .filter(|(_, v)| matches!(v, VerdictStatus::Vulnerable(_)))
+            .count();
+        let clean = results
+            .iter()
+            .filter(|(_, v)| matches!(v, VerdictStatus::Clean))
+            .count();
+        assert_eq!(flagged, 1, "only evil flagged");
+        assert_eq!(clean, 5, "rest clean");
+        let evil = results
+            .iter()
+            .find(|(p, _)| p.name == "evil")
+            .expect("evil present");
+        assert!(
+            matches!(&evil.1, VerdictStatus::Vulnerable(m) if m[0].advisory_id == "MAL-2024-0001")
+        );
+    }
+
     /// `pooled_map` maps every item and preserves order at any concurrency
     /// (1 = serial, 8 > item count = all workers spawn but some drain empty).
     #[test]
@@ -324,5 +548,36 @@ mod tests {
                 "concurrency {concurrency}"
             );
         }
+    }
+
+    /// Leftover origin assignment: pip `requested` ⇒ Requested; manifest
+    /// direct dep ⇒ PreExisting; otherwise Transitive. Requested wins over
+    /// a direct-dep hit.
+    #[test]
+    fn apply_verdicts_assigns_origins() {
+        let pkg = |name: &str, requested: bool| tree::TreePackage {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            requested,
+        };
+        let results = vec![
+            (pkg("reqdep", true), VerdictStatus::Clean),
+            (pkg("predep", false), VerdictStatus::Clean),
+            (pkg("deepdep", false), VerdictStatus::Clean),
+        ];
+        let direct_deps = std::collections::HashSet::from(["predep".to_string()]);
+        let mut outcomes = [];
+        let mut tree = apply_verdicts(PackageManager::Npm, results, &mut outcomes, &direct_deps);
+        tree.sort_by(|a, b| a.name.cmp(&b.name));
+        let origins: Vec<(&str, TreeOrigin)> =
+            tree.iter().map(|t| (t.name.as_str(), t.origin)).collect();
+        assert_eq!(
+            origins,
+            vec![
+                ("deepdep", TreeOrigin::Transitive),
+                ("predep", TreeOrigin::PreExisting),
+                ("reqdep", TreeOrigin::Requested),
+            ]
+        );
     }
 }

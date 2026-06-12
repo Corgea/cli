@@ -75,6 +75,10 @@ pub(crate) fn report_with(outcomes: Vec<TargetOutcome>) -> PrecheckReport {
         original_args: vec![],
         outcomes,
         threshold: Duration::from_secs(2 * 86400),
+        tree: None,
+        // Most tests model an install that named something; bare-install
+        // cases set this explicitly.
+        bare_install: false,
     }
 }
 
