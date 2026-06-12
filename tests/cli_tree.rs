@@ -52,6 +52,63 @@ fn pip_only_binary_guard_wins_over_user_no_binary() {
     );
 }
 
+#[test]
+fn pip_requirements_format_control_refuses_dry_run() {
+    // SECURITY: pip applies `--no-binary` directives found INSIDE a -r file
+    // AFTER CLI parsing, overriding the trailing `--only-binary :all:`
+    // guard — the dry-run would select and build sdists, executing package
+    // code. The tree pass must refuse to dry-run such files and degrade to
+    // the named-only fallback (whose parser skips option lines), still
+    // verdicting the file's registry entries.
+    let cwd = TempDir::new().expect("temp cwd");
+    std::fs::write(
+        cwd.path().join("requirements.txt"),
+        "--no-binary :all:\noldpkg==1.0.0\n",
+    )
+    .expect("write requirements.txt");
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("pypi", "oldpkg", "1.0.0"),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0004", None),
+    );
+    // The fake pip records argv ONLY on its dry-run branch: a recorded
+    // marker would mean the dry-run executed against the hostile file.
+    let mut h = GateHarness::new()
+        .script_with_paths("pip", |_, marker| {
+            format!(
+                "#!/bin/sh\ncase \" $* \" in *\" --dry-run \"*) printf '%s' \"$*\" > '{}';; esac\nexit 0\n",
+                marker.display()
+            )
+        })
+        .oldpkg_registry()
+        .vuln_checks(checks)
+        .build();
+    let out = h
+        .cmd
+        .current_dir(cwd.path())
+        .args(["pip", "install", "-r", "requirements.txt"])
+        .output()
+        .expect("run corgea");
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the file's vulnerable entry must still block via the fallback"
+    );
+    assert_eq!(
+        h.recorded_argv(),
+        None,
+        "the dry-run must never execute against a format-control requirements file"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--no-binary") && stderr.contains("not dry-running"),
+        "stderr must name the refusing directive: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("MAL-2024-0004"), "stdout: {stdout}");
+}
+
 fn vulnerable_evildep_body(ecosystem: &str) -> String {
     vulnerable_body(ecosystem, "evildep", "0.4.2", "MAL-2024-0002", None)
 }
