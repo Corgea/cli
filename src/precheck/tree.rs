@@ -1,7 +1,11 @@
 //! Full would-install-set resolution (the "tree pass").
 //!
 //! Safety invariant: resolution must never execute package code.
-//! pip: `--only-binary :all:` prevents sdist builds (pypa/pip#13091).
+//! pip: `--only-binary :all:` (appended last, so it wins over CLI
+//! format-control flags) prevents sdist builds (pypa/pip#13091) — BUT pip
+//! applies format-control directives found *inside* `-r` files after CLI
+//! parsing, so requirements files are pre-scanned and any `--no-binary` /
+//! `--only-binary` line refuses the dry-run (named-only fallback) instead.
 //! npm: `--ignore-scripts` guards npm/cli#2787.
 
 use std::process::Command;
@@ -64,9 +68,10 @@ pub(super) fn npm_root_redirect_flag(args: &[String]) -> Option<String> {
 pub fn resolve_tree(
     manager: PackageManager,
     install_args: &[String],
+    parsed: &super::parse::ParsedInstall,
 ) -> Result<Vec<TreePackage>, String> {
     match manager {
-        PackageManager::Pip => resolve_pip_tree(manager.binary_name(), install_args),
+        PackageManager::Pip => resolve_pip_tree(manager.binary_name(), install_args, parsed),
         PackageManager::Npm => resolve_npm_tree(manager.binary_name(), install_args),
     }
 }
@@ -81,7 +86,27 @@ fn stderr_tail(output: &std::process::Output) -> String {
         .to_string()
 }
 
-fn resolve_pip_tree(binary: &str, install_args: &[String]) -> Result<Vec<TreePackage>, String> {
+fn resolve_pip_tree(
+    binary: &str,
+    install_args: &[String],
+    parsed: &super::parse::ParsedInstall,
+) -> Result<Vec<TreePackage>, String> {
+    // pip applies format-control directives found INSIDE a requirements
+    // file AFTER command-line parsing (acknowledged pip behavior — the file
+    // parser mutates the shared FormatControl object), so a `--no-binary
+    // :all:` line in a `-r` file would override the trailing CLI guard
+    // below and build sdists during the dry-run. Refuse to dry-run such
+    // files; the caller degrades to the named-only fallback, whose
+    // requirements parser skips option lines entirely.
+    if let Some((file, directive)) =
+        super::parse::requirements_format_control_directive(&parsed.requirements_files)
+    {
+        return Err(format!(
+            "{} sets {} (file-level format-control overrides the sdist guard; not dry-running)",
+            file.display(),
+            directive
+        ));
+    }
     // Same binary resolution as the exec path (pip → pip3 fallback) — the
     // tree pass must not silently degrade on pip3-only systems.
     let resolved = super::exec::resolve_binary(binary)?;
@@ -181,7 +206,12 @@ fn resolve_npm_tree(binary: &str, install_args: &[String]) -> Result<Vec<TreePac
     let resolved = super::exec::resolve_binary(binary)?;
     let work = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
     // Copy the manifests from the project npm would operate on (nearest
-    // ancestor package.json), not just the CWD.
+    // ancestor package.json), not just the CWD. The `.npmrc` copy is
+    // config-only (registry/auth/save prefs) so resolution matches a real
+    // install; CLI flags below still win over it (`--ignore-scripts` can't
+    // be undone by an `ignore-scripts=false` line). A `package-lock=false`
+    // `.npmrc` makes the resolution emit no lockfile → named-only fallback
+    // by design, not a hole: nothing executes either way.
     let root = npm_project_root();
     for manifest in [
         "package.json",
@@ -263,21 +293,36 @@ pub(super) fn parse_npm_lockfile(json: &str) -> Result<Vec<TreePackage>, String>
             .collect())
     } else if let Some(deps) = lock.get("dependencies").and_then(|v| v.as_object()) {
         let mut out = Vec::new();
-        collect_v1_dependencies(deps, &mut out);
+        collect_v1_dependencies(deps, &mut out, 0)?;
         Ok(out)
     } else {
         Err("package-lock.json has neither a packages map nor a dependencies tree".to_string())
     }
 }
 
+/// npm-written v1 trees are finite (no cycles by construction), but
+/// `npm ci` feeds this parser an attacker-supplied file — cap the depth so
+/// a crafted deep nest can't overflow the stack. In practice serde_json's
+/// own 128-level recursion limit rejects such files at parse time (each v1
+/// level is two JSON levels); this cap is defense-in-depth should that
+/// limit ever change. Real trees are a handful of levels deep.
+const V1_MAX_DEPTH: usize = 64;
+
 /// Recursively collect `name@version` from a lockfileVersion 1
 /// `dependencies` tree. Nested `dependencies` are deduped by the caller's
 /// pool; local/link entries (`"link": true`) carry no registry identity and
-/// are skipped.
+/// are skipped. Fails loudly past `V1_MAX_DEPTH` (callers refuse or fall
+/// back — never silently truncate the verdict set).
 fn collect_v1_dependencies(
     deps: &serde_json::Map<String, serde_json::Value>,
     out: &mut Vec<TreePackage>,
-) {
+    depth: usize,
+) -> Result<(), String> {
+    if depth > V1_MAX_DEPTH {
+        return Err(format!(
+            "package-lock.json dependencies nest deeper than {V1_MAX_DEPTH} levels; refusing to parse"
+        ));
+    }
     for (name, entry) in deps {
         if entry.get("link").and_then(|v| v.as_bool()) == Some(true) {
             continue;
@@ -290,9 +335,10 @@ fn collect_v1_dependencies(
             });
         }
         if let Some(nested) = entry.get("dependencies").and_then(|v| v.as_object()) {
-            collect_v1_dependencies(nested, out);
+            collect_v1_dependencies(nested, out, depth + 1)?;
         }
     }
+    Ok(())
 }
 
 /// Derive a package name from a lockfile path key like
@@ -432,6 +478,25 @@ mod tests {
     fn parse_npm_lockfile_neither_schema_is_error() {
         let err = parse_npm_lockfile(r#"{"lockfileVersion":1}"#).expect_err("no deps");
         assert!(err.contains("neither a packages map"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_npm_lockfile_v1_depth_bomb_errors_instead_of_overflowing() {
+        // `npm ci` parses attacker-supplied lockfiles; a crafted deep nest
+        // must hit the depth cap (loud error → refuse/fallback), not
+        // overflow the stack.
+        let mut inner = r#"{"version":"1.0.0"}"#.to_string();
+        for _ in 0..(V1_MAX_DEPTH + 2) {
+            inner = format!(r#"{{"version":"1.0.0","dependencies":{{"d":{inner}}}}}"#);
+        }
+        let lock = format!(r#"{{"lockfileVersion":1,"dependencies":{{"a":{inner}}}}}"#);
+        let err = parse_npm_lockfile(&lock).expect_err("depth bomb must error");
+        // serde_json's recursion limit fires first today; the explicit
+        // V1_MAX_DEPTH cap is the backstop. Either way: loud error.
+        assert!(
+            err.contains("deeper than") || err.contains("recursion limit"),
+            "got: {err}"
+        );
     }
 
     #[test]

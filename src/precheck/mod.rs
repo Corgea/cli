@@ -488,7 +488,7 @@ fn run_parsed_install(
     // network/subprocess work — overlap them; verdicts need both.
     let now = Utc::now();
     let (mut outcomes, tree_resolution) = std::thread::scope(|s| {
-        let tree = tree_eligible.then(|| s.spawn(|| tree::resolve_tree(manager, rest)));
+        let tree = tree_eligible.then(|| s.spawn(|| tree::resolve_tree(manager, rest, &parsed)));
         let outcomes = verdict::verify_all(&parsed.targets, &opts, &now, parsed.allow_prerelease);
         (
             outcomes,

@@ -63,8 +63,11 @@ fn alternate_pypi_spelling_hits_canonical_verdict() {
         ),
         _ => ("404 Not Found", common::NOT_FOUND_JSON.to_string()),
     });
+    // Like `pip_harness`: the tree dry-run exits 2 (old pip, no --report),
+    // so the block is the named verdict's doing and a recorded argv would
+    // mean the real install ran.
     let mut h = common::GateHarness::new()
-        .fake_recorder("pip", 0)
+        .fake_tree_pm("pip", common::RESOLUTION_FAILS, 0)
         .registry_env("CORGEA_PYPI_REGISTRY", &registry)
         .vuln_checks(checks)
         .build();
