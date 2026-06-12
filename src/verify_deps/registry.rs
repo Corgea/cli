@@ -16,7 +16,9 @@ use std::time::Duration;
 const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmjs.org";
 const DEFAULT_PYPI_REGISTRY: &str = "https://pypi.org";
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+// Matches `vuln_api::REQUEST_TIMEOUT` so a gate run degrades uniformly:
+// both legs of a verdict pass give up at the same horizon.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `corgea-cli/<version> (<label>)` user-agent string. Also used by
 /// `vuln_api` for its own client.

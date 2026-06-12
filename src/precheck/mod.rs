@@ -818,7 +818,15 @@ fn run_verdict_pass(
     let mut results = verdict::verdict_pool(jobs, cfg, manager).into_iter();
     for o in outcomes.iter_mut() {
         if let TargetOutcome::Resolved { verdict, .. } = o {
-            *verdict = results.next().expect("one verdict per resolved outcome").1;
+            *verdict = match results.next() {
+                Some((_, v)) => v,
+                // Pool invariant broken — fail safe instead of panicking:
+                // Unverifiable blocks in authenticated mode and warns in
+                // public mode, same as a client failure.
+                None => VerdictStatus::Unverifiable(
+                    "internal error: verdict pool returned fewer results than outcomes".to_string(),
+                ),
+            };
         }
     }
 }
