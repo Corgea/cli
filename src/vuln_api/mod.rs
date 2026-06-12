@@ -2,16 +2,18 @@
 //!
 //! Deliberately independent of `utils::api::SHARED_CLIENT` because:
 //!   * the vuln-api host is user-configurable via `CORGEA_VULN_API_URL`,
-//!     so we must never silently replay Corgea cookies or auth headers
-//!     via redirect following or the shared cookie jar.
+//!     so we must never silently replay Corgea cookies / non-JWT
+//!     `CORGEA-TOKEN` headers via redirect following or the shared
+//!     cookie jar.
 //!   * the shared client's `check_for_warnings` exits the process on
 //!     HTTP 410, which is wrong for per-dep CVE lookups.
 //!
-//! This phase attaches no Corgea credential: the staging deployment
-//! (`VULN_API_REQUIRE_AUTH=false`) accepts anonymous checks. The
-//! production /check route requires a Corgea token — wired in with
-//! authenticated mode, and never sent to a user-configured host
-//! without explicit opt-in.
+//! The auth header is attached explicitly per call from a caller-owned
+//! token (no global state); `token: None` is the public, unauthenticated
+//! mode (sufficient against staging, which runs
+//! `VULN_API_REQUIRE_AUTH=false`; the production /check route requires a
+//! token). A token is never sent to a user-configured host without
+//! explicit opt-in.
 
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -107,6 +109,23 @@ pub fn http_client() -> Result<reqwest::blocking::Client, String> {
         .clone()
 }
 
+/// Whether `token` looks like a JWT (three non-empty dot-separated parts).
+fn is_jwt(token: &str) -> bool {
+    let parts: Vec<&str> = token.splitn(4, '.').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty())
+}
+
+/// The auth header for a Corgea token: JWT → `Authorization: Bearer`,
+/// otherwise the opaque `CORGEA-TOKEN` header. The one definition of the
+/// header shape, shared with the binary crate's `utils/api.rs`.
+pub fn auth_header(token: &str) -> (&'static str, String) {
+    if is_jwt(token) {
+        ("Authorization", format!("Bearer {token}"))
+    } else {
+        ("CORGEA-TOKEN", token.to_string())
+    }
+}
+
 /// URL-encode an npm package name for a URL path segment. Scoped names
 /// contain `@` and `/`; the latter must be encoded as `%2f`.
 pub(crate) fn encode_npm_name(name: &str) -> String {
@@ -138,18 +157,24 @@ pub fn source() -> String {
         .clone()
 }
 
-/// Build a JSON GET with the standard `Accept` / `CORGEA-SOURCE` headers.
-/// No auth header in this phase (staging accepts anonymous checks); the
-/// token attach lands with authenticated mode, and the host may be
-/// user-configured — so nothing credential-shaped goes here by default.
+/// Build a JSON GET: the standard `Accept` / `CORGEA-SOURCE` headers plus,
+/// when present, the per-call auth header (JWT → `Authorization: Bearer`,
+/// otherwise `CORGEA-TOKEN`). The single place auth is attached, shared by
+/// every route.
 fn build_json_get(
     client: &reqwest::blocking::Client,
     url: &str,
+    token: Option<&str>,
 ) -> reqwest::blocking::RequestBuilder {
-    client
+    let mut req = client
         .get(url)
         .header("Accept", "application/json")
-        .header("CORGEA-SOURCE", source())
+        .header("CORGEA-SOURCE", source());
+    if let Some(token) = token {
+        let (name, value) = auth_header(token);
+        req = req.header(name, value);
+    }
+    req
 }
 
 /// Validate the per-call preconditions shared by every vuln-api request:
@@ -193,12 +218,68 @@ fn body_snippet(body: &str, max_chars: usize) -> String {
     }
 }
 
+fn retry_after_seconds(response: &reqwest::blocking::Response) -> u64 {
+    response
+        .headers()
+        .get("Retry-After")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|s| s.clamp(1, 10))
+        .unwrap_or(1)
+}
+
+/// Send the package-check GET, retrying transient failures within a single
+/// budget of `MAX_SENDS` sends total:
+///   * any `send()` error (connect, reset, timeout) retries up to twice with
+///     500ms / 1500ms backoff — the request is an idempotent GET, so a
+///     blanket retry is safe and simpler than classifying error kinds;
+///   * HTTP 429 honors `Retry-After` (clamped 1–10s) and retries once, then
+///     surfaces the 429 to the caller's status mapping.
+///
+/// The sleeps block the calling verdict-pool worker thread. Deliberate:
+/// bounded at ≤3 sends and ≤2 sleeps per package, that costs less at CLI
+/// scale than a non-blocking reschedule would in queue machinery.
+fn send_package_check_with_retry(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    token: Option<&str>,
+) -> Result<reqwest::blocking::Response, Box<dyn std::error::Error>> {
+    const MAX_SENDS: usize = 3;
+    const SEND_ERROR_BACKOFF: [Duration; 2] =
+        [Duration::from_millis(500), Duration::from_millis(1500)];
+
+    let mut rate_limit_retried = false;
+    let mut sends = 0;
+    loop {
+        sends += 1;
+        match build_json_get(client, url, token).send() {
+            Ok(response) => {
+                if response.status().as_u16() == 429 && !rate_limit_retried && sends < MAX_SENDS {
+                    rate_limit_retried = true;
+                    std::thread::sleep(Duration::from_secs(retry_after_seconds(&response)));
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(e) if sends < MAX_SENDS => {
+                debug(&format!(
+                    "vuln-api send failed (attempt {}/{}), retrying: {}",
+                    sends, MAX_SENDS, e
+                ));
+                std::thread::sleep(SEND_ERROR_BACKOFF[sends - 1]);
+            }
+            Err(e) => return Err(format!("Failed to send vuln-api request: {}", e).into()),
+        }
+    }
+}
+
 /// One HTTP request per `(name, version)`. A 1000-package lockfile makes
 /// 1000 requests (through the verdict pool's bounded concurrency); the
 /// future optimization is a server-side batch endpoint, not client tricks.
 pub fn check_package_version(
     client: &reqwest::blocking::Client,
     base_url: &str,
+    token: Option<&str>,
     ecosystem: Ecosystem,
     name: &str,
     version: &str,
@@ -224,9 +305,7 @@ pub fn check_package_version(
 
     debug(&format!("Sending vuln-api request to URL: {}", url));
 
-    let response = build_json_get(client, &url)
-        .send()
-        .map_err(|e| format!("Failed to send vuln-api request: {}", e))?;
+    let response = send_package_check_with_retry(client, &url, token)?;
 
     let status = response.status();
     // Fixed messages for recognized statuses — tests assert these strings,
@@ -235,6 +314,11 @@ pub fn check_package_version(
     // treating it as "clean" would silently disable the gate on a
     // misconfigured endpoint.
     match status.as_u16() {
+        401 if token.is_some() => {
+            return Err(
+                "vuln-api rejected the Corgea token (run `corgea login` to refresh)".into(),
+            );
+        }
         401 => return Err("vuln-api requires authentication".into()),
         403 => return Err("vuln-api access denied (check your Corgea plan/permissions)".into()),
         429 => return Err("vuln-api rate-limited this request (retry later)".into()),
@@ -316,7 +400,7 @@ pub fn check_package_version(
 mod tests {
     use super::*;
     use crate::vuln_api_stub::{self, header_value, spawn_capturing_vuln_api_stub, PackageKey};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     fn lodash_key() -> PackageKey {
         vuln_api_stub::key("npm", "lodash", "4.17.20")
@@ -324,9 +408,17 @@ mod tests {
 
     fn check_lodash(
         stub: &vuln_api_stub::VulnApiStub,
+        token: Option<&str>,
     ) -> Result<VulnCheckResponse, Box<dyn std::error::Error>> {
         let client = http_client().expect("test client");
-        check_package_version(&client, &stub.base_url, Ecosystem::Npm, "lodash", "4.17.20")
+        check_package_version(
+            &client,
+            &stub.base_url,
+            token,
+            Ecosystem::Npm,
+            "lodash",
+            "4.17.20",
+        )
     }
 
     fn check_with_stub_status(
@@ -337,7 +429,7 @@ mod tests {
             HashMap::from([(lodash_key(), body.to_string())]),
             HashMap::from([(lodash_key(), status_code)]),
         );
-        check_lodash(&stub)
+        check_lodash(&stub, Some("test-token"))
     }
 
     fn check_with_stub_body(body: &str) -> Result<VulnCheckResponse, Box<dyn std::error::Error>> {
@@ -345,7 +437,23 @@ mod tests {
             HashMap::from([(lodash_key(), body.to_string())]),
             HashMap::new(),
         );
-        check_lodash(&stub)
+        check_lodash(&stub, Some("test-token"))
+    }
+
+    fn captured_request(auth_token: Option<&str>) -> String {
+        let (base_url, requests) = spawn_capturing_vuln_api_stub();
+        let client = http_client().expect("test client");
+        check_package_version(
+            &client,
+            &base_url,
+            auth_token,
+            Ecosystem::Npm,
+            "lodash",
+            "4.17.20",
+        )
+        .expect("captured request should succeed");
+        let requests = requests.lock().unwrap();
+        requests[0].clone()
     }
 
     #[test]
@@ -364,6 +472,7 @@ mod tests {
         let resp = check_package_version(
             &client,
             &stub.base_url,
+            None,
             Ecosystem::Pypi,
             "Flask_Cors",
             "1.0.0",
@@ -383,6 +492,7 @@ mod tests {
         check_package_version(
             &client,
             &base_url,
+            None,
             Ecosystem::Pypi,
             "Zope.Interface",
             "5.0.0",
@@ -404,26 +514,112 @@ mod tests {
     fn public_check_sends_no_auth_headers() {
         // The host is user-configurable; without a caller-owned token the
         // client must never attach a Corgea credential or cookie.
-        let (base_url, requests) = spawn_capturing_vuln_api_stub();
-        let client = http_client().expect("test client");
-        check_package_version(&client, &base_url, Ecosystem::Npm, "lodash", "4.17.20")
-            .expect("captured request should succeed");
-        let requests = requests.lock().unwrap();
-        let request = &requests[0];
-        assert!(header_value(request, "Authorization").is_none());
-        assert!(header_value(request, "CORGEA-TOKEN").is_none());
-        assert!(header_value(request, "Cookie").is_none());
+        let request = captured_request(None);
+        assert!(header_value(&request, "Authorization").is_none());
+        assert!(header_value(&request, "CORGEA-TOKEN").is_none());
+        assert!(header_value(&request, "Cookie").is_none());
         assert_eq!(
-            header_value(request, "CORGEA-SOURCE").as_deref(),
+            header_value(&request, "CORGEA-SOURCE").as_deref(),
             Some("cli")
         );
+    }
+
+    #[test]
+    fn jwt_auth_sends_authorization_bearer() {
+        let request = captured_request(Some("aaa.bbb.ccc"));
+        assert_eq!(
+            header_value(&request, "Authorization").as_deref(),
+            Some("Bearer aaa.bbb.ccc")
+        );
+        assert!(header_value(&request, "CORGEA-TOKEN").is_none());
+    }
+
+    #[test]
+    fn opaque_auth_sends_corgea_token() {
+        let request = captured_request(Some("opaque-token"));
+        assert_eq!(
+            header_value(&request, "CORGEA-TOKEN").as_deref(),
+            Some("opaque-token")
+        );
+        assert!(header_value(&request, "Authorization").is_none());
     }
 
     #[test]
     fn check_package_version_401_returns_actionable_error() {
         let err = check_with_stub_status(401, r#"{"error":"unauthorized"}"#)
             .expect_err("401 should fail");
-        assert!(err.to_string().contains("requires authentication"));
+        assert!(err.to_string().contains("rejected the Corgea token"));
+    }
+
+    #[test]
+    fn check_package_version_429_retries_then_succeeds() {
+        let vulnerable_body = vuln_api_stub::vulnerable_body(
+            "npm",
+            "lodash",
+            "4.17.20",
+            "GHSA-retry-test",
+            Some("4.17.21"),
+        );
+        let stub = vuln_api_stub::spawn_with_retry_once(
+            HashMap::from([(lodash_key(), vulnerable_body)]),
+            HashMap::new(),
+            HashSet::from([lodash_key()]),
+        );
+        let resp = check_lodash(&stub, Some("test-token")).expect("retry should succeed");
+        assert!(resp.is_vulnerable);
+    }
+
+    /// Run a check against a stub that drops the connection (reads the
+    /// request, closes without responding) for the first `drops` hits on
+    /// lodash, then serves a vulnerable verdict.
+    fn check_with_drops(drops: usize) -> Result<VulnCheckResponse, Box<dyn std::error::Error>> {
+        let vulnerable_body = vuln_api_stub::vulnerable_body(
+            "npm",
+            "lodash",
+            "4.17.20",
+            "GHSA-drop-test",
+            Some("4.17.21"),
+        );
+        let stub = vuln_api_stub::spawn_with_drops(
+            HashMap::from([(lodash_key(), vulnerable_body)]),
+            HashMap::new(),
+            HashMap::from([(lodash_key(), drops)]),
+        );
+        check_lodash(&stub, Some("test-token"))
+    }
+
+    #[test]
+    fn check_package_version_retries_dropped_connection_then_succeeds() {
+        let resp = check_with_drops(1).expect("one dropped connection should be retried");
+        assert!(resp.is_vulnerable);
+    }
+
+    #[test]
+    fn check_package_version_retries_two_dropped_connections_then_succeeds() {
+        let resp = check_with_drops(2).expect("two dropped connections fit the 2-retry budget");
+        assert!(resp.is_vulnerable);
+    }
+
+    #[test]
+    fn check_package_version_fails_after_three_dropped_connections() {
+        let err = check_with_drops(3).expect_err("three drops exhaust the 3-send budget");
+        assert!(
+            err.to_string().contains("Failed to send vuln-api request"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn is_jwt_detection() {
+        assert!(is_jwt("a.b.c"));
+        assert!(!is_jwt("plain-token"));
+        assert!(!is_jwt(""));
+        assert!(!is_jwt("a.b"));
+        assert!(!is_jwt("a.b.c.d"));
+        assert!(!is_jwt("a..c"));
+        assert!(!is_jwt(".b.c"));
+        assert!(!is_jwt("a.b."));
     }
 
     #[test]

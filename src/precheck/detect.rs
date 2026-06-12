@@ -1,8 +1,11 @@
-//! Package-manager/project detection: wrong-manager guidance messages.
+//! Package-manager/project detection: wrong-manager and
+//! externally-managed-pip (PEP 668) guidance messages.
 
+use std::ffi::OsString;
 use std::path::Path;
+use std::process::Command;
 
-use super::{parse, PackageManager};
+use super::{corgea_cmd, parse, PackageManager};
 
 pub(super) fn wrong_package_manager_message(
     manager: PackageManager,
@@ -266,6 +269,96 @@ fn is_plain_pip_target_install(rest: &[String], parsed: &parse::ParsedInstall) -
             .iter()
             .zip(&parsed.targets)
             .all(|(arg, target)| arg == &target.display)
+}
+
+pub(super) fn externally_managed_pip_message(
+    manager: PackageManager,
+    rest: &[String],
+    _parsed: &parse::ParsedInstall,
+) -> Option<String> {
+    if manager != PackageManager::Pip
+        || pip_install_overrides_external_management(rest)
+        || !pip_environment_is_externally_managed()
+    {
+        return None;
+    }
+
+    Some(format!(
+        "error: this Python environment is externally managed (PEP 668).\nCreate and activate a virtualenv, then retry `{}`.",
+        corgea_cmd(&["pip", "install"], rest)
+    ))
+}
+
+fn pip_install_overrides_external_management(args: &[String]) -> bool {
+    const VALUE_FLAGS: [&str; 4] = ["-t", "--target", "--prefix", "--root"];
+    args.iter().any(|arg| {
+        arg == "--break-system-packages"
+            || VALUE_FLAGS
+                .iter()
+                .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
+    })
+}
+
+fn pip_environment_is_externally_managed() -> bool {
+    // Every error arm falls open (`false`) deliberately — PEP 668 is a UX
+    // guard, not the vuln gate, and pip enforces it itself — but each is
+    // debug-traced so a silent miss is diagnosable.
+    let Ok(pip) = super::exec::resolve_binary("pip") else {
+        crate::log::debug("PEP 668 check skipped: pip not resolvable");
+        return false;
+    };
+    // PEP 668 markers live in a system interpreter's stdlib; pip inside an
+    // active virtualenv can't be externally managed - skip the spawn.
+    if let Some(venv) = std::env::var_os("VIRTUAL_ENV") {
+        if pip.starts_with(&venv) {
+            return false;
+        }
+    }
+    let Some(interpreter) = python_interpreter_from_shebang(&pip) else {
+        crate::log::debug("PEP 668 check skipped: no python shebang in pip");
+        return false;
+    };
+
+    let mut command = Command::new(&interpreter[0]);
+    command.args(&interpreter[1..]);
+    let Ok(output) = command.arg("-c").arg(EXTERNALLY_MANAGED_PYTHON).output() else {
+        crate::log::debug("PEP 668 check skipped: python spawn failed");
+        return false;
+    };
+    output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1"
+}
+
+const EXTERNALLY_MANAGED_PYTHON: &str = r#"
+import pathlib
+import sysconfig
+
+paths = []
+for key in ("stdlib", "platstdlib"):
+    path = sysconfig.get_path(key)
+    if path and path not in paths:
+        paths.append(path)
+
+print("1" if any((pathlib.Path(path) / "EXTERNALLY-MANAGED").is_file() for path in paths) else "0")
+"#;
+
+fn python_interpreter_from_shebang(path: &Path) -> Option<Vec<OsString>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let first = content.lines().next()?.strip_prefix("#!")?.trim();
+    let mut parts: Vec<&str> = first.split_whitespace().collect();
+    if parts.is_empty() {
+        return None;
+    }
+    if parts[0].ends_with("/env") || parts[0] == "env" {
+        parts.remove(0);
+        if parts.first() == Some(&"-S") {
+            parts.remove(0);
+        }
+    }
+    let executable = parts.first()?;
+    if !executable.contains("python") {
+        return None;
+    }
+    Some(parts.iter().map(OsString::from).collect())
 }
 
 #[cfg(test)]

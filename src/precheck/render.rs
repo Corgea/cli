@@ -62,7 +62,7 @@ pub(super) fn requirements_note(parsed: &parse::ParsedInstall) {
 }
 
 pub(super) fn warn_public_lookup_failures(report: &PrecheckReport, opts: &PrecheckOptions) {
-    if opts.verdict.is_some() && report.unverifiable_count() > 0 {
+    if super::verdict::public_verdict(opts).is_some() && report.unverifiable_count() > 0 {
         eprintln!("warning: CVE check unavailable; continuing because public mode is fail-open.");
     }
 }
@@ -419,10 +419,10 @@ fn verdict_json(verdict: &VerdictStatus) -> serde_json::Value {
 
 pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
     use serde_json::json;
-    let verdict_mode = if opts.verdict.is_some() {
-        "public"
-    } else {
-        "recency-only"
+    let verdict_mode = match opts.verdict.as_ref().map(|cfg| &cfg.mode) {
+        Some(super::VerdictMode::Public) => "public",
+        Some(super::VerdictMode::Authenticated { .. }) => "authenticated",
+        None => "recency-only",
     };
     let outcomes: Vec<_> = report
         .outcomes
