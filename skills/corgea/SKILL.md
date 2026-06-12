@@ -143,8 +143,24 @@ else passes through with the package manager's own exit code. Git/URL/path
 specs (including `pip install .`, PEP 508 `name @ url` direct references, and
 npm GitHub shorthand `user/repo`) are noted, never blocked. The install verb
 is found behind global flags (`npm --loglevel silent install x` is still
-gated). Bare installs (no named targets) and `-r requirements.txt` files are
-noted, not gated. `npm ci` passes through ungated.
+gated). Bare `npm install` (zero specs, project `package.json` found like npm
+finds it — nearest ancestor) is gated too: the full lockfile-resolved tree is
+verdicted, so a vulnerable lockfile blocks. `npm ci` (and aliases) is gated
+from the project lockfile directly.
+
+The vuln check covers the **full would-install set**, not just the named
+targets: `pip` and `npm` resolve the complete tree (named + transitive) via a
+safe dry-run (`pip install --dry-run …`; an isolated
+`npm install --package-lock-only` in a temp dir, never touching your
+lockfile); every resolved package is verdicted, so a flagged **transitive**
+dependency blocks the install too, labeled by provenance (`(transitive)`,
+`(from requirements)`, `(already in package.json)`, `(locked)`). Whenever a
+dry-run fails or an npm flag redirects the project root (`--prefix`, `-g`),
+the gate falls back to named-only and prints
+`warning: transitive dependencies not checked (…); only named packages were verified.`
+— for pip, entries of `-r requirements.txt` files are still parsed and
+verified in that fallback. Verdict requests run in a bounded pool
+(8 parallel).
 
 Wrapper flags (`--force`, `--no-fail`, `-t`) are read between the manager
 name and the install verb (`corgea npm --force install x`); flags after the
@@ -182,10 +198,9 @@ The gate is a wrapper, not an enforcement boundary. By design it cannot catch:
   `pip.conf` overrides change where packages resolve from. The gate still
   verdicts each `name@version`, but it cannot vouch that a substituted
   registry serves the same artifact those advisories describe.
-- **Transitive dependencies** — only the named install targets are verified;
-  the rest of the resolved tree installs unchecked.
-- **Bare installs and lockfiles** — `npm install` with no targets, `npm ci`,
-  and `-r requirements.txt` files run unchecked after a note.
+- **Named-only fallback** — when a dry-run fails (old pip, broken resolution)
+  or `--prefix`/`-g` redirects npm's root, transitive dependencies install
+  unchecked behind the printed warning.
 
 Hard enforcement needs org-level controls — lockfile review, registry
 allow-listing — alongside the wrapper.

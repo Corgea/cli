@@ -1,14 +1,14 @@
 //! Install wrappers: `corgea npm`, `corgea pip`.
 //!
-//! Wraps an install command from a supported package manager, resolves the
-//! named install targets against the public registry, and either blocks the
-//! install or runs it transparently.
+//! Wraps an install command from a supported package manager, resolves what
+//! the package manager *would* install against the public registry, and
+//! either blocks the install or runs it transparently.
 //!
 //! Two independent blocks:
 //!   * recency — the resolved version was published within `--threshold`
 //!     (default `2d`); `--no-fail` demotes this to a warning;
-//!   * vuln verdict — the vuln-api knows the resolved version is vulnerable
-//!     or malicious; only `--force` overrides this.
+//!   * vuln verdict — the vuln-api knows a resolved version (named or
+//!     transitive) is vulnerable or malicious; only `--force` overrides this.
 //!
 //! Verdict lookups are public and fail open: a vuln-api outage warns and the
 //! install continues.
@@ -16,6 +16,7 @@
 mod exec;
 mod parse;
 mod render;
+mod tree;
 mod verdict;
 
 #[cfg(test)]
@@ -57,6 +58,17 @@ impl PackageManager {
             PackageManager::Pip => crate::vuln_api::Ecosystem::Pypi,
         }
     }
+
+    /// Canonical package name for dedup/matching across spec spellings —
+    /// the ecosystem's rule (`vuln_api::Ecosystem::normalize_name`).
+    ///
+    /// Invariant: request-time normalization is owned by the vuln-api
+    /// client (`vuln_api::check_package_version`); comparison sites
+    /// (`verdict::apply_verdicts` / tree dedup) normalize here. Parsers
+    /// and resolvers carry raw names.
+    pub fn normalize_name(self, name: &str) -> String {
+        self.ecosystem().normalize_name(name)
+    }
 }
 
 /// Connection details for the vuln-api verdict pass. Lookups are public
@@ -83,7 +95,8 @@ pub enum VerdictStatus {
 
 impl VerdictStatus {
     /// Whether this verdict blocks the install. The single definition of
-    /// "blocking finding", used by `verdict::block_reason`.
+    /// "blocking finding", shared by `verdict::block_reason` and the
+    /// refusal-blame predicate.
     fn blocks(&self) -> bool {
         matches!(self, VerdictStatus::Vulnerable(_))
     }
@@ -106,7 +119,7 @@ pub struct PrecheckOptions {
     pub pypi_registry: Option<String>,
 }
 
-/// Each item the user asked us to install.
+/// Each item the user (or a `-r` requirements file) asked us to install.
 #[derive(Debug, Clone)]
 pub struct InstallTarget {
     pub name: String,
@@ -150,6 +163,58 @@ pub enum TargetOutcome {
     },
 }
 
+/// Why a tree-pass finding is in the would-install set. Drives the
+/// provenance label so a package the user asked for (or already depends on)
+/// is never mislabeled "(transitive)".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeOrigin {
+    /// Pulled in as a dependency of something else.
+    Transitive,
+    /// Explicitly requested (pip report `"requested"` — CLI arg or
+    /// requirements file; leftovers here come from `-r` files since named
+    /// CLI targets match a named outcome instead).
+    Requested,
+    /// Already a direct dependency in the project's `package.json`.
+    PreExisting,
+    /// Pinned by the project's lockfile (`npm ci`).
+    Locked,
+}
+
+impl TreeOrigin {
+    fn label(self) -> &'static str {
+        match self {
+            TreeOrigin::Transitive => "(transitive)",
+            TreeOrigin::Requested => "(from requirements)",
+            TreeOrigin::PreExisting => "(already in package.json)",
+            TreeOrigin::Locked => "(locked)",
+        }
+    }
+}
+
+/// Verdict for one package the tree pass resolved beyond the named targets.
+#[derive(Debug)]
+pub struct TreeOutcome {
+    pub name: String,
+    pub version: String,
+    pub origin: TreeOrigin,
+    pub verdict: VerdictStatus,
+}
+
+/// Result of the tree pass. `PrecheckReport.tree` is `None` when the pass
+/// never ran (verdicts disabled, or nothing to resolve).
+#[derive(Debug)]
+pub enum TreeReport {
+    /// The full would-install set was resolved and verdicted.
+    Full {
+        /// Distinct packages the dry-run resolved (named + transitive).
+        resolved_count: usize,
+        /// Verdicts for resolved packages beyond the named targets.
+        transitive: Vec<TreeOutcome>,
+    },
+    /// Resolution unavailable or failed — only named targets were verified.
+    NamedOnly { reason: String },
+}
+
 #[derive(Debug)]
 pub struct PrecheckReport {
     pub manager: PackageManager,
@@ -157,6 +222,14 @@ pub struct PrecheckReport {
     pub original_args: Vec<String>,
     pub outcomes: Vec<TargetOutcome>,
     pub threshold: Duration,
+    /// `None` ⇒ no tree pass ran.
+    pub tree: Option<TreeReport>,
+    /// True when the command named nothing — no CLI targets and no
+    /// requirements files — so everything the tree pass resolved predates
+    /// this command (bare `npm install`). Distinct from
+    /// `outcomes.is_empty()`: a requirements-only install also has no named
+    /// outcomes, but its resolved set IS added by the command.
+    pub bare_install: bool,
 }
 
 impl PrecheckReport {
@@ -174,12 +247,26 @@ impl PrecheckReport {
     pub fn recent_count(&self) -> usize {
         self.count(|o| matches!(o, TargetOutcome::Resolved { age, .. } if self.is_recent(*age)))
     }
-    /// Verdicts on the resolved named targets.
+    /// Every verdict in the report: named (resolved) outcomes, then
+    /// transitive tree findings.
     fn verdicts(&self) -> impl Iterator<Item = &VerdictStatus> {
+        self.named_verdicts().chain(self.tree_verdicts())
+    }
+    /// Verdicts on the named targets this command adds.
+    fn named_verdicts(&self) -> impl Iterator<Item = &VerdictStatus> {
         self.outcomes.iter().filter_map(|o| match o {
             TargetOutcome::Resolved { verdict, .. } => Some(verdict),
             _ => None,
         })
+    }
+    /// Verdicts beyond the named targets (the resolved tree).
+    fn tree_verdicts(&self) -> impl Iterator<Item = &VerdictStatus> {
+        match &self.tree {
+            Some(TreeReport::Full { transitive, .. }) => transitive.as_slice(),
+            Some(TreeReport::NamedOnly { .. }) | None => &[],
+        }
+        .iter()
+        .map(|o| &o.verdict)
     }
     pub fn vulnerable_count(&self) -> usize {
         self.verdicts()
@@ -188,6 +275,18 @@ impl PrecheckReport {
     }
     pub fn unverifiable_count(&self) -> usize {
         self.verdicts()
+            .filter(|v| matches!(v, VerdictStatus::Unverifiable(_)))
+            .count()
+    }
+    /// Vulnerable findings beyond the named targets (the resolved tree).
+    pub fn tree_vulnerable_count(&self) -> usize {
+        self.tree_verdicts()
+            .filter(|v| matches!(v, VerdictStatus::Vulnerable(_)))
+            .count()
+    }
+    /// Unverifiable findings beyond the named targets (the resolved tree).
+    pub fn tree_unverifiable_count(&self) -> usize {
+        self.tree_verdicts()
             .filter(|v| matches!(v, VerdictStatus::Unverifiable(_)))
             .count()
     }
@@ -226,6 +325,17 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
     if manager == PackageManager::Pip && subcommand == "add" {
         eprintln!("{}", unsupported_pip_add_message(rest));
         return 1;
+    }
+
+    // `npm ci` installs the lockfile exactly as written — gate it from the
+    // project lockfile directly.
+    if manager == PackageManager::Npm
+        && matches!(
+            subcommand.as_str(),
+            "ci" | "ic" | "clean-install" | "install-clean" | "isntall-clean"
+        )
+    {
+        return run_npm_ci(subcommand, rest, opts);
     }
 
     if !manager.is_install_subcommand(subcommand) {
@@ -323,9 +433,23 @@ fn warn_registry_override(manager: PackageManager, rest: &[String]) {
     }
 }
 
-/// Post-parse verification: resolve named targets, verdict them, render the
-/// report, refuse (exit 1) when the block predicate fires, otherwise run
-/// the install.
+/// Shared tail of every gated path: render the report, refuse (exit 1) when
+/// the block predicate fires, otherwise run the install.
+fn report_and_exec(
+    report: &PrecheckReport,
+    opts: &PrecheckOptions,
+    exec: impl FnOnce() -> i32,
+) -> i32 {
+    render::print_text(report);
+    render::warn_public_lookup_failures(report, opts);
+    if let Some(reason) = verdict::block_reason(report, opts) {
+        render::print_refusal(reason);
+        return 1;
+    }
+    exec()
+}
+
+/// Post-parse verification shared by the npm and pip install paths.
 fn run_parsed_install(
     manager: PackageManager,
     subcommand_label: &str,
@@ -334,17 +458,69 @@ fn run_parsed_install(
     exec: impl FnOnce() -> i32,
     opts: PrecheckOptions,
 ) -> i32 {
-    if parsed.targets.is_empty() {
-        // Nothing named: bare installs and requirements-only installs are
-        // noted, never gated, by this phase.
+    // With a verdict config, the tree pass resolves the full would-install
+    // set; `tree::covers_input` owns what each manager's resolver can chew on.
+    let tree_eligible = opts.verdict.is_some() && tree::covers_input(manager, &parsed);
+    let bare_install = parsed.targets.is_empty() && parsed.requirements_files.is_empty();
+
+    // A BARE `npm install --prefix <other>` installs another project's whole
+    // tree, but the gate can't safely resolve that redirected root from a copy
+    // of the CWD. Nothing named verifies it either, so it would install wholly
+    // unchecked — fail closed unless `--force`. (A NAMED install still verifies
+    // its targets and degrades the tree pass to a loud named-only warning.)
+    if manager == PackageManager::Npm && bare_install && opts.verdict.is_some() && !opts.force {
+        if let Some(flag) = tree::npm_root_redirect_flag(rest) {
+            eprintln!(
+                "error: cannot verify a bare 'npm install' that redirects the project root ('{flag}'): the would-install tree is unknown (pass --force to proceed unchecked)"
+            );
+            return 1;
+        }
+    }
+
+    if parsed.targets.is_empty() && !tree_eligible {
+        // A `-r requirements.txt` install with verdicts disabled is only
+        // noted; a truly bare install has nothing to note at all.
         render::requirements_note(&parsed);
         return exec();
     }
 
+    // The named-target registry lookups and the tree dry-run are independent
+    // network/subprocess work — overlap them; verdicts need both.
     let now = Utc::now();
-    let mut outcomes = verdict::verify_all(&parsed.targets, &opts, &now, parsed.allow_prerelease);
-    verdict::run_verdict_pass(manager, &mut outcomes, &opts);
-    render::requirements_note(&parsed);
+    let (mut outcomes, tree_resolution) = std::thread::scope(|s| {
+        let tree = tree_eligible.then(|| s.spawn(|| tree::resolve_tree(manager, rest, &parsed)));
+        let outcomes = verdict::verify_all(&parsed.targets, &opts, &now, parsed.allow_prerelease);
+        (
+            outcomes,
+            tree.map(|handle| handle.join().expect("tree resolution thread panicked")),
+        )
+    });
+
+    let tree = if let Some(resolution) = tree_resolution {
+        Some(run_tree_pass(
+            manager,
+            resolution,
+            &mut outcomes,
+            &parsed,
+            &opts,
+            &now,
+        ))
+    } else {
+        run_verdict_pass(manager, &mut outcomes, &opts);
+        None
+    };
+
+    // The mandatory loud warning when the tree pass fell back to named-only.
+    if let Some(TreeReport::NamedOnly { reason }) = &tree {
+        eprintln!(
+            "warning: transitive dependencies not checked ({reason}); only named packages were verified."
+        );
+    }
+    // The requirements note only matters when the tree pass did *not* cover
+    // those files (fallback to named-only, or verdicts disabled).
+    if !matches!(&tree, Some(TreeReport::Full { .. })) {
+        render::requirements_note(&parsed);
+    }
 
     let report = PrecheckReport {
         manager,
@@ -352,15 +528,234 @@ fn run_parsed_install(
         original_args: rest.to_vec(),
         outcomes,
         threshold: opts.threshold,
+        tree,
+        bare_install,
     };
 
-    render::print_text(&report);
-    render::warn_public_lookup_failures(&report, &opts);
-    if let Some(reason) = verdict::block_reason(&report, &opts) {
-        render::print_refusal(reason);
-        return 1;
+    report_and_exec(&report, &opts, exec)
+}
+
+/// `npm ci` (and aliases): installs the project lockfile exactly as
+/// written, so the gate verdicts the lockfile-pinned set directly — no
+/// dry-run needed. Recency isn't checked — locked versions aren't newly
+/// chosen by this command; the verdict pass is the gate. Without a project
+/// or lockfile npm errors on its own; the gate just execs.
+fn run_npm_ci(subcommand: &str, rest: &[String], opts: PrecheckOptions) -> i32 {
+    let exec = || exec::exec_install_with_args(PackageManager::Npm, subcommand, rest);
+
+    let Some(cfg) = &opts.verdict else {
+        return exec();
+    };
+    // A root-redirect flag (`--prefix ../other`, `-C ../other`) makes npm ci
+    // install a DIFFERENT project's lockfile than the CWD one we'd verdict, so
+    // verifying the CWD lockfile would pass on the wrong project. Fail closed
+    // unless `--force`.
+    if !opts.force {
+        if let Some(flag) = tree::npm_root_redirect_flag(rest) {
+            eprintln!(
+                "error: cannot verify 'npm {subcommand}' with '{flag}': it installs a redirected project's lockfile, not this one (pass --force to proceed unchecked)"
+            );
+            return 1;
+        }
     }
-    exec()
+    let Some(root) = tree::npm_project_root() else {
+        return exec();
+    };
+    // npm-shrinkwrap.json takes precedence over package-lock.json.
+    let Some(lock_path) = ["npm-shrinkwrap.json", "package-lock.json"]
+        .iter()
+        .map(|n| root.join(n))
+        .find(|p| p.is_file())
+    else {
+        return exec();
+    };
+
+    let lock = std::fs::read_to_string(&lock_path)
+        .map_err(|e| format!("read {}: {e}", lock_path.display()))
+        .and_then(|content| tree::parse_npm_lockfile(&content));
+    let jobs = match lock {
+        Ok(jobs) => jobs,
+        Err(e) if opts.force => {
+            eprintln!("warning: cannot verify 'npm {subcommand}' ({e}); proceeding under --force");
+            return exec();
+        }
+        Err(e) => {
+            // The single documented bypass of the "all blocking goes through
+            // `verdict::block_reason`" invariant: an unparsable lockfile
+            // means there is no report to feed the predicate, so the gate
+            // refuses directly (--force above is the only escape).
+            eprintln!(
+                "error: cannot verify 'npm {subcommand}': {e} (pass --force to proceed unchecked)"
+            );
+            return 1;
+        }
+    };
+
+    let resolved_count = jobs.len();
+    let results = verdict::verdict_pool(jobs, cfg, PackageManager::Npm);
+    let transitive = results
+        .into_iter()
+        .map(|(pkg, verdict)| TreeOutcome {
+            name: pkg.name,
+            version: pkg.version,
+            origin: TreeOrigin::Locked,
+            verdict,
+        })
+        .collect();
+    let report = PrecheckReport {
+        manager: PackageManager::Npm,
+        subcommand: subcommand.to_string(),
+        original_args: rest.to_vec(),
+        outcomes: Vec::new(),
+        threshold: opts.threshold,
+        tree: Some(TreeReport::Full {
+            resolved_count,
+            transitive,
+        }),
+        bare_install: true,
+    };
+
+    report_and_exec(&report, &opts, exec)
+}
+
+/// One verdict job (`requested: true`) per named resolved target, in
+/// outcome order.
+fn resolved_jobs(outcomes: &[TargetOutcome]) -> impl Iterator<Item = tree::TreePackage> + '_ {
+    outcomes.iter().filter_map(|o| match o {
+        TargetOutcome::Resolved { resolved, .. } => Some(tree::TreePackage {
+            name: resolved.name.clone(),
+            version: resolved.version.clone(),
+            requested: true,
+        }),
+        _ => None,
+    })
+}
+
+/// Verdict the resolved would-install set (`tree::resolve_tree`'s result).
+/// On any resolution failure, fall back to the named-only verdict pass; the
+/// caller renders the loud warning from the returned `NamedOnly` reason.
+/// Only called when `opts.verdict.is_some()`.
+fn run_tree_pass(
+    manager: PackageManager,
+    resolution: Result<Vec<tree::TreePackage>, String>,
+    outcomes: &mut Vec<TargetOutcome>,
+    parsed: &parse::ParsedInstall,
+    opts: &PrecheckOptions,
+    now: &chrono::DateTime<Utc>,
+) -> TreeReport {
+    let set = match resolution {
+        Ok(set) => set,
+        Err(reason) => {
+            outcomes.extend(requirements_fallback_outcomes(manager, parsed, opts, now));
+            run_verdict_pass(manager, outcomes, opts);
+            return TreeReport::NamedOnly { reason };
+        }
+    };
+
+    // Dedup the dry-run set (npm lockfiles repeat the same name@version at
+    // multiple nested paths), then union in the named-resolved targets — a
+    // named target already installed is absent from the dry-run delta but
+    // must still be verdicted.
+    let norm = |n: &str| manager.normalize_name(n);
+    let mut seen = std::collections::HashSet::new();
+    let mut jobs: Vec<tree::TreePackage> = Vec::with_capacity(set.len());
+    for p in set {
+        if seen.insert((norm(&p.name), p.version.clone())) {
+            jobs.push(p);
+        }
+    }
+    let resolved_count = jobs.len();
+    for p in resolved_jobs(outcomes) {
+        if seen.insert((norm(&p.name), p.version.clone())) {
+            jobs.push(p);
+        }
+    }
+
+    // npm leftovers that are direct deps of the project manifest are
+    // pre-existing, not transitive. pip carries `requested` instead.
+    let direct_deps = if manager == PackageManager::Npm {
+        tree::project_direct_deps()
+    } else {
+        Default::default()
+    };
+
+    let cfg = opts
+        .verdict
+        .as_ref()
+        .expect("tree pass requires verdict config");
+    let results = verdict::verdict_pool(jobs, cfg, manager);
+    let transitive = verdict::apply_verdicts(manager, results, outcomes, &direct_deps);
+    TreeReport::Full {
+        resolved_count,
+        transitive,
+    }
+}
+
+fn requirements_fallback_outcomes(
+    manager: PackageManager,
+    parsed: &parse::ParsedInstall,
+    opts: &PrecheckOptions,
+    now: &chrono::DateTime<Utc>,
+) -> Vec<TargetOutcome> {
+    if manager != PackageManager::Pip || parsed.requirements_files.is_empty() {
+        return Vec::new();
+    }
+
+    let mut targets = Vec::new();
+    let mut outcomes = Vec::new();
+    for file in &parsed.requirements_files {
+        match parse::parse_requirement_file_targets(file) {
+            Ok(mut file_targets) => targets.append(&mut file_targets),
+            Err(error) => outcomes.push(TargetOutcome::Error {
+                target: InstallTarget {
+                    name: file.display().to_string(),
+                    display: file.display().to_string(),
+                    kind: TargetKind::Unverifiable {
+                        reason: "requirements file could not be read".to_string(),
+                    },
+                },
+                error,
+            }),
+        }
+    }
+
+    outcomes.extend(verdict::verify_all(
+        &targets,
+        opts,
+        now,
+        parsed.allow_prerelease,
+    ));
+    outcomes
+}
+
+/// Vuln-api verdict pass over resolved targets, run through the bounded
+/// worker pool. No-op without a `VerdictConfig` (recency-only callers).
+/// Any client/call failure becomes `Unverifiable`, which warns but never
+/// blocks: public lookups fail open.
+fn run_verdict_pass(
+    manager: PackageManager,
+    outcomes: &mut [TargetOutcome],
+    opts: &PrecheckOptions,
+) {
+    let Some(cfg) = &opts.verdict else { return };
+
+    // One job per resolved target, in outcome order; the pool preserves
+    // order, so verdicts zip straight back onto the resolved outcomes.
+    let jobs: Vec<tree::TreePackage> = resolved_jobs(outcomes).collect();
+
+    let mut results = verdict::verdict_pool(jobs, cfg, manager).into_iter();
+    for o in outcomes.iter_mut() {
+        if let TargetOutcome::Resolved { verdict, .. } = o {
+            *verdict = match results.next() {
+                Some((_, v)) => v,
+                // Pool invariant broken — fail safe instead of panicking:
+                // Unverifiable warns instead of silently reading as clean.
+                None => VerdictStatus::Unverifiable(
+                    "internal error: verdict pool returned fewer results than outcomes".to_string(),
+                ),
+            };
+        }
+    }
 }
 
 #[cfg(test)]
@@ -420,7 +815,8 @@ mod tests {
 
     #[test]
     fn requirements_files_note_then_exec() {
-        // `-r reqs.txt` alone → printed note, no verification, exec runs.
+        // `-r reqs.txt` alone, verdicts disabled → printed note, no
+        // verification, exec runs.
         let opts = stub_opts();
         let (code, exec_ran) = gate_pip_install(&["-r", "reqs.txt"], opts);
         assert_eq!(code, 42);
@@ -432,5 +828,17 @@ mod tests {
         use crate::vuln_api::Ecosystem;
         assert_eq!(PackageManager::Pip.ecosystem(), Ecosystem::Pypi);
         assert_eq!(PackageManager::Npm.ecosystem(), Ecosystem::Npm);
+    }
+
+    #[test]
+    fn normalize_name_per_manager() {
+        // pypi: PEP 503 — lowercase, separator runs collapse to one `-`.
+        assert_eq!(
+            PackageManager::Pip.normalize_name("Flask_Cors"),
+            "flask-cors"
+        );
+        assert_eq!(PackageManager::Pip.normalize_name("a__b"), "a-b");
+        // npm names are case-sensitive and pass through verbatim.
+        assert_eq!(PackageManager::Npm.normalize_name("Left_Pad"), "Left_Pad");
     }
 }

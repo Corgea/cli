@@ -4,7 +4,7 @@
 //! mix flags, package specs, and pass-through args freely) and clear
 //! about anything we can't verify (URLs / git / filesystem refs).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::verify_deps::registry::{NpmSpec, PypiSpec};
 
@@ -91,6 +91,201 @@ pub fn parse_install_args(
             ))
         }
     }
+}
+
+/// Best-effort extraction of registry-installable entries from pip
+/// requirements files. This is a fallback for when pip's full dry-run cannot
+/// resolve the tree. It deliberately skips file-level options and constraints,
+/// while preserving URL/VCS/editable entries as unverifiable targets.
+pub(super) fn parse_requirement_file_targets(path: &Path) -> Result<Vec<InstallTarget>, String> {
+    let mut seen = std::collections::HashSet::new();
+    parse_requirement_file_targets_inner(path, &mut seen)
+}
+
+fn parse_requirement_file_targets_inner(
+    path: &Path,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) -> Result<Vec<InstallTarget>, String> {
+    let path_for_io = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("read {}: {e}", path.display()))?
+            .join(path)
+    };
+    let seen_key = std::fs::canonicalize(&path_for_io).unwrap_or_else(|_| path_for_io.clone());
+    if !seen.insert(seen_key) {
+        return Ok(Vec::new());
+    }
+
+    let content = std::fs::read_to_string(&path_for_io)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let base = path_for_io.parent().unwrap_or_else(|| Path::new("."));
+    let mut targets = Vec::new();
+
+    for line in requirement_logical_lines(&content) {
+        match requirement_line_entry(&line) {
+            Some(RequirementLineEntry::Target(spec)) => targets.push(parse_pypi_spec(&spec)),
+            Some(RequirementLineEntry::Include(include)) => {
+                targets.extend(parse_requirement_file_targets_inner(
+                    &base.join(include),
+                    seen,
+                )?);
+            }
+            None => {}
+        }
+    }
+
+    Ok(targets)
+}
+
+/// First format-control directive (`--no-binary` / `--only-binary`) found in
+/// any of `files`, following nested `-r` includes. pip applies file-level
+/// format-control AFTER command-line options (the file parser mutates the
+/// shared FormatControl object post-CLI-parse), so a `--no-binary :all:`
+/// line inside a requirements file overrides the tree pass's trailing
+/// `--only-binary :all:` guard and would build sdists — executing package
+/// code — during the dry-run. The tree pass must refuse to dry-run such
+/// files. Returns `(file, directive)` of the first hit.
+pub(super) fn requirements_format_control_directive(
+    files: &[PathBuf],
+) -> Option<(PathBuf, String)> {
+    let mut seen = std::collections::HashSet::new();
+    files
+        .iter()
+        .find_map(|file| format_control_scan(file, &mut seen))
+}
+
+fn format_control_scan(
+    path: &Path,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) -> Option<(PathBuf, String)> {
+    let path_for_io = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let seen_key = std::fs::canonicalize(&path_for_io).unwrap_or_else(|_| path_for_io.clone());
+    if !seen.insert(seen_key) {
+        return None;
+    }
+
+    // Best-effort: an unreadable/missing file can't carry a directive we'd
+    // miss — pip runs as the same uid, so it can't read it either and the
+    // dry-run fails loudly on its own.
+    let content = std::fs::read_to_string(&path_for_io).ok()?;
+    let base = path_for_io.parent().unwrap_or_else(|| Path::new("."));
+
+    for line in requirement_logical_lines(&content) {
+        let line = strip_requirement_comment(&line);
+        let first = line.split_whitespace().next().unwrap_or_default();
+        if first == "--no-binary"
+            || first == "--only-binary"
+            || first.starts_with("--no-binary=")
+            || first.starts_with("--only-binary=")
+        {
+            return Some((path.to_path_buf(), first.to_string()));
+        }
+        if let Some(include) = requirement_flag_value(line, "-r", "--requirement") {
+            if let Some(hit) = format_control_scan(&base.join(include), seen) {
+                return Some(hit);
+            }
+        }
+    }
+    None
+}
+
+enum RequirementLineEntry {
+    Target(String),
+    Include(PathBuf),
+}
+
+fn requirement_logical_lines(content: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for raw in content.lines() {
+        let trimmed = raw.trim_end();
+        let (part, continued) = match trimmed.strip_suffix('\\') {
+            Some(part) => (part.trim_end(), true),
+            None => (trimmed, false),
+        };
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(part.trim());
+        if !continued {
+            lines.push(std::mem::take(&mut current));
+        }
+    }
+
+    if !current.trim().is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn requirement_line_entry(line: &str) -> Option<RequirementLineEntry> {
+    let line = strip_requirement_comment(line);
+    if line.is_empty() {
+        return None;
+    }
+
+    if let Some(path) = requirement_flag_value(line, "-r", "--requirement") {
+        return Some(RequirementLineEntry::Include(PathBuf::from(path)));
+    }
+    if requirement_flag_value(line, "-c", "--constraint").is_some() {
+        return None;
+    }
+    if let Some(path) = requirement_flag_value(line, "-e", "--editable") {
+        return Some(RequirementLineEntry::Target(format!("-e {path}")));
+    }
+
+    if line.starts_with('-') {
+        return None;
+    }
+
+    let spec = strip_inline_requirement_options(line);
+    (!spec.is_empty()).then(|| RequirementLineEntry::Target(spec.to_string()))
+}
+
+fn strip_requirement_comment(line: &str) -> &str {
+    let trimmed = line.trim();
+    if trimmed.starts_with('#') {
+        return "";
+    }
+    [" #", "\t#"]
+        .iter()
+        .filter_map(|marker| trimmed.find(marker))
+        .min()
+        .map_or(trimmed, |idx| trimmed[..idx].trim())
+}
+
+fn requirement_flag_value<'a>(line: &'a str, short: &str, long: &str) -> Option<&'a str> {
+    let mut parts = line.split_whitespace();
+    let first = parts.next()?;
+    if first == short || first == long {
+        return parts.next();
+    }
+    if let Some(value) = first.strip_prefix(&format!("{long}=")) {
+        return Some(value);
+    }
+    first
+        .strip_prefix(short)
+        .filter(|value| !value.is_empty() && !value.starts_with('-'))
+}
+
+fn strip_inline_requirement_options(line: &str) -> &str {
+    [
+        " --hash",
+        " --config-setting",
+        " --global-option",
+        " --install-option",
+    ]
+    .iter()
+    .filter_map(|marker| line.find(marker))
+    .min()
+    .map_or(line.trim(), |idx| line[..idx].trim())
 }
 
 #[derive(Debug, Default)]
@@ -964,5 +1159,43 @@ mod tests {
         ];
         let p = extract_pip_positionals(&args).unwrap();
         assert_eq!(p.specs, vec!["requests".to_string()]);
+    }
+
+    #[test]
+    fn requirements_format_control_scan_follows_includes() {
+        // SECURITY: pip applies file-level format-control AFTER CLI flags,
+        // so a --no-binary line (even in a nested -r include) defeats the
+        // tree pass's trailing --only-binary :all: guard. The scan must
+        // find it transitively; option lines that don't touch
+        // format-control must not trip it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("inner.txt"),
+            "# comment\n--no-binary :all:\n",
+        )
+        .expect("write inner");
+        std::fs::write(dir.path().join("outer.txt"), "flask==1.0\n-r inner.txt\n")
+            .expect("write outer");
+        let (file, directive) =
+            requirements_format_control_directive(&[dir.path().join("outer.txt")])
+                .expect("directive must be found through the include");
+        assert!(file.ends_with("outer.txt") || file.ends_with("inner.txt"));
+        assert_eq!(directive, "--no-binary");
+
+        // Attached `=` form counts too.
+        std::fs::write(dir.path().join("eq.txt"), "--only-binary=:none:\n").expect("write eq");
+        assert!(requirements_format_control_directive(&[dir.path().join("eq.txt")]).is_some());
+
+        // Non-format-control options don't trip the scan.
+        std::fs::write(
+            dir.path().join("clean.txt"),
+            "flask==1.0\n--prefer-binary\n--hash=sha256:abc\n",
+        )
+        .expect("write clean");
+        assert!(requirements_format_control_directive(&[dir.path().join("clean.txt")]).is_none());
+
+        // A missing file is pip's error to report, not the scan's — it
+        // can't hide a directive pip could read (same uid).
+        assert!(requirements_format_control_directive(&[dir.path().join("absent.txt")]).is_none());
     }
 }

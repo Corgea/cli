@@ -107,7 +107,15 @@ impl Config {
 /// Base URL for the vuln-api service: `CORGEA_VULN_API_URL` env var,
 /// then the public default. Pure env/constant — no config file field.
 pub fn vuln_api_url() -> String {
-    crate::utils::generic::get_env_var_if_exists("CORGEA_VULN_API_URL")
+    resolve_vuln_api_url(crate::utils::generic::get_env_var_if_exists(
+        "CORGEA_VULN_API_URL",
+    ))
+}
+
+/// Pure resolution rule, split out so tests never mutate process-global
+/// env (`set_var` races concurrent `getenv` under the parallel harness).
+fn resolve_vuln_api_url(override_url: Option<String>) -> String {
+    override_url
         .unwrap_or_else(|| DEFAULT_VULN_API_URL.to_string())
         .trim()
         .trim_end_matches('/')
@@ -118,23 +126,16 @@ pub fn vuln_api_url() -> String {
 mod tests {
     use super::*;
 
-    /// All `vuln_api_url` cases in one test fn: the env-var cases
-    /// mutate process-global state, so they must not run concurrently
-    /// with each other under the parallel test harness.
     #[test]
     fn vuln_api_url_resolution_order() {
-        env::remove_var("CORGEA_VULN_API_URL");
+        // Default when the env var is unset (`get_env_var_if_exists`
+        // already maps empty/whitespace-only values to None).
+        assert_eq!(resolve_vuln_api_url(None), DEFAULT_VULN_API_URL);
 
-        // Default when the env var is unset.
-        assert_eq!(vuln_api_url(), DEFAULT_VULN_API_URL);
-
-        // Env var wins; whitespace and trailing slash trimmed.
-        env::set_var("CORGEA_VULN_API_URL", " https://env.example.com/ ");
-        assert_eq!(vuln_api_url(), "https://env.example.com");
-
-        // Empty / whitespace-only env var is treated as unset.
-        env::set_var("CORGEA_VULN_API_URL", "   ");
-        assert_eq!(vuln_api_url(), DEFAULT_VULN_API_URL);
-        env::remove_var("CORGEA_VULN_API_URL");
+        // Override wins; whitespace and trailing slash trimmed.
+        assert_eq!(
+            resolve_vuln_api_url(Some(" https://env.example.com/ ".to_string())),
+            "https://env.example.com"
+        );
     }
 }

@@ -2,13 +2,18 @@
 
 use crate::verify_deps;
 
-use super::{parse, PrecheckOptions, PrecheckReport, TargetOutcome, VerdictStatus};
+use super::{
+    parse, PrecheckOptions, PrecheckReport, TargetOutcome, TreeOrigin, TreeReport, VerdictStatus,
+};
 
 /// The refusal line on stderr. Messaging only; the block decision and the
 /// choice of escape hatch live in `verdict::block_reason`.
 pub(super) fn print_refusal(reason: super::verdict::BlockReason) {
     use super::verdict::BlockReason;
     match reason {
+        BlockReason::ExistingTree => eprintln!(
+            "Refusing to run install: your existing dependency tree has known-vulnerable packages (none were added by this command). Fix them or pass --force."
+        ),
         BlockReason::Findings => {
             eprintln!("Refusing to run install. Pass --force to proceed despite findings.")
         }
@@ -51,10 +56,10 @@ fn fix_note(m: &crate::vuln_api::VulnMatch) -> String {
 
 /// Highest of `fixes` after sort/dedup: a single distinct value is returned
 /// as-is (no parsing — preserves odd-but-unambiguous forms); several distinct
-/// values compare by lenient semver. One unparsable candidate among several
-/// poisons the answer (`None`) — certifying a "safe version" from a partial
-/// ordering could steer to a still-vulnerable release.
-fn highest_fix(mut fixes: Vec<&str>) -> Option<String> {
+/// values compare by lenient semver. With `all_must_parse`, one unparsable
+/// candidate among several poisons the answer (`None`); otherwise unparsable
+/// candidates are skipped.
+fn highest_fix(mut fixes: Vec<&str>, all_must_parse: bool) -> Option<String> {
     fixes.sort_unstable();
     fixes.dedup();
     match fixes.as_slice() {
@@ -65,7 +70,8 @@ fn highest_fix(mut fixes: Vec<&str>) -> Option<String> {
             for raw in many {
                 match semver::Version::parse(&verify_deps::registry::normalize_for_semver(raw)) {
                     Ok(v) => parsed.push((v, *raw)),
-                    Err(_) => return None,
+                    Err(_) if all_must_parse => return None,
+                    Err(_) => {}
                 }
             }
             parsed
@@ -84,10 +90,23 @@ fn safe_version(matches: &[crate::vuln_api::VulnMatch]) -> Option<String> {
         .iter()
         .map(|m| m.fixed_version.as_deref())
         .collect::<Option<_>>()?;
-    highest_fix(fixes)
+    highest_fix(fixes, true)
 }
 
-/// Per-match advisory lines plus the safe-version steer. Built for agent
+/// Highest `fixed_version` the advisories advertise, by lenient semver.
+/// Unlike `safe_version` this is *not* a certification: matches without a
+/// fix are ignored, so the result may still be vulnerable to them. `None`
+/// only when no match advertises a fix (or no candidate parses).
+fn advertised_fix(matches: &[crate::vuln_api::VulnMatch]) -> Option<String> {
+    let fixes: Vec<&str> = matches
+        .iter()
+        .filter_map(|m| m.fixed_version.as_deref())
+        .collect();
+    highest_fix(fixes, false)
+}
+
+/// Per-match advisory lines plus the safe-version steer, shared by the
+/// named-target and transitive vulnerable render arms. Built for agent
 /// self-correction: each advisory carries `fixed in <version>`, and the
 /// steer names the exact spec to install instead.
 fn print_vulnerable_matches(name: &str, matches: &[crate::vuln_api::VulnMatch]) {
@@ -104,14 +123,87 @@ fn print_vulnerable_matches(name: &str, matches: &[crate::vuln_api::VulnMatch]) 
     }
 }
 
+/// One summary-line segment, e.g. `"2 vulnerable (2 from resolved tree)"`.
+/// The parenthetical separates findings the resolved tree carried in from
+/// findings on the targets this command names; omitted when the tree
+/// contributed none.
+fn summary_segment(total: usize, from_tree: usize, label: &str) -> String {
+    if from_tree > 0 {
+        format!("{total} {label} ({from_tree} from resolved tree)")
+    } else {
+        format!("{total} {label}")
+    }
+}
+
+/// More than this many unverifiable findings with the same error-prefix
+/// render as one collapsed line instead of one line per package.
+const UNVERIFIABLE_COLLAPSE_THRESHOLD: usize = 3;
+
+/// Group key for collapsing repeated unverifiable errors: the text before
+/// the first `(` — strips per-package detail (URLs, status codes) so one
+/// outage groups under one key.
+fn error_prefix(error: &str) -> &str {
+    match error.find('(') {
+        Some(i) => error[..i].trim_end(),
+        None => error,
+    }
+}
+
+/// Unverifiable error strings across transitive tree findings and named
+/// outcomes, in render order.
+fn unverifiable_errors(report: &PrecheckReport) -> Vec<&str> {
+    let mut errors = Vec::new();
+    if let Some(TreeReport::Full { transitive, .. }) = &report.tree {
+        for t in transitive {
+            if let VerdictStatus::Unverifiable(e) = &t.verdict {
+                errors.push(e.as_str());
+            }
+        }
+    }
+    for o in &report.outcomes {
+        if let TargetOutcome::Resolved {
+            verdict: VerdictStatus::Unverifiable(e),
+            ..
+        } = o
+        {
+            errors.push(e.as_str());
+        }
+    }
+    errors
+}
+
+/// `(prefix, count, first error)` groups of unverifiable findings large
+/// enough to collapse (> `UNVERIFIABLE_COLLAPSE_THRESHOLD` per prefix) —
+/// the vuln-api outage case, where every package fails the same way.
+/// Display-only: counts and exit codes never change.
+fn collapsed_unverifiable_groups(report: &PrecheckReport) -> Vec<(&str, usize, &str)> {
+    let mut groups: Vec<(&str, usize, &str)> = Vec::new();
+    for e in unverifiable_errors(report) {
+        let prefix = error_prefix(e);
+        match groups.iter_mut().find(|(p, _, _)| *p == prefix) {
+            Some((_, count, _)) => *count += 1,
+            None => groups.push((prefix, 1, e)),
+        }
+    }
+    groups.retain(|(_, count, _)| *count > UNVERIFIABLE_COLLAPSE_THRESHOLD);
+    groups
+}
+
 pub(super) fn print_text(report: &PrecheckReport) {
-    // Build the echoed command from non-empty parts: a gated install with
-    // zero remaining args has nothing to append.
+    // Build the echoed command from non-empty parts: a bare gated install
+    // (e.g. `npm install` with zero specs) has no args to append.
     let mut command = format!("{} {}", report.manager.binary_name(), report.subcommand);
     if !report.original_args.is_empty() {
         command.push(' ');
         command.push_str(&report.original_args.join(" "));
     }
+
+    let collapsed = collapsed_unverifiable_groups(report);
+    let is_collapsed = |error: &str| {
+        collapsed
+            .iter()
+            .any(|(prefix, _, _)| *prefix == error_prefix(error))
+    };
 
     println!(
         "Pre-checking `{}` (threshold {})",
@@ -119,14 +211,95 @@ pub(super) fn print_text(report: &PrecheckReport) {
         verify_deps::format_duration(report.threshold)
     );
     println!(
-        "  {} ok, {} recent, {} vulnerable, {} unverifiable, {} skipped, {} errors",
+        "  {} ok, {} recent, {}, {}, {} skipped, {} errors",
         report.ok_count(),
         report.recent_count(),
-        report.vulnerable_count(),
-        report.unverifiable_count(),
+        summary_segment(
+            report.vulnerable_count(),
+            report.tree_vulnerable_count(),
+            "vulnerable"
+        ),
+        summary_segment(
+            report.unverifiable_count(),
+            report.tree_unverifiable_count(),
+            "unverifiable"
+        ),
         report.skipped_count(),
         report.error_count(),
     );
+
+    match &report.tree {
+        Some(TreeReport::Full {
+            resolved_count,
+            transitive,
+            ..
+        }) => {
+            println!(
+                "  tree: {} packages resolved, {} transitive checked",
+                resolved_count,
+                transitive.len()
+            );
+            for t in transitive {
+                match &t.verdict {
+                    VerdictStatus::Vulnerable(matches) => {
+                        println!(
+                            "  ✗ {}@{} {}  known vulnerable:",
+                            t.name,
+                            t.version,
+                            t.origin.label()
+                        );
+                        print_vulnerable_matches(&t.name, matches);
+                        // A vulnerable dep the project already declares can be
+                        // bumped directly — point at the fix as a command.
+                        // When `safe_version` is `Some` it equals
+                        // `advertised_fix` and clears every advisory; otherwise
+                        // some advisory has no fix, so the "(advertised fix)"
+                        // hedge marks the bump as partial.
+                        if t.origin == TreeOrigin::PreExisting {
+                            if let Some(fix) = advertised_fix(matches) {
+                                let hedge = if safe_version(matches).is_some() {
+                                    ""
+                                } else {
+                                    " (advertised fix)"
+                                };
+                                println!(
+                                    "      fix with: corgea {} install {}@{}{}",
+                                    report.manager.binary_name(),
+                                    t.name,
+                                    fix,
+                                    hedge
+                                );
+                            }
+                        }
+                    }
+                    VerdictStatus::Unverifiable(error) => {
+                        if !is_collapsed(error) {
+                            println!(
+                                "  ⚠ {}@{} {}  could not be verified: {}",
+                                t.name,
+                                t.version,
+                                t.origin.label(),
+                                error
+                            );
+                        }
+                    }
+                    // Clean / not-checked tree entries stay quiet in text mode.
+                    VerdictStatus::Clean | VerdictStatus::NotChecked => {}
+                }
+            }
+        }
+        Some(TreeReport::NamedOnly { reason }) => {
+            println!("  tree: transitive dependencies NOT checked ({reason})");
+        }
+        None => {}
+    }
+
+    // One line per collapsed outage group instead of one per package.
+    for (_, count, first_error) in &collapsed {
+        println!(
+            "  ⚠ {count} packages could not be verified (vuln-api unreachable: {first_error})"
+        );
+    }
 
     for o in &report.outcomes {
         match o {
@@ -144,10 +317,12 @@ pub(super) fn print_text(report: &PrecheckReport) {
                     print_vulnerable_matches(&resolved.name, matches);
                 }
                 VerdictStatus::Unverifiable(error) => {
-                    println!(
-                        "  ⚠ {} → {}@{}  could not be verified: {}",
-                        target.display, resolved.name, resolved.version, error,
-                    );
+                    if !is_collapsed(error) {
+                        println!(
+                            "  ⚠ {} → {}@{}  could not be verified: {}",
+                            target.display, resolved.name, resolved.version, error,
+                        );
+                    }
                 }
                 VerdictStatus::Clean | VerdictStatus::NotChecked => {
                     if report.is_recent(*age) {
@@ -189,6 +364,7 @@ pub(super) fn print_text(report: &PrecheckReport) {
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
+    use super::super::TreeOutcome;
     use super::*;
 
     #[test]
@@ -244,5 +420,78 @@ mod tests {
     #[test]
     fn safe_version_empty_matches_is_none() {
         assert_eq!(safe_version(&[]), None);
+    }
+
+    #[test]
+    fn error_prefix_strips_parenthesized_detail() {
+        // The reqwest network-failure shape: per-package URL in parens.
+        assert_eq!(
+            error_prefix("Failed to send vuln-api request: error sending request for url (http://x/v1/packages/pypi/a/versions/1.0.0/check)"),
+            "Failed to send vuln-api request: error sending request for url"
+        );
+        assert_eq!(
+            error_prefix("vuln-api unavailable (HTTP 503)"),
+            "vuln-api unavailable"
+        );
+        assert_eq!(error_prefix("no parens here"), "no parens here");
+    }
+
+    /// Four unverifiable findings sharing a prefix collapse into one group
+    /// (named + transitive both count); three do not.
+    #[test]
+    fn collapsed_groups_require_more_than_threshold() {
+        let unverifiable = |name: &str| {
+            let mut o = resolved_outcome(name, "1.0.0", false);
+            set_verdict(
+                &mut o,
+                VerdictStatus::Unverifiable(format!("vuln-api unavailable (HTTP 503: {name})")),
+            );
+            o
+        };
+
+        let mut report = report_with(vec![
+            unverifiable("a"),
+            unverifiable("b"),
+            unverifiable("c"),
+        ]);
+        assert!(collapsed_unverifiable_groups(&report).is_empty());
+
+        report.tree = Some(TreeReport::Full {
+            resolved_count: 4,
+            transitive: vec![TreeOutcome {
+                name: "d".to_string(),
+                version: "1.0.0".to_string(),
+                verdict: VerdictStatus::Unverifiable(
+                    "vuln-api unavailable (HTTP 503: d)".to_string(),
+                ),
+                origin: TreeOrigin::Transitive,
+            }],
+        });
+        let groups = collapsed_unverifiable_groups(&report);
+        assert_eq!(groups.len(), 1);
+        let (prefix, count, first) = groups[0];
+        assert_eq!(prefix, "vuln-api unavailable");
+        assert_eq!(count, 4);
+        // Render order is transitive-first, so the tree finding leads.
+        assert_eq!(first, "vuln-api unavailable (HTTP 503: d)");
+    }
+
+    #[test]
+    fn advertised_fix_ignores_matches_without_fix() {
+        // safe_version returns None here; the advertised fix still surfaces.
+        assert_eq!(
+            advertised_fix(&[vm("A-1", Some("2.0.0")), vm("A-2", None)]),
+            Some("2.0.0".to_string())
+        );
+        assert_eq!(advertised_fix(&[vm("A-1", None)]), None);
+        assert_eq!(advertised_fix(&[]), None);
+    }
+
+    #[test]
+    fn advertised_fix_picks_highest_by_semver() {
+        assert_eq!(
+            advertised_fix(&[vm("A-1", Some("1.2.0")), vm("A-2", Some("1.10.0"))]),
+            Some("1.10.0".to_string())
+        );
     }
 }
