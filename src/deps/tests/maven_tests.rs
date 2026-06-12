@@ -54,7 +54,9 @@ fn gradle_classify_latest_release_is_unbounded() {
 }
 
 use super::common::scan_fixture;
-use crate::deps::model::{PackageId, Severity};
+use crate::deps::model::{PackageId, Scope, Severity};
+use crate::deps::policy::Policy;
+use crate::deps::scan;
 
 #[test]
 fn maven_graph_lists_all_direct_dependencies() {
@@ -126,4 +128,37 @@ fn maven_snapshot_is_dep021_high() {
         f.recommendation.to_lowercase().contains("snapshot"),
         "recommendation should name SNAPSHOT"
     );
+}
+
+#[test]
+fn maven_parser_accepts_namespace_prefixes_and_attributes() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(
+        tmp.path().join("pom.xml"),
+        r#"<?xml version="1.0"?>
+<m:project xmlns:m="http://maven.apache.org/POM/4.0.0">
+  <m:dependencies>
+    <m:dependency optional="true">
+      <m:groupId>org.example</m:groupId>
+      <m:artifactId>demo-lib</m:artifactId>
+      <m:version>1.2.3</m:version>
+      <m:scope>test</m:scope>
+      <m:exclusions>
+        <m:exclusion>
+          <m:groupId>ignored</m:groupId>
+          <m:artifactId>ignored-artifact</m:artifactId>
+        </m:exclusion>
+      </m:exclusions>
+    </m:dependency>
+  </m:dependencies>
+</m:project>
+"#,
+    )
+    .expect("write pom");
+
+    let inv = scan(tmp.path(), &Policy::default()).expect("scan");
+    let node = inv.node("demo-lib").expect("demo-lib node");
+    assert_eq!(node.version(), Some("1.2.3"));
+    assert_eq!(node.scope(), Scope::Development);
+    assert!(inv.node("ignored-artifact").is_none());
 }

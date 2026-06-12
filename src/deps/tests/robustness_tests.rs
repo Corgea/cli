@@ -103,3 +103,25 @@ fn robust_scan_skips_node_modules() {
         .components()
         .any(|c| { c.as_os_str() == "node_modules" })));
 }
+
+#[test]
+fn robust_scan_skips_hidden_tooling_dirs() {
+    use std::fs;
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    fs::write(
+        tmp.path().join("package.json"),
+        r#"{"name":"x","version":"1.0.0","dependencies":{}}"#,
+    )
+    .unwrap();
+    let hidden = tmp
+        .path()
+        .join(".claude/worktrees/agent/tests/fixtures/malformed");
+    fs::create_dir_all(&hidden).unwrap();
+    fs::write(hidden.join("package-lock.json"), "{").unwrap();
+
+    let files = crate::deps::detect::detect_dependency_files(tmp.path());
+    assert!(files
+        .iter()
+        .all(|f| !f.path.components().any(|c| { c.as_os_str() == ".claude" })));
+    assert!(scan(tmp.path(), &Policy::default()).is_ok());
+}

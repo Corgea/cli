@@ -45,6 +45,6 @@ fn detect_finds_gradle_files() {
 }
 
 #[test]
-fn detect_finds_go_mod_smoke() {
-    assert!(kinds("go-mod-smoke").contains(&DepFileKind::GoMod));
+fn detect_ignores_unsupported_go_files() {
+    assert!(kinds("go-mod-smoke").is_empty());
 }

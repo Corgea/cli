@@ -18,6 +18,6 @@ Offline fixture projects for `corgea deps` unit and CLI tests per `docs/PRD_DEPS
 | `python-pip-nolock` | DEP001 + requirements.txt |
 | `python-uv-requirements` | `uv.lock` does not suppress requirements scanning |
 | `java-maven` / `java-gradle` | Maven/Gradle parsers |
-| `go-mod-smoke` | detection only |
+| `go-mod-smoke` | unsupported Go files are ignored |
 | `malformed/` | graceful parse errors |
 | `vuln-db.json` | mock DEP010 advisories |
