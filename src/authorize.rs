@@ -94,7 +94,8 @@ pub fn run(scope: Option<String>, url: Option<String>) -> Result<(), Box<dyn std
 fn find_available_port(start_port: u16) -> Result<u16, Box<dyn std::error::Error>> {
     // Try a more reliable approach - start from a higher range that's less likely to be used
     let search_ranges = vec![
-        (start_port, start_port + 50),
+        // Saturate: a start port near u16::MAX must clamp, not overflow.
+        (start_port, start_port.saturating_add(50)),
         (9000, 9100),
         (8000, 8100),
         (7000, 7100),
@@ -632,7 +633,16 @@ mod tests {
 
         assert!(!port_is_available(port));
         drop(listener);
-        assert!(port_is_available(port));
+        // The freed port returns to the OS ephemeral pool, where a parallel
+        // test's `bind(":0")` can snatch it before the re-check — so accept
+        // any of several freshly freed ports reading available. The chain is
+        // lazy: fresh ports are only reserved after a collision.
+        assert!(
+            std::iter::once(port)
+                .chain((0..4).map(|_| reserve_ephemeral_port()))
+                .any(port_is_available),
+            "five consecutive freed ports all read unavailable"
+        );
     }
 
     #[test]

@@ -199,6 +199,16 @@ enum Commands {
         #[command(subcommand)]
         command: corgea::deps::run::DepsSubcommand,
     },
+    /// Wrap `npm` commands: verify install targets' publish recency, then run npm.
+    Npm(InstallWrapArgs),
+    /// Wrap `yarn` commands: verify install targets' publish recency, then run yarn.
+    Yarn(InstallWrapArgs),
+    /// Wrap `pnpm` commands: verify install targets' publish recency, then run pnpm.
+    Pnpm(InstallWrapArgs),
+    /// Wrap `pip` commands: verify install targets' publish recency, then run pip.
+    Pip(InstallWrapArgs),
+    /// Wrap `uv` commands: verify install targets' publish recency, then run uv.
+    Uv(InstallWrapArgs),
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -219,6 +229,191 @@ impl FromStr for Scanner {
             _ => Err("Only snyk, semgrep and blast are valid scanners."),
         }
     }
+}
+
+/// Shared flags for the install-wrapper subcommands (`corgea npm|yarn|pnpm|pip|uv`).
+#[derive(clap::Args, Debug, Clone)]
+struct InstallWrapArgs {
+    #[arg(
+        long,
+        short = 't',
+        default_value = "2d",
+        value_parser = corgea::verify_deps::parse_threshold,
+        help = "Recency threshold. Resolved versions younger than this are blocked. e.g. '2d', '12h'."
+    )]
+    threshold: std::time::Duration,
+
+    #[arg(
+        long,
+        help = "Demote a recency block to a printed warning. The install still runs."
+    )]
+    no_fail: bool,
+
+    #[arg(
+        long,
+        help = "Proceed with the install despite vulnerable, unverifiable, or recent findings. Findings are still printed."
+    )]
+    force: bool,
+
+    #[arg(
+        long,
+        help = "Output the result as JSON instead of human-readable text."
+    )]
+    json: bool,
+
+    /// Arguments forwarded to the package manager (subcommand and package specs).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    cmd: Vec<String>,
+}
+
+fn install_wrap_options(
+    args: &InstallWrapArgs,
+    config: &Config,
+) -> corgea::precheck::PrecheckOptions {
+    let token = config.get_token();
+    let token = token.trim();
+    let custom_vuln_api = utils::generic::get_env_var_if_exists("CORGEA_VULN_API_URL").is_some();
+    let send_token_to_custom =
+        utils::generic::get_env_var_if_exists("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL")
+            .is_some_and(|v| v == "1");
+    let token_for_vuln_api = if !token.is_empty() && (!custom_vuln_api || send_token_to_custom) {
+        Some(token.to_string())
+    } else {
+        None
+    };
+    let fail_closed = token_for_vuln_api.is_some();
+    let verdict = Some(corgea::precheck::VerdictConfig {
+        base_url: config.get_vuln_api_url(),
+        token: token_for_vuln_api,
+        fail_closed,
+    });
+    corgea::precheck::PrecheckOptions {
+        threshold: args.threshold,
+        no_fail: args.no_fail,
+        force: args.force,
+        json: args.json,
+        verdict,
+        osv: Some(corgea::osv::OsvConfig {
+            base_url: utils::generic::get_env_var_if_exists("CORGEA_OSV_API_URL")
+                .unwrap_or_else(|| "https://api.osv.dev".to_string()),
+        }),
+        npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
+        pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
+    }
+}
+
+fn run_install_wrap_command(
+    manager: corgea::precheck::PackageManager,
+    args: &InstallWrapArgs,
+    config: &Config,
+) {
+    let code =
+        corgea::precheck::run_install(manager, &args.cmd, install_wrap_options(args, config));
+    std::process::exit(code);
+}
+
+fn maybe_run_install_wrap_from_raw_args() {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let Some(first) = raw.first().map(String::as_str) else {
+        return;
+    };
+    if first == "pip3" {
+        eprintln!("`corgea pip3 ...` is not supported. Use `corgea pip ...`; Corgea will fall back to the pip3 binary when needed.");
+        std::process::exit(2);
+    }
+    let manager = match first {
+        "npm" => corgea::precheck::PackageManager::Npm,
+        "yarn" => corgea::precheck::PackageManager::Yarn,
+        "pnpm" => corgea::precheck::PackageManager::Pnpm,
+        "pip" => corgea::precheck::PackageManager::Pip,
+        "uv" => corgea::precheck::PackageManager::Uv,
+        _ => return,
+    };
+    if install_wrapper_requests_help(&raw[1..]) {
+        return;
+    }
+    let args = match parse_install_wrap_raw_args(&raw[1..]) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
+    let config = Config::load().expect("Failed to load config");
+    run_install_wrap_command(manager, &args, &config);
+}
+
+fn install_wrapper_requests_help(raw: &[String]) -> bool {
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i].as_str() {
+            "--help" | "-h" => return true,
+            "--threshold" | "-t" => {
+                i += 2;
+            }
+            "--no-fail" | "--force" | "--json" => {
+                i += 1;
+            }
+            arg if arg.starts_with("--threshold=") => {
+                i += 1;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn parse_install_wrap_raw_args(raw: &[String]) -> Result<InstallWrapArgs, String> {
+    let mut args = InstallWrapArgs {
+        threshold: corgea::verify_deps::parse_threshold("2d").expect("default threshold"),
+        no_fail: false,
+        force: false,
+        json: false,
+        cmd: Vec::new(),
+    };
+    let mut wrapper_allowed = true;
+    let mut i = 0;
+    while i < raw.len() {
+        let arg = &raw[i];
+        if wrapper_allowed {
+            match arg.as_str() {
+                "--threshold" | "-t" => {
+                    let value = raw
+                        .get(i + 1)
+                        .ok_or_else(|| format!("{arg} requires a duration"))?;
+                    args.threshold = corgea::verify_deps::parse_threshold(value)?;
+                    i += 2;
+                    continue;
+                }
+                "--no-fail" => {
+                    args.no_fail = true;
+                    i += 1;
+                    continue;
+                }
+                "--force" => {
+                    args.force = true;
+                    i += 1;
+                    continue;
+                }
+                "--json" => {
+                    args.json = true;
+                    i += 1;
+                    continue;
+                }
+                _ => {
+                    if let Some(value) = arg.strip_prefix("--threshold=") {
+                        args.threshold = corgea::verify_deps::parse_threshold(value)?;
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        wrapper_allowed = false;
+        args.cmd.push(arg.clone());
+        i += 1;
+    }
+    Ok(args)
 }
 
 /// Initialize the global logger.
@@ -246,6 +441,7 @@ fn default_log_level(debug_flag: i8) -> &'static str {
 }
 
 fn main() {
+    maybe_run_install_wrap_from_raw_args();
     let cli = Cli::parse();
     let mut corgea_config = Config::load().expect("Failed to load config");
     init_logging(&corgea_config);
@@ -503,6 +699,23 @@ fn main() {
         Some(Commands::Deps { command }) => {
             // Offline: no token / network. Exit code propagates fail-on policy.
             std::process::exit(i32::from(corgea::deps::run::run(command.clone())));
+        }
+        // Install wrappers: no hard auth gate. Public vulnerability checks run
+        // without a token; authenticated default-url checks fail closed.
+        Some(Commands::Npm(args)) => {
+            run_install_wrap_command(corgea::precheck::PackageManager::Npm, args, &corgea_config)
+        }
+        Some(Commands::Yarn(args)) => {
+            run_install_wrap_command(corgea::precheck::PackageManager::Yarn, args, &corgea_config)
+        }
+        Some(Commands::Pnpm(args)) => {
+            run_install_wrap_command(corgea::precheck::PackageManager::Pnpm, args, &corgea_config)
+        }
+        Some(Commands::Pip(args)) => {
+            run_install_wrap_command(corgea::precheck::PackageManager::Pip, args, &corgea_config)
+        }
+        Some(Commands::Uv(args)) => {
+            run_install_wrap_command(corgea::precheck::PackageManager::Uv, args, &corgea_config)
         }
         None => {
             utils::terminal::show_welcome_message();

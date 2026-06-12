@@ -1,5 +1,6 @@
 use crate::log::debug;
 use crate::utils;
+use corgea::vuln_api::is_jwt;
 use reqwest::header::HeaderMap;
 use reqwest::StatusCode;
 use reqwest::{
@@ -20,11 +21,6 @@ const API_BASE: &str = "/api/v1";
 
 fn get_source() -> String {
     std::env::var("CORGEA_SOURCE").unwrap_or_else(|_| "cli".to_string())
-}
-
-fn is_jwt(token: &str) -> bool {
-    let parts: Vec<&str> = token.splitn(4, '.').collect();
-    parts.len() == 3 && parts.iter().all(|p| !p.is_empty())
 }
 
 fn auth_headers(token: &str) -> HeaderMap {
@@ -1038,27 +1034,6 @@ pub struct SCAIssuesResponse {
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue};
-
-    #[test]
-    fn is_jwt_accepts_three_dot_separated_non_empty_parts() {
-        assert!(is_jwt("aaa.bbb.ccc"));
-        assert!(is_jwt("header.payload.signature"));
-    }
-
-    #[test]
-    fn is_jwt_rejects_wrong_part_count() {
-        assert!(!is_jwt("aaa.bbb"));
-        assert!(!is_jwt("aaa.bbb.ccc.ddd"));
-        assert!(!is_jwt("plainstring"));
-        assert!(!is_jwt(""));
-    }
-
-    #[test]
-    fn is_jwt_rejects_when_any_part_is_empty() {
-        assert!(!is_jwt("aaa..ccc"));
-        assert!(!is_jwt(".bbb.ccc"));
-        assert!(!is_jwt("aaa.bbb."));
-    }
 
     #[test]
     fn auth_headers_uses_bearer_for_jwt_tokens() {

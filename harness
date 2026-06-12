@@ -260,6 +260,12 @@ $output"
 }
 
 cmd_pre_commit() {
+    # git exports GIT_DIR/GIT_INDEX_FILE/… to hooks. From a linked
+    # worktree GIT_DIR is absolute, so any `git init`/`git add` a test
+    # spawns in a tempdir would resolve to the shared gitdir and
+    # corrupt the real repo. Scrub the hook env before running tests.
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+        GIT_COMMON_DIR GIT_PREFIX
     local staged; staged="$(staged_rs_files)"
     if [ -z "$staged" ]; then
         printf "No staged Rust files — skipping checks\n"
