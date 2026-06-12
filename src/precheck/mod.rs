@@ -453,9 +453,15 @@ fn unsupported_pip_add_message(rest: &[String]) -> String {
 fn warn_registry_override(manager: PackageManager, rest: &[String]) {
     let flags: &[&str] = match manager {
         PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => &["--registry"],
-        PackageManager::Pip | PackageManager::Uv => {
-            &["-i", "--index-url", "--extra-index-url", "--default-index"]
-        }
+        PackageManager::Pip | PackageManager::Uv => &[
+            "-i",
+            "--index-url",
+            "--extra-index-url",
+            "--index",
+            "--default-index",
+            "-f",
+            "--find-links",
+        ],
     };
     if let Some(flag) = rest.iter().find(|a| {
         flags
