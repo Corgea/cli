@@ -14,9 +14,10 @@
 mod common;
 
 use common::{
-    npm_packument, pypi_release_json, spawn_http_stub, GateHarness, NOT_FOUND_JSON, OLD_TS,
-    RESOLUTION_FAILS,
+    npm_packument, pip_harness, pypi_release_json, spawn_http_stub, GateHarness, NOT_FOUND_JSON,
+    OLD_TS, RESOLUTION_FAILS,
 };
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -745,4 +746,88 @@ fn wrapper_forwards_package_manager_exit_code() {
         "the package manager's exit code must be forwarded"
     );
     assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg==1.0.0"));
+}
+
+// SKILL.md promises "Git/URL/path specs … are noted, never blocked". The
+// three tests below pin that end-to-end in authenticated mode — the strict
+// (fail-closed) mode, so a regression that turned "skip" into "block" or
+// "unverifiable" would surface here.
+
+#[test]
+fn pip_git_url_spec_skips_verification_and_execs() {
+    let mut h = pip_harness(HashMap::new(), HashMap::new(), Some("test-token"), 0);
+    let out = h
+        .cmd
+        .args(["pip", "install", "git+https://github.com/x/y.git"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("install git+https://github.com/x/y.git"),
+        "pip must receive the raw spec"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("registry verification skipped"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn pip_filesystem_path_spec_skips_verification_and_execs() {
+    let mut h = pip_harness(HashMap::new(), HashMap::new(), Some("test-token"), 0);
+    let out = h
+        .cmd
+        .args(["pip", "install", "."])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.recorded_argv().as_deref(), Some("install ."));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("registry verification skipped"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn npm_github_shorthand_skips_verification_and_execs() {
+    let mut h = GateHarness::new()
+        .fake_recorder("npm", 0)
+        .vuln_checks(HashMap::new())
+        .token("test-token")
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "install", "user/repo"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Exact match also proves the final write came from the real install,
+    // not the (failed) tree dry-run that records its argv first.
+    assert_eq!(h.recorded_argv().as_deref(), Some("install user/repo"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("registry verification skipped"),
+        "stdout: {stdout}"
+    );
 }
