@@ -20,6 +20,7 @@ use common::{
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use tempfile::TempDir;
 
 /// Spawn a registry stub serving both the PyPI and npm routes the
 /// resolver hits. Returns the base URL and a counter of accepted
@@ -62,10 +63,13 @@ fn wrapper_with_hits(
     let (base_url, registry_hits) = spawn_registry_stub();
     // RESOLUTION_FAILS: the tree dry-run exits non-zero without touching
     // the argv marker, so `recorded_argv()` reflects only the real install.
-    let h = GateHarness::new()
-        .fake_tree_pm(binary, RESOLUTION_FAILS, pm_exit_code)
-        .registry_env(registry_env, &base_url)
-        .build();
+    // yarn/pnpm/uv have no tree invocation to intercept — plain recorders.
+    let h = GateHarness::new();
+    let h = match binary {
+        "npm" | "pip" => h.fake_tree_pm(binary, RESOLUTION_FAILS, pm_exit_code),
+        _ => h.fake_recorder(binary, pm_exit_code),
+    };
+    let h = h.registry_env(registry_env, &base_url).build();
     (h, registry_hits)
 }
 
@@ -259,6 +263,240 @@ fn npm_old_pin_runs_install_with_forwarded_args() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg@1.0.0"));
+}
+
+#[test]
+fn node_wrong_manager_lockfiles_block_with_suggestions() {
+    struct Case {
+        run_manager: &'static str,
+        lockfile: &'static str,
+        lock_contents: &'static str,
+        args: &'static [&'static str],
+        expected_manager: &'static str,
+        expected_suggestion: &'static str,
+    }
+
+    let cases = [
+        Case {
+            run_manager: "npm",
+            lockfile: "pnpm-lock.yaml",
+            lock_contents: "lockfileVersion: '9.0'\n",
+            args: &["npm", "i", "oldpkg"],
+            expected_manager: "pnpm",
+            expected_suggestion: "corgea pnpm add oldpkg",
+        },
+        Case {
+            run_manager: "pnpm",
+            lockfile: "package-lock.json",
+            lock_contents: "{}",
+            args: &["pnpm", "install"],
+            expected_manager: "npm",
+            expected_suggestion: "corgea npm install",
+        },
+        Case {
+            run_manager: "npm",
+            lockfile: "yarn.lock",
+            lock_contents: "# yarn lockfile v1\n",
+            args: &["npm", "i", "oldpkg"],
+            expected_manager: "yarn",
+            expected_suggestion: "corgea yarn add oldpkg",
+        },
+    ];
+
+    for case in cases {
+        let (mut h, registry_hits) = wrapper_with_hits(case.run_manager, "CORGEA_NPM_REGISTRY", 0);
+        let project = TempDir::new().expect("project dir");
+        std::fs::write(project.path().join(case.lockfile), case.lock_contents)
+            .expect("write lockfile");
+        let out = h
+            .cmd
+            .current_dir(project.path())
+            .args(case.args)
+            .output()
+            .expect("run corgea");
+        assert_eq!(out.status.code(), Some(1), "{}", case.lockfile);
+        assert_eq!(
+            h.recorded_argv(),
+            None,
+            "{} must not run in a {} project",
+            case.run_manager,
+            case.expected_manager
+        );
+        assert_eq!(
+            registry_hits.load(Ordering::SeqCst),
+            0,
+            "wrong-manager refusal must not touch the registry"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "this project appears to use {}",
+                case.expected_manager
+            )),
+            "{} stderr: {stderr}",
+            case.lockfile
+        );
+        assert!(
+            stderr.contains(&format!("Did you mean `{}`?", case.expected_suggestion)),
+            "{} stderr: {stderr}",
+            case.lockfile
+        );
+    }
+}
+
+#[test]
+fn force_overrides_the_wrong_manager_guard() {
+    let mut h = wrapper("npm", "CORGEA_NPM_REGISTRY", 0);
+    let project = TempDir::new().expect("project dir");
+    std::fs::write(
+        project.path().join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    )
+    .expect("write lockfile");
+    let out = h
+        .cmd
+        .current_dir(project.path())
+        .args(["npm", "--force", "install", "oldpkg@1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--force must bypass the guard: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg@1.0.0"));
+}
+
+#[test]
+fn fresh_project_is_not_blamed_for_ancestor_lockfiles() {
+    // A project with its own package.json but no manager indicators must
+    // not inherit a stray ancestor pnpm-lock.yaml.
+    let mut h = wrapper("npm", "CORGEA_NPM_REGISTRY", 0);
+    let root = TempDir::new().expect("root dir");
+    std::fs::write(
+        root.path().join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    )
+    .expect("write ancestor lockfile");
+    let project = root.path().join("newapp");
+    std::fs::create_dir(&project).expect("mkdir");
+    std::fs::write(project.join("package.json"), "{}").expect("write manifest");
+    let out = h
+        .cmd
+        .current_dir(&project)
+        .args(["npm", "install", "oldpkg@1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "fresh project must not be refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg@1.0.0"));
+}
+
+#[test]
+fn package_manager_field_beats_missing_lockfile_for_node_guard() {
+    // `packageManager: "pnpm@9"` marks a pnpm project even before the
+    // first install writes a lockfile.
+    let mut h = wrapper("npm", "CORGEA_NPM_REGISTRY", 0);
+    let project = TempDir::new().expect("project dir");
+    std::fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"proj","packageManager":"pnpm@9.0.0"}"#,
+    )
+    .expect("write manifest");
+    let out = h
+        .cmd
+        .current_dir(project.path())
+        .args(["npm", "i", "oldpkg"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("this project appears to use pnpm"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn conflicting_node_lockfiles_do_not_block_as_wrong_manager() {
+    // Two lockfiles → ambiguous; the guard must stand down rather than
+    // guess.
+    let mut h = wrapper("npm", "CORGEA_NPM_REGISTRY", 0);
+    let project = TempDir::new().expect("project dir");
+    std::fs::write(
+        project.path().join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    )
+    .expect("write pnpm lockfile");
+    std::fs::write(project.path().join("yarn.lock"), "# yarn lockfile v1\n")
+        .expect("write yarn lockfile");
+    let out = h
+        .cmd
+        .current_dir(project.path())
+        .args(["npm", "install", "oldpkg@1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ambiguous indicators must not refuse: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg@1.0.0"));
+}
+
+#[test]
+fn pip_in_uv_lock_project_blocks_with_uv_add_suggestion() {
+    let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
+    let project = TempDir::new().expect("project dir");
+    std::fs::write(project.path().join("uv.lock"), "version = 1\n").expect("write uv.lock");
+    let out = h
+        .cmd
+        .current_dir(project.path())
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None, "pip must not run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("this project appears to use uv"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Did you mean `corgea uv add oldpkg==1.0.0`?"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn uv_add_in_requirements_project_blocks_with_pip_install_suggestion() {
+    let mut h = wrapper("uv", "CORGEA_PYPI_REGISTRY", 0);
+    let project = TempDir::new().expect("project dir");
+    std::fs::write(project.path().join("requirements.txt"), "oldpkg==1.0.0\n")
+        .expect("write requirements.txt");
+    let out = h
+        .cmd
+        .current_dir(project.path())
+        .args(["uv", "add", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None, "uv must not run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("this project appears to use pip"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Did you mean `corgea pip install oldpkg==1.0.0`?"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
