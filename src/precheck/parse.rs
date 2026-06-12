@@ -4,7 +4,7 @@
 //! mix flags, package specs, and pass-through args freely) and clear
 //! about anything we can't verify (URLs / git / filesystem refs).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::verify_deps::registry::{NpmSpec, PypiSpec};
 
@@ -59,6 +59,145 @@ pub fn parse_install_args(
         ),
         PackageManager::Uv => unreachable!("uv uses classify_uv_command"),
     }
+}
+
+/// Best-effort extraction of registry-installable entries from pip
+/// requirements files. This is a fallback for when pip's full dry-run cannot
+/// resolve the tree. It deliberately skips file-level options and constraints,
+/// while preserving URL/VCS/editable entries as unverifiable targets.
+pub(super) fn parse_requirement_file_targets(path: &Path) -> Result<Vec<InstallTarget>, String> {
+    let mut seen = std::collections::HashSet::new();
+    parse_requirement_file_targets_inner(path, &mut seen)
+}
+
+fn parse_requirement_file_targets_inner(
+    path: &Path,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) -> Result<Vec<InstallTarget>, String> {
+    let path_for_io = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("read {}: {e}", path.display()))?
+            .join(path)
+    };
+    let seen_key = std::fs::canonicalize(&path_for_io).unwrap_or_else(|_| path_for_io.clone());
+    if !seen.insert(seen_key) {
+        return Ok(Vec::new());
+    }
+
+    let content = std::fs::read_to_string(&path_for_io)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let base = path_for_io.parent().unwrap_or_else(|| Path::new("."));
+    let mut targets = Vec::new();
+
+    for line in requirement_logical_lines(&content) {
+        match requirement_line_entry(&line) {
+            Some(RequirementLineEntry::Target(spec)) => targets.push(parse_pypi_spec(&spec)),
+            Some(RequirementLineEntry::Include(include)) => {
+                targets.extend(parse_requirement_file_targets_inner(
+                    &base.join(include),
+                    seen,
+                )?);
+            }
+            None => {}
+        }
+    }
+
+    Ok(targets)
+}
+
+enum RequirementLineEntry {
+    Target(String),
+    Include(PathBuf),
+}
+
+fn requirement_logical_lines(content: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for raw in content.lines() {
+        let trimmed = raw.trim_end();
+        let (part, continued) = match trimmed.strip_suffix('\\') {
+            Some(part) => (part.trim_end(), true),
+            None => (trimmed, false),
+        };
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(part.trim());
+        if !continued {
+            lines.push(std::mem::take(&mut current));
+        }
+    }
+
+    if !current.trim().is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn requirement_line_entry(line: &str) -> Option<RequirementLineEntry> {
+    let line = strip_requirement_comment(line);
+    if line.is_empty() {
+        return None;
+    }
+
+    if let Some(path) = requirement_flag_value(line, "-r", "--requirement") {
+        return Some(RequirementLineEntry::Include(PathBuf::from(path)));
+    }
+    if requirement_flag_value(line, "-c", "--constraint").is_some() {
+        return None;
+    }
+    if let Some(path) = requirement_flag_value(line, "-e", "--editable") {
+        return Some(RequirementLineEntry::Target(format!("-e {path}")));
+    }
+
+    if line.starts_with('-') {
+        return None;
+    }
+
+    let spec = strip_inline_requirement_options(line);
+    (!spec.is_empty()).then(|| RequirementLineEntry::Target(spec.to_string()))
+}
+
+fn strip_requirement_comment(line: &str) -> &str {
+    let trimmed = line.trim();
+    if trimmed.starts_with('#') {
+        return "";
+    }
+    [" #", "\t#"]
+        .iter()
+        .filter_map(|marker| trimmed.find(marker))
+        .min()
+        .map_or(trimmed, |idx| trimmed[..idx].trim())
+}
+
+fn requirement_flag_value<'a>(line: &'a str, short: &str, long: &str) -> Option<&'a str> {
+    let mut parts = line.split_whitespace();
+    let first = parts.next()?;
+    if first == short || first == long {
+        return parts.next();
+    }
+    if let Some(value) = first.strip_prefix(&format!("{long}=")) {
+        return Some(value);
+    }
+    first
+        .strip_prefix(short)
+        .filter(|value| !value.is_empty() && !value.starts_with('-'))
+}
+
+fn strip_inline_requirement_options(line: &str) -> &str {
+    [
+        " --hash",
+        " --config-setting",
+        " --global-option",
+        " --install-option",
+    ]
+    .iter()
+    .filter_map(|marker| line.find(marker))
+    .min()
+    .map_or(line.trim(), |idx| line[..idx].trim())
 }
 
 /// Install-shaped `uv` invocations we know how to verify.

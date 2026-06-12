@@ -549,7 +549,14 @@ fn run_parsed_install(
     });
 
     let tree = if let Some(resolution) = tree_resolution {
-        Some(run_tree_pass(manager, resolution, &mut outcomes, &opts))
+        Some(run_tree_pass(
+            manager,
+            resolution,
+            &mut outcomes,
+            &parsed,
+            &opts,
+            &now,
+        ))
     } else {
         run_verdict_pass(manager, &mut outcomes, &opts);
         None
@@ -706,12 +713,15 @@ fn resolved_jobs(outcomes: &[TargetOutcome]) -> impl Iterator<Item = tree::TreeP
 fn run_tree_pass(
     manager: PackageManager,
     resolution: Result<Vec<tree::TreePackage>, String>,
-    outcomes: &mut [TargetOutcome],
+    outcomes: &mut Vec<TargetOutcome>,
+    parsed: &parse::ParsedInstall,
     opts: &PrecheckOptions,
+    now: &chrono::DateTime<Utc>,
 ) -> TreeReport {
     let set = match resolution {
         Ok(set) => set,
         Err(reason) => {
+            outcomes.extend(requirements_fallback_outcomes(manager, parsed, opts, now));
             run_verdict_pass(manager, outcomes, opts);
             return TreeReport::NamedOnly { reason };
         }
@@ -754,6 +764,40 @@ fn run_tree_pass(
         resolved_count,
         transitive,
     }
+}
+
+fn requirements_fallback_outcomes(
+    manager: PackageManager,
+    parsed: &parse::ParsedInstall,
+    opts: &PrecheckOptions,
+    now: &chrono::DateTime<Utc>,
+) -> Vec<TargetOutcome> {
+    if !matches!(manager, PackageManager::Pip | PackageManager::Uv)
+        || parsed.requirements_files.is_empty()
+    {
+        return Vec::new();
+    }
+
+    let mut targets = Vec::new();
+    let mut outcomes = Vec::new();
+    for file in &parsed.requirements_files {
+        match parse::parse_requirement_file_targets(file) {
+            Ok(mut file_targets) => targets.append(&mut file_targets),
+            Err(error) => outcomes.push(TargetOutcome::Error {
+                target: InstallTarget {
+                    name: file.display().to_string(),
+                    display: file.display().to_string(),
+                    kind: TargetKind::Unverifiable {
+                        reason: "requirements file could not be read".to_string(),
+                    },
+                },
+                error,
+            }),
+        }
+    }
+
+    outcomes.extend(verdict::verify_all(&targets, opts, now));
+    outcomes
 }
 
 /// Vuln-api verdict pass over resolved targets, run through the bounded

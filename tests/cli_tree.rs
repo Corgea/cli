@@ -168,6 +168,52 @@ fn resolution_failure_falls_back_with_loud_warning() {
 }
 
 #[test]
+fn pip_requirements_fallback_checks_file_entries_when_tree_fails() {
+    // A VCS requirement can make pip's dry-run fail before it emits a report.
+    // The degraded path must still verify registry requirements from the file
+    // and surface the VCS row as skipped instead of producing an empty check.
+    let cwd = TempDir::new().expect("temp cwd");
+    std::fs::write(
+        cwd.path().join("requirements.txt"),
+        "oldpkg==1.0.0\nidna @ git+https://github.com/jazzband/idna.git@main\n",
+    )
+    .expect("write requirements.txt");
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("pypi", "oldpkg", "1.0.0"),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0003", None),
+    );
+    let mut h = tree_harness("pip", checks, HashMap::new(), RESOLUTION_FAILS);
+    let out = h
+        .cmd
+        .current_dir(cwd.path())
+        .args(["pip", "install", "-r", "requirements.txt"])
+        .output()
+        .expect("run corgea");
+
+    assert_eq!(out.status.code(), Some(1), "requirements vuln must block");
+    assert_eq!(
+        h.recorded_argv(),
+        None,
+        "pip must not run on a vulnerable requirements entry"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for needle in [
+        "oldpkg==1.0.0",
+        "MAL-2024-0003",
+        "idna @ git+https://github.com/jazzband/idna.git@main",
+        "PEP 508 direct reference",
+    ] {
+        assert!(stdout.contains(needle), "stdout: {stdout}");
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("transitive dependencies not checked"),
+        "stderr must carry the fallback warning: {stderr}"
+    );
+}
+
+#[test]
 fn pip_json_carries_tree_object() {
     let mut checks = HashMap::new();
     checks.insert(
