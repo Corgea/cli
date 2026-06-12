@@ -130,6 +130,9 @@ fn takes_value(manager: PackageManager, flag: &str) -> bool {
                 | "--omit"
                 | "--include"
                 | "--loglevel"
+                | "--userconfig"
+                | "--cache"
+                | "--globalconfig"
         ),
         PackageManager::Pnpm => matches!(
             flag,
@@ -440,6 +443,8 @@ fn parse_pypi_spec(raw: &str) -> InstallTarget {
         };
     }
 
+    let requirement = trimmed.split(';').next().unwrap_or(trimmed).trim();
+
     // Find the first specifier operator (`==`, `>=`, `<=`, `!=`, `~=`,
     // `>`, `<`). PEP 440 also allows `===` (arbitrary equality).
     // Find the leftmost specifier operator. On ties, prefer the
@@ -447,7 +452,7 @@ fn parse_pypi_spec(raw: &str) -> InstallTarget {
     let separators = ["===", "==", ">=", "<=", "!=", "~=", ">", "<"];
     let mut split_at: Option<usize> = None;
     for sep in &separators {
-        if let Some(idx) = trimmed.find(sep) {
+        if let Some(idx) = requirement.find(sep) {
             split_at = match split_at {
                 Some(prev) if prev <= idx => Some(prev),
                 _ => Some(idx),
@@ -456,21 +461,20 @@ fn parse_pypi_spec(raw: &str) -> InstallTarget {
     }
 
     let (name_part, spec_part): (&str, &str) = match split_at {
-        Some(idx) => (&trimmed[..idx], &trimmed[idx..]),
-        None => (trimmed, ""),
+        Some(idx) => (&requirement[..idx], &requirement[idx..]),
+        None => (requirement, ""),
     };
 
     // Strip extras: `requests[security]` -> `requests`.
     let name_no_extras = name_part.split('[').next().unwrap_or(name_part).trim();
 
-    // Strip env markers: `package; python_version >= "3.7"`.
-    let spec_no_marker = spec_part.split(';').next().unwrap_or(spec_part).trim();
+    let spec = spec_part.trim();
 
-    let kind = if spec_no_marker.is_empty() {
+    let kind = if spec.is_empty() {
         TargetKind::Pypi(PypiSpec::Latest)
-    } else if let Some(rest) = spec_no_marker.strip_prefix("===") {
+    } else if let Some(rest) = spec.strip_prefix("===") {
         TargetKind::Pypi(PypiSpec::Exact(rest.trim().to_string()))
-    } else if let Some(rest) = spec_no_marker.strip_prefix("==") {
+    } else if let Some(rest) = spec.strip_prefix("==") {
         let v = rest.trim();
         if v.is_empty() {
             TargetKind::Unverifiable {
@@ -480,7 +484,7 @@ fn parse_pypi_spec(raw: &str) -> InstallTarget {
             TargetKind::Pypi(PypiSpec::Exact(v.to_string()))
         }
     } else {
-        TargetKind::Pypi(PypiSpec::Specifier(spec_no_marker.to_string()))
+        TargetKind::Pypi(PypiSpec::Specifier(spec.to_string()))
     };
 
     InstallTarget {
@@ -681,6 +685,22 @@ mod tests {
         assert!(
             matches!(t.kind, TargetKind::Pypi(PypiSpec::Exact(ref v)) if v == "2.31.0"),
             "env marker must not leak into the spec: {:?}",
+            t.kind
+        );
+
+        let t = parse_pypi_spec("requests; python_version >= \"3.8\"");
+        assert_eq!(t.name, "requests");
+        assert!(
+            matches!(t.kind, TargetKind::Pypi(PypiSpec::Latest)),
+            "marker-only requirement must still query the package: {:?}",
+            t.kind
+        );
+
+        let t = parse_pypi_spec("requests[security]; python_version >= \"3.8\"");
+        assert_eq!(t.name, "requests");
+        assert!(
+            matches!(t.kind, TargetKind::Pypi(PypiSpec::Latest)),
+            "extras plus marker must still query the package: {:?}",
             t.kind
         );
     }

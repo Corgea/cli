@@ -26,9 +26,21 @@ use std::process::Command;
 use tempfile::TempDir;
 
 const PACKAGE_JSON: &str = r#"{"name":"proj","version":"1.0.0","dependencies":{"oldpkg":"1.0.0"}}"#;
+const RANGE_PACKAGE_JSON: &str =
+    r#"{"name":"proj","version":"1.0.0","dependencies":{"oldpkg":"^1.0.0"}}"#;
+const LOCK_OLDPKG_100: &str = r#"{"name":"proj","lockfileVersion":3,"packages":{
+  "":{"name":"proj","version":"1.0.0","dependencies":{"oldpkg":"^1.0.0"}},
+  "node_modules/oldpkg":{"version":"1.0.0"}}}"#;
+const LOCK_OLDPKG_110: &str = r#"{"name":"proj","lockfileVersion":3,"packages":{
+  "":{"name":"proj","version":"1.0.0","dependencies":{"oldpkg":"^1.0.0"}},
+  "node_modules/oldpkg":{"version":"1.1.0"}}}"#;
 
 fn vulnerable_evildep_body() -> String {
     vulnerable_body("npm", "evildep", "0.4.2", "MAL-2024-0002", None)
+}
+
+fn vulnerable_oldpkg_body() -> String {
+    vulnerable_body("npm", "oldpkg", "1.0.0", "MAL-2024-0001", None)
 }
 
 /// `corgea` wired to a fake package manager, the registry + vuln-api stubs,
@@ -223,6 +235,32 @@ fn npm_ci_with_lockfile_is_gated() {
     assert_eq!(h.recorded_argv(), None);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("evildep"), "stdout: {stdout}");
+}
+
+#[test]
+fn npm_ci_checks_locked_versions_not_package_json_resolution() {
+    let mut checks = HashMap::new();
+    checks.insert(key("npm", "oldpkg", "1.0.0"), vulnerable_oldpkg_body());
+    let mut h = BareHarness::new("npm", checks, Some(LOCK_OLDPKG_110), 0);
+    std::fs::write(h.project.path().join("package.json"), RANGE_PACKAGE_JSON)
+        .expect("write package.json");
+    std::fs::write(h.project.path().join("package-lock.json"), LOCK_OLDPKG_100)
+        .expect("write package-lock");
+
+    let out = h.cmd.args(["npm", "ci"]).output().expect("run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "locked vulnerable version must block"
+    );
+    assert_eq!(h.recorded_argv(), None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("oldpkg"), "stdout: {stdout}");
+    assert!(stdout.contains("MAL-2024-0001"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("1.1.0"),
+        "ci must not use package.json resolution: {stdout}"
+    );
 }
 
 #[test]

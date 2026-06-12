@@ -381,13 +381,35 @@ fn find_package_manager_subcommand(manager: PackageManager, cmd: &[String]) -> O
         if !arg.starts_with('-') {
             return Some(i);
         }
-        if flag_takes_leading_value(manager, arg) && !arg.contains('=') {
+        if !arg.contains('=')
+            && (flag_takes_leading_value(manager, arg)
+                || possible_unknown_flag_value_before_install(manager, cmd, i))
+        {
             i += 2;
         } else {
             i += 1;
         }
     }
     None
+}
+
+fn possible_unknown_flag_value_before_install(
+    manager: PackageManager,
+    cmd: &[String],
+    flag_index: usize,
+) -> bool {
+    let flag = &cmd[flag_index];
+    if flag.contains('=') {
+        return false;
+    }
+    let Some(next) = cmd.get(flag_index + 1).map(String::as_str) else {
+        return false;
+    };
+    !next.starts_with('-')
+        && !manager.is_install_subcommand(next)
+        && cmd[flag_index + 2..]
+            .iter()
+            .any(|arg| manager.is_install_subcommand(arg))
 }
 
 fn flag_takes_leading_value(manager: PackageManager, flag: &str) -> bool {
@@ -401,6 +423,9 @@ fn flag_takes_leading_value(manager: PackageManager, flag: &str) -> bool {
                 | "--omit"
                 | "--include"
                 | "--loglevel"
+                | "--userconfig"
+                | "--cache"
+                | "--globalconfig"
         ),
         PackageManager::Pnpm => matches!(
             flag,
@@ -628,7 +653,14 @@ fn run_parsed_install(
         .collect();
 
     let tree = if tree_eligible {
-        Some(run_tree_pass(manager, rest, &parsed, &mut outcomes, &opts))
+        Some(run_tree_pass(
+            manager,
+            subcommand_label,
+            rest,
+            &parsed,
+            &mut outcomes,
+            &opts,
+        ))
     } else {
         run_verdict_pass(manager, &mut outcomes, &opts); // no-op tokenless
         None
@@ -876,12 +908,13 @@ fn coverage_note(opts: &PrecheckOptions) {
 /// `opts.verdict.is_some()`.
 fn run_tree_pass(
     manager: PackageManager,
+    subcommand_label: &str,
     rest: &[String],
     parsed: &parse::ParsedInstall,
     outcomes: &mut [TargetOutcome],
     opts: &PrecheckOptions,
 ) -> TreeReport {
-    let set = match tree::resolve_tree(manager, rest, parsed) {
+    let set = match tree::resolve_tree(manager, subcommand_label, rest, parsed) {
         Ok(Some(set)) => set,
         Ok(None) => {
             run_verdict_pass(manager, outcomes, opts);

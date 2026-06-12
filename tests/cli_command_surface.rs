@@ -88,6 +88,34 @@ fn npm_leading_package_manager_flags_are_forwarded_and_install_is_gated() {
 }
 
 #[test]
+fn npm_leading_flags_with_bare_values_do_not_hide_install() {
+    for (flag, value) in [
+        ("--userconfig", ".npmrc"),
+        ("--cache", ".npm-cache"),
+        ("--globalconfig", "npmrc-global"),
+    ] {
+        let mut h = SurfaceHarness::new("npm");
+        let out = h
+            .cmd
+            .args(["npm", flag, value, "install", "oldpkg@1.0.0"])
+            .output()
+            .expect("run corgea");
+        assert_eq!(out.status.code(), Some(0), "flag {flag}");
+        let expected = format!("{flag} {value} install oldpkg@1.0.0");
+        assert_eq!(
+            h.recorded_argv().as_deref(),
+            Some(expected.as_str()),
+            "flag {flag}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("Pre-checking"),
+            "flag {flag} stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
+#[test]
 fn pip_add_is_refused_with_install_suggestion() {
     let mut h = SurfaceHarness::new("pip");
     let out = h

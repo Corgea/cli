@@ -34,11 +34,15 @@ pub fn covers_input(manager: PackageManager, parsed: &super::parse::ParsedInstal
 /// `Err(reason)`: dry-run attempted and failed — named-only, warning carries reason.
 pub fn resolve_tree(
     manager: PackageManager,
+    subcommand_label: &str,
     install_args: &[String],
     parsed: &super::parse::ParsedInstall,
 ) -> Result<Option<Vec<TreePackage>>, String> {
     match manager {
         PackageManager::Pip => resolve_pip_tree(manager.binary_name(), install_args).map(Some),
+        PackageManager::Npm if matches!(subcommand_label, "ci" | "clean-install") => {
+            resolve_npm_locked_tree().map(Some)
+        }
         PackageManager::Npm => resolve_npm_tree(manager.binary_name(), install_args).map(Some),
         PackageManager::Uv => resolve_uv_tree(parsed).map(Some),
         // yarn/pnpm have no safe dry-run for installs.
@@ -298,13 +302,26 @@ fn resolve_npm_tree(binary: &str, install_args: &[String]) -> Result<Vec<TreePac
     parse_npm_lockfile(&lock)
 }
 
+/// `npm ci` / `npm clean-install` install the existing lockfile exactly.
+/// Do not re-resolve with `npm install --package-lock-only`: that can choose
+/// newer versions allowed by package.json and miss vulnerable pinned versions.
+fn resolve_npm_locked_tree() -> Result<Vec<TreePackage>, String> {
+    let path = if std::path::Path::new("npm-shrinkwrap.json").exists() {
+        "npm-shrinkwrap.json"
+    } else {
+        "package-lock.json"
+    };
+    let lock = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+    parse_npm_lockfile(&lock)
+}
+
 fn parse_npm_lockfile(json: &str) -> Result<Vec<TreePackage>, String> {
     let lock: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| format!("parse package-lock.json: {e}"))?;
+        serde_json::from_str(json).map_err(|e| format!("parse npm lockfile: {e}"))?;
     let packages = lock
         .get("packages")
         .and_then(|v| v.as_object())
-        .ok_or("package-lock.json has no packages map (npm < 7?)")?;
+        .ok_or("npm lockfile has no packages map (npm < 7?)")?;
     Ok(packages
         .iter()
         // Skip the root project entry ("") and symlinked (workspace) entries.
