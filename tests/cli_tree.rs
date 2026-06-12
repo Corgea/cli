@@ -220,6 +220,75 @@ fn tree_pass_runs_via_pip3_when_pip_is_absent() {
 }
 
 #[test]
+fn authenticated_tree_resolution_failure_fails_closed() {
+    // The org guarantee: with a token (authenticated mode), a pip/npm/uv tree
+    // pass that degrades to NamedOnly leaves the whole transitive set
+    // unchecked — that must BLOCK, not install unverified transitives. The
+    // named target itself is clean, so the block is purely the unchecked tree.
+    let mut h = GateHarness::new()
+        .fake_tree_pm("pip", RESOLUTION_FAILS, 0)
+        .oldpkg_registry()
+        .vuln_checks(HashMap::new())
+        .token("test-token")
+        .build();
+    h.cmd.env("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL", "1");
+    let out = h
+        .cmd
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "authenticated tree-resolution failure must fail closed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.recorded_argv(), None, "pip must not run");
+
+    // The SAME command in public mode (no token) fails open and proceeds.
+    let mut h = GateHarness::new()
+        .fake_tree_pm("pip", RESOLUTION_FAILS, 0)
+        .oldpkg_registry()
+        .vuln_checks(HashMap::new())
+        .build();
+    let out = h
+        .cmd
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0), "public mode fails open");
+    assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg==1.0.0"));
+}
+
+#[test]
+fn authenticated_yarn_named_only_does_not_fail_closed() {
+    // yarn has no safe dry-run, so its NamedOnly tree is inherent, not a
+    // resolution failure. An authenticated yarn install with clean named
+    // targets must still proceed — fail-closed applies only to managers that
+    // HAVE a resolver (pip/npm/uv).
+    let mut h = GateHarness::new()
+        .fake_recorder("yarn", 0)
+        .oldpkg_registry()
+        .vuln_checks(HashMap::new())
+        .token("test-token")
+        .in_project_dir()
+        .build();
+    h.cmd.env("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL", "1");
+    let out = h
+        .cmd
+        .args(["yarn", "add", "oldpkg@1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "authenticated yarn named-only must proceed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.recorded_argv().as_deref(), Some("add oldpkg@1.0.0"));
+}
+
+#[test]
 fn resolution_failure_falls_back_with_loud_warning() {
     // The fake manager fails its tree invocation (pip: exits 2 on `--dry-run`,
     // simulating an old pip with no `--report`; npm: exits 1 on
