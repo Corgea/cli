@@ -43,6 +43,9 @@ fn build_parsed_install(
 /// than `latest`, or a fresh/vulnerable `beta`/`canary` release bypasses
 /// both blocks whenever `latest` is old/clean.
 fn npm_default_tag(args: &[String]) -> Option<String> {
+    // npm config is last-wins: `--tag beta --tag canary` installs canary.
+    // Returning the first match would gate the wrong dist-tag.
+    let mut tag = None;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -50,14 +53,16 @@ fn npm_default_tag(args: &[String]) -> Option<String> {
             break;
         }
         if a == "--tag" {
-            return args.get(i + 1).cloned();
+            tag = args.get(i + 1).cloned();
+            i += 2;
+            continue;
         }
         if let Some(v) = a.strip_prefix("--tag=") {
-            return Some(v.to_string());
+            tag = Some(v.to_string());
         }
         i += 1;
     }
-    None
+    tag
 }
 
 /// Whether the forwarded pip args request prereleases (`--pre`). Stops at
@@ -669,6 +674,24 @@ mod tests {
             &p.targets[0].kind,
             TargetKind::Npm(NpmSpec::Latest)
         ));
+    }
+
+    #[test]
+    fn npm_tag_flag_is_last_wins_like_npm_config() {
+        // npm's config parser is last-wins: `--tag beta --tag canary`
+        // installs canary. Gating beta would verdict the wrong release.
+        let args = vec![
+            "--tag".to_string(),
+            "beta".to_string(),
+            "pkg".to_string(),
+            "--tag=canary".to_string(),
+        ];
+        let p = parse_install_args(PackageManager::Npm, &args).unwrap();
+        assert!(
+            matches!(&p.targets[0].kind, TargetKind::Npm(NpmSpec::Tag(t)) if t == "canary"),
+            "last --tag must win: {:?}",
+            p.targets[0].kind
+        );
     }
 
     #[test]

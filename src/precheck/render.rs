@@ -174,7 +174,13 @@ pub(super) fn print_text(report: &PrecheckReport) {
                 println!("  ? {}: {}", target.display, reason);
             }
             TargetOutcome::Error { target, error } => {
-                println!("  ✗ {}: {}", target.display, error);
+                // Be explicit that an unresolvable target was NOT vetted:
+                // without this line a resolution failure followed by a
+                // proceeding install reads like a pass.
+                println!(
+                    "  ✗ {}: {} (not verified — this target is ungated)",
+                    target.display, error
+                );
             }
         }
     }

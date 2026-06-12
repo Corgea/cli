@@ -44,14 +44,30 @@ fn vulnerable_pin_blocks_without_running_install() {
 
 #[test]
 fn alternate_pypi_spelling_hits_canonical_verdict() {
-    // Advisories are keyed by the PEP 503 canonical name; `Flask_Cors`
-    // must query (and block on) the `flask-cors` verdict.
+    // Advisories are keyed by lowercase(canonical) — the server does NOT
+    // apply PEP 503. `pip install Flask_Cors` must still block on the
+    // `flask-cors` row: resolution adopts the registry's canonical
+    // spelling (`info.name`, like real PyPI, which answers any PEP 503-
+    // equivalent request) and the verdict checks that.
     let mut checks = HashMap::new();
     checks.insert(
         key("pypi", "flask-cors", "1.0.0"),
         vulnerable_body("pypi", "flask-cors", "1.0.0", "GHSA-TEST-0001", None),
     );
-    let mut h = pip_harness(checks, HashMap::new(), 0);
+    // Model real PyPI: serve the alternate request spelling, echo the
+    // canonical name in info.name.
+    let registry = common::spawn_http_stub(|path| match path {
+        "/pypi/Flask_Cors/json" | "/pypi/flask-cors/json" => (
+            "200 OK",
+            common::pypi_release_json("Flask-Cors", "1.0.0", common::OLD_TS),
+        ),
+        _ => ("404 Not Found", common::NOT_FOUND_JSON.to_string()),
+    });
+    let mut h = common::GateHarness::new()
+        .fake_recorder("pip", 0)
+        .registry_env("CORGEA_PYPI_REGISTRY", &registry)
+        .vuln_checks(checks)
+        .build();
     let out = h
         .cmd
         .args(["pip", "install", "Flask_Cors==1.0.0"])
