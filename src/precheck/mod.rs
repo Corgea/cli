@@ -241,6 +241,8 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
         }
     };
 
+    warn_registry_override(manager, rest);
+
     run_parsed_install(
         manager,
         subcommand,
@@ -298,6 +300,29 @@ fn unsupported_pip_add_message(rest: &[String]) -> String {
     )
 }
 
+/// Warn when a custom registry/index flag is forwarded: the gate resolves
+/// and verdicts against the default (env/public) registry, so it cannot
+/// vouch that the artifact the manager pulls from the override matches the
+/// advisory universe. Resolving against the override (and multi-index cases
+/// like `--extra-index-url`) is a documented limitation — registry
+/// allow-listing is future work, separate PRD.
+fn warn_registry_override(manager: PackageManager, rest: &[String]) {
+    let flags: &[&str] = match manager {
+        PackageManager::Npm => &["--registry"],
+        PackageManager::Pip => &["-i", "--index-url", "--extra-index-url"],
+    };
+    if let Some(flag) = rest.iter().find(|a| {
+        flags
+            .iter()
+            .any(|f| a.as_str() == *f || a.starts_with(&format!("{f}=")))
+    }) {
+        eprintln!(
+            "warning: '{flag}' points {} at a custom registry/index; the gate resolves and verdicts against the default registry and cannot vouch the installed artifact matches.",
+            manager.binary_name()
+        );
+    }
+}
+
 /// Post-parse verification: resolve named targets, verdict them, render the
 /// report, refuse (exit 1) when the block predicate fires, otherwise run
 /// the install.
@@ -317,7 +342,7 @@ fn run_parsed_install(
     }
 
     let now = Utc::now();
-    let mut outcomes = verdict::verify_all(&parsed.targets, &opts, &now);
+    let mut outcomes = verdict::verify_all(&parsed.targets, &opts, &now, parsed.allow_prerelease);
     verdict::run_verdict_pass(manager, &mut outcomes, &opts);
     render::requirements_note(&parsed);
 

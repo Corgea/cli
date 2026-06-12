@@ -16,11 +16,15 @@ pub struct ParsedInstall {
     /// `pip install -r foo.txt` — requirements files are only noted
     /// (not verified) by the baseline gate.
     pub requirements_files: Vec<PathBuf>,
+    /// `pip install --pre` — allow prerelease versions when resolving the
+    /// version that would install, so the gate verdicts what pip installs
+    /// rather than the latest stable.
+    pub allow_prerelease: bool,
 }
 
 fn build_parsed_install(
     positionals: PositionalSplit,
-    parse_spec: fn(&str) -> InstallTarget,
+    parse_spec: impl Fn(&str) -> InstallTarget,
 ) -> ParsedInstall {
     ParsedInstall {
         targets: positionals
@@ -29,7 +33,39 @@ fn build_parsed_install(
             .map(|raw| parse_spec(raw))
             .collect(),
         requirements_files: positionals.requirements_files,
+        allow_prerelease: false,
     }
+}
+
+/// The default npm dist-tag from `--tag <value>` / `--tag=value`, which
+/// changes what a *bare* spec (`pkg`, no `@version`) installs. Stops at `--`
+/// (everything after is positional). The gate must resolve that tag rather
+/// than `latest`, or a fresh/vulnerable `beta`/`canary` release bypasses
+/// both blocks whenever `latest` is old/clean.
+fn npm_default_tag(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" {
+            break;
+        }
+        if a == "--tag" {
+            return args.get(i + 1).cloned();
+        }
+        if let Some(v) = a.strip_prefix("--tag=") {
+            return Some(v.to_string());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether the forwarded pip args request prereleases (`--pre`). Stops at
+/// `--` (positional thereafter).
+fn pip_allows_prerelease(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| a == "--pre")
 }
 
 pub fn parse_install_args(
@@ -37,14 +73,18 @@ pub fn parse_install_args(
     args: &[String],
 ) -> Result<ParsedInstall, String> {
     match manager {
-        PackageManager::Pip => Ok(build_parsed_install(
-            extract_pip_positionals(args)?,
-            parse_pypi_spec,
-        )),
-        PackageManager::Npm => Ok(build_parsed_install(
-            extract_node_positionals(manager, args),
-            parse_npm_spec,
-        )),
+        PackageManager::Pip => {
+            let mut parsed = build_parsed_install(extract_pip_positionals(args)?, parse_pypi_spec);
+            parsed.allow_prerelease = pip_allows_prerelease(args);
+            Ok(parsed)
+        }
+        PackageManager::Npm => {
+            let default_tag = npm_default_tag(args);
+            Ok(build_parsed_install(
+                extract_node_positionals(manager, args),
+                |raw| parse_npm_spec(raw, default_tag.as_deref()),
+            ))
+        }
     }
 }
 
@@ -276,7 +316,12 @@ fn attached_short_value<'a>(arg: &'a str, flag: &str) -> Option<&'a str> {
 /// Parse a single npm-style positional, e.g. `axios`, `axios@1.0.0`,
 /// `axios@^1.0.0`, `axios@latest`, `@types/node@20.10.5`,
 /// `git+https://...`, `file:./local`, `./local`, `npm:other@1.0.0`.
-fn parse_npm_spec(raw: &str) -> InstallTarget {
+///
+/// `default_tag` is the `--tag <value>` from the command, applied only to a
+/// *bare* spec (no `@version`): `npm install --tag beta pkg` installs the
+/// `beta` dist-tag, so the gate must resolve that, not `latest`. An explicit
+/// `pkg@latest` / `pkg@1.0.0` overrides the default tag.
+fn parse_npm_spec(raw: &str, default_tag: Option<&str>) -> InstallTarget {
     let display = raw.to_string();
     let trimmed = raw.trim();
 
@@ -362,7 +407,13 @@ fn parse_npm_spec(raw: &str) -> InstallTarget {
     let name = name_part.trim().to_string();
     let spec_str = spec_part.trim();
 
-    let kind = if spec_str.is_empty() || spec_str.eq_ignore_ascii_case("latest") {
+    let kind = if spec_str.is_empty() {
+        // A bare spec picks up the command's `--tag`, if any; otherwise latest.
+        match default_tag {
+            Some(tag) => TargetKind::Npm(NpmSpec::Tag(tag.to_string())),
+            None => TargetKind::Npm(NpmSpec::Latest),
+        }
+    } else if spec_str.eq_ignore_ascii_case("latest") {
         TargetKind::Npm(NpmSpec::Latest)
     } else if semver::Version::parse(spec_str).is_ok() {
         TargetKind::Npm(NpmSpec::Exact(spec_str.to_string()))
@@ -582,6 +633,58 @@ mod tests {
     }
 
     #[test]
+    fn npm_tag_flag_changes_bare_spec_resolution() {
+        // `--tag beta` (before or after the verb's rest) makes a bare spec
+        // resolve the beta dist-tag, not latest. An explicit version wins.
+        for args in [
+            vec!["--tag".to_string(), "beta".to_string(), "pkg".to_string()],
+            vec!["pkg".to_string(), "--tag=beta".to_string()],
+        ] {
+            let p = parse_install_args(PackageManager::Npm, &args).unwrap();
+            assert_eq!(p.targets.len(), 1, "args {args:?}");
+            assert!(
+                matches!(&p.targets[0].kind, TargetKind::Npm(NpmSpec::Tag(t)) if t == "beta"),
+                "bare spec must pick up --tag: {:?}",
+                p.targets[0].kind
+            );
+        }
+
+        // Explicit pin ignores --tag.
+        let args = vec![
+            "--tag".to_string(),
+            "beta".to_string(),
+            "pkg@1.0.0".to_string(),
+        ];
+        let p = parse_install_args(PackageManager::Npm, &args).unwrap();
+        assert!(
+            matches!(&p.targets[0].kind, TargetKind::Npm(NpmSpec::Exact(v)) if v == "1.0.0"),
+            "explicit version must override --tag: {:?}",
+            p.targets[0].kind
+        );
+
+        // No --tag → bare spec stays latest.
+        let args = vec!["pkg".to_string()];
+        let p = parse_install_args(PackageManager::Npm, &args).unwrap();
+        assert!(matches!(
+            &p.targets[0].kind,
+            TargetKind::Npm(NpmSpec::Latest)
+        ));
+    }
+
+    #[test]
+    fn pip_pre_flag_sets_allow_prerelease() {
+        let with = parse_install_args(
+            PackageManager::Pip,
+            &["--pre".to_string(), "flask".to_string()],
+        )
+        .unwrap();
+        assert!(with.allow_prerelease, "--pre must set allow_prerelease");
+
+        let without = parse_install_args(PackageManager::Pip, &["flask".to_string()]).unwrap();
+        assert!(!without.allow_prerelease);
+    }
+
+    #[test]
     fn parse_npm_spec_classifies() {
         let cases = vec![
             ("axios", NpmSpec::Latest),
@@ -602,7 +705,7 @@ mod tests {
             ("@types/node@latest", NpmSpec::Latest),
         ];
         for (input, expected) in cases {
-            let target = parse_npm_spec(input);
+            let target = parse_npm_spec(input, None);
             match (&target.kind, &expected) {
                 (TargetKind::Npm(actual), expected) => {
                     assert_eq!(actual, expected, "for input '{}'", input);
@@ -614,10 +717,13 @@ mod tests {
 
     #[test]
     fn parse_npm_spec_extracts_scoped_names() {
-        assert_eq!(parse_npm_spec("@types/node").name, "@types/node");
-        assert_eq!(parse_npm_spec("@types/node@20.10.5").name, "@types/node");
-        assert_eq!(parse_npm_spec("axios@1.2.3").name, "axios");
-        assert_eq!(parse_npm_spec("axios").name, "axios");
+        assert_eq!(parse_npm_spec("@types/node", None).name, "@types/node");
+        assert_eq!(
+            parse_npm_spec("@types/node@20.10.5", None).name,
+            "@types/node"
+        );
+        assert_eq!(parse_npm_spec("axios@1.2.3", None).name, "axios");
+        assert_eq!(parse_npm_spec("axios", None).name, "axios");
     }
 
     #[test]
@@ -640,7 +746,7 @@ mod tests {
             "..",
         ];
         for u in unverifiable {
-            let t = parse_npm_spec(u);
+            let t = parse_npm_spec(u, None);
             assert!(
                 matches!(t.kind, TargetKind::Unverifiable { .. }),
                 "for '{}'",
@@ -649,7 +755,7 @@ mod tests {
         }
         // Scoped names keep their one `/` and stay verifiable.
         assert!(matches!(
-            parse_npm_spec("@types/node").kind,
+            parse_npm_spec("@types/node", None).kind,
             TargetKind::Npm(NpmSpec::Latest)
         ));
     }
@@ -657,14 +763,14 @@ mod tests {
     #[test]
     fn parse_npm_spec_coerces_leading_v() {
         // npm installs `pkg@v1.2.3` as 1.2.3; a dist-tag reading would error.
-        let t = parse_npm_spec("axios@v1.2.3");
+        let t = parse_npm_spec("axios@v1.2.3", None);
         assert!(
             matches!(t.kind, TargetKind::Npm(NpmSpec::Exact(ref v)) if v == "1.2.3"),
             "got {:?}",
             t.kind
         );
         // …but a real tag that merely starts with `v` stays a tag.
-        let t = parse_npm_spec("node@v8-canary");
+        let t = parse_npm_spec("node@v8-canary", None);
         assert!(
             matches!(t.kind, TargetKind::Npm(NpmSpec::Tag(ref s)) if s == "v8-canary"),
             "got {:?}",

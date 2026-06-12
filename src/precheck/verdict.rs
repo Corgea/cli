@@ -129,14 +129,18 @@ pub(super) fn verify_all(
     targets: &[InstallTarget],
     opts: &PrecheckOptions,
     now: &chrono::DateTime<chrono::Utc>,
+    allow_prerelease: bool,
 ) -> Vec<TargetOutcome> {
-    pooled_map(targets, VERDICT_CONCURRENCY, |t| verify_one(t, opts, now))
+    pooled_map(targets, VERDICT_CONCURRENCY, |t| {
+        verify_one(t, opts, now, allow_prerelease)
+    })
 }
 
 fn verify_one(
     target: &InstallTarget,
     opts: &PrecheckOptions,
     now: &chrono::DateTime<chrono::Utc>,
+    allow_prerelease: bool,
 ) -> TargetOutcome {
     use crate::verify_deps::registry;
 
@@ -150,9 +154,12 @@ fn verify_one(
         TargetKind::Npm(spec) => {
             registry::npm_resolve(&target.name, spec, opts.npm_registry.as_deref())
         }
-        TargetKind::Pypi(spec) => {
-            registry::pypi_resolve(&target.name, spec, opts.pypi_registry.as_deref())
-        }
+        TargetKind::Pypi(spec) => registry::pypi_resolve(
+            &target.name,
+            spec,
+            opts.pypi_registry.as_deref(),
+            allow_prerelease,
+        ),
     };
 
     match resolved {
