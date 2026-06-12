@@ -183,6 +183,22 @@ when `CORGEA_TOKEN` exists; set `CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` to 
 the token to that custom URL and make lookup failures fail closed. Overrides for
 testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`, `CORGEA_VULN_API_URL`.
 
+#### Limitations
+
+The gate is a wrapper, not an enforcement boundary. By design it cannot catch:
+
+- **Direct invocation** — running the package manager itself (`pip`, `npm`,
+  `python -m pip`) skips the gate entirely.
+- **Custom indexes/registries** — `--index-url`, `--registry`, and `.npmrc`/
+  `pip.conf` overrides change where packages resolve from. The gate still
+  verdicts each `name@version`, but it cannot vouch that a substituted
+  registry serves the same artifact those advisories describe.
+- **Ungated managers** — bare `yarn`/`pnpm` installs run unchecked (see the
+  bare-install note above); only their named targets are verified.
+
+Hard enforcement needs org-level controls — lockfile review, registry
+allow-listing — alongside the wrapper.
+
 #### Testing the gate
 
 The staging vuln-api (`https://cve-worker-staging.corgea.workers.dev`) serves
