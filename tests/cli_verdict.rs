@@ -267,7 +267,11 @@ fn custom_vuln_api_url_sends_token_only_with_opt_in() {
         .args(["pip", "install", "oldpkg==1.0.0"])
         .output()
         .expect("run corgea");
-    assert_eq!(out.status.code(), Some(0));
+    // The opt-in puts the gate in authenticated mode, and pip_harness's tree
+    // pass degrades to named-only, so the install fails closed (exit 1) — but
+    // the named target's verdict request is still made first, which is what
+    // this test asserts: with the opt-in, the token IS sent to the custom URL.
+    assert_eq!(out.status.code(), Some(1));
     let captured = requests.lock().unwrap();
     let request = captured.first().expect("one vuln-api request");
     assert_eq!(

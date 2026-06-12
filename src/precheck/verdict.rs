@@ -184,7 +184,15 @@ pub(super) fn block_reason(report: &PrecheckReport, opts: &PrecheckOptions) -> O
     // in authenticated mode it fails closed like `Unverifiable` — otherwise a
     // registry outage silently bypasses the gate.
     let fail_closed = authenticated_verdict(opts);
-    if report.verdicts().any(|v| v.blocks(fail_closed)) || (fail_closed && report.error_count() > 0)
+    // Authenticated mode also fails closed when a manager that HAS a tree
+    // resolver (pip/npm/uv) degraded to `NamedOnly`: the whole transitive set
+    // went unverified, which can hide the vulnerable package the gate exists
+    // to catch. (yarn/pnpm have no resolver, so their NamedOnly is inherent
+    // and not a failure — left to the named-only warning.)
+    let tree_degraded_unchecked = report.manager.has_tree_resolver()
+        && matches!(report.tree, Some(TreeReport::NamedOnly { .. }));
+    if report.verdicts().any(|v| v.blocks(fail_closed))
+        || (fail_closed && (report.error_count() > 0 || tree_degraded_unchecked))
     {
         return Some(if blames_existing_tree(report, opts) {
             BlockReason::ExistingTree

@@ -83,6 +83,17 @@ impl PackageManager {
     pub fn normalize_name(self, name: &str) -> String {
         self.ecosystem().normalize_name(name)
     }
+
+    /// Whether this manager has a safe would-install-set resolver (pip
+    /// dry-run, npm lockfile, uv compile). yarn/pnpm have none, so for them a
+    /// `NamedOnly` tree is inherent and expected — not a resolution failure
+    /// that should fail closed under authentication.
+    pub fn has_tree_resolver(self) -> bool {
+        matches!(
+            self,
+            PackageManager::Npm | PackageManager::Pip | PackageManager::Uv
+        )
+    }
 }
 
 /// Auth and failure policy for the vuln-api verdict pass.
