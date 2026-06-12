@@ -54,7 +54,9 @@ fn gradle_classify_latest_release_is_unbounded() {
 }
 
 use super::common::scan_fixture;
-use crate::deps::model::{PackageId, Severity};
+use crate::deps::model::{PackageId, Scope, Severity};
+use crate::deps::policy::Policy;
+use crate::deps::scan;
 
 #[test]
 fn maven_graph_lists_all_direct_dependencies() {
@@ -125,5 +127,86 @@ fn maven_snapshot_is_dep021_high() {
     assert!(
         f.recommendation.to_lowercase().contains("snapshot"),
         "recommendation should name SNAPSHOT"
+    );
+}
+
+#[test]
+fn maven_parser_accepts_namespace_prefixes_and_attributes() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(
+        tmp.path().join("pom.xml"),
+        r#"<?xml version="1.0"?>
+<m:project xmlns:m="http://maven.apache.org/POM/4.0.0">
+  <m:dependencies>
+    <m:dependency optional="true">
+      <m:groupId>org.example</m:groupId>
+      <m:artifactId>demo-lib</m:artifactId>
+      <m:version>1.2.3</m:version>
+      <m:scope>test</m:scope>
+      <m:exclusions>
+        <m:exclusion>
+          <m:groupId>ignored</m:groupId>
+          <m:artifactId>ignored-artifact</m:artifactId>
+        </m:exclusion>
+      </m:exclusions>
+    </m:dependency>
+  </m:dependencies>
+</m:project>
+"#,
+    )
+    .expect("write pom");
+
+    let inv = scan(tmp.path(), &Policy::default()).expect("scan");
+    let node = inv.node("demo-lib").expect("demo-lib node");
+    assert_eq!(node.version(), Some("1.2.3"));
+    assert_eq!(node.scope(), Scope::Development);
+    assert!(inv.node("ignored-artifact").is_none());
+}
+
+#[test]
+fn maven_parser_reads_cdata_and_comment_split_versions() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(
+        tmp.path().join("pom.xml"),
+        r#"<?xml version="1.0"?>
+<project>
+  <dependencies>
+    <dependency>
+      <groupId>org.example</groupId>
+      <artifactId>cdata-lib</artifactId>
+      <version><![CDATA[1.2.3]]></version>
+    </dependency>
+    <dependency>
+      <groupId>org.example</groupId>
+      <artifactId>split-lib</artifactId>
+      <version>1.<!-- gap -->2</version>
+    </dependency>
+  </dependencies>
+</project>
+"#,
+    )
+    .expect("write pom");
+
+    let inv = scan(tmp.path(), &Policy::default()).expect("scan");
+    let cdata = inv.node("cdata-lib").expect("cdata-lib node");
+    assert_eq!(cdata.version(), Some("1.2.3"));
+    let split = inv.node("split-lib").expect("split-lib node");
+    assert_eq!(split.version(), Some("1.2"));
+}
+
+#[test]
+fn maven_parse_error_names_the_pom() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(
+        tmp.path().join("pom.xml"),
+        "<?xml version=\"1.0\"?>\n<project><dependencies><dependency><groupId>g</groupId><artifactId>a</artifactId><version>1</badtag></dependency></dependencies></project>",
+    )
+    .expect("write pom");
+
+    let err = scan(tmp.path(), &Policy::default()).expect_err("malformed pom must error");
+    assert!(
+        err.0.contains("pom.xml"),
+        "error should name the file: {}",
+        err.0
     );
 }

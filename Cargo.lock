@@ -106,6 +106,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-compression"
+version = "0.4.41"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0f9ee0f6e02ffd7ad5816e9464499fba7b3effd01123b515c41d1697c43dad1"
+dependencies = [
+ "compression-codecs",
+ "compression-core",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -288,6 +300,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
 
 [[package]]
+name = "compression-codecs"
+version = "0.4.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb7b51a7d9c967fc26773061ba86150f19c50c0d65c887cb1fbe295fd16619b7"
+dependencies = [
+ "compression-core",
+ "flate2",
+ "memchr",
+]
+
+[[package]]
+name = "compression-core"
+version = "0.4.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75984efb6ed102a0d42db99afb6c1948f0380d1d91808d5529916e6c08b49d8d"
+
+[[package]]
 name = "constant_time_eq"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -344,6 +373,7 @@ version = "1.8.8"
 dependencies = [
  "chrono",
  "clap",
+ "corgea",
  "dirs",
  "env_logger",
  "git2",
@@ -359,6 +389,7 @@ dependencies = [
  "quick-xml",
  "regex",
  "reqwest",
+ "semver",
  "serde",
  "serde_derive",
  "serde_json",
@@ -1625,6 +1656,7 @@ version = "0.12.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d0946410b9f7b082a427e4ef5c8ff541a88b357bc6c637c40db3a68ac70a36f"
 dependencies = [
+ "async-compression",
  "base64",
  "bytes",
  "cookie",
@@ -1651,6 +1683,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
@@ -1759,6 +1792,12 @@ dependencies = [
  "core-foundation-sys",
  "libc",
 ]
+
+[[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"

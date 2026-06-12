@@ -1,27 +1,8 @@
+mod common;
+
+use common::{corgea_isolated, fixture};
 use std::process::Command;
 use tempfile::TempDir;
-
-fn corgea_isolated() -> (Command, TempDir) {
-    let home = TempDir::new().expect("temp HOME");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_corgea"));
-    cmd.env("HOME", home.path())
-        .env("USERPROFILE", home.path())
-        .env_remove("CORGEA_TOKEN")
-        .env_remove("CORGEA_URL")
-        .env_remove("AI_AGENT")
-        .env_remove("CODEX_SANDBOX")
-        .env_remove("CLAUDECODE")
-        .env_remove("CLAUDE_CODE")
-        .env_remove("CURSOR_AGENT")
-        .env_remove("CURSOR_TRACE_ID")
-        .env_remove("GEMINI_CLI")
-        .env_remove("PI_AGENT");
-    (cmd, home)
-}
-
-fn fixture(name: &str) -> String {
-    format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name)
-}
 
 #[test]
 fn cli_scan_runs_without_token_or_config() {

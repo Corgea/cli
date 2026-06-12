@@ -16,10 +16,6 @@ pub enum DepFileKind {
     MavenPom,
     GradleBuild,
     GradleLockfile,
-    GoMod,
-    GoSum,
-    CargoManifest,
-    CargoLock,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +57,7 @@ fn detect_recursive(dir: &Path, out: &mut Vec<DetectedFile>) {
         let name = file_name.to_string_lossy();
 
         if path.is_dir() {
-            if SKIP_DIRS.iter().any(|s| name == *s) {
+            if should_skip_dir(&name) {
                 continue;
             }
             detect_recursive(&path, out);
@@ -89,10 +85,6 @@ fn classify_file(path: &Path) -> Option<DetectedFile> {
         "pom.xml" => (DepFileKind::MavenPom, Ecosystem::Maven),
         "build.gradle" | "build.gradle.kts" => (DepFileKind::GradleBuild, Ecosystem::Maven),
         "gradle.lockfile" => (DepFileKind::GradleLockfile, Ecosystem::Maven),
-        "go.mod" => (DepFileKind::GoMod, Ecosystem::Go),
-        "go.sum" => (DepFileKind::GoSum, Ecosystem::Go),
-        "Cargo.toml" => (DepFileKind::CargoManifest, Ecosystem::Cargo),
-        "Cargo.lock" => (DepFileKind::CargoLock, Ecosystem::Cargo),
         _ => return None,
     };
     Some(DetectedFile {
@@ -100,4 +92,8 @@ fn classify_file(path: &Path) -> Option<DetectedFile> {
         kind: kind_eco.0,
         ecosystem: kind_eco.1,
     })
+}
+
+fn should_skip_dir(name: &str) -> bool {
+    name.starts_with('.') || SKIP_DIRS.contains(&name)
 }

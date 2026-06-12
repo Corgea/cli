@@ -199,6 +199,16 @@ enum Commands {
         #[command(subcommand)]
         command: corgea::deps::run::DepsSubcommand,
     },
+    /// Wrap `npm` commands: verify install targets' publish recency, then run npm.
+    Npm(InstallWrapArgs),
+    /// Wrap `yarn` commands: verify install targets' publish recency, then run yarn.
+    Yarn(InstallWrapArgs),
+    /// Wrap `pnpm` commands: verify install targets' publish recency, then run pnpm.
+    Pnpm(InstallWrapArgs),
+    /// Wrap `pip` commands: verify install targets' publish recency, then run pip.
+    Pip(InstallWrapArgs),
+    /// Wrap `uv` commands: verify install targets' publish recency, then run uv.
+    Uv(InstallWrapArgs),
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -219,6 +229,93 @@ impl FromStr for Scanner {
             _ => Err("Only snyk, semgrep and blast are valid scanners."),
         }
     }
+}
+
+/// Shared flags for the install-wrapper subcommands (`corgea npm|yarn|pnpm|pip|uv`).
+#[derive(clap::Args, Debug, Clone)]
+struct InstallWrapArgs {
+    #[arg(
+        long,
+        short = 't',
+        default_value = "2d",
+        value_parser = corgea::verify_deps::parse_threshold,
+        help = "Recency threshold. Resolved versions younger than this are blocked. e.g. '2d', '12h'."
+    )]
+    threshold: std::time::Duration,
+
+    #[arg(
+        long,
+        help = "Demote a recency block to a printed warning. The install still runs."
+    )]
+    no_fail: bool,
+
+    #[arg(
+        long,
+        help = "Proceed with the install despite vulnerable, unverifiable, or recent findings. Findings are still printed."
+    )]
+    force: bool,
+
+    #[arg(
+        long,
+        help = "Output the result as JSON instead of human-readable text."
+    )]
+    json: bool,
+
+    /// Arguments forwarded to the package manager (subcommand and package specs).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    cmd: Vec<String>,
+}
+
+fn install_wrap_options(
+    args: &InstallWrapArgs,
+    config: &Config,
+) -> corgea::precheck::PrecheckOptions {
+    let token = config.get_token();
+    let token = token.trim();
+    let base_url = config::vuln_api_url();
+    let custom_vuln_api_url = base_url != config::DEFAULT_VULN_API_URL;
+    let send_token_to_custom =
+        utils::generic::get_env_var_if_exists("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL")
+            .is_some_and(|v| v.trim() == "1");
+    let mode = select_verdict_mode(token, custom_vuln_api_url, send_token_to_custom);
+    let verdict = Some(corgea::precheck::VerdictConfig {
+        base_url,
+        mode,
+        public_login_hint: token.is_empty(),
+    });
+    corgea::precheck::PrecheckOptions {
+        threshold: args.threshold,
+        no_fail: args.no_fail,
+        force: args.force,
+        json: args.json,
+        verdict,
+        npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
+        pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
+    }
+}
+
+fn select_verdict_mode(
+    token: &str,
+    custom_vuln_api_url: bool,
+    send_token_to_custom: bool,
+) -> corgea::precheck::VerdictMode {
+    if !token.is_empty() && (!custom_vuln_api_url || send_token_to_custom) {
+        corgea::precheck::VerdictMode::Authenticated {
+            token: token.to_string(),
+        }
+    } else {
+        corgea::precheck::VerdictMode::Public
+    }
+}
+
+fn run_install_wrap_command(
+    manager: corgea::precheck::PackageManager,
+    args: &InstallWrapArgs,
+    config: &Config,
+) {
+    let code =
+        corgea::precheck::run_install(manager, &args.cmd, install_wrap_options(args, config));
+    std::process::exit(code);
 }
 
 /// Initialize the global logger.
@@ -504,7 +601,29 @@ fn main() {
             // Offline: no token / network. Exit code propagates fail-on policy.
             std::process::exit(i32::from(corgea::deps::run::run(command.clone())));
         }
+        // Install wrappers: no hard auth gate. Public CVE checks run without a
+        // token; a token on the default service enables authenticated fail-closed
+        // enforcement.
+        Some(Commands::Npm(args)) => {
+            run_install_wrap_command(corgea::precheck::PackageManager::Npm, args, &corgea_config)
+        }
+        Some(Commands::Yarn(args)) => {
+            run_install_wrap_command(corgea::precheck::PackageManager::Yarn, args, &corgea_config)
+        }
+        Some(Commands::Pnpm(args)) => {
+            run_install_wrap_command(corgea::precheck::PackageManager::Pnpm, args, &corgea_config)
+        }
+        Some(Commands::Pip(args)) => {
+            run_install_wrap_command(corgea::precheck::PackageManager::Pip, args, &corgea_config)
+        }
+        Some(Commands::Uv(args)) => {
+            run_install_wrap_command(corgea::precheck::PackageManager::Uv, args, &corgea_config)
+        }
         None => {
+            if let Some(message) = corgea::precheck::pip3_alias_message(&cli.args) {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }
             utils::terminal::show_welcome_message();
             let _ = Cli::command().print_help();
             println!();
@@ -522,5 +641,28 @@ mod tests {
         assert_eq!(default_log_level(0), "info");
         assert_eq!(default_log_level(2), "info"); // only ==1 means debug
         assert_eq!(default_log_level(-1), "info");
+    }
+
+    #[test]
+    fn verdict_mode_selection_matrix() {
+        use corgea::precheck::VerdictMode;
+
+        assert_eq!(
+            select_verdict_mode("token", false, false),
+            VerdictMode::Authenticated {
+                token: "token".to_string()
+            }
+        );
+        assert_eq!(select_verdict_mode("", false, false), VerdictMode::Public);
+        assert_eq!(
+            select_verdict_mode("token", true, false),
+            VerdictMode::Public
+        );
+        assert_eq!(
+            select_verdict_mode("token", true, true),
+            VerdictMode::Authenticated {
+                token: "token".to_string()
+            }
+        );
     }
 }

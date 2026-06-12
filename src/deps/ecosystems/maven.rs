@@ -1,5 +1,8 @@
 use std::path::Path;
 
+use quick_xml::events::Event;
+use quick_xml::reader::Reader;
+
 use crate::deps::detect::DepFileKind;
 use crate::deps::ecosystems::classify_constraint;
 use crate::deps::ecosystems::evaluate::{
@@ -33,6 +36,22 @@ struct MavenDep {
     scope: Scope,
 }
 
+#[derive(Default)]
+struct PartialMavenDep {
+    group: String,
+    artifact: String,
+    version: String,
+    scope: String,
+}
+
+#[derive(Clone, Copy)]
+enum MavenField {
+    Group,
+    Artifact,
+    Version,
+    Scope,
+}
+
 fn scan_maven_pom(ctx: &mut ScanContext<'_>, dir: &Path, pom_path: &Path) -> Result<(), DepsError> {
     let rel = pom_path
         .strip_prefix(ctx.root)
@@ -51,7 +70,10 @@ fn scan_maven_pom(ctx: &mut ScanContext<'_>, dir: &Path, pom_path: &Path) -> Res
 
     dep001(ctx.findings, ctx.policy, &rel, "Maven");
 
-    let deps = parse_pom_dependencies(&content)?;
+    // Name the offending pom — a monorepo scan dies on the first malformed
+    // one, and a path-less error gives nothing to act on.
+    let deps = parse_pom_dependencies(&content)
+        .map_err(|e| DepsError(format!("parse XML {}: {}", pom_path.display(), e.0)))?;
     for dep in deps {
         let name = dep.artifact.clone();
         let declared = dep.version.clone();
@@ -90,44 +112,116 @@ fn scan_maven_pom(ctx: &mut ScanContext<'_>, dir: &Path, pom_path: &Path) -> Res
 }
 
 fn parse_pom_dependencies(content: &str) -> Result<Vec<MavenDep>, DepsError> {
-    Ok(parse_pom_regex(content))
-}
-
-fn parse_pom_regex(content: &str) -> Vec<MavenDep> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
     let mut deps = Vec::new();
-    let dep_blocks: Vec<&str> = content.split("<dependency>").skip(1).collect();
-    for block in dep_blocks {
-        let group = extract_xml_tag(block, "groupId");
-        let artifact = extract_xml_tag(block, "artifactId");
-        let version = extract_xml_tag(block, "version");
-        let scope = extract_xml_tag(block, "scope");
-        if artifact.is_empty() {
-            continue;
+    let mut current: Option<PartialMavenDep> = None;
+    let mut dep_depth = 0usize;
+    let mut field: Option<MavenField> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                let name = e.name();
+                let tag = local_xml_name(name.as_ref());
+                if current.is_none() && tag == b"dependency" {
+                    current = Some(PartialMavenDep::default());
+                    dep_depth = 1;
+                    field = None;
+                } else if current.is_some() {
+                    if dep_depth == 1 {
+                        field = maven_field_from_tag(tag);
+                    }
+                    dep_depth += 1;
+                }
+            }
+            Ok(Event::Text(text)) => {
+                if dep_depth == 2 {
+                    let value = text
+                        .unescape()
+                        .map(|value| value.trim().to_string())
+                        .unwrap_or_else(|_| {
+                            String::from_utf8_lossy(text.as_ref()).trim().to_string()
+                        });
+                    append_maven_field(current.as_mut(), field, &value);
+                }
+            }
+            // `<version><![CDATA[1.2.3]]></version>` — CDATA is element text.
+            Ok(Event::CData(text)) => {
+                if dep_depth == 2 {
+                    let value = String::from_utf8_lossy(text.as_ref()).trim().to_string();
+                    append_maven_field(current.as_mut(), field, &value);
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                if current.is_some() {
+                    let name = e.name();
+                    let tag = local_xml_name(name.as_ref());
+                    if dep_depth == 2 {
+                        field = None;
+                    }
+                    if tag == b"dependency" && dep_depth == 1 {
+                        let dep = current.take().expect("dependency started");
+                        if !dep.artifact.is_empty() {
+                            deps.push(MavenDep {
+                                group: dep.group,
+                                artifact: dep.artifact,
+                                version: dep.version,
+                                scope: if dep.scope == "test" {
+                                    Scope::Development
+                                } else {
+                                    Scope::Production
+                                },
+                            });
+                        }
+                        field = None;
+                    } else {
+                        dep_depth = dep_depth.saturating_sub(1);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(DepsError(e.to_string())),
+            _ => {}
         }
-        deps.push(MavenDep {
-            group,
-            artifact: artifact.clone(),
-            version: version.clone(),
-            scope: if scope == "test" {
-                Scope::Development
-            } else {
-                Scope::Production
-            },
-        });
+        buf.clear();
     }
-    deps
+
+    Ok(deps)
 }
 
-fn extract_xml_tag(block: &str, tag: &str) -> String {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    if let Some(start) = block.find(&open) {
-        let rest = &block[start + open.len()..];
-        if let Some(end) = rest.find(&close) {
-            return rest[..end].trim().to_string();
-        }
+fn local_xml_name(name: &[u8]) -> &[u8] {
+    name.rsplit(|b| *b == b':').next().unwrap_or(name)
+}
+
+fn maven_field_from_tag(tag: &[u8]) -> Option<MavenField> {
+    match tag {
+        b"groupId" => Some(MavenField::Group),
+        b"artifactId" => Some(MavenField::Artifact),
+        b"version" => Some(MavenField::Version),
+        b"scope" => Some(MavenField::Scope),
+        _ => None,
     }
-    String::new()
+}
+
+/// Append a text/CDATA segment to the active field. Appending (rather than
+/// assigning) keeps values split by inline comments intact:
+/// `<version>1.<!-- -->2</version>` is `1.2`, not `2`.
+fn append_maven_field(dep: Option<&mut PartialMavenDep>, field: Option<MavenField>, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    let (Some(dep), Some(field)) = (dep, field) else {
+        return;
+    };
+    let slot = match field {
+        MavenField::Group => &mut dep.group,
+        MavenField::Artifact => &mut dep.artifact,
+        MavenField::Version => &mut dep.version,
+        MavenField::Scope => &mut dep.scope,
+    };
+    slot.push_str(value);
 }
 
 fn scan_gradle(ctx: &mut ScanContext<'_>, dir: &Path, gradle_path: &Path) -> Result<(), DepsError> {

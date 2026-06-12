@@ -109,6 +109,138 @@ corgea setup-hooks --default-config            # Default: secrets + PII, fail on
 
 Installs a pre-commit hook running `corgea scan blast --only-uncommitted`. Bypass with `git commit --no-verify`.
 
+### Install Wrappers — `corgea pip|npm|yarn|pnpm|uv <args...>`
+
+Run a package manager through Corgea's install gate. Install commands with named
+targets are resolved against the public registry first, then gated twice: a version
+published within `--threshold` (default `2d`) blocks (exit 1), and each resolved
+version is checked against Corgea's vuln-api. Baseline public CVE checks need no
+token: known-vulnerable or malicious versions block, but vuln-api lookup outages
+warn and continue because public mode is fail-open. A Corgea token on the default
+vuln-api enables authenticated enforcement and private Corgea intelligence; in
+that mode, verdict lookup failures also block (fail-closed). Everything else
+passes through with the package manager's own exit code. Git/URL/path specs
+(including `pip install .`, PEP 508 `name @ url` direct references, and npm
+GitHub shorthand `user/repo`) are noted, never blocked. The install verb is
+found behind global flags (`npm --loglevel silent install x` is still gated).
+Bare `npm install` (zero specs, project `package.json` found like npm finds it
+— nearest ancestor) is gated too: the full lockfile-resolved tree is verdicted,
+so a vulnerable lockfile blocks. `npm ci` (and aliases) is gated from the
+project lockfile directly, like `uv sync`. Bare `yarn` (with or without the
+`install` verb) and bare `pnpm` installs have no safe dry-run; they run
+unchecked after a stderr note (`note: bare '<pm> <sub>' is not gated …`).
+`-r requirements.txt` files get a printed note when the tree pass doesn't
+cover them.
+
+Wrapper flags (`--force`, `--no-fail`, `--json`, `-t`) are read between the
+manager name and the install verb (`corgea npm --force install x`); flags
+after the verb belong to the package manager and are forwarded untouched.
+
+Blocked findings steer to the fix: each advisory line shows `fixed in <version>` (or
+`no fixed version known`). When every advisory on a package has a fix, the gate
+prints `→ safe version: <name>@<version>` — the highest fix covering every advisory.
+
+The vuln check covers the **full would-install set** where the manager has a safe
+resolver, not just the named targets: `pip` and `npm` resolve the complete tree
+(named + transitive) via a safe dry-run (`pip install --dry-run …`; an isolated
+`npm install --package-lock-only` in a temp dir, never touching your lockfile), and
+`uv pip install` / `uv add` / `uv pip sync` resolve theirs via `uv pip compile`;
+every resolved package is verdicted, so a flagged **transitive** dependency blocks
+the install too. `uv sync` is gated from `uv.lock` (found like uv finds it —
+nearest ancestor). `yarn` and `pnpm` have no safe dry-run, so they verify the
+named targets only and print
+`warning: transitive dependencies not checked (…); only named packages were verified.`
+The same warning is emitted (and the gate falls back to named-only) whenever a
+dry-run fails or an npm flag redirects the project root (`--prefix`, `-g`).
+Verdict requests run in a bounded pool (8 parallel).
+
+```bash
+corgea pip install requests==2.31.0   # resolves, checks recency + vuln verdict, then runs pip
+corgea npm install axios@^1.0.0       # same gate for npm ranges
+corgea pip --no-fail install newpkg   # demote a recency block to a warning (vuln blocks still apply)
+corgea pip --force install badpkg     # print findings but install anyway (overrides every block)
+corgea pip --json install newpkg      # machine-readable per-target report incl. verdicts
+corgea pip list                       # non-install subcommands pass straight through
+```
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--threshold` | `-t` | Recency threshold (`2d`, `12h`). Younger resolved versions block. |
+| `--no-fail` | | Demote a recency block to a warning. Does NOT bypass vulnerable blocks or authenticated unverifiable blocks. |
+| `--force` | | Proceed despite all findings (vulnerable, unverifiable, recent). Findings still print. Also bypasses the wrong-package-manager and PEP 668 refusals, and unparsable-lockfile refusals on `uv sync`/`npm ci`. |
+| `--json` | | JSON report instead of text. Per-result `verdict` object + `verdict_mode` + `tree`. Stdout carries only the report; the package manager's output moves to stderr. |
+
+`--json` adds `verdict_mode` (`"public"` or `"authenticated"`) and a
+`tree` object: `null` when no tree pass ran; otherwise `mode` is `"full"` (transitive
+checked) or `"named-only"` (with a `reason`), plus `resolved_count` and a `transitive[]`
+array of `{name, version, verdict}` for packages beyond the named targets. Vulnerable
+`verdict` objects carry a `remediation` field: the safe version covering every advisory,
+or `null` when any advisory has no known fix.
+
+Recency gating and baseline CVE checks need no token. The default vuln-api uses
+`CORGEA_TOKEN` when present. A custom `CORGEA_VULN_API_URL` is public by default, even
+when `CORGEA_TOKEN` exists; set `CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` to send
+the token to that custom URL and make lookup failures fail closed. Overrides for
+testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`, `CORGEA_VULN_API_URL`.
+
+#### Limitations
+
+The gate is a wrapper, not an enforcement boundary. By design it cannot catch:
+
+- **Direct invocation** — running the package manager itself (`pip`, `npm`,
+  `python -m pip`) skips the gate entirely.
+- **Custom indexes/registries** — `--index-url`, `--registry`, and `.npmrc`/
+  `pip.conf` overrides change where packages resolve from. The gate still
+  verdicts each `name@version`, but it cannot vouch that a substituted
+  registry serves the same artifact those advisories describe.
+- **Ungated managers** — bare `yarn`/`pnpm` installs run unchecked (see the
+  bare-install note above); only their named targets are verified.
+
+Hard enforcement needs org-level controls — lockfile review, registry
+allow-listing — alongside the wrapper.
+
+#### Testing the gate
+
+The staging vuln-api (`https://cve-worker-staging.corgea.workers.dev`) serves
+deterministic verdicts for dogfooding and is currently the default endpoint, so
+with `CORGEA_TOKEN` set it runs authenticated with no extra setup. The explicit
+`CORGEA_VULN_API_URL` + `CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` below keep
+that true even if the default endpoint moves (a custom URL is public-mode unless
+the opt-in is set). Known-vulnerable targets:
+
+| Ecosystem | Target | Verdict |
+|-----------|--------|---------|
+| npm | `axios@0.21.0` | vulnerable — fixed in 0.21.2 |
+| npm | `minimist@0.0.8` | vulnerable — fixed in 1.2.2 |
+| npm | `node-fetch@2.6.0` | vulnerable — fixed in 2.6.7 |
+| PyPI | `mezzanine==6.0.0` | vulnerable — no fixed version known |
+
+Verify the gate end-to-end:
+
+```bash
+CORGEA_TOKEN=dogfood-dummy \
+CORGEA_VULN_API_URL=https://cve-worker-staging.corgea.workers.dev \
+CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1 \
+corgea npm install axios@0.21.0
+```
+
+Expected output (exit code 1; nothing is installed):
+
+```
+Pre-checking `npm install axios@0.21.0` (threshold 2d)
+  1 ok, 0 recent, 1 vulnerable, 0 unverifiable, 0 skipped, 0 errors
+  tree: 2 packages resolved, 1 transitive checked
+  ✗ axios@0.21.0 → axios@0.21.0  known vulnerable:
+      CVE-2021-3749 (high) — fixed in 0.21.2
+      CVE-2020-28168 (medium) — fixed in 0.21.1
+      → safe version: axios@0.21.2
+Refusing to run install. Pass --force to proceed despite findings.
+```
+
+Caveat: the staging PyPI seed covers recent CVEs only. Decade-old classics
+(`pyyaml==5.1`, `django==2.2`) return clean **by design** — a clean verdict on
+those does not mean the gate is broken.
+
 <!-- BEGIN GENERATED CORGEA DEPS SKILL -->
 ### Deps — `corgea deps <command>`
 
