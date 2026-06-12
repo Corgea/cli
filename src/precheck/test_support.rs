@@ -18,6 +18,7 @@ pub(crate) fn stub_opts() -> PrecheckOptions {
         threshold: Duration::from_secs(2 * 86400),
         no_fail: false,
         force: false,
+        json: false,
         verdict: None,
         npm_registry: None,
         pypi_registry: Some("http://127.0.0.1:9".to_string()),

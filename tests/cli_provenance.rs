@@ -152,6 +152,74 @@ fn npm_preexisting_without_fix_has_no_hint() {
     );
 }
 
+/// Pip report mixing all three origins: `oldpkg` (named on the CLI, matches
+/// the named outcome), `reqpkg` (requested via `-r`), `evildep` (transitive).
+const PIP_MIXED_REPORT: &str = r#"{"version":"1","pip_version":"24.0","install":[
+  {"metadata":{"name":"oldpkg","version":"1.0.0"},"requested":true},
+  {"metadata":{"name":"reqpkg","version":"6.0.0"},"requested":true},
+  {"metadata":{"name":"evildep","version":"0.4.2"},"requested":false}]}"#;
+
+#[test]
+fn pip_json_carries_origin_per_tree_entry() {
+    // All-clean run mixing origins: the named `oldpkg` matches its outcome,
+    // `reqpkg` (requested) and `evildep` (transitive) land in `tree.transitive`
+    // with their origins.
+    let mut h = tree_harness("pip", HashMap::new(), HashMap::new(), PIP_MIXED_REPORT);
+    let out = h
+        .cmd
+        .args([
+            "pip",
+            "--json",
+            "install",
+            "oldpkg==1.0.0",
+            "-r",
+            "reqs.txt",
+        ])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0), "clean tree must proceed");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["tree"]["mode"], "full");
+    let entries = parsed["tree"]["transitive"]
+        .as_array()
+        .expect("transitive array");
+    let origin_of = |name: &str| {
+        entries
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing from tree entries"))["origin"]
+            .clone()
+    };
+    assert_eq!(origin_of("reqpkg"), "requested");
+    assert_eq!(origin_of("evildep"), "transitive");
+    assert_eq!(entries.len(), 2, "named oldpkg must not be a tree entry");
+}
+
+#[test]
+fn npm_json_carries_preexisting_origin() {
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("npm", "evildep", "0.4.2"),
+        vulnerable_body("npm", "evildep", "0.4.2", Some("1.2.2")),
+    );
+    let mut h = npm_project_harness(checks, NPM_LOCK);
+    let out = h
+        .cmd
+        .args(["npm", "--json", "install", "oldpkg@1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["tree"]["transitive"][0]["name"], "evildep");
+    assert_eq!(parsed["tree"]["transitive"][0]["origin"], "pre-existing");
+    assert_eq!(
+        parsed["tree"]["transitive"][0]["verdict"]["status"],
+        "vulnerable"
+    );
+}
+
 #[test]
 fn named_install_with_transitive_vulnerable_keeps_generic_refusal() {
     // A named install pulling in a vulnerable transitive is the command's

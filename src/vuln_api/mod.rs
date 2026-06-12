@@ -14,7 +14,7 @@
 //! authenticated mode, and never sent to a user-configured host
 //! without explicit opt-in.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -79,7 +79,7 @@ pub struct VulnCheckResponse {
     pub matches: Vec<VulnMatch>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VulnMatch {
     pub advisory_id: String,
     pub severity_level: String,
