@@ -15,7 +15,7 @@ mod common;
 
 use common::{
     npm_packument, pip_harness, pypi_release_json, spawn_http_stub, GateHarness, NOT_FOUND_JSON,
-    OLD_TS,
+    OLD_TS, RESOLUTION_FAILS,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -60,8 +60,10 @@ fn wrapper_with_hits(
     pm_exit_code: i32,
 ) -> (GateHarness, Arc<AtomicUsize>) {
     let (base_url, registry_hits) = spawn_registry_stub();
+    // RESOLUTION_FAILS: the tree dry-run exits non-zero without touching
+    // the argv marker, so `recorded_argv()` reflects only the real install.
     let h = GateHarness::new()
-        .fake_recorder(binary, pm_exit_code)
+        .fake_tree_pm(binary, RESOLUTION_FAILS, pm_exit_code)
         .registry_env(registry_env, &base_url)
         .build();
     (h, registry_hits)

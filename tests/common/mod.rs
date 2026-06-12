@@ -69,6 +69,20 @@ pub fn npm_packument(version: &str, ts: &str) -> String {
     )
 }
 
+/// Pip `--report -` payload: `oldpkg` (named/requested) + `evildep`
+/// (transitive).
+#[allow(dead_code)]
+pub const TREE_REPORT: &str = r#"{"version":"1","pip_version":"24.0","install":[
+  {"metadata":{"name":"oldpkg","version":"1.0.0"},"requested":true},
+  {"metadata":{"name":"evildep","version":"0.4.2"},"requested":false}]}"#;
+
+/// npm lockfile-v3 fixture: named `oldpkg` 1.0.0 + transitive `evildep` 0.4.2.
+#[allow(dead_code)]
+pub const NPM_LOCK: &str = r#"{"name":"proj","lockfileVersion":3,"packages":{
+  "":{"name":"proj","version":"1.0.0"},
+  "node_modules/oldpkg":{"version":"1.0.0"},
+  "node_modules/evildep":{"version":"0.4.2"}}}"#;
+
 /// Spawn a one-response-per-connection HTTP stub on an ephemeral 127.0.0.1
 /// port; `route` maps a request path to `(status line, body)`. Returns the
 /// base URL.
@@ -138,6 +152,18 @@ pub fn write_script(dir: &std::path::Path, binary: &str, script: &str) {
         .expect("chmod fake script");
 }
 
+/// Shell loop that emits the file at `path` line by line via builtins —
+/// works under the locked-down test PATH (no `cat`); the `|| [ -n "$line" ]`
+/// guard keeps a final line with no trailing newline.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn emit(path: &std::path::Path) -> String {
+    format!(
+        "while IFS= read -r line || [ -n \"$line\" ]; do printf '%s\\n' \"$line\"; done < '{}'",
+        path.display()
+    )
+}
+
 /// Write an executable fake package manager named `binary` into `dir`. It
 /// records its argv to `marker` and exits `exit_code` — proving both "the
 /// install ran (with these args)" and exit-code forwarding.
@@ -153,6 +179,46 @@ pub fn write_fake_recorder(
         "#!/bin/sh\nprintf '%s' \"$*\" > '{}'\nexit {}\n",
         marker.display(),
         exit_code
+    );
+    write_script(dir, binary, &script);
+}
+
+/// Sentinel payload that makes a tree-aware fake manager exit non-zero on
+/// its tree (resolution) invocation, forcing the named-only fallback.
+#[allow(dead_code)]
+pub const RESOLUTION_FAILS: &str = "RESOLUTION_FAILS";
+
+/// Write an executable tree-aware fake package manager into `dir`. An
+/// invocation carrying the manager's tree flag emits `payload` (stdout for
+/// pip's `--dry-run --report -`, `./package-lock.json` for npm's
+/// `--package-lock-only`, whose cwd is the resolver's throwaway temp dir)
+/// and exits 0 — the tree pass; if `payload` is `RESOLUTION_FAILS` it exits
+/// non-zero instead, emitting nothing. Any other invocation records its
+/// argv to `marker` and exits `exit_code`.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn write_fake_tree_pm(
+    dir: &std::path::Path,
+    binary: &str,
+    marker: &std::path::Path,
+    payload: &str,
+    exit_code: i32,
+) {
+    let (tree_flag, redirect, fail_exit) = match binary {
+        "pip" | "pip3" => ("--dry-run", "", 2),
+        "npm" => ("--package-lock-only", " > package-lock.json", 1),
+        other => panic!("unsupported fake manager {other}"),
+    };
+    let tree_branch = if payload == RESOLUTION_FAILS {
+        format!("exit {fail_exit}")
+    } else {
+        let payload_path = dir.join(format!("{binary}-tree-payload.json"));
+        std::fs::write(&payload_path, payload).expect("write fake pm payload");
+        format!("{}{redirect}; exit 0", emit(&payload_path))
+    };
+    let script = format!(
+        "#!/bin/sh\ncase \" $* \" in *\" {tree_flag} \"*) {tree_branch};; esac\nprintf '%s' \"$*\" > '{marker}'\nexit {exit_code}\n",
+        marker = marker.display(),
     );
     write_script(dir, binary, &script);
 }
@@ -193,6 +259,13 @@ impl GateHarness {
             _bin: bin,
             _vuln_stub: None,
         }
+    }
+
+    /// Tree-aware fake manager: emits `payload` on its tree flag, records
+    /// argv and exits `exit_code` otherwise.
+    pub fn fake_tree_pm(self, binary: &str, payload: &str, exit_code: i32) -> Self {
+        write_fake_tree_pm(self._bin.path(), binary, &self.marker, payload, exit_code);
+        self
     }
 
     /// Plain argv recorder. Call repeatedly for multiple binaries; call
@@ -267,6 +340,18 @@ impl GateHarness {
         self
     }
 
+    /// Re-point the corgea invocation at a (created) subdirectory of the
+    /// project dir — for tests proving ancestor-walk behavior.
+    pub fn in_subdir(mut self, name: &str) -> Self {
+        if self.project.is_none() {
+            self = self.in_project_dir();
+        }
+        let dir = self.project.as_ref().unwrap().path().join(name);
+        std::fs::create_dir_all(&dir).expect("create subdir");
+        self.cmd.current_dir(&dir);
+        self
+    }
+
     pub fn build(mut self) -> Self {
         if !self.vuln_api {
             return self;
@@ -286,9 +371,9 @@ impl GateHarness {
 }
 
 /// `corgea` wired to the wildcard pypi registry stub (every package
-/// published 2020 → recency never blocks), a fake pip recording its argv
-/// to a marker, and a vuln-api stub. Every block in a `pip_harness` test
-/// is the verdict's doing.
+/// published 2020 → recency never blocks), a report-less fake pip
+/// (recording its argv to a marker), and a vuln-api stub. Every block in a
+/// `pip_harness` test is the verdict's doing.
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn pip_harness(
@@ -296,9 +381,30 @@ pub fn pip_harness(
     statuses: HashMap<PackageKey, u16>,
     pip_exit_code: i32,
 ) -> GateHarness {
+    // RESOLUTION_FAILS models an old pip with no `--report`: the tree
+    // dry-run exits 2, so these tests exercise the named-only fallback.
     GateHarness::new()
-        .fake_recorder("pip", pip_exit_code)
+        .fake_tree_pm("pip", RESOLUTION_FAILS, pip_exit_code)
         .wildcard_pypi_registry()
+        .vuln_checks(checks)
+        .vuln_statuses(statuses)
+        .build()
+}
+
+/// `corgea` wired to the oldpkg registry stub, a tree-aware fake `binary`
+/// (`"pip"`, `"pip3"`, or `"npm"`) answering the tree pass with `payload`,
+/// and a vuln-api stub.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn tree_harness(
+    binary: &str,
+    checks: HashMap<PackageKey, String>,
+    statuses: HashMap<PackageKey, u16>,
+    payload: &str,
+) -> GateHarness {
+    GateHarness::new()
+        .fake_tree_pm(binary, payload, 0)
+        .oldpkg_registry()
         .vuln_checks(checks)
         .vuln_statuses(statuses)
         .build()

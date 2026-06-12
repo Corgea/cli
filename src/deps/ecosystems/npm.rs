@@ -312,7 +312,11 @@ fn parse_npm_lock(path: &Path) -> Result<HashMap<String, LockPackage>, DepsError
     Ok(out)
 }
 
-fn package_name_from_lock_key(key: &str) -> &str {
+/// Package name from a lockfile `packages` key: the path after the last
+/// `node_modules/` (or the whole key), truncated to one component — two for
+/// scoped names. Also shared with the install gate's lockfile parse
+/// (`precheck::tree`).
+pub(crate) fn package_name_from_lock_key(key: &str) -> &str {
     let package_path = key
         .rsplit_once("node_modules/")
         .map(|(_, name)| name)
