@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
@@ -45,7 +45,44 @@ pub fn spawn_with_statuses(
     package_checks: HashMap<PackageKey, String>,
     status_overrides: HashMap<PackageKey, u16>,
 ) -> VulnApiStub {
-    spawn(package_checks, status_overrides, None)
+    spawn_with_retry_once(package_checks, status_overrides, HashSet::new())
+}
+
+/// Like [`spawn_with_statuses`], but keys in `retry_once` answer their first
+/// hit with 429 + `Retry-After: 1` and fall through to the scripted response
+/// from the second hit on — for exercising the client's retry path.
+pub fn spawn_with_retry_once(
+    package_checks: HashMap<PackageKey, String>,
+    status_overrides: HashMap<PackageKey, u16>,
+    retry_once: HashSet<PackageKey>,
+) -> VulnApiStub {
+    spawn(
+        package_checks,
+        status_overrides,
+        retry_once,
+        HashMap::new(),
+        None,
+    )
+}
+
+/// Like [`spawn_with_statuses`], but keys in `drops` have their first N hits
+/// answered by reading the request and closing the connection without
+/// writing a response — the client surfaces each as a `send()` error
+/// (`connection closed before message completed`). Falls through to the
+/// scripted response once the drops are spent. For exercising the client's
+/// transient-failure retry path hermetically.
+pub fn spawn_with_drops(
+    package_checks: HashMap<PackageKey, String>,
+    status_overrides: HashMap<PackageKey, u16>,
+    drops: HashMap<PackageKey, usize>,
+) -> VulnApiStub {
+    spawn(
+        package_checks,
+        status_overrides,
+        HashSet::new(),
+        drops,
+        None,
+    )
 }
 
 /// Vuln-api stub that records raw requests and answers every package check
@@ -55,6 +92,8 @@ pub fn spawn_capturing_vuln_api_stub() -> (String, std::sync::Arc<std::sync::Mut
     let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let stub = spawn(
         HashMap::new(),
+        HashMap::new(),
+        HashSet::new(),
         HashMap::new(),
         Some(std::sync::Arc::clone(&requests)),
     );
@@ -66,6 +105,8 @@ pub fn spawn_capturing_vuln_api_stub() -> (String, std::sync::Arc<std::sync::Mut
 fn spawn(
     package_checks: HashMap<PackageKey, String>,
     status_overrides: HashMap<PackageKey, u16>,
+    retry_once: HashSet<PackageKey>,
+    drops: HashMap<PackageKey, usize>,
     capture: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 ) -> VulnApiStub {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
@@ -73,6 +114,8 @@ fn spawn(
     let base_url = format!("http://127.0.0.1:{bound_port}");
 
     let handle = thread::spawn(move || {
+        let mut pending_retries = retry_once;
+        let mut pending_drops = drops;
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else {
                 continue;
@@ -81,6 +124,8 @@ fn spawn(
                 &mut stream,
                 &package_checks,
                 &status_overrides,
+                &mut pending_retries,
+                &mut pending_drops,
                 capture.as_deref(),
             );
         }
@@ -137,6 +182,8 @@ fn handle_connection(
     stream: &mut std::net::TcpStream,
     package_checks: &HashMap<PackageKey, String>,
     status_overrides: &HashMap<PackageKey, u16>,
+    pending_retries: &mut HashSet<PackageKey>,
+    pending_drops: &mut HashMap<PackageKey, usize>,
     capture: Option<&std::sync::Mutex<Vec<String>>>,
 ) {
     let buf = read_http_request(stream);
@@ -147,7 +194,7 @@ fn handle_connection(
 
     let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1));
 
-    let (status_code, response_body) = match path {
+    let (status_code, response_body, retry_after) = match path {
         Some(path) => {
             let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
             if parts.len() >= 7
@@ -161,22 +208,40 @@ fn handle_connection(
                     &urlencoding::decode(parts[3]).unwrap_or_default(),
                     &urlencoding::decode(parts[5]).unwrap_or_default(),
                 );
-                let body = package_checks
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or_else(|| default_clean_response(&key.0, &key.1, &key.2));
-                let status = status_overrides.get(&key).copied().unwrap_or(200);
-                (status, body)
+                if let Some(remaining) = pending_drops.get_mut(&key) {
+                    // Close without writing: the request was read, so the
+                    // client sees its connection die mid-exchange — the
+                    // transient `send()` error this mode exists to script.
+                    *remaining -= 1;
+                    if *remaining == 0 {
+                        pending_drops.remove(&key);
+                    }
+                    return;
+                }
+                if pending_retries.remove(&key) {
+                    (429, r#"{"error":"rate limited"}"#.to_string(), true)
+                } else {
+                    let body = package_checks
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| default_clean_response(&key.0, &key.1, &key.2));
+                    let status = status_overrides.get(&key).copied().unwrap_or(200);
+                    (status, body, false)
+                }
             } else {
-                (404, NOT_FOUND_BODY.to_string())
+                (404, NOT_FOUND_BODY.to_string(), false)
             }
         }
-        None => (400, r#"{"error":"bad request"}"#.to_string()),
+        None => (400, r#"{"error":"bad request"}"#.to_string(), false),
     };
 
     let response = http_response(
         &format!("{} {}", status_code, status_text(status_code)),
-        "",
+        if retry_after {
+            "Retry-After: 1\r\n"
+        } else {
+            ""
+        },
         &response_body,
     );
     let _ = stream.write_all(response.as_bytes());

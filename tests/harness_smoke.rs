@@ -57,6 +57,7 @@ fn gate_harness_wires_stubs_and_fake_manager() {
     let verdict = corgea::vuln_api::check_package_version(
         &client,
         &vuln_url,
+        None,
         corgea::vuln_api::Ecosystem::Pypi,
         "evil",
         "1.0.0",
