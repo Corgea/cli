@@ -7,7 +7,7 @@ use chrono::Utc;
 
 use super::{
     InstallTarget, PackageManager, PrecheckOptions, PrecheckReport, TargetKind, TargetOutcome,
-    VerdictConfig, VerdictStatus,
+    VerdictConfig, VerdictMode, VerdictStatus,
 };
 
 /// Baseline options: pypi registry at a dead address (a port that
@@ -25,17 +25,34 @@ pub(crate) fn stub_opts() -> PrecheckOptions {
     }
 }
 
-/// `stub_opts()` plus a verdict config pointing at `base_url`.
+/// `stub_opts()` plus an authenticated verdict config pointing at `base_url`.
 pub(crate) fn verdict_opts(base_url: &str) -> PrecheckOptions {
     PrecheckOptions {
         verdict: Some(VerdictConfig {
             base_url: base_url.to_string(),
+            mode: VerdictMode::Authenticated {
+                token: "test-token".to_string(),
+            },
+            public_login_hint: false,
         }),
         ..stub_opts()
     }
 }
 
 pub(crate) fn public_opts(no_fail: bool, force: bool) -> PrecheckOptions {
+    PrecheckOptions {
+        no_fail,
+        force,
+        verdict: Some(VerdictConfig {
+            base_url: "http://127.0.0.1:9".to_string(),
+            mode: VerdictMode::Public,
+            public_login_hint: true,
+        }),
+        ..stub_opts()
+    }
+}
+
+pub(crate) fn authenticated_opts(no_fail: bool, force: bool) -> PrecheckOptions {
     PrecheckOptions {
         no_fail,
         force,

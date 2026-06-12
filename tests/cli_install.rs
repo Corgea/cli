@@ -73,6 +73,79 @@ fn wrapper_with_hits(
     (h, registry_hits)
 }
 
+/// Harness whose fake `pip` shebang points at a fake `python-managed`
+/// interpreter that reports an EXTERNALLY-MANAGED stdlib (PEP 668).
+fn externally_managed_pip() -> (GateHarness, Arc<AtomicUsize>) {
+    let (base_url, registry_hits) = spawn_registry_stub();
+    let h = GateHarness::new()
+        .script_with_paths("python-managed", |_, marker| {
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then printf '1\\n'; exit 0; fi\nprintf '%s' \"$*\" > '{}'\nexit 0\n",
+                marker.display()
+            )
+        })
+        .script_with_paths("pip", |bin, _| {
+            format!("#!{}\n", bin.join("python-managed").display())
+        });
+    (
+        h.registry_env("CORGEA_PYPI_REGISTRY", &base_url).build(),
+        registry_hits,
+    )
+}
+
+#[test]
+fn externally_managed_pip_blocks_before_registry_checks() {
+    let (mut h, registry_hits) = externally_managed_pip();
+    let out = h
+        .cmd
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("failed to run corgea");
+
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None, "pip must not run");
+    assert_eq!(
+        registry_hits.load(Ordering::SeqCst),
+        0,
+        "externally-managed preflight must run before registry checks"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error: this Python environment is externally managed (PEP 668)."),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Create and activate a virtualenv, then retry `corgea pip install oldpkg==1.0.0`."
+        ),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn externally_managed_pip_force_proceeds() {
+    // The fake nested-shebang pip is not a usable recorder on macOS (the
+    // libc ENOEXEC fallback runs it as an empty sh script), so this test
+    // pins only the guard bypass: no PEP 668 refusal, exit 0.
+    let (mut h, _registry_hits) = externally_managed_pip();
+    let out = h
+        .cmd
+        .args(["pip", "--force", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--force must bypass the PEP 668 guard: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("externally managed"),
+        "no PEP 668 refusal under --force: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn pip_fresh_pin_blocks_without_running_install() {
     let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
@@ -652,7 +725,7 @@ fn wrapper_forwards_package_manager_exit_code() {
 
 #[test]
 fn pip_git_url_spec_skips_verification_and_execs() {
-    let mut h = pip_harness(HashMap::new(), HashMap::new(), 0);
+    let mut h = pip_harness(HashMap::new(), HashMap::new(), None, 0);
     let out = h
         .cmd
         .args(["pip", "install", "git+https://github.com/x/y.git"])
@@ -679,7 +752,7 @@ fn pip_git_url_spec_skips_verification_and_execs() {
 
 #[test]
 fn pip_filesystem_path_spec_skips_verification_and_execs() {
-    let mut h = pip_harness(HashMap::new(), HashMap::new(), 0);
+    let mut h = pip_harness(HashMap::new(), HashMap::new(), None, 0);
     let out = h
         .cmd
         .args(["pip", "install", "."])

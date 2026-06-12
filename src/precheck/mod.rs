@@ -85,12 +85,33 @@ impl PackageManager {
     }
 }
 
-/// Connection details for the vuln-api verdict pass. Lookups are public
-/// (no auth) and fail open: known vulnerable/malicious verdicts block,
-/// while lookup errors warn and continue.
+/// Auth and failure policy for the vuln-api verdict pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerdictMode {
+    /// No auth header; vuln-api lookup errors warn and fail open.
+    Public,
+    /// Auth header sent; vuln-api lookup errors fail closed.
+    Authenticated { token: String },
+}
+
+impl VerdictMode {
+    fn auth_token(&self) -> Option<&str> {
+        match self {
+            VerdictMode::Public => None,
+            VerdictMode::Authenticated { token } => Some(token.as_str()),
+        }
+    }
+}
+
+/// Connection details for the vuln-api verdict pass.
+/// Public mode is still a verdict pass: known vulnerable/malicious verdicts
+/// block, while lookup errors warn and continue.
 #[derive(Debug, Clone)]
 pub struct VerdictConfig {
     pub base_url: String,
+    pub mode: VerdictMode,
+    /// Print the tokenless public-mode hint after a check is attempted.
+    pub public_login_hint: bool,
 }
 
 /// Threat verdict for one resolved target.
@@ -100,19 +121,24 @@ pub enum VerdictStatus {
     Clean,
     /// vuln-api answered: known vulnerable or malicious — blocks.
     Vulnerable(Vec<crate::vuln_api::VulnMatch>),
-    /// The verdict could not be obtained (network/5xx/integrity).
-    /// Public mode fails open: warns, never blocks.
+    /// The verdict could not be obtained (network/5xx/auth/integrity).
+    /// Blocks only in authenticated mode.
     Unverifiable(String),
     /// Verdict never attempted (no `VerdictConfig`).
     NotChecked,
 }
 
 impl VerdictStatus {
-    /// Whether this verdict blocks the install. The single definition of
-    /// "blocking finding", shared by `verdict::block_reason` and the
-    /// refusal-blame predicate.
-    fn blocks(&self) -> bool {
-        matches!(self, VerdictStatus::Vulnerable(_))
+    /// Whether this verdict blocks the install: vulnerable always;
+    /// unverifiable only when the mode fails closed (authenticated).
+    /// The single definition of "blocking finding", shared by
+    /// `verdict::block_reason` and the refusal-blame predicate.
+    fn blocks(&self, fail_closed: bool) -> bool {
+        match self {
+            VerdictStatus::Vulnerable(_) => true,
+            VerdictStatus::Unverifiable(_) => fail_closed,
+            VerdictStatus::Clean | VerdictStatus::NotChecked => false,
+        }
     }
 }
 
@@ -386,11 +412,15 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
 
     warn_registry_override(manager, rest);
 
-    // Project guard. `--force` (documented as overriding every block) is
+    // Project guards. `--force` (documented as overriding every block) is
     // the escape hatch — a stray ancestor lockfile must not leave the
     // command permanently refused.
     if !opts.force {
         if let Some(message) = detect::wrong_package_manager_message(manager, rest, &parsed) {
+            return refuse_guard(&opts, message, 1);
+        }
+
+        if let Some(message) = detect::externally_managed_pip_message(manager, rest, &parsed) {
             return refuse_guard(&opts, message, 1);
         }
     }
@@ -625,6 +655,11 @@ fn run_parsed_install(
     // those files (fallback to named-only, or verdicts disabled).
     if !matches!(&tree, Some(TreeReport::Full { .. })) {
         render::requirements_note(&parsed);
+    }
+    if verdict::public_verdict(&opts).is_some_and(|cfg| cfg.public_login_hint) {
+        eprintln!(
+            "warning: using public CVE checks; login enables authenticated enforcement and private Corgea intelligence."
+        );
     }
 
     let report = PrecheckReport {

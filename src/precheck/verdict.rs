@@ -16,8 +16,9 @@ const VERDICT_PROGRESS_THRESHOLD: usize = 8;
 const VERDICT_CONCURRENCY: usize = 8;
 
 /// Bounded worker pool over the verdict jobs. On client/request failure every
-/// job comes back `Unverifiable`, which warns but never blocks: public
-/// lookups fail open. Order is preserved: result `i` belongs to job `i`.
+/// job comes back `Unverifiable`; `block_reason` decides whether that
+/// fails closed for the selected mode. Order is preserved: result `i`
+/// belongs to job `i`.
 pub(super) fn verdict_pool(
     jobs: Vec<tree::TreePackage>,
     cfg: &VerdictConfig,
@@ -45,6 +46,7 @@ pub(super) fn verdict_pool(
             |job| match crate::vuln_api::check_package_version(
                 &client,
                 &cfg.base_url,
+                cfg.mode.auth_token(),
                 ecosystem,
                 &job.name,
                 &job.version,
@@ -55,6 +57,22 @@ pub(super) fn verdict_pool(
             },
         );
     jobs.into_iter().zip(verdicts).collect()
+}
+
+/// Authenticated mode fails closed: lookup errors block instead of warning.
+pub(super) fn authenticated_verdict(opts: &PrecheckOptions) -> bool {
+    opts.verdict
+        .as_ref()
+        .is_some_and(|cfg| cfg.mode.auth_token().is_some())
+}
+
+/// The verdict config when running in fail-open public mode; `None` when
+/// verdicts are off or authenticated. The one definition of "public mode",
+/// dual of `authenticated_verdict`.
+pub(super) fn public_verdict(opts: &PrecheckOptions) -> Option<&VerdictConfig> {
+    opts.verdict
+        .as_ref()
+        .filter(|cfg| matches!(cfg.mode, super::VerdictMode::Public))
 }
 
 /// Order-preserving bounded worker pool: `results[i]` is `f(&items[i])`.
@@ -162,8 +180,13 @@ pub(super) fn block_reason(report: &PrecheckReport, opts: &PrecheckOptions) -> O
     if opts.force {
         return None;
     }
-    if report.verdicts().any(|v| v.blocks()) {
-        return Some(if blames_existing_tree(report) {
+    // A resolution error means no verdict was obtained for that target, so
+    // in authenticated mode it fails closed like `Unverifiable` — otherwise a
+    // registry outage silently bypasses the gate.
+    let fail_closed = authenticated_verdict(opts);
+    if report.verdicts().any(|v| v.blocks(fail_closed)) || (fail_closed && report.error_count() > 0)
+    {
+        return Some(if blames_existing_tree(report, opts) {
             BlockReason::ExistingTree
         } else {
             BlockReason::Findings
@@ -184,8 +207,9 @@ pub(super) fn block_reason(report: &PrecheckReport, opts: &PrecheckOptions) -> O
 /// files is being pulled in by them right now. Only a truly bare install
 /// (`report.bare_install`) or manifest-declared `PreExisting` findings may
 /// blame the existing tree.
-fn blames_existing_tree(report: &PrecheckReport) -> bool {
-    let named_blocks = report.named_verdicts().any(|v| v.blocks());
+fn blames_existing_tree(report: &PrecheckReport, opts: &PrecheckOptions) -> bool {
+    let fail_closed = authenticated_verdict(opts);
+    let named_blocks = report.named_verdicts().any(|v| v.blocks(fail_closed));
     if report.vulnerable_count() == 0 || named_blocks {
         return false;
     }
@@ -194,9 +218,9 @@ fn blames_existing_tree(report: &PrecheckReport) -> bool {
     };
     transitive
         .iter()
-        .filter(|t| t.verdict.blocks())
+        .filter(|t| t.verdict.blocks(fail_closed))
         .all(|t| match t.origin {
-            // A locked pin predates the `npm ci` that installs it.
+            // A locked pin predates the `npm ci` / `uv sync` that installs it.
             TreeOrigin::PreExisting | TreeOrigin::Locked => true,
             TreeOrigin::Requested => false,
             TreeOrigin::Transitive => report.bare_install,
@@ -276,10 +300,9 @@ mod tests {
         block_reason(report, opts).is_some()
     }
 
-    /// Predicate matrix: force ⇒ never block; vulnerable always blocks
-    /// (`--no-fail` must not waive it); unverifiable findings and resolution
-    /// errors never block (public mode fails open); recency blocks unless
-    /// `--no-fail` demotes it.
+    /// Predicate matrix: force ⇒ never block; vulnerable blocks in every
+    /// verdict mode; unverifiable/error findings block only in authenticated
+    /// mode; recency keeps its --no-fail demotion.
     #[test]
     fn block_predicate_matrix() {
         let clean = {
@@ -325,8 +348,16 @@ mod tests {
             "public mode must fail open on lookup errors"
         );
         assert!(
+            should_block_install(&unverifiable, &authenticated_opts(true, false)),
+            "authenticated mode must fail closed on lookup errors"
+        );
+        assert!(
             !should_block_install(&resolution_error, &public_opts(false, false)),
             "public mode must fail open when no verdict can be obtained"
+        );
+        assert!(
+            should_block_install(&resolution_error, &authenticated_opts(false, false)),
+            "authenticated mode must fail closed when no verdict can be obtained"
         );
         for report in [
             &clean,
@@ -339,6 +370,10 @@ mod tests {
                 !should_block_install(report, &public_opts(false, true)),
                 "--force must never block"
             );
+            assert!(!should_block_install(
+                report,
+                &authenticated_opts(true, true)
+            ));
         }
     }
 
@@ -410,7 +445,7 @@ mod tests {
                 transitive: vec![tree_vulnerable(origin)],
             });
             assert_eq!(
-                blames_existing_tree(&report),
+                blames_existing_tree(&report, &authenticated_opts(false, false)),
                 blames_tree,
                 "origin {origin:?}, with_named {with_named}, bare {bare_install}"
             );
@@ -433,7 +468,7 @@ mod tests {
                 origin: TreeOrigin::PreExisting,
             }],
         });
-        assert!(!blames_existing_tree(&report));
+        assert!(!blames_existing_tree(&report, &public_opts(false, false)));
     }
 
     /// Verdict pass against an in-process stub: vulnerable body → Vulnerable
@@ -504,6 +539,10 @@ mod tests {
 
         let cfg = VerdictConfig {
             base_url: stub.base_url.clone(),
+            mode: super::super::VerdictMode::Authenticated {
+                token: "test-token".to_string(),
+            },
+            public_login_hint: false,
         };
 
         let jobs: Vec<tree::TreePackage> = ["a", "b", "evil", "c", "d", "e"]

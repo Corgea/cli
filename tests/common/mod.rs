@@ -29,6 +29,7 @@ pub fn corgea_isolated() -> (Command, TempDir) {
         .env_remove("CORGEA_NPM_REGISTRY")
         .env_remove("CORGEA_PYPI_REGISTRY")
         .env_remove("CORGEA_VULN_API_URL")
+        .env_remove("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL")
         .env_remove("AI_AGENT")
         .env_remove("CODEX_SANDBOX")
         .env_remove("CLAUDECODE")
@@ -323,6 +324,11 @@ impl GateHarness {
         self
     }
 
+    pub fn token(mut self, token: &str) -> Self {
+        self.cmd.env("CORGEA_TOKEN", token);
+        self
+    }
+
     pub fn in_project_dir(mut self) -> Self {
         let project = TempDir::new().expect("project dir");
         self.cmd.current_dir(project.path());
@@ -380,21 +386,26 @@ impl GateHarness {
 /// published 2020 → recency never blocks), a report-less fake pip
 /// (recording its argv to a marker), and a vuln-api stub. Every block in a
 /// `pip_harness` test is the verdict's doing.
+/// `token: None` exercises public mode (no CORGEA_TOKEN set).
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn pip_harness(
     checks: HashMap<PackageKey, String>,
     statuses: HashMap<PackageKey, u16>,
+    token: Option<&str>,
     pip_exit_code: i32,
 ) -> GateHarness {
     // RESOLUTION_FAILS models an old pip with no `--report`: the tree
     // dry-run exits 2, so these tests exercise the named-only fallback.
-    GateHarness::new()
+    let mut h = GateHarness::new()
         .fake_tree_pm("pip", RESOLUTION_FAILS, pip_exit_code)
         .wildcard_pypi_registry()
         .vuln_checks(checks)
-        .vuln_statuses(statuses)
-        .build()
+        .vuln_statuses(statuses);
+    if let Some(t) = token {
+        h = h.token(t);
+    }
+    h.build()
 }
 
 /// `corgea` wired to the oldpkg registry stub, a tree-aware fake `binary`
