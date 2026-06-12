@@ -472,6 +472,60 @@ fn node_wrong_manager_lockfiles_block_with_suggestions() {
 }
 
 #[test]
+fn force_overrides_the_wrong_manager_guard() {
+    // `--force` is documented as overriding every block; a stray ancestor
+    // lockfile must not leave the command permanently refused.
+    let (mut h, _hits) = wrapper_with_hits("npm", "CORGEA_NPM_REGISTRY", 0);
+    let project = TempDir::new().expect("project dir");
+    std::fs::write(project.path().join("package.json"), r#"{"name":"proj"}"#)
+        .expect("write package.json");
+    std::fs::write(project.path().join("yarn.lock"), "# yarn lockfile v1\n")
+        .expect("write lockfile");
+
+    let out = h
+        .cmd
+        .current_dir(project.path())
+        .args(["npm", "--force", "i", "oldpkg"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--force must bypass the wrong-manager refusal: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.recorded_argv().as_deref(), Some("i oldpkg"));
+}
+
+#[test]
+fn fresh_project_is_not_blamed_for_ancestor_lockfiles() {
+    // A project with its own package.json (but no lockfile or
+    // packageManager field) is the project boundary: a stray lockfile
+    // further up must not hard-refuse installs in it.
+    let (mut h, _hits) = wrapper_with_hits("yarn", "CORGEA_NPM_REGISTRY", 0);
+    let outer = TempDir::new().expect("outer dir");
+    std::fs::write(outer.path().join("package-lock.json"), "{}").expect("write stray lock");
+    let project = outer.path().join("newapp");
+    std::fs::create_dir(&project).expect("mkdir");
+    std::fs::write(project.join("package.json"), r#"{"name":"newapp"}"#)
+        .expect("write package.json");
+
+    let out = h
+        .cmd
+        .current_dir(&project)
+        .args(["yarn", "add", "oldpkg"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "fresh project must not inherit the ancestor lockfile: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.recorded_argv().as_deref(), Some("add oldpkg"));
+}
+
+#[test]
 fn package_manager_field_beats_missing_lockfile_for_node_guard() {
     let (mut h, registry_hits) = wrapper_with_hits("npm", "CORGEA_NPM_REGISTRY", 0);
     let project = TempDir::new().expect("project dir");

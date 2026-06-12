@@ -343,6 +343,18 @@ impl GateHarness {
         self
     }
 
+    /// Re-point the corgea invocation at a (created) subdirectory of the
+    /// project dir — for tests proving ancestor-walk behavior.
+    pub fn in_subdir(mut self, name: &str) -> Self {
+        if self.project.is_none() {
+            self = self.in_project_dir();
+        }
+        let dir = self.project.as_ref().unwrap().path().join(name);
+        std::fs::create_dir_all(&dir).expect("create subdir");
+        self.cmd.current_dir(&dir);
+        self
+    }
+
     pub fn build(mut self) -> Self {
         let stub = corgea::vuln_api_stub::spawn_with_statuses(
             std::mem::take(&mut self.checks),

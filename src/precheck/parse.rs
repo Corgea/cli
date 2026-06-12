@@ -68,6 +68,11 @@ pub enum UvCommand<'a> {
     PipInstall {
         install_args: &'a [String],
     },
+    /// `uv pip sync reqs.txt` — installs exactly the given requirements
+    /// set; gated like `uv pip install -r reqs.txt`.
+    PipSync {
+        sync_args: &'a [String],
+    },
     Add {
         add_args: &'a [String],
     },
@@ -83,11 +88,26 @@ pub fn classify_uv_command(cmd: &[String]) -> UvCommand<'_> {
                 install_args: &cmd[2..],
             }
         }
+        Some("pip") if cmd.get(1).map(String::as_str) == Some("sync") => UvCommand::PipSync {
+            sync_args: &cmd[2..],
+        },
         Some("add") => UvCommand::Add {
             add_args: &cmd[1..],
         },
         Some("sync") => UvCommand::Sync,
         _ => UvCommand::Passthrough,
+    }
+}
+
+/// `uv pip sync` argument list: positionals are requirements files, not
+/// package specs.
+pub fn parse_pip_sync_args(args: &[String]) -> ParsedInstall {
+    let split = extract_node_positionals(PackageManager::Uv, args);
+    let mut requirements_files = split.requirements_files;
+    requirements_files.extend(split.specs.iter().map(PathBuf::from));
+    ParsedInstall {
+        targets: Vec::new(),
+        requirements_files,
     }
 }
 
@@ -104,7 +124,7 @@ struct PositionalSplit {
 /// heuristic still backstops anything unlisted. The same letter can differ
 /// by manager: npm's `-w <name>` takes a value, while pnpm's `-w`
 /// (workspace-root) and yarn's `-W` are boolean.
-fn takes_value(manager: PackageManager, flag: &str) -> bool {
+pub(super) fn takes_value(manager: PackageManager, flag: &str) -> bool {
     match manager {
         PackageManager::Npm => matches!(
             flag,
@@ -115,20 +135,111 @@ fn takes_value(manager: PackageManager, flag: &str) -> bool {
                 | "--omit"
                 | "--include"
                 | "--loglevel"
+                | "--install-strategy"
+                | "--before"
+                | "--cpu"
+                | "--os"
+                | "--libc"
+                | "--otp"
+                | "--location"
+                | "--cache"
+                | "--script-shell"
+                | "--userconfig"
+                | "--globalconfig"
+                | "--depth"
         ),
         PackageManager::Pnpm => matches!(
             flag,
-            "-C" | "--dir" | "--filter" | "--registry" | "--reporter" | "--loglevel"
+            "-C" | "--dir"
+                | "--filter"
+                | "--registry"
+                | "--reporter"
+                | "--loglevel"
+                | "--store-dir"
+                | "--virtual-store-dir"
+                | "--modules-dir"
+                | "--lockfile-dir"
         ),
         PackageManager::Yarn => matches!(
             flag,
-            "--registry" | "--modules-folder" | "--cache-folder" | "--mutex" | "--network-timeout"
+            "--registry"
+                | "--modules-folder"
+                | "--cache-folder"
+                | "--mutex"
+                | "--network-timeout"
+                | "--network-concurrency"
+                | "--global-folder"
+                | "--link-folder"
+                | "--preferred-cache-folder"
         ),
         PackageManager::Uv => matches!(
             flag,
-            "--group" | "--extra" | "--index" | "--tag" | "--branch" | "--rev" | "--package"
+            "--group"
+                | "--extra"
+                | "--index"
+                | "--default-index"
+                | "--index-url"
+                | "--extra-index-url"
+                | "-f"
+                | "--find-links"
+                | "--index-strategy"
+                | "--keyring-provider"
+                | "--tag"
+                | "--branch"
+                | "--rev"
+                | "--package"
+                | "-c"
+                | "--constraints"
+                | "--constraint"
+                | "--overrides"
+                | "-p"
+                | "--python"
+                | "--resolution"
+                | "--prerelease"
+                | "--exclude-newer"
+                | "--directory"
+                | "--project"
+                | "--config-setting"
+                | "--link-mode"
         ),
-        PackageManager::Pip => false,
+        PackageManager::Pip => matches!(
+            flag,
+            "-i" | "--index-url"
+                | "--extra-index-url"
+                | "-f"
+                | "--find-links"
+                | "--platform"
+                | "--python-version"
+                | "--implementation"
+                | "--abi"
+                | "-t"
+                | "--target"
+                | "--prefix"
+                | "--root"
+                | "--src"
+                | "--upgrade-strategy"
+                | "--no-binary"
+                | "--only-binary"
+                | "--progress-bar"
+                | "--proxy"
+                | "--retries"
+                | "--timeout"
+                | "--exists-action"
+                | "--trusted-host"
+                | "--cert"
+                | "--client-cert"
+                | "--cache-dir"
+                | "--log"
+                | "--python"
+                | "--keyring-provider"
+                | "--report"
+                | "--use-feature"
+                | "--use-deprecated"
+                | "--config-settings"
+                | "-C"
+                | "--global-option"
+                | "--hash"
+        ),
     }
 }
 
@@ -154,6 +265,25 @@ fn extract_node_positionals(manager: PackageManager, args: &[String]) -> Positio
             break;
         }
         if a.starts_with('-') {
+            // `uv add -r reqs.txt` adds the file's entries as dependencies —
+            // track the file like pip's `-r` so the gate covers its contents.
+            if manager == PackageManager::Uv {
+                if matches!(a.as_str(), "-r" | "--requirements" | "--requirement") {
+                    if let Some(path) = args.get(i + 1) {
+                        out.requirements_files.push(PathBuf::from(path));
+                    }
+                    i += 2;
+                    continue;
+                }
+                if let Some(rest) = a
+                    .strip_prefix("--requirements=")
+                    .or_else(|| a.strip_prefix("--requirement="))
+                {
+                    out.requirements_files.push(PathBuf::from(rest));
+                    i += 1;
+                    continue;
+                }
+            }
             if !a.contains('=') && takes_value(manager, a) {
                 i += 2;
                 continue;
@@ -227,6 +357,24 @@ fn extract_pip_positionals(args: &[String]) -> Result<PositionalSplit, String> {
             }
             _ => {}
         }
+        // Attached short-option forms (pip's optparse): `-rreqs.txt`,
+        // `-cfile`, `-e./path`. Missing these would silently skip the
+        // whole gate (`-rreqs.txt` would read as a boolean flag and the
+        // install would look bare).
+        if let Some(path) = attached_short_value(a, "-r") {
+            out.requirements_files.push(PathBuf::from(path));
+            i += 1;
+            continue;
+        }
+        if attached_short_value(a, "-c").is_some() {
+            i += 1;
+            continue;
+        }
+        if let Some(path) = attached_short_value(a, "-e") {
+            out.specs.push(format!("-e {}", path));
+            i += 1;
+            continue;
+        }
         // Long-form `--requirement=foo.txt`.
         if let Some(rest) = a.strip_prefix("--requirement=") {
             out.requirements_files.push(PathBuf::from(rest));
@@ -243,6 +391,10 @@ fn extract_pip_positionals(args: &[String]) -> Result<PositionalSplit, String> {
             continue;
         }
         if a.starts_with('-') {
+            if !a.contains('=') && takes_value(PackageManager::Pip, a) {
+                i += 2;
+                continue;
+            }
             i = skip_unknown_flag(args, i);
             continue;
         }
@@ -250,6 +402,13 @@ fn extract_pip_positionals(args: &[String]) -> Result<PositionalSplit, String> {
         i += 1;
     }
     Ok(out)
+}
+
+/// `-rreqs.txt` → `reqs.txt`: the value attached directly to a short
+/// option. `None` for the bare flag itself (handled by the exact-match
+/// arms) and for long `--` forms.
+fn attached_short_value<'a>(arg: &'a str, flag: &str) -> Option<&'a str> {
+    arg.strip_prefix(flag).filter(|rest| !rest.is_empty())
 }
 
 /// Parse a single npm-style positional, e.g. `axios`, `axios@1.0.0`,
@@ -263,6 +422,10 @@ fn parse_npm_spec(raw: &str) -> InstallTarget {
         "git+",
         "git:",
         "git@",
+        "github:",
+        "gist:",
+        "bitbucket:",
+        "gitlab:",
         "ssh://",
         "http://",
         "https://",
@@ -292,6 +455,30 @@ fn parse_npm_spec(raw: &str) -> InstallTarget {
         };
     }
 
+    // Bare `.` / `..` install the current/parent directory; `user/repo`
+    // (one `/`, not an `@scope/` name) is npm's GitHub shorthand. Neither
+    // is a registry package — resolving them would 404 and (in
+    // authenticated mode) block a command plain npm accepts.
+    if trimmed == "." || trimmed == ".." {
+        return InstallTarget {
+            name: trimmed.to_string(),
+            display,
+            kind: TargetKind::Unverifiable {
+                reason: "spec is a filesystem path — registry verification skipped".to_string(),
+            },
+        };
+    }
+    if !trimmed.starts_with('@') && trimmed.contains('/') {
+        return InstallTarget {
+            name: trimmed.to_string(),
+            display,
+            kind: TargetKind::Unverifiable {
+                reason: "spec is a GitHub shorthand or path — registry verification skipped"
+                    .to_string(),
+            },
+        };
+    }
+
     // Find the version separator. Scoped names start with `@` and the
     // version separator is the *next* `@` (if any). Unscoped names
     // use the first `@`.
@@ -317,6 +504,13 @@ fn parse_npm_spec(raw: &str) -> InstallTarget {
         TargetKind::Npm(NpmSpec::Latest)
     } else if semver::Version::parse(spec_str).is_ok() {
         TargetKind::Npm(NpmSpec::Exact(spec_str.to_string()))
+    } else if let Some(rest) = spec_str
+        .strip_prefix('v')
+        .filter(|rest| semver::Version::parse(rest).is_ok())
+    {
+        // npm coerces a leading `v` (`pkg@v1.2.3` installs 1.2.3); without
+        // this it would read as a dist-tag and error.
+        TargetKind::Npm(NpmSpec::Exact(rest.to_string()))
     } else if looks_like_npm_range(spec_str) {
         TargetKind::Npm(NpmSpec::Range(spec_str.to_string()))
     } else if is_npm_dist_tag(spec_str) {
@@ -386,15 +580,46 @@ fn parse_pypi_spec(raw: &str) -> InstallTarget {
         };
     }
 
+    // Strip the PEP 508 environment marker first — its comparison operators
+    // (`; python_version >= "3.7"`) must not be mistaken for version
+    // operators, which would split the name inside the marker.
+    let req_part = trimmed.split(';').next().unwrap_or(trimmed).trim();
+
+    // PEP 508 direct reference: `name @ https://…` — unverifiable like a
+    // bare URL (never a registry lookup, never a block).
+    if let Some((_, after_at)) = req_part.split_once('@') {
+        if after_at.contains("://") {
+            return InstallTarget {
+                name: trimmed.to_string(),
+                display,
+                kind: TargetKind::Unverifiable {
+                    reason: "spec is a PEP 508 direct reference (name @ url) — registry verification skipped".to_string(),
+                },
+            };
+        }
+    }
+
+    // Bare `.` / `..` and anything with a path separator install from the
+    // filesystem (`pip install .`), not the registry.
+    if req_part == "." || req_part == ".." || req_part.contains('/') || req_part.contains('\\') {
+        return InstallTarget {
+            name: trimmed.to_string(),
+            display,
+            kind: TargetKind::Unverifiable {
+                reason: "spec is a filesystem path — registry verification skipped".to_string(),
+            },
+        };
+    }
+
     // Split at the leftmost specifier operator (`==`, `>=`, `<=`, `!=`,
     // `~=`, `>`, `<`; PEP 440 also allows `===`). Only the index matters —
     // the operator itself stays with the spec part.
     let separators = ["===", "==", ">=", "<=", "!=", "~=", ">", "<"];
-    let split_at = separators.iter().filter_map(|sep| trimmed.find(sep)).min();
+    let split_at = separators.iter().filter_map(|sep| req_part.find(sep)).min();
 
     let (name_part, spec_part): (&str, &str) = match split_at {
-        Some(idx) => (&trimmed[..idx], &trimmed[idx..]),
-        None => (trimmed, ""),
+        Some(idx) => (&req_part[..idx], &req_part[idx..]),
+        None => (req_part, ""),
     };
 
     // Strip extras: `requests[security]` -> `requests`.
@@ -403,24 +628,27 @@ fn parse_pypi_spec(raw: &str) -> InstallTarget {
         .map_or(name_part, |(n, _)| n)
         .trim();
 
-    // Strip env markers: `package; python_version >= "3.7"`.
-    let spec_no_marker = spec_part.split(';').next().unwrap_or(spec_part).trim();
+    let spec_str = spec_part.trim();
 
-    let kind = if spec_no_marker.is_empty() {
+    let kind = if spec_str.is_empty() {
         TargetKind::Pypi(PypiSpec::Latest)
-    } else if let Some(rest) = spec_no_marker.strip_prefix("===") {
+    } else if let Some(rest) = spec_str.strip_prefix("===") {
         TargetKind::Pypi(PypiSpec::Exact(rest.trim().to_string()))
-    } else if let Some(rest) = spec_no_marker.strip_prefix("==") {
+    } else if let Some(rest) = spec_str.strip_prefix("==") {
         let v = rest.trim();
         if v.is_empty() {
             TargetKind::Unverifiable {
                 reason: "empty `==` specifier".to_string(),
             }
+        } else if v.contains('*') {
+            // Wildcard pin (`==1.4.*`) — a range, not a literal version;
+            // the resolver desugars it.
+            TargetKind::Pypi(PypiSpec::Specifier(spec_str.to_string()))
         } else {
             TargetKind::Pypi(PypiSpec::Exact(v.to_string()))
         }
     } else {
-        TargetKind::Pypi(PypiSpec::Specifier(spec_no_marker.to_string()))
+        TargetKind::Pypi(PypiSpec::Specifier(spec_str.to_string()))
     };
 
     InstallTarget {
@@ -575,6 +803,7 @@ mod tests {
         let unverifiable = vec![
             "git+https://github.com/x/y.git",
             "git@github.com:x/y.git",
+            "github:expressjs/express",
             "https://example.com/pkg.tgz",
             "file:./local-pkg",
             "./local-pkg",
@@ -582,6 +811,11 @@ mod tests {
             "/abs/path",
             "npm:alias-of-other@1.0.0",
             "workspace:*",
+            // GitHub shorthand and bare paths — registry lookups would 404.
+            "expressjs/express",
+            "user/repo#semver:^1.0.0",
+            ".",
+            "..",
         ];
         for u in unverifiable {
             let t = parse_npm_spec(u);
@@ -591,6 +825,29 @@ mod tests {
                 u
             );
         }
+        // Scoped names keep their one `/` and stay verifiable.
+        assert!(matches!(
+            parse_npm_spec("@types/node").kind,
+            TargetKind::Npm(NpmSpec::Latest)
+        ));
+    }
+
+    #[test]
+    fn parse_npm_spec_coerces_leading_v() {
+        // npm installs `pkg@v1.2.3` as 1.2.3; a dist-tag reading would error.
+        let t = parse_npm_spec("axios@v1.2.3");
+        assert!(
+            matches!(t.kind, TargetKind::Npm(NpmSpec::Exact(ref v)) if v == "1.2.3"),
+            "got {:?}",
+            t.kind
+        );
+        // …but a real tag that merely starts with `v` stays a tag.
+        let t = parse_npm_spec("node@v8-canary");
+        assert!(
+            matches!(t.kind, TargetKind::Npm(NpmSpec::Tag(ref s)) if s == "v8-canary"),
+            "got {:?}",
+            t.kind
+        );
     }
 
     #[test]
@@ -632,13 +889,49 @@ mod tests {
             t.kind
         );
 
+        // A marker-only spec must not split inside the marker: the name is
+        // `pkg` and the (versionless) spec resolves latest.
         let marker_only = parse_pypi_spec("pkg; python_version >= \"3.7\"");
-        assert_eq!(marker_only.name, "pkg; python_version");
+        assert_eq!(marker_only.name, "pkg");
         assert!(
-            matches!(marker_only.kind, TargetKind::Pypi(PypiSpec::Specifier(ref s)) if s == ">= \"3.7\""),
+            matches!(marker_only.kind, TargetKind::Pypi(PypiSpec::Latest)),
             "got {:?}",
             marker_only.kind
         );
+    }
+
+    #[test]
+    fn parse_pypi_spec_wildcard_pin_is_a_specifier() {
+        // `==1.4.*` is a range; matching it as a literal release key would
+        // always miss and block.
+        let t = parse_pypi_spec("django==4.2.*");
+        assert_eq!(t.name, "django");
+        assert!(
+            matches!(t.kind, TargetKind::Pypi(PypiSpec::Specifier(ref s)) if s == "==4.2.*"),
+            "got {:?}",
+            t.kind
+        );
+    }
+
+    #[test]
+    fn parse_pypi_spec_direct_reference_and_paths_are_unverifiable() {
+        // PEP 508 direct reference, bare dot, and separator-bearing paths
+        // must never be looked up (and thus never blocked) as registry names.
+        for spec in [
+            "requests @ https://files.pythonhosted.org/requests-2.31.0.whl",
+            "pkg @ https://example.com/x.whl ; python_version >= \"3.7\"",
+            ".",
+            "..",
+            "sub/dir",
+        ] {
+            let t = parse_pypi_spec(spec);
+            assert!(
+                matches!(t.kind, TargetKind::Unverifiable { .. }),
+                "for '{}': {:?}",
+                spec,
+                t.kind
+            );
+        }
     }
 
     #[test]
@@ -744,5 +1037,65 @@ mod tests {
         assert!(!p
             .requirements_files
             .contains(&PathBuf::from("other-constraints.txt")));
+    }
+
+    #[test]
+    fn pip_attached_short_options_are_recognized() {
+        // pip accepts `-rreqs.txt` (value attached); reading it as a boolean
+        // flag would make the install look bare and skip the gate entirely.
+        let args = vec![
+            "-rreqs.txt".to_string(),
+            "-cconstraints.txt".to_string(),
+            "-e./local".to_string(),
+        ];
+        let p = extract_pip_positionals(&args).unwrap();
+        assert_eq!(p.requirements_files, vec![PathBuf::from("reqs.txt")]);
+        assert!(p.specs.contains(&"-e ./local".to_string()));
+        assert!(!p.specs.contains(&"-cconstraints.txt".to_string()));
+    }
+
+    #[test]
+    fn pip_value_flag_values_are_not_specs() {
+        // A bare-word value of a known value-taking flag must not be
+        // verified (or blocked) as a package.
+        let args = vec![
+            "--platform".to_string(),
+            "win_amd64".to_string(),
+            "--no-binary".to_string(),
+            ":all:".to_string(),
+            "--target".to_string(),
+            "build".to_string(),
+            "requests".to_string(),
+        ];
+        let p = extract_pip_positionals(&args).unwrap();
+        assert_eq!(p.specs, vec!["requests".to_string()]);
+    }
+
+    #[test]
+    fn uv_add_requirements_flag_tracks_the_file() {
+        for args in [
+            vec!["-r".to_string(), "reqs.txt".to_string()],
+            vec!["--requirements".to_string(), "reqs.txt".to_string()],
+            vec!["--requirements=reqs.txt".to_string()],
+        ] {
+            let p = extract_node_positionals(PackageManager::Uv, &args);
+            assert_eq!(
+                p.requirements_files,
+                vec![PathBuf::from("reqs.txt")],
+                "args {args:?}"
+            );
+            assert!(p.specs.is_empty(), "args {args:?}");
+        }
+        // `-c constraints.txt` doesn't add packages — value skipped.
+        let p = extract_node_positionals(
+            PackageManager::Uv,
+            &[
+                "-c".to_string(),
+                "cons.txt".to_string(),
+                "flask".to_string(),
+            ],
+        );
+        assert_eq!(p.specs, vec!["flask".to_string()]);
+        assert!(p.requirements_files.is_empty());
     }
 }

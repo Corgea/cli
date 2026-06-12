@@ -179,6 +179,60 @@ fn bare_npm_without_package_json_passes_through() {
 }
 
 #[test]
+fn bare_npm_install_from_subdirectory_is_gated() {
+    // npm walks ancestors to find the project; the gate must too, or a
+    // bare install from <project>/src would install the whole (vulnerable)
+    // tree silently unchecked.
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("npm", "evildep", "0.4.2"),
+        vulnerable_body("npm", "evildep", "0.4.2", "MAL-2024-0002", None),
+    );
+    let mut h = GateHarness::new()
+        .fake_tree_pm("npm", NPM_LOCK, 0)
+        .oldpkg_registry()
+        .vuln_checks(checks)
+        .token("test-token")
+        .with_project_file("package.json", PACKAGE_JSON)
+        .in_subdir("src")
+        .build();
+    let out = h.cmd.args(["npm", "install"]).output().expect("run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "vulnerable lockfile must block from a subdirectory too"
+    );
+    assert_eq!(
+        h.recorded_argv(),
+        None,
+        "npm must not run on a vulnerable verdict"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("evildep"), "stdout: {stdout}");
+}
+
+#[test]
+fn bare_yarn_with_no_args_prints_note_and_execs() {
+    // `corgea yarn` with zero args IS `yarn install` — it must get the same
+    // honest ungated note instead of a silent exec.
+    let mut h = GateHarness::new()
+        .fake_recorder("yarn", 0)
+        .oldpkg_registry()
+        .vuln_checks(HashMap::new())
+        .token("test-token")
+        .in_project_dir()
+        .build();
+    let out = h.cmd.args(["yarn"]).output().expect("run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(h.recorded_argv().as_deref(), Some("install"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("bare 'yarn install' is not gated"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn bare_npm_tokenless_runs_public_tree_check() {
     // package.json present but no token → public mode still verdicts the tree.
     let mut h = GateHarness::new()

@@ -119,12 +119,22 @@ token: known-vulnerable or malicious versions block, but vuln-api lookup outages
 warn and continue because public mode is fail-open. A Corgea token on the default
 vuln-api enables authenticated enforcement and private Corgea intelligence; in
 that mode, verdict lookup failures also block (fail-closed). Everything else
-passes through with the package manager's own exit code. Git/URL/path specs are
-noted, never blocked. Bare `npm install` (zero specs, `package.json` present) is
-gated too: the full lockfile-resolved tree is verdicted, so a vulnerable lockfile
-blocks. Bare `yarn`/`pnpm`/`uv` installs have no safe dry-run; they run unchecked
-after a stderr note (`note: bare '<pm> <sub>' is not gated …`). `-r requirements.txt`
-files get a printed note when the tree pass doesn't cover them.
+passes through with the package manager's own exit code. Git/URL/path specs
+(including `pip install .`, PEP 508 `name @ url` direct references, and npm
+GitHub shorthand `user/repo`) are noted, never blocked. The install verb is
+found behind global flags (`npm --loglevel silent install x` is still gated).
+Bare `npm install` (zero specs, project `package.json` found like npm finds it
+— nearest ancestor) is gated too: the full lockfile-resolved tree is verdicted,
+so a vulnerable lockfile blocks. `npm ci` (and aliases) is gated from the
+project lockfile directly, like `uv sync`. Bare `yarn` (with or without the
+`install` verb) and bare `pnpm` installs have no safe dry-run; they run
+unchecked after a stderr note (`note: bare '<pm> <sub>' is not gated …`).
+`-r requirements.txt` files get a printed note when the tree pass doesn't
+cover them.
+
+Wrapper flags (`--force`, `--no-fail`, `--json`, `-t`) are read between the
+manager name and the install verb (`corgea npm --force install x`); flags
+after the verb belong to the package manager and are forwarded untouched.
 
 Blocked findings steer to the fix: each advisory line shows `fixed in <version>` (or
 `no fixed version known`). When every advisory on a package has a fix, the gate
@@ -133,13 +143,16 @@ prints `→ safe version: <name>@<version>` — the highest fix covering every a
 The vuln check covers the **full would-install set** where the manager has a safe
 resolver, not just the named targets: `pip` and `npm` resolve the complete tree
 (named + transitive) via a safe dry-run (`pip install --dry-run …`; an isolated
-`npm install --package-lock-only` in a temp dir, never touching your lockfile) and
-verdict every package, so a flagged **transitive** dependency blocks the install
-too. `yarn`, `pnpm`, and `uv` have no safe dry-run, so they verify the named targets
-only and print
+`npm install --package-lock-only` in a temp dir, never touching your lockfile), and
+`uv pip install` / `uv add` / `uv pip sync` resolve theirs via `uv pip compile`;
+every resolved package is verdicted, so a flagged **transitive** dependency blocks
+the install too. `uv sync` is gated from `uv.lock` (found like uv finds it —
+nearest ancestor). `yarn` and `pnpm` have no safe dry-run, so they verify the
+named targets only and print
 `warning: transitive dependencies not checked (…); only named packages were verified.`
-The same warning is emitted (and the gate falls back to named-only) whenever a pip/npm
-dry-run fails. Verdict requests run in a bounded pool (8 parallel).
+The same warning is emitted (and the gate falls back to named-only) whenever a
+dry-run fails or an npm flag redirects the project root (`--prefix`, `-g`).
+Verdict requests run in a bounded pool (8 parallel).
 
 ```bash
 corgea pip install requests==2.31.0   # resolves, checks recency + vuln verdict, then runs pip
@@ -154,7 +167,7 @@ corgea pip list                       # non-install subcommands pass straight th
 |------|-------|-------------|
 | `--threshold` | `-t` | Recency threshold (`2d`, `12h`). Younger resolved versions block. |
 | `--no-fail` | | Demote a recency block to a warning. Does NOT bypass vulnerable blocks or authenticated unverifiable blocks. |
-| `--force` | | Proceed despite all findings (vulnerable, unverifiable, recent). Findings still print. |
+| `--force` | | Proceed despite all findings (vulnerable, unverifiable, recent). Findings still print. Also bypasses the wrong-package-manager and PEP 668 refusals, and unparsable-lockfile refusals on `uv sync`/`npm ci`. |
 | `--json` | | JSON report instead of text. Per-result `verdict` object + `verdict_mode` + `tree`. Stdout carries only the report; the package manager's output moves to stderr. |
 
 `--json` adds `verdict_mode` (`"public"` or `"authenticated"`) and a

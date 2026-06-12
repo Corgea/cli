@@ -359,37 +359,67 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
     }
 
     if cmd.is_empty() {
+        // Bare `yarn` IS `yarn install` — route it through the install
+        // path so the bare-install note prints instead of a silent exec.
+        if manager == PackageManager::Yarn {
+            let install = ["install".to_string()];
+            return run_install(manager, &install, opts);
+        }
         return exec::exec_command(manager.binary_name(), &[]);
     }
 
-    let subcommand = &cmd[0];
-    let rest = &cmd[1..];
+    // The install verb may follow global flags (`npm --silent install x`);
+    // route on the first non-flag token so flags-before-verb can't slip
+    // past the gate ungated.
+    let Some(verb_idx) = find_subcommand(manager, cmd) else {
+        return exec::exec_command(manager.binary_name(), cmd);
+    };
+    let subcommand = &cmd[verb_idx];
+    let rest_vec: Vec<String> = cmd[..verb_idx]
+        .iter()
+        .chain(&cmd[verb_idx + 1..])
+        .cloned()
+        .collect();
+    let rest = rest_vec.as_slice();
 
     if manager == PackageManager::Pip && subcommand == "add" {
-        eprintln!("{}", unsupported_pip_add_message(rest));
-        return 1;
+        return refuse_guard(&opts, unsupported_pip_add_message(rest), 1);
+    }
+
+    // `npm ci` installs the lockfile exactly as written — gate it from the
+    // project lockfile like `uv sync` is gated from `uv.lock`.
+    if manager == PackageManager::Npm
+        && matches!(
+            subcommand.as_str(),
+            "ci" | "ic" | "clean-install" | "install-clean" | "isntall-clean"
+        )
+    {
+        return run_npm_ci(subcommand, rest, opts);
     }
 
     if !manager.is_install_subcommand(subcommand) {
-        return exec::exec_install_with_args(manager, subcommand, rest, false);
+        // Non-install subcommand: transparent passthrough, args untouched.
+        return exec::exec_command(manager.binary_name(), cmd);
     }
 
     let parsed = match parse::parse_install_args(manager, rest) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("failed to parse install args: {}", e);
-            return 2;
+            return refuse_guard(&opts, format!("failed to parse install args: {}", e), 2);
         }
     };
 
-    if let Some(message) = detect::wrong_package_manager_message(manager, rest, &parsed) {
-        eprintln!("{message}");
-        return 1;
-    }
+    // Project guards. `--force` (documented as overriding every block) is
+    // the escape hatch — a stray ancestor lockfile must not leave the
+    // command permanently refused.
+    if !opts.force {
+        if let Some(message) = detect::wrong_package_manager_message(manager, rest, &parsed) {
+            return refuse_guard(&opts, message, 1);
+        }
 
-    if let Some(message) = detect::externally_managed_pip_message(manager, rest, &parsed) {
-        eprintln!("{message}");
-        return 1;
+        if let Some(message) = detect::externally_managed_pip_message(manager, rest, &parsed) {
+            return refuse_guard(&opts, message, 1);
+        }
     }
 
     let json = opts.json;
@@ -401,6 +431,39 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
         || exec::exec_install_with_args(manager, subcommand, rest, json),
         opts,
     )
+}
+
+/// Index of the first non-flag token in `cmd` — the subcommand verb.
+/// Skips flag values with the same `takes_value` table as the arg parsers,
+/// so `npm --loglevel silent install x` routes on `install`, not `silent`.
+/// `None` ⇒ no subcommand at all (flags only, e.g. `npm --version`).
+fn find_subcommand(manager: PackageManager, cmd: &[String]) -> Option<usize> {
+    let mut i = 0;
+    while i < cmd.len() {
+        let a = &cmd[i];
+        if a == "--" {
+            return (i + 1 < cmd.len()).then_some(i + 1);
+        }
+        if !a.starts_with('-') {
+            return Some(i);
+        }
+        i += if !a.contains('=') && parse::takes_value(manager, a) {
+            2
+        } else {
+            1
+        };
+    }
+    None
+}
+
+/// Guard refusals happen before any report exists; under `--json` stdout
+/// must still carry one parseable document.
+fn refuse_guard(opts: &PrecheckOptions, message: String, code: i32) -> i32 {
+    if opts.json {
+        println!("{}", serde_json::json!({ "error": message }));
+    }
+    eprintln!("{message}");
+    code
 }
 
 /// `corgea <words…> <rest…>` — the suggested-command string used by the
@@ -520,6 +583,107 @@ fn run_parsed_install(
     };
 
     report_and_exec(&report, &opts, exec)
+}
+
+/// Gate a lockfile-pinned install (`uv sync`, `npm ci`): verdict every
+/// locked package. Recency isn't checked — locked versions aren't newly
+/// chosen by this command; the verdict pass is the gate.
+fn run_locked_install(
+    manager: PackageManager,
+    subcommand: &str,
+    original_args: Vec<String>,
+    lock: Result<Vec<tree::TreePackage>, String>,
+    opts: &PrecheckOptions,
+    exec: impl FnOnce() -> i32,
+) -> i32 {
+    let Some(cfg) = &opts.verdict else {
+        // Direct callers may still disable verdicts completely.
+        return exec();
+    };
+    let jobs = match lock {
+        Ok(jobs) => jobs,
+        Err(e) if opts.force => {
+            eprintln!(
+                "warning: cannot verify '{} {}' ({e}); proceeding under --force",
+                manager.binary_name(),
+                subcommand
+            );
+            return exec();
+        }
+        Err(e) => {
+            // The single documented bypass of the "all blocking goes through
+            // `verdict::block_reason`" invariant: an unparsable lockfile
+            // means there is no report to feed the predicate, so the gate
+            // refuses directly (--force above is the only escape).
+            eprintln!(
+                "error: cannot verify '{} {}': {e} (pass --force to proceed unchecked)",
+                manager.binary_name(),
+                subcommand
+            );
+            return 1;
+        }
+    };
+
+    let resolved_count = jobs.len();
+    let results = verdict::verdict_pool(jobs, cfg, manager);
+    let transitive = results
+        .into_iter()
+        .map(|(pkg, verdict)| TreeOutcome {
+            name: pkg.name,
+            version: pkg.version,
+            origin: TreeOrigin::Locked,
+            verdict,
+        })
+        .collect();
+    let report = PrecheckReport {
+        manager,
+        subcommand: subcommand.to_string(),
+        original_args,
+        outcomes: Vec::new(),
+        threshold: opts.threshold,
+        tree: Some(TreeReport::Full {
+            resolved_count,
+            transitive,
+        }),
+        bare_install: true,
+    };
+
+    report_and_exec(&report, opts, exec)
+}
+
+/// `npm ci` (and aliases): installs the project lockfile exactly as
+/// written, so the gate verdicts the lockfile-pinned set directly — no
+/// dry-run needed. Without a project or lockfile npm errors on its own;
+/// the gate just execs.
+fn run_npm_ci(subcommand: &str, rest: &[String], opts: PrecheckOptions) -> i32 {
+    let json = opts.json;
+    let exec = || exec::exec_install_with_args(PackageManager::Npm, subcommand, rest, json);
+
+    if opts.verdict.is_none() {
+        return exec();
+    }
+    let Some(root) = tree::npm_project_root() else {
+        return exec();
+    };
+    let Some(lock_path) = ["package-lock.json", "npm-shrinkwrap.json"]
+        .iter()
+        .map(|n| root.join(n))
+        .find(|p| p.is_file())
+    else {
+        return exec();
+    };
+
+    let lock = std::fs::read_to_string(&lock_path)
+        .map_err(|e| format!("read {}: {e}", lock_path.display()))
+        .and_then(|content| tree::parse_npm_lockfile(&content));
+    run_locked_install(
+        PackageManager::Npm,
+        subcommand,
+        rest.to_vec(),
+        lock,
+        &opts,
+        exec,
+    )
 }
 
 /// One verdict job (`requested: true`) per named resolved target, in

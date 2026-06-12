@@ -22,12 +22,28 @@ pub struct TreePackage {
 /// install. pip's dry-run and uv's compile also read `-r` requirements
 /// files, so those make an install eligible even with no named targets.
 /// npm's lockfile resolution reads `package.json`, so a bare `npm install`
-/// is eligible whenever the working directory has one.
+/// is eligible whenever the project (found like npm finds it — nearest
+/// ancestor manifest) has one.
 pub fn covers_input(manager: PackageManager, parsed: &super::parse::ParsedInstall) -> bool {
     !parsed.targets.is_empty()
         || (matches!(manager, PackageManager::Pip | PackageManager::Uv)
             && !parsed.requirements_files.is_empty())
-        || (manager == PackageManager::Npm && std::path::Path::new("package.json").exists())
+        || (manager == PackageManager::Npm && npm_project_root().is_some())
+}
+
+/// Nearest ancestor file named `name`, starting at the CWD.
+pub(super) fn find_up(name: &str) -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    cwd.ancestors()
+        .map(|dir| dir.join(name))
+        .find(|p| p.is_file())
+}
+
+/// The project directory npm itself would operate on: the nearest ancestor
+/// holding `package.json`. A bare `npm install` from a subdirectory
+/// installs THAT project's tree, so the gate must look there too.
+pub(super) fn npm_project_root() -> Option<std::path::PathBuf> {
+    Some(find_up("package.json")?.parent()?.to_path_buf())
 }
 
 /// `Err(reason)`: no safe dry-run for this manager, or the dry-run failed —
@@ -225,12 +241,13 @@ fn parse_compiled_requirements(
     Ok(pkgs)
 }
 
-/// Direct dependency names declared by the project's `package.json` in the
-/// current directory (the manifest `resolve_npm_tree` copies). Empty when
-/// the manifest is absent or unparsable — origin labeling then degrades to
-/// `(transitive)`.
+/// Direct dependency names declared by the project's `package.json` (the
+/// manifest `resolve_npm_tree` copies — nearest ancestor, like npm).
+/// Empty when the manifest is absent or unparsable — origin labeling then
+/// degrades to `(transitive)`.
 pub fn project_direct_deps() -> std::collections::HashSet<String> {
-    std::fs::read_to_string("package.json")
+    npm_project_root()
+        .and_then(|root| std::fs::read_to_string(root.join("package.json")).ok())
         .map(|s| direct_deps_from_manifest(&s))
         .unwrap_or_default()
 }
@@ -260,16 +277,37 @@ fn direct_deps_from_manifest(json: &str) -> std::collections::HashSet<String> {
 /// `--ignore-scripts` because npm has run lifecycle scripts under
 /// `--package-lock-only` before (npm/cli#2787).
 fn resolve_npm_tree(binary: &str, install_args: &[String]) -> Result<Vec<TreePackage>, String> {
+    // Flags that redirect npm's project root would defeat the throwaway-dir
+    // isolation below (`--prefix` overrides `current_dir`, so the dry run
+    // would write the USER'S package-lock.json) — degrade to named-only.
+    const ROOT_REDIRECT_FLAGS: [&str; 5] = ["--prefix", "-C", "--global", "-g", "--location"];
+    if let Some(flag) = install_args.iter().find(|a| {
+        ROOT_REDIRECT_FLAGS
+            .iter()
+            .any(|f| a.as_str() == *f || a.starts_with(&format!("{f}=")))
+    }) {
+        return Err(format!(
+            "'{flag}' redirects npm's project root; lockfile resolution skipped"
+        ));
+    }
+
     let resolved = super::exec::resolve_binary(binary)?;
     let work = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
+    // Copy the manifests from the project npm would operate on (nearest
+    // ancestor package.json), not just the CWD.
+    let root = npm_project_root();
     for manifest in [
         "package.json",
         "package-lock.json",
         "npm-shrinkwrap.json",
         ".npmrc",
     ] {
-        if std::path::Path::new(manifest).exists() {
-            std::fs::copy(manifest, work.path().join(manifest))
+        let src = match &root {
+            Some(root) => root.join(manifest),
+            None => std::path::PathBuf::from(manifest),
+        };
+        if src.exists() {
+            std::fs::copy(&src, work.path().join(manifest))
                 .map_err(|e| format!("copy {manifest}: {e}"))?;
         }
     }
@@ -296,7 +334,7 @@ fn resolve_npm_tree(binary: &str, install_args: &[String]) -> Result<Vec<TreePac
     parse_npm_lockfile(&lock)
 }
 
-fn parse_npm_lockfile(json: &str) -> Result<Vec<TreePackage>, String> {
+pub(super) fn parse_npm_lockfile(json: &str) -> Result<Vec<TreePackage>, String> {
     let lock: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("parse package-lock.json: {e}"))?;
     let packages = lock

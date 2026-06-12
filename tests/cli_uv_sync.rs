@@ -41,6 +41,27 @@ fn vulnerable_evildep_checks() -> HashMap<PackageKey, String> {
 }
 
 #[test]
+fn uv_sync_from_subdirectory_is_gated() {
+    // uv discovers the project by walking up; the gate must find uv.lock
+    // the same way or a sync from <project>/src runs silently ungated.
+    let mut h = GateHarness::new()
+        .fake_recorder("uv", 0)
+        .vuln_checks(vulnerable_evildep_checks())
+        .token("test-token")
+        .with_project_file("uv.lock", UV_LOCK)
+        .in_subdir("src")
+        .build();
+    let out = h.cmd.args(["uv", "sync"]).output().expect("run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "vulnerable ancestor lock must block: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.recorded_argv(), None, "uv must not run");
+}
+
+#[test]
 fn uv_sync_vulnerable_lockfile_blocks() {
     let mut h = GateHarness::new()
         .fake_recorder("uv", 0)

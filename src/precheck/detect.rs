@@ -45,6 +45,13 @@ fn detect_node_manager_from(start: &Path) -> Option<PackageManager> {
             ProjectManagerDetection::Ambiguous => return None,
             ProjectManagerDetection::None => {}
         }
+        // A `package.json` marks the project root (npm/yarn/pnpm scope
+        // their own discovery the same way). A project with no manager
+        // indicators of its own must not inherit a stray ancestor lockfile
+        // — that would hard-refuse installs in every fresh project under it.
+        if dir.join("package.json").is_file() {
+            return None;
+        }
     }
     None
 }
@@ -101,8 +108,20 @@ fn parse_node_package_manager(raw: &str) -> Option<PackageManager> {
     }
 }
 
+/// Walk up looking for `uv.lock`, but stop at the nearest Python project
+/// boundary (a `pyproject.toml` or requirements file without a `uv.lock`
+/// beside it) — symmetric with [`detect_pip_project_from`], so a stray
+/// `~/uv.lock` can't condemn every pip project beneath it.
 fn detect_uv_project_from(start: &Path) -> bool {
-    start.ancestors().any(|dir| dir.join("uv.lock").is_file())
+    for dir in start.ancestors() {
+        if dir.join("uv.lock").is_file() {
+            return true;
+        }
+        if dir.join("pyproject.toml").is_file() || has_requirements_file(dir) {
+            return false;
+        }
+    }
+    false
 }
 
 fn detect_pip_project_from(start: &Path) -> bool {
@@ -248,4 +267,53 @@ fn python_interpreter_from_shebang(path: &Path) -> Option<Vec<OsString>> {
         return None;
     }
     Some(parts.iter().map(OsString::from).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn touch(path: &Path) {
+        std::fs::write(path, "").expect("write marker file");
+    }
+
+    #[test]
+    fn node_walk_stops_at_the_project_boundary() {
+        // A stray ancestor lockfile must not condemn a fresh project that
+        // has its own package.json but no manager indicators yet.
+        let root = tempfile::tempdir().expect("tempdir");
+        touch(&root.path().join("package-lock.json"));
+        let project = root.path().join("newapp");
+        std::fs::create_dir(&project).expect("mkdir");
+        std::fs::write(project.join("package.json"), "{}").expect("write manifest");
+
+        assert_eq!(detect_node_manager_from(&project), None);
+
+        // Without its own package.json the walk still reaches the ancestor.
+        let bare = root.path().join("scratch");
+        std::fs::create_dir(&bare).expect("mkdir");
+        assert_eq!(detect_node_manager_from(&bare), Some(PackageManager::Npm));
+    }
+
+    #[test]
+    fn uv_walk_stops_at_a_nearer_python_project() {
+        // A pip project (requirements/pyproject, no uv.lock) must not be
+        // blamed for a stray uv.lock further up.
+        let root = tempfile::tempdir().expect("tempdir");
+        touch(&root.path().join("uv.lock"));
+        let pip_project = root.path().join("legacy");
+        std::fs::create_dir(&pip_project).expect("mkdir");
+        touch(&pip_project.join("requirements.txt"));
+
+        assert!(!detect_uv_project_from(&pip_project));
+
+        // The uv root itself (uv.lock beside pyproject.toml) still detects.
+        touch(&root.path().join("pyproject.toml"));
+        assert!(detect_uv_project_from(root.path()));
+
+        // And a plain subdirectory of the uv project still walks up to it.
+        let sub = root.path().join("src");
+        std::fs::create_dir(&sub).expect("mkdir");
+        assert!(detect_uv_project_from(&sub));
+    }
 }

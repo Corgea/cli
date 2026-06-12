@@ -212,6 +212,46 @@ fn pip_clean_tree_proceeds() {
 }
 
 #[test]
+fn npm_root_redirect_flag_degrades_to_named_only() {
+    // `--prefix` overrides npm's project root regardless of cwd, so the
+    // throwaway-dir resolution would write the REAL lockfile at that path.
+    // The tree pass must refuse and fall back to named-only instead.
+    let elsewhere = TempDir::new().expect("redirect target");
+    let lock_path = elsewhere.path().join("package-lock.json");
+
+    let mut h = tree_harness("npm", HashMap::new(), HashMap::new(), NPM_LOCK);
+    let out = h
+        .cmd
+        .args([
+            "npm",
+            "install",
+            "--prefix",
+            elsewhere.path().to_str().unwrap(),
+            "oldpkg@1.0.0",
+        ])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0), "clean named target proceeds");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("transitive dependencies not checked") && stderr.contains("--prefix"),
+        "must degrade loudly naming the flag: {stderr}"
+    );
+    assert!(
+        !lock_path.exists(),
+        "the dry run must never write through --prefix"
+    );
+    // The real install still gets the user's full argv.
+    assert_eq!(
+        h.recorded_argv(),
+        Some(format!(
+            "install --prefix {} oldpkg@1.0.0",
+            elsewhere.path().display()
+        ))
+    );
+}
+
+#[test]
 fn npm_does_not_touch_project_lockfile() {
     // Run from a project dir holding sentinel manifests; the resolver works in
     // a throwaway copy, so after a gated run both files are byte-identical.

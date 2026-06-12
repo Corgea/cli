@@ -162,3 +162,51 @@ fn maven_parser_accepts_namespace_prefixes_and_attributes() {
     assert_eq!(node.scope(), Scope::Development);
     assert!(inv.node("ignored-artifact").is_none());
 }
+
+#[test]
+fn maven_parser_reads_cdata_and_comment_split_versions() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(
+        tmp.path().join("pom.xml"),
+        r#"<?xml version="1.0"?>
+<project>
+  <dependencies>
+    <dependency>
+      <groupId>org.example</groupId>
+      <artifactId>cdata-lib</artifactId>
+      <version><![CDATA[1.2.3]]></version>
+    </dependency>
+    <dependency>
+      <groupId>org.example</groupId>
+      <artifactId>split-lib</artifactId>
+      <version>1.<!-- gap -->2</version>
+    </dependency>
+  </dependencies>
+</project>
+"#,
+    )
+    .expect("write pom");
+
+    let inv = scan(tmp.path(), &Policy::default()).expect("scan");
+    let cdata = inv.node("cdata-lib").expect("cdata-lib node");
+    assert_eq!(cdata.version(), Some("1.2.3"));
+    let split = inv.node("split-lib").expect("split-lib node");
+    assert_eq!(split.version(), Some("1.2"));
+}
+
+#[test]
+fn maven_parse_error_names_the_pom() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(
+        tmp.path().join("pom.xml"),
+        "<?xml version=\"1.0\"?>\n<project><dependencies><dependency><groupId>g</groupId><artifactId>a</artifactId><version>1</badtag></dependency></dependencies></project>",
+    )
+    .expect("write pom");
+
+    let err = scan(tmp.path(), &Policy::default()).expect_err("malformed pom must error");
+    assert!(
+        err.0.contains("pom.xml"),
+        "error should name the file: {}",
+        err.0
+    );
+}

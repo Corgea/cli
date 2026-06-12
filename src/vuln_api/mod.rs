@@ -247,8 +247,10 @@ pub fn check_package_version(
 
     let status = response.status();
     // Fixed messages for recognized statuses — tests assert these strings,
-    // keep them stable. 404 means "unknown package": synthesize a clean
-    // verdict instead of erroring.
+    // keep them stable. The /check route answers 200 (empty matches) for
+    // unknown packages; a 404 can only mean a wrong base URL or route, and
+    // treating it as "clean" would silently disable the gate on a
+    // misconfigured endpoint.
     match status.as_u16() {
         401 if token.is_some() => {
             return Err(
@@ -260,13 +262,7 @@ pub fn check_package_version(
         429 => return Err("vuln-api rate-limited this request (retry later)".into()),
         code @ 500..=599 => return Err(format!("vuln-api unavailable (HTTP {})", code).into()),
         404 => {
-            return Ok(VulnCheckResponse {
-                ecosystem: ecosystem.path_segment().to_string(),
-                package_name: name.to_string(),
-                version: version.to_string(),
-                is_vulnerable: false,
-                matches: vec![],
-            });
+            return Err("vuln-api route not found (HTTP 404) — check CORGEA_VULN_API_URL".into());
         }
         code if !status.is_success() => {
             let suffix = error_body_suffix(response);
@@ -415,13 +411,13 @@ mod tests {
     }
 
     #[test]
-    fn check_package_version_404_returns_clean() {
-        let resp =
-            check_with_stub_status(404, r#"{"error":"not found"}"#).expect("404 should be clean");
-        assert!(!resp.is_vulnerable);
-        assert!(resp.matches.is_empty());
-        assert_eq!(resp.package_name, "lodash");
-        assert_eq!(resp.version, "4.17.20");
+    fn check_package_version_404_is_an_error_not_clean() {
+        // The real /check route 200s for unknown packages; 404 means the
+        // base URL/route is wrong. Synthesizing "clean" here would turn a
+        // misconfigured CORGEA_VULN_API_URL into a silent all-clear.
+        let err = check_with_stub_status(404, r#"{"error":"not found"}"#)
+            .expect_err("404 should be an error");
+        assert!(err.to_string().contains("CORGEA_VULN_API_URL"));
     }
 
     #[test]

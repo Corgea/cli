@@ -70,7 +70,10 @@ fn scan_maven_pom(ctx: &mut ScanContext<'_>, dir: &Path, pom_path: &Path) -> Res
 
     dep001(ctx.findings, ctx.policy, &rel, "Maven");
 
-    let deps = parse_pom_dependencies(&content)?;
+    // Name the offending pom — a monorepo scan dies on the first malformed
+    // one, and a path-less error gives nothing to act on.
+    let deps = parse_pom_dependencies(&content)
+        .map_err(|e| DepsError(format!("parse XML {}: {}", pom_path.display(), e.0)))?;
     for dep in deps {
         let name = dep.artifact.clone();
         let declared = dep.version.clone();
@@ -135,17 +138,20 @@ fn parse_pom_dependencies(content: &str) -> Result<Vec<MavenDep>, DepsError> {
             }
             Ok(Event::Text(text)) => {
                 if dep_depth == 2 {
-                    if let (Some(dep), Some(active_field)) = (current.as_mut(), field) {
-                        let value = text
-                            .unescape()
-                            .map(|value| value.trim().to_string())
-                            .unwrap_or_else(|_| {
-                                String::from_utf8_lossy(text.as_ref()).trim().to_string()
-                            });
-                        if !value.is_empty() {
-                            set_maven_field(dep, active_field, value);
-                        }
-                    }
+                    let value = text
+                        .unescape()
+                        .map(|value| value.trim().to_string())
+                        .unwrap_or_else(|_| {
+                            String::from_utf8_lossy(text.as_ref()).trim().to_string()
+                        });
+                    append_maven_field(current.as_mut(), field, &value);
+                }
+            }
+            // `<version><![CDATA[1.2.3]]></version>` — CDATA is element text.
+            Ok(Event::CData(text)) => {
+                if dep_depth == 2 {
+                    let value = String::from_utf8_lossy(text.as_ref()).trim().to_string();
+                    append_maven_field(current.as_mut(), field, &value);
                 }
             }
             Ok(Event::End(ref e)) => {
@@ -176,7 +182,7 @@ fn parse_pom_dependencies(content: &str) -> Result<Vec<MavenDep>, DepsError> {
                 }
             }
             Ok(Event::Eof) => break,
-            Err(e) => return Err(DepsError(format!("parse XML: {e}"))),
+            Err(e) => return Err(DepsError(e.to_string())),
             _ => {}
         }
         buf.clear();
@@ -199,13 +205,23 @@ fn maven_field_from_tag(tag: &[u8]) -> Option<MavenField> {
     }
 }
 
-fn set_maven_field(dep: &mut PartialMavenDep, field: MavenField, value: String) {
-    match field {
-        MavenField::Group => dep.group = value,
-        MavenField::Artifact => dep.artifact = value,
-        MavenField::Version => dep.version = value,
-        MavenField::Scope => dep.scope = value,
+/// Append a text/CDATA segment to the active field. Appending (rather than
+/// assigning) keeps values split by inline comments intact:
+/// `<version>1.<!-- -->2</version>` is `1.2`, not `2`.
+fn append_maven_field(dep: Option<&mut PartialMavenDep>, field: Option<MavenField>, value: &str) {
+    if value.is_empty() {
+        return;
     }
+    let (Some(dep), Some(field)) = (dep, field) else {
+        return;
+    };
+    let slot = match field {
+        MavenField::Group => &mut dep.group,
+        MavenField::Artifact => &mut dep.artifact,
+        MavenField::Version => &mut dep.version,
+        MavenField::Scope => &mut dep.scope,
+    };
+    slot.push_str(value);
 }
 
 fn scan_gradle(ctx: &mut ScanContext<'_>, dir: &Path, gradle_path: &Path) -> Result<(), DepsError> {

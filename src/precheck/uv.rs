@@ -1,18 +1,14 @@
-//! `corgea uv` routing: `uv pip install` / `uv add` reuse the parsed-install
-//! gate; `uv sync` is gated from `uv.lock`.
+//! `corgea uv` routing: `uv pip install` / `uv add` / `uv pip sync` reuse
+//! the parsed-install gate; `uv sync` is gated from `uv.lock`.
 
-use super::{
-    corgea_cmd, detect, exec, parse, tree, verdict, PackageManager, PrecheckOptions,
-    PrecheckReport, TreeOrigin, TreeOutcome, TreeReport,
-};
+use super::{corgea_cmd, detect, exec, parse, tree, PackageManager, PrecheckOptions};
 
 pub(super) fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
     let json = opts.json;
     let exec = move || exec::exec_command_with_stdio("uv", cmd, json);
 
     if matches!(cmd.first().map(String::as_str), Some("install" | "i")) {
-        eprintln!("{}", unsupported_uv_install_message(&cmd[1..]));
-        return 1;
+        return super::refuse_guard(&opts, unsupported_uv_install_message(&cmd[1..]), 1);
     }
 
     match parse::classify_uv_command(cmd) {
@@ -22,8 +18,11 @@ pub(super) fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
             let parsed = match parse::parse_pip_install_args(install_args) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("failed to parse install args: {}", e);
-                    return 2;
+                    return super::refuse_guard(
+                        &opts,
+                        format!("failed to parse install args: {}", e),
+                        2,
+                    );
                 }
             };
             super::run_parsed_install(
@@ -35,13 +34,31 @@ pub(super) fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
                 opts,
             )
         }
+        parse::UvCommand::PipSync { sync_args } => {
+            // `uv pip sync reqs.txt` installs exactly the given requirements
+            // set — gate it like `uv pip install -r reqs.txt`.
+            let parsed = parse::parse_pip_sync_args(sync_args);
+            if parsed.requirements_files.is_empty() {
+                // No files named: uv errors on its own.
+                return exec::exec_command("uv", cmd);
+            }
+            super::run_parsed_install(
+                PackageManager::Uv,
+                "pip sync",
+                sync_args,
+                parsed,
+                exec,
+                opts,
+            )
+        }
         parse::UvCommand::Add { add_args } => {
             let parsed = parse::parse_pypi_positionals_args(add_args);
-            if let Some(message) =
-                detect::wrong_package_manager_message(PackageManager::Uv, add_args, &parsed)
-            {
-                eprintln!("{message}");
-                return 1;
+            if !opts.force {
+                if let Some(message) =
+                    detect::wrong_package_manager_message(PackageManager::Uv, add_args, &parsed)
+                {
+                    return super::refuse_guard(&opts, message, 1);
+                }
             }
             super::run_parsed_install(PackageManager::Uv, "add", add_args, parsed, exec, opts)
         }
@@ -64,60 +81,29 @@ fn unsupported_uv_install_message(rest: &[String]) -> String {
 /// never run `uv lock` ourselves — locking can build sdists, which would
 /// execute package code before any verdict.
 fn run_uv_sync(cmd: &[String], opts: PrecheckOptions, exec: impl FnOnce() -> i32) -> i32 {
-    let Some(cfg) = &opts.verdict else {
+    if opts.verdict.is_none() {
         // Direct callers may still disable verdicts completely.
         return exec();
+    }
+    // uv discovers the project by walking up from the CWD — find `uv.lock`
+    // the same way, so a sync run from a project subdirectory stays gated.
+    let Some(lock_path) = tree::find_up("uv.lock") else {
+        eprintln!(
+            "note: no uv.lock here — 'uv sync' is not gated; dependencies install unchecked (run 'uv lock' first to enable the gate)"
+        );
+        return exec();
     };
-    let lock = match std::fs::read_to_string("uv.lock") {
-        Ok(content) => content,
-        Err(_) => {
-            eprintln!(
-                "note: no uv.lock here — 'uv sync' is not gated; dependencies install unchecked (run 'uv lock' first to enable the gate)"
-            );
-            return exec();
-        }
-    };
-    let jobs = match parse_uv_lock(&lock) {
-        Ok(jobs) => jobs,
-        Err(e) if opts.force => {
-            eprintln!("warning: cannot verify 'uv sync' ({e}); proceeding under --force");
-            return exec();
-        }
-        Err(e) => {
-            // The single documented bypass of the "all blocking goes through
-            // `verdict::block_reason`" invariant: an unparsable
-            // uv.lock means there is no report to feed the predicate, so the
-            // gate refuses directly (--force above is the only escape).
-            eprintln!("error: cannot verify 'uv sync': {e} (pass --force to proceed unchecked)");
-            return 1;
-        }
-    };
-
-    let resolved_count = jobs.len();
-    let results = verdict::verdict_pool(jobs, cfg, PackageManager::Uv);
-    let transitive = results
-        .into_iter()
-        .map(|(pkg, verdict)| TreeOutcome {
-            name: pkg.name,
-            version: pkg.version,
-            origin: TreeOrigin::Locked,
-            verdict,
-        })
-        .collect();
-    let report = PrecheckReport {
-        manager: PackageManager::Uv,
-        subcommand: "sync".to_string(),
-        original_args: cmd[1..].to_vec(),
-        outcomes: Vec::new(),
-        threshold: opts.threshold,
-        tree: Some(TreeReport::Full {
-            resolved_count,
-            transitive,
-        }),
-        bare_install: true,
-    };
-
-    super::report_and_exec(&report, &opts, exec)
+    let lock = std::fs::read_to_string(&lock_path)
+        .map_err(|e| format!("read {}: {e}", lock_path.display()))
+        .and_then(|content| parse_uv_lock(&content));
+    super::run_locked_install(
+        PackageManager::Uv,
+        "sync",
+        cmd[1..].to_vec(),
+        lock,
+        &opts,
+        exec,
+    )
 }
 
 /// Packages from `uv.lock` that `uv sync` installs from an index. Local

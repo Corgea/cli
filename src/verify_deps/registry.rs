@@ -228,16 +228,71 @@ pub fn npm_resolve(
     })
 }
 
-/// Translate an npm-style version range (`>=1.0.0 <2.0.0`,
-/// `1.x`, `>=1.0.0`) to a `semver::VersionReq`. The Rust crate uses
-/// `,` as the AND separator, npm uses whitespace, so we normalise
-/// before parsing. npm's `||` OR syntax is unsupported — best-effort skipped.
-fn parse_npm_range(range: &str) -> Option<semver::VersionReq> {
-    if let Ok(req) = semver::VersionReq::parse(range) {
+/// Translate an npm-style version range to `semver::VersionReq`
+/// alternatives (one per `||` branch — any-match). Handles npm grammar
+/// the Rust crate doesn't: whitespace AND separators, hyphen ranges
+/// (`1.0.0 - 2.0.0`), `||` unions, and bare partials (`1.0`, which npm
+/// reads as `1.0.x` but Cargo would read as `^1.0`).
+fn parse_npm_range(range: &str) -> Option<Vec<semver::VersionReq>> {
+    range
+        .split("||")
+        .map(|alt| parse_npm_range_alternative(alt.trim()))
+        .collect()
+}
+
+fn parse_npm_range_alternative(alt: &str) -> Option<semver::VersionReq> {
+    if let Some((lo, hi)) = alt.split_once(" - ") {
+        return hyphen_range(lo.trim(), hi.trim());
+    }
+    if let Some(tilde) = bare_partial_to_tilde(alt) {
+        return semver::VersionReq::parse(&tilde).ok();
+    }
+    if let Ok(req) = semver::VersionReq::parse(alt) {
         return Some(req);
     }
-    let normalised = range.split_whitespace().collect::<Vec<_>>().join(",");
+    let normalised = alt.split_whitespace().collect::<Vec<_>>().join(",");
     semver::VersionReq::parse(&normalised).ok()
+}
+
+/// node-semver hyphen range `A - B`. A partial low bound fills with zeros
+/// (`1.2` → `>=1.2.0`); a partial high bound excludes the next component
+/// (`- 2.3` → `<2.4.0`, `- 2` → `<3.0.0`), matching npm.
+fn hyphen_range(lo: &str, hi: &str) -> Option<semver::VersionReq> {
+    let lo_v = pad_partial(lo)?;
+    let hi_segments = hi.split('.').count();
+    let hi_v = pad_partial(hi)?;
+    let expr = match hi_segments {
+        1 => format!(">={lo_v}, <{}", semver::Version::new(hi_v.major + 1, 0, 0)),
+        2 => format!(
+            ">={lo_v}, <{}",
+            semver::Version::new(hi_v.major, hi_v.minor + 1, 0)
+        ),
+        _ => format!(">={lo_v}, <={hi_v}"),
+    };
+    semver::VersionReq::parse(&expr).ok()
+}
+
+/// `1.2` → `1.2.0` (accepts an optional leading `v`, like npm).
+fn pad_partial(v: &str) -> Option<semver::Version> {
+    let v = v.trim();
+    let v = v.strip_prefix('v').unwrap_or(v);
+    let mut segments: Vec<&str> = v.split('.').collect();
+    while segments.len() < 3 {
+        segments.push("0");
+    }
+    semver::Version::parse(&segments.join(".")).ok()
+}
+
+/// npm desugars a bare two-component version (`1.0`) to the x-range
+/// `1.0.x`; Cargo's `VersionReq` would read it as caret (`^1.0`, matching
+/// 1.9). Translate to tilde, which has npm's intended bounds.
+fn bare_partial_to_tilde(alt: &str) -> Option<String> {
+    let segments: Vec<&str> = alt.split('.').collect();
+    (segments.len() == 2
+        && segments
+            .iter()
+            .all(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())))
+    .then(|| format!("~{alt}"))
 }
 
 /// Pick the highest published version that satisfies `range`. Pre-releases
@@ -246,12 +301,14 @@ fn npm_pick_highest_matching(
     versions: &std::collections::BTreeMap<String, serde::de::IgnoredAny>,
     range: &str,
 ) -> Option<String> {
-    let req = parse_npm_range(range)?;
-    let range_has_prerelease = range.contains('-');
+    let reqs = parse_npm_range(range)?;
+    let range_has_prerelease = range.contains('-') && !range.contains(" - ");
     versions
         .keys()
         .filter_map(|raw| semver::Version::parse(raw).ok().map(|v| (v, raw)))
-        .filter(|(v, _)| (v.pre.is_empty() || range_has_prerelease) && req.matches(v))
+        .filter(|(v, _)| {
+            (v.pre.is_empty() || range_has_prerelease) && reqs.iter().any(|req| req.matches(v))
+        })
         .max_by(|(a, _), (b, _)| a.cmp(b))
         .map(|(_, raw)| raw.clone())
 }
@@ -301,12 +358,21 @@ pub fn pypi_resolve(
         candidates.iter().filter(|c| !c.yanked).cloned().collect();
     let chosen = match spec {
         PypiSpec::Latest => pick_latest_stable(&installable).map(|c| c.version.clone()),
+        // PEP 440 equality, not string equality: `==2.31` must match the
+        // release key `2.31.0` (and resolve to the key, so the publish-time
+        // lookup below finds it).
         PypiSpec::Exact(v) => {
-            if candidates.iter().any(|c| &c.version == v) {
-                Some(v.clone())
-            } else {
-                None
-            }
+            let want = PypiVersion::parse(v);
+            candidates
+                .iter()
+                .find(|c| {
+                    &c.version == v
+                        || matches!(
+                            (&want, PypiVersion::parse(&c.version)),
+                            (Some(w), Some(cv)) if *w == cv
+                        )
+                })
+                .map(|c| c.version.clone())
         }
         PypiSpec::Specifier(spec_str) => pypi_resolve_specifier(&installable, spec_str)
             .map_err(|e| format!("{} for '{}'", e, name))?,
@@ -380,16 +446,48 @@ fn collect_pypi_candidates(meta: &PypiInfoResponse) -> Vec<PypiCandidate> {
     out
 }
 
-/// Pick the latest non-prerelease version using `semver` parsing as a
-/// best-effort PEP 440 ordering. Falls back to the entry with the
-/// latest upload time if no candidate parses as semver.
+/// PEP 440-ish ordering key: the semver-parsed release plus its `.postN`
+/// number. Post-releases order after their base (`1.0.post1` > `1.0`) and
+/// pip installs them by default — dropping them from candidates would
+/// verdict a different version than the install. Pre/dev releases stay
+/// excluded (matching pip's defaults); epochs (`1!2.0`) remain unsupported
+/// and are skipped.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PypiVersion {
+    base: semver::Version,
+    /// `.postN` number; `None` for a plain release. Ordering: derive(Ord)
+    /// compares `base` first, then `post` (`None` < `Some(_)`), which is
+    /// exactly PEP 440's post-release ordering.
+    post: Option<u64>,
+}
+
+impl PypiVersion {
+    fn parse(raw: &str) -> Option<Self> {
+        let (release, post) = match raw.find(".post") {
+            Some(idx) => {
+                let n: u64 = raw[idx + ".post".len()..].parse().ok()?;
+                (&raw[..idx], Some(n))
+            }
+            None => (raw, None),
+        };
+        let base = semver::Version::parse(&normalize_for_semver(release)).ok()?;
+        Some(PypiVersion { base, post })
+    }
+
+    fn is_prerelease(&self) -> bool {
+        !self.base.pre.is_empty()
+    }
+}
+
+/// Pick the latest non-prerelease version using PEP 440-ish parsing as a
+/// best-effort ordering. Falls back to the entry with the latest upload
+/// time if no candidate parses.
 fn pick_latest_stable(candidates: &[PypiCandidate]) -> Option<&PypiCandidate> {
     candidates
         .iter()
         .filter_map(|c| {
-            semver::Version::parse(&normalize_for_semver(&c.version))
-                .ok()
-                .filter(|v| v.pre.is_empty())
+            PypiVersion::parse(&c.version)
+                .filter(|v| !v.is_prerelease())
                 .map(|v| (v, c))
         })
         .max_by(|(a, _), (b, _)| a.cmp(b))
@@ -423,10 +521,10 @@ pub(crate) fn normalize_for_semver(v: &str) -> String {
 
 /// Apply a PEP 440-style specifier expression to the candidate list
 /// and return the highest match (`Ok(None)` when nothing satisfies it).
-/// Supported operators: `==`, `>=`, `>`, `<=`, `<`, `~=`, `!=`. An
-/// expression we can't parse (unknown operator, wildcard like `==1.*`)
-/// is `Err` — resolving anything else would gate a different version
-/// than the package manager installs.
+/// Supported operators: `==` (incl. wildcards `==1.4.*`), `>=`, `>`,
+/// `<=`, `<`, `~=`, `!=`. An expression we can't parse (unknown operator,
+/// exotic version) is `Err` — resolving anything else would gate a
+/// different version than the package manager installs.
 fn pypi_resolve_specifier(
     candidates: &[PypiCandidate],
     spec: &str,
@@ -451,32 +549,68 @@ fn pypi_resolve_specifier(
             .iter()
             .find_map(|(prefix, op)| p.strip_prefix(prefix).map(|v| (*op, v.trim())))
             .ok_or_else(unsupported)?;
+        // Wildcard pin `==X.Y.*` — desugar to the half-open range it means.
+        if op == "==" {
+            if let Some(prefix) = val.strip_suffix(".*") {
+                let (lo, hi) = wildcard_bounds(prefix).ok_or_else(unsupported)?;
+                requirements.push((">=", lo));
+                requirements.push(("<", hi));
+                continue;
+            }
+        }
+        if val.contains('*') {
+            return Err(unsupported());
+        }
         let v = semver::Version::parse(&normalize_for_semver(val)).map_err(|_| unsupported())?;
+        // PEP 440 `~=X.Y` bumps the LAST release component of the written
+        // spec: `~=1.4` means `<2.0`, `~=1.4.5` means `<1.5.0`. Desugar
+        // here — the padded `v` has lost the component count.
+        if op == "~=" {
+            let hi = match val.split('.').count() {
+                2 => semver::Version::new(v.major + 1, 0, 0),
+                3 => semver::Version::new(v.major, v.minor + 1, 0),
+                _ => return Err(unsupported()),
+            };
+            requirements.push((">=", v));
+            requirements.push(("<", hi));
+            continue;
+        }
         requirements.push((op, v));
     }
 
-    let satisfies = |v: &semver::Version| {
+    // PEP 440 comparison against a candidate that may be a post-release:
+    // `>=V` includes V's posts, `>V`/`<=V` exclude them, `==V` matches
+    // only the plain release.
+    let satisfies = |c: &PypiVersion| {
         requirements.iter().all(|(op, want)| match *op {
-            "==" => v == want,
-            ">=" => v >= want,
-            "<=" => v <= want,
-            "!=" => v != want,
-            ">" => v > want,
-            "<" => v < want,
-            "~=" => *v >= *want && *v < semver::Version::new(want.major, want.minor + 1, 0),
+            "==" => c.base == *want && c.post.is_none(),
+            ">=" => c.base >= *want,
+            "<=" => c.base < *want || (c.base == *want && c.post.is_none()),
+            "!=" => !(c.base == *want && c.post.is_none()),
+            ">" => c.base > *want,
+            "<" => c.base < *want,
             _ => false,
         })
     };
     Ok(candidates
         .iter()
-        .filter_map(|c| {
-            semver::Version::parse(&normalize_for_semver(&c.version))
-                .ok()
-                .filter(|v| v.pre.is_empty() && satisfies(v))
-                .map(|v| (v, &c.version))
-        })
+        .filter_map(|c| PypiVersion::parse(&c.version).map(|v| (v, &c.version)))
+        .filter(|(v, _)| !v.is_prerelease() && satisfies(v))
         .max_by(|(a, _), (b, _)| a.cmp(b))
         .map(|(_, raw)| raw.clone()))
+}
+
+/// `==X.*` / `==X.Y.*` / `==X.Y.Z.*` bounds: everything the written prefix
+/// covers, half-open at the bumped last component.
+fn wildcard_bounds(prefix: &str) -> Option<(semver::Version, semver::Version)> {
+    let lo = semver::Version::parse(&normalize_for_semver(prefix)).ok()?;
+    let hi = match prefix.split('.').count() {
+        1 => semver::Version::new(lo.major + 1, 0, 0),
+        2 => semver::Version::new(lo.major, lo.minor + 1, 0),
+        3 => semver::Version::new(lo.major, lo.minor, lo.patch + 1),
+        _ => return None,
+    };
+    Some((lo, hi))
 }
 
 #[cfg(test)]
@@ -518,16 +652,70 @@ mod tests {
 
     #[test]
     fn unparseable_specifier_errors_instead_of_falling_back() {
-        // `==1.*` is valid PEP 440 but not representable here; resolving
-        // "latest stable" instead would gate the wrong version.
+        // Resolving "latest stable" for an expression we can't represent
+        // would gate the wrong version.
         let c = candidates(&["1.0.0", "2.0.0"]);
-        for spec in ["==1.*", "@weird", ">= not-a-version"] {
+        for spec in ["@weird", ">= not-a-version", "!=1.*"] {
             let err = pypi_resolve_specifier(&c, spec).expect_err(spec);
             assert!(
                 err.contains("unsupported version specifier"),
                 "{spec}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn wildcard_pin_resolves_as_a_range() {
+        // pip: `==4.2.*` matches the 4.2 series, highest first.
+        let c = candidates(&["4.1.0", "4.2.0", "4.2.9", "4.3.0"]);
+        assert_eq!(
+            pypi_resolve_specifier(&c, "==4.2.*").expect("parse"),
+            Some("4.2.9".to_string())
+        );
+        let c = candidates(&["0.9.0", "1.0.0", "1.9.0", "2.0.0"]);
+        assert_eq!(
+            pypi_resolve_specifier(&c, "==1.*").expect("parse"),
+            Some("1.9.0".to_string())
+        );
+    }
+
+    #[test]
+    fn compatible_release_bumps_the_written_component() {
+        // PEP 440: `~=4.0` means `>=4.0, <5.0` (NOT `<4.1`) — pip installs
+        // 4.2.x, so the gate must verdict the same series.
+        let c = candidates(&["4.0.0", "4.0.5", "4.2.9", "5.0.0"]);
+        assert_eq!(
+            pypi_resolve_specifier(&c, "~=4.0").expect("parse"),
+            Some("4.2.9".to_string())
+        );
+        // `~=1.4.5` means `>=1.4.5, <1.5.0`.
+        let c = candidates(&["1.4.4", "1.4.6", "1.5.0"]);
+        assert_eq!(
+            pypi_resolve_specifier(&c, "~=1.4.5").expect("parse"),
+            Some("1.4.6".to_string())
+        );
+    }
+
+    #[test]
+    fn post_releases_resolve_and_outrank_their_base() {
+        // pip installs post-releases by default; dropping them would
+        // verdict a different version than the install.
+        let c = candidates(&["1.0", "1.0.post1", "0.9.0"]);
+        assert_eq!(
+            pypi_resolve_specifier(&c, ">=1.0").expect("parse"),
+            Some("1.0.post1".to_string())
+        );
+        assert_eq!(
+            pick_latest_stable(&c).map(|c| c.version.as_str()),
+            Some("1.0.post1")
+        );
+        // …but a plain `==1.0` pin means the base release, not its posts.
+        assert_eq!(
+            pypi_resolve_specifier(&c, "==1.0").expect("parse"),
+            Some("1.0".to_string())
+        );
+        // PEP 440: `>V` excludes V's own post-releases.
+        assert_eq!(pypi_resolve_specifier(&c, ">1.0").expect("parse"), None);
     }
 
     #[test]
