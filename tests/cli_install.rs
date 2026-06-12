@@ -230,6 +230,38 @@ fn externally_managed_pip_blocks_before_registry_checks() {
 }
 
 #[test]
+fn bare_externally_managed_pip_blocks_before_running_pip() {
+    let (mut h, registry_hits) = externally_managed_pip();
+    let out = h
+        .cmd
+        .args(["pip", "install"])
+        .output()
+        .expect("failed to run corgea");
+
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None, "pip must not run");
+    assert_eq!(
+        registry_hits.load(Ordering::SeqCst),
+        0,
+        "externally-managed preflight must run before registry checks"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).is_empty(),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error: this Python environment is externally managed (PEP 668)."),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Create and activate a virtualenv, then retry `corgea pip install`."),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn pip_json_reports_fresh_pin_as_recent() {
     let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
     let out = h

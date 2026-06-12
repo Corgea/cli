@@ -169,10 +169,9 @@ fn is_plain_pip_target_install(rest: &[String], parsed: &parse::ParsedInstall) -
 pub(super) fn externally_managed_pip_message(
     manager: PackageManager,
     rest: &[String],
-    parsed: &parse::ParsedInstall,
+    _parsed: &parse::ParsedInstall,
 ) -> Option<String> {
     if manager != PackageManager::Pip
-        || (parsed.targets.is_empty() && parsed.requirements_files.is_empty())
         || pip_install_overrides_external_management(rest)
         || !pip_environment_is_externally_managed()
     {
