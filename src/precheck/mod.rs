@@ -319,18 +319,26 @@ impl PrecheckReport {
         .map(|o| &o.verdict)
     }
     pub fn vulnerable_count(&self) -> usize {
-        count_vulnerable(self.verdicts())
+        self.verdicts()
+            .filter(|v| matches!(v, VerdictStatus::Vulnerable(_)))
+            .count()
     }
     pub fn unverifiable_count(&self) -> usize {
-        count_unverifiable(self.verdicts())
+        self.verdicts()
+            .filter(|v| matches!(v, VerdictStatus::Unverifiable(_)))
+            .count()
     }
     /// Vulnerable findings beyond the named targets (the resolved tree).
     pub fn tree_vulnerable_count(&self) -> usize {
-        count_vulnerable(self.tree_verdicts())
+        self.tree_verdicts()
+            .filter(|v| matches!(v, VerdictStatus::Vulnerable(_)))
+            .count()
     }
     /// Unverifiable findings beyond the named targets (the resolved tree).
     pub fn tree_unverifiable_count(&self) -> usize {
-        count_unverifiable(self.tree_verdicts())
+        self.tree_verdicts()
+            .filter(|v| matches!(v, VerdictStatus::Unverifiable(_)))
+            .count()
     }
     pub fn skipped_count(&self) -> usize {
         self.count(|o| matches!(o, TargetOutcome::Skipped { .. }))
@@ -338,18 +346,6 @@ impl PrecheckReport {
     pub fn error_count(&self) -> usize {
         self.count(|o| matches!(o, TargetOutcome::Error { .. }))
     }
-}
-
-fn count_vulnerable<'a>(verdicts: impl Iterator<Item = &'a VerdictStatus>) -> usize {
-    verdicts
-        .filter(|v| matches!(v, VerdictStatus::Vulnerable(_)))
-        .count()
-}
-
-fn count_unverifiable<'a>(verdicts: impl Iterator<Item = &'a VerdictStatus>) -> usize {
-    verdicts
-        .filter(|v| matches!(v, VerdictStatus::Unverifiable(_)))
-        .count()
 }
 
 /// Canonical entry for ecosystem commands (`corgea npm install …`).
@@ -506,11 +502,7 @@ fn run_parsed_install(
     if !matches!(&tree, Some(TreeReport::Full { .. })) {
         render::requirements_note(&parsed);
     }
-    if opts
-        .verdict
-        .as_ref()
-        .is_some_and(|cfg| matches!(cfg.mode, VerdictMode::Public) && cfg.public_login_hint)
-    {
+    if verdict::public_verdict(&opts).is_some_and(|cfg| cfg.public_login_hint) {
         eprintln!(
             "warning: using public CVE checks; login enables authenticated enforcement and private Corgea intelligence."
         );

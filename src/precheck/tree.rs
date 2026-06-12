@@ -165,7 +165,7 @@ fn resolve_uv_tree(parsed: &super::parse::ParsedInstall) -> Result<Vec<TreePacka
 /// pip's `requested` report flag. Best-effort line parse; anything unparsed
 /// just labels "(transitive)".
 fn requested_names(parsed: &super::parse::ParsedInstall) -> std::collections::HashSet<String> {
-    let norm = crate::deps::ecosystems::pypi::normalize_pypi_name;
+    let norm = |n: &str| crate::vuln_api::Ecosystem::Pypi.normalize_name(n);
     let mut out: std::collections::HashSet<String> = parsed
         .targets
         .iter()
@@ -214,8 +214,7 @@ fn parse_compiled_requirements(
         // Strip extras: `celery[redis]==5.3.4`.
         let name = super::parse::pypi_name_part(name).to_string();
         pkgs.push(TreePackage {
-            requested: requested
-                .contains(&crate::deps::ecosystems::pypi::normalize_pypi_name(&name)),
+            requested: requested.contains(&crate::vuln_api::Ecosystem::Pypi.normalize_name(&name)),
             name,
             version: version.trim().to_string(),
         });

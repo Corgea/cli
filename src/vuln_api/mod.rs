@@ -116,10 +116,15 @@ fn encode_package_name(ecosystem: Ecosystem, name: &str) -> String {
 }
 
 /// Value for the `CORGEA-SOURCE` header: the `CORGEA_SOURCE` env override,
-/// otherwise `cli`. The one definition, shared with the binary crate's
+/// otherwise `cli`. Read once and cached — it's attached per request from
+/// concurrent pool workers, and `std::env::var` takes the process-global
+/// env lock. The one definition, shared with the binary crate's
 /// `utils/api.rs`.
 pub fn source() -> String {
-    std::env::var("CORGEA_SOURCE").unwrap_or_else(|_| "cli".to_string())
+    static SOURCE: OnceLock<String> = OnceLock::new();
+    SOURCE
+        .get_or_init(|| std::env::var("CORGEA_SOURCE").unwrap_or_else(|_| "cli".to_string()))
+        .clone()
 }
 
 /// Build a JSON GET: the standard `Accept` / `CORGEA-SOURCE` headers plus,
@@ -212,22 +217,6 @@ fn send_package_check_with_429_retry(
     Ok(response)
 }
 
-/// The fixed error message for a recognized non-success status; `None` for
-/// statuses needing bespoke handling (404 → clean, anything else → body
-/// suffix). Tests assert these strings — keep them stable.
-fn status_error_message(code: u16, token_present: bool) -> Option<String> {
-    match code {
-        401 if token_present => {
-            Some("vuln-api rejected the Corgea token (run `corgea login` to refresh)".to_string())
-        }
-        401 => Some("vuln-api requires authentication".to_string()),
-        403 => Some("vuln-api access denied (check your Corgea plan/permissions)".to_string()),
-        429 => Some("vuln-api rate-limited this request (retry later)".to_string()),
-        500..=599 => Some(format!("vuln-api unavailable (HTTP {})", code)),
-        _ => None,
-    }
-}
-
 pub fn check_package_version(
     client: &reqwest::blocking::Client,
     base_url: &str,
@@ -257,22 +246,33 @@ pub fn check_package_version(
     let response = send_package_check_with_429_retry(client, &url, token)?;
 
     let status = response.status();
-    let code = status.as_u16();
-    if let Some(message) = status_error_message(code, token.is_some()) {
-        return Err(message.into());
-    }
-    if code == 404 {
-        return Ok(VulnCheckResponse {
-            ecosystem: ecosystem.path_segment().to_string(),
-            package_name: name.to_string(),
-            version: version.to_string(),
-            is_vulnerable: false,
-            matches: vec![],
-        });
-    }
-    if !status.is_success() {
-        let suffix = error_body_suffix(response);
-        return Err(format!("vuln-api returned unexpected HTTP {}{}", code, suffix).into());
+    // Fixed messages for recognized statuses — tests assert these strings,
+    // keep them stable. 404 means "unknown package": synthesize a clean
+    // verdict instead of erroring.
+    match status.as_u16() {
+        401 if token.is_some() => {
+            return Err(
+                "vuln-api rejected the Corgea token (run `corgea login` to refresh)".into(),
+            );
+        }
+        401 => return Err("vuln-api requires authentication".into()),
+        403 => return Err("vuln-api access denied (check your Corgea plan/permissions)".into()),
+        429 => return Err("vuln-api rate-limited this request (retry later)".into()),
+        code @ 500..=599 => return Err(format!("vuln-api unavailable (HTTP {})", code).into()),
+        404 => {
+            return Ok(VulnCheckResponse {
+                ecosystem: ecosystem.path_segment().to_string(),
+                package_name: name.to_string(),
+                version: version.to_string(),
+                is_vulnerable: false,
+                matches: vec![],
+            });
+        }
+        code if !status.is_success() => {
+            let suffix = error_body_suffix(response);
+            return Err(format!("vuln-api returned unexpected HTTP {}{}", code, suffix).into());
+        }
+        _ => {}
     }
 
     let response_text = response.text()?;

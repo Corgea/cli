@@ -1,6 +1,6 @@
 use crate::log::debug;
 use crate::utils;
-use corgea::vuln_api::{auth_header, source as get_source};
+use corgea::vuln_api::{auth_header, source};
 use reqwest::header::HeaderMap;
 use reqwest::StatusCode;
 use reqwest::{
@@ -23,7 +23,7 @@ fn auth_headers(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     let (name, value) = auth_header(token);
     headers.insert(name, value.parse().unwrap());
-    headers.insert("CORGEA-SOURCE", get_source().parse().unwrap());
+    headers.insert("CORGEA-SOURCE", source().parse().unwrap());
     headers
 }
 
@@ -652,7 +652,7 @@ pub fn exchange_code_for_token(
 
     let response = client
         .get(&exchange_url)
-        .header("CORGEA-SOURCE", get_source())
+        .header("CORGEA-SOURCE", source())
         .query(&[("code", code)])
         .send()?;
 

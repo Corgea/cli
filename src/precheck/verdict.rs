@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use super::{
     tree, InstallTarget, PackageManager, PrecheckOptions, PrecheckReport, TargetKind,
-    TargetOutcome, TreeOrigin, TreeOutcome, TreeReport, VerdictConfig, VerdictStatus,
+    TargetOutcome, TreeOrigin, TreeOutcome, TreeReport, VerdictConfig, VerdictMode, VerdictStatus,
 };
 
 /// Above this many verdict jobs, print a stderr progress line so a big tree
@@ -24,15 +24,6 @@ pub(super) fn verdict_pool(
     cfg: &VerdictConfig,
     manager: PackageManager,
 ) -> Vec<(tree::TreePackage, VerdictStatus)> {
-    verdict_pool_with(jobs, cfg, manager, VERDICT_CONCURRENCY)
-}
-
-fn verdict_pool_with(
-    jobs: Vec<tree::TreePackage>,
-    cfg: &VerdictConfig,
-    manager: PackageManager,
-    concurrency: usize,
-) -> Vec<(tree::TreePackage, VerdictStatus)> {
     let client = match crate::vuln_api::http_client() {
         Ok(c) => c,
         Err(e) => {
@@ -48,22 +39,23 @@ fn verdict_pool_with(
     }
 
     let ecosystem = manager.ecosystem();
-    let verdicts = pooled_map(
-        &jobs,
-        concurrency,
-        |job| match crate::vuln_api::check_package_version(
-            &client,
-            &cfg.base_url,
-            cfg.mode.auth_token(),
-            ecosystem,
-            &job.name,
-            &job.version,
-        ) {
-            Ok(resp) if resp.is_vulnerable => VerdictStatus::Vulnerable(resp.matches),
-            Ok(_) => VerdictStatus::Clean,
-            Err(e) => VerdictStatus::Unverifiable(e.to_string()),
-        },
-    );
+    let verdicts =
+        pooled_map(
+            &jobs,
+            VERDICT_CONCURRENCY,
+            |job| match crate::vuln_api::check_package_version(
+                &client,
+                &cfg.base_url,
+                cfg.mode.auth_token(),
+                ecosystem,
+                &job.name,
+                &job.version,
+            ) {
+                Ok(resp) if resp.is_vulnerable => VerdictStatus::Vulnerable(resp.matches),
+                Ok(_) => VerdictStatus::Clean,
+                Err(e) => VerdictStatus::Unverifiable(e.to_string()),
+            },
+        );
     jobs.into_iter().zip(verdicts).collect()
 }
 
@@ -159,6 +151,15 @@ pub(super) fn authenticated_verdict(opts: &PrecheckOptions) -> bool {
     opts.verdict
         .as_ref()
         .is_some_and(|cfg| cfg.mode.auth_token().is_some())
+}
+
+/// The verdict config when running in fail-open public mode; `None` when
+/// verdicts are off or authenticated. The one definition of "public mode",
+/// dual of `authenticated_verdict`.
+pub(super) fn public_verdict(opts: &PrecheckOptions) -> Option<&VerdictConfig> {
+    opts.verdict
+        .as_ref()
+        .filter(|cfg| matches!(cfg.mode, VerdictMode::Public))
 }
 
 /// Why the gate refuses to run the install. The single owner of both the
@@ -552,8 +553,7 @@ mod tests {
     }
 
     /// The pool must verdict every job exactly once and return the flagged
-    /// job `Vulnerable` with the rest `Clean`, regardless of `concurrency`
-    /// (1 = serial, 8 > job count = all workers spawn but some drain empty).
+    /// job `Vulnerable` with the rest `Clean`.
     #[test]
     fn verdict_pool_returns_all_results() {
         use std::collections::HashMap;
@@ -582,29 +582,37 @@ mod tests {
             })
             .collect();
 
+        let results = verdict_pool(jobs, &cfg, PackageManager::Pip);
+        assert_eq!(results.len(), 6, "all jobs verdicted");
+        let flagged = results
+            .iter()
+            .filter(|(_, v)| matches!(v, VerdictStatus::Vulnerable(_)))
+            .count();
+        let clean = results
+            .iter()
+            .filter(|(_, v)| matches!(v, VerdictStatus::Clean))
+            .count();
+        assert_eq!(flagged, 1, "only evil flagged");
+        assert_eq!(clean, 5, "rest clean");
+        let evil = results
+            .iter()
+            .find(|(p, _)| p.name == "evil")
+            .expect("evil present");
+        assert!(
+            matches!(&evil.1, VerdictStatus::Vulnerable(m) if m[0].advisory_id == "MAL-2024-0001")
+        );
+    }
+
+    /// `pooled_map` maps every item and preserves order at any concurrency
+    /// (1 = serial, 8 > item count = all workers spawn but some drain empty).
+    #[test]
+    fn pooled_map_preserves_order_at_any_concurrency() {
+        let items: Vec<usize> = (0..6).collect();
         for concurrency in [1usize, 8] {
-            let results = verdict_pool_with(jobs.clone(), &cfg, PackageManager::Pip, concurrency);
             assert_eq!(
-                results.len(),
-                6,
-                "concurrency {concurrency}: all jobs verdicted"
-            );
-            let flagged = results
-                .iter()
-                .filter(|(_, v)| matches!(v, VerdictStatus::Vulnerable(_)))
-                .count();
-            let clean = results
-                .iter()
-                .filter(|(_, v)| matches!(v, VerdictStatus::Clean))
-                .count();
-            assert_eq!(flagged, 1, "concurrency {concurrency}: only evil flagged");
-            assert_eq!(clean, 5, "concurrency {concurrency}: rest clean");
-            let evil = results
-                .iter()
-                .find(|(p, _)| p.name == "evil")
-                .expect("evil present");
-            assert!(
-                matches!(&evil.1, VerdictStatus::Vulnerable(m) if m[0].advisory_id == "MAL-2024-0001")
+                pooled_map(&items, concurrency, |i| i * 2),
+                vec![0, 2, 4, 6, 8, 10],
+                "concurrency {concurrency}"
             );
         }
     }

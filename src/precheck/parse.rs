@@ -394,7 +394,10 @@ fn parse_pypi_spec(raw: &str) -> InstallTarget {
     };
 
     // Strip extras: `requests[security]` -> `requests`.
-    let name_no_extras = name_part.split('[').next().unwrap_or(name_part).trim();
+    let name_no_extras = name_part
+        .split_once('[')
+        .map_or(name_part, |(n, _)| n)
+        .trim();
 
     // Strip env markers: `package; python_version >= "3.7"`.
     let spec_no_marker = spec_part.split(';').next().unwrap_or(spec_part).trim();

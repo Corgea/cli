@@ -5,9 +5,16 @@ use std::thread;
 
 pub type PackageKey = (String, String, String);
 
-/// `(ecosystem, name, version)` key for the stub's route tables.
+/// `(ecosystem, name, version)` key for the stub's route tables. Applies the
+/// client's canonical-name rule (`Ecosystem::normalize_name`) on both the
+/// fixture and lookup sides, so a fixture keyed under an alternate pypi
+/// spelling can't silently miss and read as clean.
 pub fn key(eco: &str, name: &str, ver: &str) -> PackageKey {
-    (eco.to_string(), name.to_string(), ver.to_string())
+    let name = match eco {
+        "pypi" => crate::vuln_api::Ecosystem::Pypi.normalize_name(name),
+        _ => name.to_string(),
+    };
+    (eco.to_string(), name, ver.to_string())
 }
 
 /// Single-match vulnerable verdict body; `fixed: None` renders
@@ -168,14 +175,10 @@ fn handle_connection(
                 && parts[4] == "versions"
                 && parts[6] == "check"
             {
-                let key = (
-                    parts[2].to_string(),
-                    urlencoding::decode(parts[3])
-                        .unwrap_or_default()
-                        .into_owned(),
-                    urlencoding::decode(parts[5])
-                        .unwrap_or_default()
-                        .into_owned(),
+                let key = key(
+                    parts[2],
+                    &urlencoding::decode(parts[3]).unwrap_or_default(),
+                    &urlencoding::decode(parts[5]).unwrap_or_default(),
                 );
                 if pending_retries.remove(&key) {
                     (429, r#"{"error":"rate limited"}"#.to_string(), true)

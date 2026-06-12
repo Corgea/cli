@@ -62,11 +62,7 @@ pub(super) fn requirements_note(parsed: &parse::ParsedInstall) {
 }
 
 pub(super) fn warn_public_lookup_failures(report: &PrecheckReport, opts: &PrecheckOptions) {
-    let public = opts
-        .verdict
-        .as_ref()
-        .is_some_and(|cfg| matches!(cfg.mode, VerdictMode::Public));
-    if public && report.unverifiable_count() > 0 {
+    if super::verdict::public_verdict(opts).is_some() && report.unverifiable_count() > 0 {
         eprintln!("warning: CVE check unavailable; continuing because public mode is fail-open.");
     }
 }
