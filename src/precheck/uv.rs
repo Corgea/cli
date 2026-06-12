@@ -4,7 +4,8 @@
 use super::{corgea_cmd, detect, exec, parse, tree, PackageManager, PrecheckOptions};
 
 pub(super) fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
-    let exec = move || exec::exec_command("uv", cmd);
+    let json = opts.json;
+    let exec = move || exec::exec_command_with_stdio("uv", cmd, json);
 
     // Classify on the subcommand, skipping any leading uv global flags
     // (`uv --project ./app sync` is still a gated sync). The exec path always
@@ -12,8 +13,7 @@ pub(super) fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
     let sub = parse::uv_subcommand(cmd);
 
     if matches!(sub.first().map(String::as_str), Some("install" | "i")) {
-        eprintln!("{}", unsupported_uv_install_message(&sub[1..]));
-        return 1;
+        return super::refuse_guard(&opts, unsupported_uv_install_message(&sub[1..]), 1);
     }
 
     match parse::classify_uv_command(sub) {
@@ -28,8 +28,11 @@ pub(super) fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
             let parsed = match parse::parse_pip_install_args(install_args) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("failed to parse install args: {}", e);
-                    return 2;
+                    return super::refuse_guard(
+                        &opts,
+                        format!("failed to parse install args: {}", e),
+                        2,
+                    );
                 }
             };
             // No wrong-manager guard here: `uv pip install` IS uv's
@@ -73,8 +76,7 @@ pub(super) fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
                 if let Some(message) =
                     detect::wrong_package_manager_message(PackageManager::Uv, add_args, &parsed)
                 {
-                    eprintln!("{message}");
-                    return 1;
+                    return super::refuse_guard(&opts, message, 1);
                 }
             }
             super::run_parsed_install(PackageManager::Uv, "add", add_args, parsed, exec, opts)

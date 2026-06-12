@@ -124,6 +124,9 @@ pub struct PrecheckOptions {
     /// If true, never block: print findings (recent, vulnerable,
     /// unverifiable) and run the install anyway.
     pub force: bool,
+    /// If true, print the report as one JSON document on stdout; the
+    /// package manager's own stdout moves to stderr.
+    pub json: bool,
     /// `Some` ⇒ run the vuln-api verdict pass against this endpoint.
     /// `None` is retained for tests and direct library callers that want
     /// recency-only behavior.
@@ -347,8 +350,7 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
     let rest = rest_vec.as_slice();
 
     if manager == PackageManager::Pip && subcommand == "add" {
-        eprintln!("{}", unsupported_pip_add_message(rest));
-        return 1;
+        return refuse_guard(&opts, unsupported_pip_add_message(rest), 1);
     }
 
     // `npm ci` installs the lockfile exactly as written — gate it from the
@@ -378,8 +380,7 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
     let parsed = match parse::parse_install_args(manager, rest) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("failed to parse install args: {}", e);
-            return 2;
+            return refuse_guard(&opts, format!("failed to parse install args: {}", e), 2);
         }
     };
 
@@ -390,19 +391,29 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
     // command permanently refused.
     if !opts.force {
         if let Some(message) = detect::wrong_package_manager_message(manager, rest, &parsed) {
-            eprintln!("{message}");
-            return 1;
+            return refuse_guard(&opts, message, 1);
         }
     }
 
+    let json = opts.json;
     run_parsed_install(
         manager,
         subcommand,
         rest,
         parsed,
-        || exec::exec_install_with_args(manager, subcommand, rest),
+        || exec::exec_install_with_args(manager, subcommand, rest, json),
         opts,
     )
+}
+
+/// Guard refusals happen before any report exists; under `--json` stdout
+/// must still carry one parseable document.
+fn refuse_guard(opts: &PrecheckOptions, message: String, code: i32) -> i32 {
+    if opts.json {
+        println!("{}", serde_json::json!({ "error": message }));
+    }
+    eprintln!("{message}");
+    code
 }
 
 /// Index of the first non-flag token in `cmd` — the subcommand verb.
@@ -490,10 +501,16 @@ fn report_and_exec(
     opts: &PrecheckOptions,
     exec: impl FnOnce() -> i32,
 ) -> i32 {
-    render::print_text(report);
+    if opts.json {
+        render::print_json(report, opts);
+    } else {
+        render::print_text(report);
+    }
     render::warn_public_lookup_failures(report, opts);
     if let Some(reason) = verdict::block_reason(report, opts) {
-        render::print_refusal(reason);
+        if !opts.json {
+            render::print_refusal(reason);
+        }
         return 1;
     }
     exec()
@@ -659,7 +676,8 @@ fn run_locked_install(
 /// dry-run needed. Without a project or lockfile npm errors on its own;
 /// the gate just execs.
 fn run_npm_ci(subcommand: &str, rest: &[String], opts: PrecheckOptions) -> i32 {
-    let exec = || exec::exec_install_with_args(PackageManager::Npm, subcommand, rest);
+    let json = opts.json;
+    let exec = || exec::exec_install_with_args(PackageManager::Npm, subcommand, rest, json);
 
     if opts.verdict.is_none() {
         return exec();
