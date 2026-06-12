@@ -182,6 +182,58 @@ fn uv_lock_stays_passthrough() {
 }
 
 #[test]
+fn uv_global_flags_before_subcommand_still_gate() {
+    // `uv --quiet sync` (global flag before the subcommand) must classify as
+    // a gated sync, not fall through to ungated passthrough.
+    let mut h = GateHarness::new()
+        .fake_recorder("uv", 0)
+        .vuln_checks(vulnerable_evildep_checks())
+        .with_project_file("uv.lock", UV_LOCK)
+        .build();
+    let out = h
+        .cmd
+        .args(["uv", "--quiet", "sync"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "flags before the subcommand must not skip the gate: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.recorded_argv(), None, "uv must not run when blocked");
+}
+
+#[test]
+fn uv_pip_install_in_requirements_project_is_not_wrong_manager() {
+    // `uv pip install` is uv's pip-compatible interface — using it in a
+    // requirements/pip project is correct, NOT a wrong-manager mistake. It is
+    // still fully gated (the tree pass blocks a vulnerable pin), but it must
+    // not be refused with a "did you mean pip" suggestion the way `uv add` is.
+    let mut h = GateHarness::new()
+        .fake_recorder("uv", 0)
+        .vuln_checks(HashMap::new())
+        .with_project_file("requirements.txt", "flask\n")
+        .build();
+    let out = h
+        .cmd
+        .args(["uv", "pip", "install", "git+https://example.com/x.git"])
+        .output()
+        .expect("run corgea");
+    // The only target is an unverifiable VCS spec → clean gate → uv runs.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "uv pip install must not be wrong-manager refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("this project appears to use pip"),
+        "uv pip install is pip-compatible, not wrong-manager"
+    );
+}
+
+#[test]
 fn uv_top_level_install_blocks_with_suggestion() {
     let mut h = GateHarness::new()
         .fake_recorder("uv", 0)

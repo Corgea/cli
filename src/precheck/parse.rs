@@ -127,6 +127,29 @@ pub enum UvCommand<'a> {
     Sync,
 }
 
+/// Skip leading uv global flags (and their values) to where the uv
+/// subcommand starts, so install-shaped commands behind global flags
+/// (`uv --project ./app sync`, `uv --quiet add x`) classify as the
+/// subcommand instead of falling through to `Passthrough` ungated.
+pub fn uv_subcommand(cmd: &[String]) -> &[String] {
+    let mut i = 0;
+    while i < cmd.len() {
+        let a = &cmd[i];
+        if a == "--" {
+            return &cmd[(i + 1).min(cmd.len())..];
+        }
+        if !a.starts_with('-') {
+            return &cmd[i..];
+        }
+        i += if !a.contains('=') && takes_value(PackageManager::Uv, a) {
+            2
+        } else {
+            1
+        };
+    }
+    &[]
+}
+
 pub fn classify_uv_command(cmd: &[String]) -> UvCommand<'_> {
     match cmd.first().map(String::as_str) {
         Some("pip") if matches!(cmd.get(1).map(String::as_str), Some("install" | "i")) => {
