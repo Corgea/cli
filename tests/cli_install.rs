@@ -282,6 +282,25 @@ fn pip_json_guard_refusal_is_parseable() {
 }
 
 #[test]
+fn npm_json_passthrough_forwards_flag_to_manager() {
+    // A non-install subcommand produces no Corgea report, so the wrapper's
+    // `--json` belongs to npm — it must reach the manager rather than being
+    // silently swallowed.
+    let mut h = GateHarness::new().fake_recorder("npm", 0).build();
+    let out = h
+        .cmd
+        .args(["npm", "--json", "ls"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("ls --json"),
+        "the wrapper's --json must be forwarded to the manager on passthrough"
+    );
+}
+
+#[test]
 fn pip_mixed_fresh_and_old_pins_block_without_running_install() {
     let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
     let out = h

@@ -332,14 +332,14 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
             let install = ["install".to_string()];
             return run_install(manager, &install, opts);
         }
-        return exec::exec_command(manager.binary_name(), &[]);
+        return passthrough_exec(manager.binary_name(), &[], &opts);
     }
 
     // The install verb may follow global flags (`npm --silent install x`);
     // route on the first non-flag token so flags-before-verb can't slip
     // past the gate ungated.
     let Some(verb_idx) = find_subcommand(manager, cmd) else {
-        return exec::exec_command(manager.binary_name(), cmd);
+        return passthrough_exec(manager.binary_name(), cmd, &opts);
     };
     let subcommand = &cmd[verb_idx];
     let rest_vec: Vec<String> = cmd[..verb_idx]
@@ -374,7 +374,7 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
         {
             eprintln!("note: 'yarn global add' is not gated; packages install unchecked");
         }
-        return exec::exec_command(manager.binary_name(), cmd);
+        return passthrough_exec(manager.binary_name(), cmd, &opts);
     }
 
     let parsed = match parse::parse_install_args(manager, rest) {
@@ -404,6 +404,20 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
         || exec::exec_install_with_args(manager, subcommand, rest, json),
         opts,
     )
+}
+
+/// A non-install passthrough produces no Corgea report, so the wrapper's
+/// `--json` (consumed by the CLI parser) belongs to the package manager —
+/// forward it so e.g. `corgea npm --json view x` still gets npm's JSON
+/// output instead of silently losing the flag.
+fn passthrough_exec(binary: &str, args: &[String], opts: &PrecheckOptions) -> i32 {
+    if opts.json {
+        let mut forwarded = args.to_vec();
+        forwarded.push("--json".to_string());
+        exec::exec_command(binary, &forwarded)
+    } else {
+        exec::exec_command(binary, args)
+    }
 }
 
 /// Guard refusals happen before any report exists; under `--json` stdout
@@ -537,10 +551,11 @@ fn run_parsed_install(
     // its targets and degrades the tree pass to a loud named-only warning.)
     if manager == PackageManager::Npm && bare_install && opts.verdict.is_some() && !opts.force {
         if let Some(flag) = tree::npm_root_redirect_flag(rest) {
-            eprintln!(
-                "error: cannot verify a bare 'npm install' that redirects the project root ('{flag}'): the would-install tree is unknown (pass --force to proceed unchecked)"
+            return refuse_guard(
+                &opts,
+                format!("error: cannot verify a bare 'npm install' that redirects the project root ('{flag}'): the would-install tree is unknown (pass --force to proceed unchecked)"),
+                1,
             );
-            return 1;
         }
     }
 
@@ -634,13 +649,18 @@ fn run_locked_install(
             // The single documented bypass of the "all blocking goes through
             // `verdict::block_reason`" invariant: an unparsable lockfile
             // means there is no report to feed the predicate, so the gate
-            // refuses directly (--force above is the only escape).
-            eprintln!(
-                "error: cannot verify '{} {}': {e} (pass --force to proceed unchecked)",
-                manager.binary_name(),
-                subcommand
+            // refuses directly (--force above is the only escape). Route it
+            // through `refuse_guard` so `--json` still emits a parseable
+            // `{"error": …}` document instead of bare stderr.
+            return refuse_guard(
+                opts,
+                format!(
+                    "error: cannot verify '{} {}': {e} (pass --force to proceed unchecked)",
+                    manager.binary_name(),
+                    subcommand
+                ),
+                1,
             );
-            return 1;
         }
     };
 
@@ -688,10 +708,11 @@ fn run_npm_ci(subcommand: &str, rest: &[String], opts: PrecheckOptions) -> i32 {
     // unless `--force`.
     if !opts.force {
         if let Some(flag) = tree::npm_root_redirect_flag(rest) {
-            eprintln!(
-                "error: cannot verify 'npm {subcommand}' with '{flag}': it installs a redirected project's lockfile, not this one (pass --force to proceed unchecked)"
+            return refuse_guard(
+                &opts,
+                format!("error: cannot verify 'npm {subcommand}' with '{flag}': it installs a redirected project's lockfile, not this one (pass --force to proceed unchecked)"),
+                1,
             );
-            return 1;
         }
     }
     let Some(root) = tree::npm_project_root() else {

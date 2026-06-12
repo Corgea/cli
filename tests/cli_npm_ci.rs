@@ -105,6 +105,33 @@ fn npm_ci_unparsable_lockfile_force_proceeds() {
 }
 
 #[test]
+fn npm_ci_unparsable_lockfile_json_refusal_is_parseable() {
+    // The unparsable-lockfile refusal must emit a parseable {"error": …}
+    // document under --json, not bare stderr.
+    let mut h = GateHarness::new()
+        .fake_recorder("npm", 0)
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .with_project_file("package-lock.json", "not json")
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "--json", "ci"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None, "npm must not run");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert!(
+        parsed["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("cannot verify 'npm ci'")),
+        "parsed: {parsed}"
+    );
+}
+
+#[test]
 fn npm_ci_root_redirect_refuses_without_force() {
     // `npm ci --prefix ../other` installs a different project's lockfile than
     // the CWD one we'd verdict — fail closed rather than pass on the wrong
