@@ -371,7 +371,7 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
     }
 
     if !manager.is_install_subcommand(subcommand) {
-        return exec::exec_install_with_args(manager, subcommand, rest);
+        return exec::exec_install_with_args(manager, subcommand, rest, false);
     }
 
     let parsed = match parse::parse_install_args(manager, rest) {
@@ -392,12 +392,13 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
         return 1;
     }
 
+    let json = opts.json;
     run_parsed_install(
         manager,
         subcommand,
         rest,
         parsed,
-        || exec::exec_install_with_args(manager, subcommand, rest),
+        || exec::exec_install_with_args(manager, subcommand, rest, json),
         opts,
     )
 }

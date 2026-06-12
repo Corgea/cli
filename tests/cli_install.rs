@@ -279,6 +279,38 @@ fn pip_json_reports_fresh_pin_as_recent() {
 }
 
 #[test]
+fn pip_json_routes_package_manager_stdout_to_stderr() {
+    // The fake pip fails its tree dry-run (named-only fallback) and prints
+    // to stdout on the real install; under --json that output must move to
+    // stderr so stdout stays parseable JSON.
+    let (base_url, _hits) = spawn_registry_stub();
+    let mut h = GateHarness::new()
+        .script_with_paths("pip", |_, marker| {
+            format!(
+                "#!/bin/sh\ncase \" $* \" in *\" --dry-run \"*) exit 2;; esac\nprintf 'FAKE-PM-STDOUT\\n'\nprintf '%s' \"$*\" > '{}'\nexit 0\n",
+                marker.display()
+            )
+        })
+        .registry_env("CORGEA_PYPI_REGISTRY", &base_url)
+        .build();
+    let out = h
+        .cmd
+        .args(["pip", "--json", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg==1.0.0"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str::<serde_json::Value>(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be valid JSON ({e}): {stdout}"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("FAKE-PM-STDOUT"),
+        "pip output must land on stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn pip_resolution_error_prints_error_but_install_proceeds() {
     // `nosuchpkg` hits the stub's 404 route → an error outcome, which
     // warns but does not block in public mode (authenticated mode fails

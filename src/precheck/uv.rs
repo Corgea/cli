@@ -7,7 +7,8 @@ use super::{
 };
 
 pub(super) fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
-    let exec = || exec::exec_command("uv", cmd);
+    let json = opts.json;
+    let exec = move || exec::exec_command_with_stdio("uv", cmd, json);
 
     if matches!(cmd.first().map(String::as_str), Some("install" | "i")) {
         eprintln!("{}", unsupported_uv_install_message(&cmd[1..]));
@@ -15,7 +16,8 @@ pub(super) fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
     }
 
     match parse::classify_uv_command(cmd) {
-        parse::UvCommand::Passthrough => exec(),
+        // Passthrough is a transparent shim: no report, untouched stdio.
+        parse::UvCommand::Passthrough => exec::exec_command("uv", cmd),
         parse::UvCommand::PipInstall { install_args } => {
             let parsed = match parse::parse_pip_install_args(install_args) {
                 Ok(p) => p,

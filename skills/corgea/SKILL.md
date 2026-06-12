@@ -155,7 +155,7 @@ corgea pip list                       # non-install subcommands pass straight th
 | `--threshold` | `-t` | Recency threshold (`2d`, `12h`). Younger resolved versions block. |
 | `--no-fail` | | Demote a recency block to a warning. Does NOT bypass vulnerable blocks or authenticated unverifiable blocks. |
 | `--force` | | Proceed despite all findings (vulnerable, unverifiable, recent). Findings still print. |
-| `--json` | | JSON report instead of text. Per-result `verdict` object + `verdict_mode` + `tree`. |
+| `--json` | | JSON report instead of text. Per-result `verdict` object + `verdict_mode` + `tree`. Stdout carries only the report; the package manager's output moves to stderr. |
 
 `--json` adds `verdict_mode` (`"public"` or `"authenticated"`) and a
 `tree` object: `null` when no tree pass ran; otherwise `mode` is `"full"` (transitive
