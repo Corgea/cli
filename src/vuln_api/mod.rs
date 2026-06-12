@@ -255,7 +255,16 @@ pub fn check_package_version(
         )
         .into());
     }
-    if !parsed.package_name.is_empty() && !parsed.package_name.eq_ignore_ascii_case(name) {
+    // Apply the ecosystem's canonical-name rule to BOTH sides before
+    // comparing: `name` is already normalized, and a response that echoes
+    // the registry/stored spelling (`flask_cors` for a `flask-cors` request,
+    // PEP 503-equivalent) must not be a hard failure — that would fail the
+    // gate closed for valid pypi packages with `_`/`.` in their names.
+    if !parsed.package_name.is_empty()
+        && !ecosystem
+            .normalize_name(&parsed.package_name)
+            .eq_ignore_ascii_case(name)
+    {
         return Err(format!(
             "vuln-api response package '{}' does not match request '{}'",
             parsed.package_name, name
@@ -316,6 +325,30 @@ mod tests {
             HashMap::new(),
         );
         check_lodash(&stub)
+    }
+
+    #[test]
+    fn pypi_response_alternate_spelling_passes_identity_guard() {
+        // The request normalizes `Flask_Cors` → `flask-cors`; a response that
+        // echoes the stored spelling `flask_cors` is PEP 503-equivalent and
+        // must NOT trip the identity guard (which would fail the gate closed
+        // for a valid package).
+        let key = vuln_api_stub::key("pypi", "flask-cors", "1.0.0");
+        let body = r#"{"ecosystem":"PyPI","package_name":"flask_cors","version":"1.0.0","is_vulnerable":false,"matches":[]}"#;
+        let stub = vuln_api_stub::spawn_with_statuses(
+            HashMap::from([(key, body.to_string())]),
+            HashMap::new(),
+        );
+        let client = http_client().expect("test client");
+        let resp = check_package_version(
+            &client,
+            &stub.base_url,
+            Ecosystem::Pypi,
+            "Flask_Cors",
+            "1.0.0",
+        )
+        .expect("alternate pypi spelling must pass the identity guard");
+        assert!(!resp.is_vulnerable);
     }
 
     #[test]

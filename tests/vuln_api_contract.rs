@@ -8,6 +8,11 @@
 //!
 //! Run the staging half with:
 //!   cargo test --test vuln_api_contract -- --ignored
+//!
+//! The hermetic stub backend runs in the default `./harness ci` gate. The
+//! `#[ignore]`d staging backend runs out-of-band on a schedule (non-blocking)
+//! via `.github/workflows/staging-contract.yml`, so endpoint/schema/seed
+//! drift in the live worker is caught instead of shipping undetected.
 
 mod common;
 
