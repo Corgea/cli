@@ -301,6 +301,34 @@ fn npm_json_passthrough_forwards_flag_to_manager() {
 }
 
 #[test]
+fn npm_json_after_verb_belongs_to_the_manager() {
+    // Position sensitivity: flags after the verb belong to the package
+    // manager. `corgea npm install --json x` forwards --json to npm on a
+    // gated install while the gate itself stays in text mode.
+    let mut h = wrapper("npm", "CORGEA_NPM_REGISTRY", 0);
+    let out = h
+        .cmd
+        .args(["npm", "install", "oldpkg@1.0.0", "--json"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(out.status.code(), Some(0), "clean old pin proceeds");
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("install oldpkg@1.0.0 --json"),
+        "post-verb --json must reach npm untouched"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Pre-checking"),
+        "the gate must stay in text mode: {stdout}"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&stdout).is_err(),
+        "stdout is the text report, not a JSON document"
+    );
+}
+
+#[test]
 fn pip_mixed_fresh_and_old_pins_block_without_running_install() {
     let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
     let out = h

@@ -421,10 +421,15 @@ fn passthrough_exec(binary: &str, args: &[String], opts: &PrecheckOptions) -> i3
 }
 
 /// Guard refusals happen before any report exists; under `--json` stdout
-/// must still carry one parseable document.
+/// must still carry one parseable document (pretty-printed, matching the
+/// main report's formatting).
 fn refuse_guard(opts: &PrecheckOptions, message: String, code: i32) -> i32 {
     if opts.json {
-        println!("{}", serde_json::json!({ "error": message }));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "error": message }))
+                .expect("static JSON shape")
+        );
     }
     eprintln!("{message}");
     code
@@ -566,6 +571,21 @@ fn run_parsed_install(
             render::bare_install_note(manager, subcommand_label);
         }
         render::requirements_note(&parsed);
+        // Under --json (bare yarn/pnpm install) stdout must still carry one
+        // parseable document — an empty report; the notes stay on stderr and
+        // the exec moves the manager's stdout to stderr.
+        if opts.json {
+            let report = PrecheckReport {
+                manager,
+                subcommand: subcommand_label.to_string(),
+                original_args: rest.to_vec(),
+                outcomes: Vec::new(),
+                threshold: opts.threshold,
+                tree: None,
+                bare_install,
+            };
+            return report_and_exec(&report, &opts, exec);
+        }
         return exec();
     }
 
@@ -638,11 +658,24 @@ fn run_locked_install(
     let jobs = match lock {
         Ok(jobs) => jobs,
         Err(e) if opts.force => {
-            eprintln!(
+            let message = format!(
                 "warning: cannot verify '{} {}' ({e}); proceeding under --force",
                 manager.binary_name(),
                 subcommand
             );
+            // Under --json stdout must still carry one parseable document —
+            // the exec below moves the manager's stdout to stderr.
+            if opts.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "warning": message,
+                        "proceeded": true,
+                    }))
+                    .expect("static JSON shape")
+                );
+            }
+            eprintln!("{message}");
             return exec();
         }
         Err(e) => {
