@@ -1,0 +1,2475 @@
+//! Install wrappers: `corgea npm`, `corgea yarn`, `corgea pnpm`, `corgea pip`, `corgea uv`.
+//!
+//! Wraps an install command from a supported package manager, resolves what
+//! the package manager *would* install against the public registry, and either
+//! blocks the install or runs it transparently.
+//!
+//! Verification rule: a package is rejected if the resolved version
+//! was published within `--threshold` (default `2d`). This mirrors
+//! the `deps` flow but applies to the install-time set of
+//! packages instead of the already-locked set.
+//!
+//! By default a "recent" finding makes the wrapper exit with status 1
+//! *without* running the install. Use `--no-fail` to demote this to a
+//! warning (the install runs anyway).
+
+pub mod parse;
+pub mod tree;
+
+use std::ffi::OsString;
+use std::process::Command;
+use std::time::Duration;
+
+use chrono::Utc;
+
+use crate::verify_deps;
+
+/// Supported package managers. Each one shares enough behaviour with
+/// the others that we only need a small per-manager dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageManager {
+    Npm,
+    Yarn,
+    Pnpm,
+    Pip,
+    Uv,
+}
+
+impl PackageManager {
+    pub fn binary_name(self) -> &'static str {
+        match self {
+            PackageManager::Npm => "npm",
+            PackageManager::Yarn => "yarn",
+            PackageManager::Pnpm => "pnpm",
+            PackageManager::Pip => "pip",
+            PackageManager::Uv => "uv",
+        }
+    }
+
+    /// Subcommands that this manager treats as "install something new"
+    /// — the only ones we need to verify before running.
+    pub fn is_install_subcommand(self, sub: &str) -> bool {
+        match self {
+            PackageManager::Npm => matches!(sub, "install" | "i" | "add" | "ci" | "clean-install"),
+            PackageManager::Yarn => matches!(sub, "add" | "install"),
+            PackageManager::Pnpm => matches!(sub, "add" | "install" | "i"),
+            PackageManager::Pip => matches!(sub, "install"),
+            PackageManager::Uv => false,
+        }
+    }
+
+    /// vuln-api ecosystem path segment for this manager's registry.
+    pub fn ecosystem(self) -> &'static str {
+        match self {
+            PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => "npm",
+            PackageManager::Pip | PackageManager::Uv => "pypi",
+        }
+    }
+
+    /// Canonical package name for dedup/matching across spec spellings:
+    /// PEP 503 for pypi (shared with `deps`), verbatim for npm.
+    pub fn normalize_name(self, name: &str) -> String {
+        match self {
+            PackageManager::Pip | PackageManager::Uv => {
+                crate::deps::ecosystems::pypi::normalize_pypi_name(name)
+            }
+            PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => name.to_string(),
+        }
+    }
+}
+
+/// Connection details for the Corgea vuln-api verdict pass. Public mode uses
+/// no token and fails open on service outages; authenticated mode carries a
+/// token and fails closed when the Corgea verdict cannot be obtained.
+#[derive(Debug, Clone)]
+pub struct VerdictConfig {
+    pub base_url: String,
+    pub token: Option<String>,
+    pub fail_closed: bool,
+}
+
+/// Threat verdict for one resolved target.
+#[derive(Debug, Clone)]
+pub enum VerdictStatus {
+    /// vuln-api answered: no known advisories for this exact version.
+    Clean,
+    /// vuln-api answered: known vulnerable or malicious — blocks.
+    Vulnerable(Vec<crate::vuln_api::VulnMatch>),
+    /// The verdict could not be obtained (network/5xx/auth/integrity).
+    /// Blocks fail-closed.
+    Unverifiable(String),
+    /// A public-mode vulnerability source could not be reached. This warns but
+    /// does not block; public checks fail open by design.
+    PublicUnavailable(String),
+    /// Verdict never attempted because all vulnerability sources are disabled.
+    /// This is used by unit tests and recency-only internal paths.
+    NotChecked,
+}
+
+/// Reason recorded on resolved targets when vulnerability checks are disabled.
+const NO_TOKEN_REASON: &str = "vulnerability checks disabled";
+
+#[derive(Debug, Clone)]
+pub struct PrecheckOptions {
+    pub threshold: Duration,
+    /// If true, demote a recent finding from "block" to "warn-and-run".
+    pub no_fail: bool,
+    /// If true, never block: print findings (recent, vulnerable,
+    /// unverifiable) and run the install anyway.
+    pub force: bool,
+    pub json: bool,
+    /// Corgea vuln-api verdict source. `None` disables this source.
+    pub verdict: Option<VerdictConfig>,
+    pub osv: Option<crate::osv::OsvConfig>,
+    /// Optional registry overrides, used by tests.
+    pub npm_registry: Option<String>,
+    pub pypi_registry: Option<String>,
+}
+
+impl PrecheckOptions {
+    fn has_vulnerability_checks(&self) -> bool {
+        self.verdict.is_some() || self.osv.is_some()
+    }
+
+    fn fail_closed(&self) -> bool {
+        self.verdict.as_ref().is_some_and(|cfg| cfg.fail_closed)
+    }
+
+    fn verdict_mode(&self) -> &'static str {
+        if self.fail_closed() {
+            "authenticated"
+        } else if self.has_vulnerability_checks() {
+            "public"
+        } else {
+            "recency-only"
+        }
+    }
+}
+
+/// Each item the user (or a `-r` requirements file) asked us to install.
+#[derive(Debug, Clone)]
+pub struct InstallTarget {
+    pub name: String,
+    /// Display form, e.g. `axios@^1.0.0` or `requests==2.31.0`.
+    pub display: String,
+    /// What we'll feed into the resolver.
+    pub kind: TargetKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum TargetKind {
+    Npm(crate::verify_deps::registry::NpmSpec),
+    Pypi(crate::verify_deps::registry::PypiSpec),
+    /// Something we can't verify (URL/git/file/path) — we surface this
+    /// as a warning but never block on it.
+    Unverifiable {
+        reason: String,
+    },
+}
+
+/// Outcome of resolving + verifying a single target.
+#[derive(Debug, Clone)]
+pub enum TargetOutcome {
+    /// Resolved cleanly. The blocking recency condition is derived from
+    /// `age` against the report's threshold (`PrecheckReport::is_recent`).
+    Resolved {
+        target: InstallTarget,
+        resolved: crate::verify_deps::registry::ResolvedPackage,
+        age: Duration,
+        verdict: VerdictStatus,
+    },
+    /// We deliberately couldn't verify this target (URL / git / etc.).
+    Skipped {
+        target: InstallTarget,
+        reason: String,
+    },
+    /// Resolution failed (network, unknown package, bad spec).
+    Error {
+        target: InstallTarget,
+        error: String,
+    },
+}
+
+/// Why a tree-pass finding is in the would-install set. Drives the
+/// provenance label so a package the user asked for (or already depends on)
+/// is never mislabeled "(transitive)".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeOrigin {
+    /// Pulled in as a dependency of something else.
+    Transitive,
+    /// Explicitly requested (pip report `"requested"` — CLI arg or
+    /// requirements file; leftovers here come from `-r` files since named
+    /// CLI targets match a named outcome instead).
+    Requested,
+    /// Already a direct dependency in the project's `package.json`.
+    PreExisting,
+    /// Pinned by the project's lockfile (`uv sync` from `uv.lock`).
+    Locked,
+}
+
+impl TreeOrigin {
+    fn label(self) -> &'static str {
+        match self {
+            TreeOrigin::Transitive => "(transitive)",
+            TreeOrigin::Requested => "(from requirements)",
+            TreeOrigin::PreExisting => "(already in package.json)",
+            TreeOrigin::Locked => "(locked)",
+        }
+    }
+
+    fn json_name(self) -> &'static str {
+        match self {
+            TreeOrigin::Transitive => "transitive",
+            TreeOrigin::Requested => "requested",
+            TreeOrigin::PreExisting => "pre-existing",
+            TreeOrigin::Locked => "locked",
+        }
+    }
+}
+
+/// Verdict for one package the tree pass resolved beyond the named targets.
+#[derive(Debug)]
+pub struct TreeOutcome {
+    pub name: String,
+    pub version: String,
+    pub origin: TreeOrigin,
+    pub verdict: VerdictStatus,
+}
+
+/// Result of the tree pass. `PrecheckReport.tree` is `None` when the pass
+/// never ran, usually because the command was recency-only or passthrough.
+#[derive(Debug)]
+pub enum TreeReport {
+    /// The full would-install set was resolved and verdicted.
+    Full {
+        /// Distinct packages the dry-run resolved (named + transitive).
+        resolved_count: usize,
+        /// Verdicts for resolved packages beyond the named targets.
+        transitive: Vec<TreeOutcome>,
+    },
+    /// Resolution unavailable or failed — only named targets were verified.
+    NamedOnly { reason: String },
+}
+
+#[derive(Debug)]
+pub struct PrecheckReport {
+    pub manager: PackageManager,
+    pub subcommand: String,
+    pub original_args: Vec<String>,
+    pub outcomes: Vec<TargetOutcome>,
+    pub threshold: Duration,
+    /// `None` means no tree pass ran.
+    pub tree: Option<TreeReport>,
+    /// True when the command named nothing — no CLI targets and no
+    /// requirements files — so everything the tree pass resolved predates
+    /// this command (bare `npm install`). Distinct from
+    /// `outcomes.is_empty()`: a requirements-only install also has no named
+    /// outcomes, but its resolved set IS added by the command.
+    pub bare_install: bool,
+}
+
+impl PrecheckReport {
+    fn count(&self, pred: impl Fn(&TargetOutcome) -> bool) -> usize {
+        self.outcomes.iter().filter(|o| pred(o)).count()
+    }
+    /// True when this age is within the recency threshold (the blocking
+    /// condition). The single definition of "recent".
+    fn is_recent(&self, age: Duration) -> bool {
+        age < self.threshold
+    }
+    pub fn ok_count(&self) -> usize {
+        self.count(|o| matches!(o, TargetOutcome::Resolved { age, .. } if !self.is_recent(*age)))
+    }
+    pub fn recent_count(&self) -> usize {
+        self.count(|o| matches!(o, TargetOutcome::Resolved { age, .. } if self.is_recent(*age)))
+    }
+    pub fn vulnerable_count(&self) -> usize {
+        self.named_vulnerable_count() + self.tree_vulnerable_count()
+    }
+    pub fn unverifiable_count(&self) -> usize {
+        self.named_unverifiable_count() + self.tree_unverifiable_count()
+    }
+    /// Vulnerable findings among the named targets this command adds.
+    pub fn named_vulnerable_count(&self) -> usize {
+        self.named_finding_count(|v| matches!(v, VerdictStatus::Vulnerable(_)))
+    }
+    /// Unverifiable findings among the named targets this command adds.
+    pub fn named_unverifiable_count(&self) -> usize {
+        self.named_finding_count(|v| matches!(v, VerdictStatus::Unverifiable(_)))
+    }
+    /// Count named (resolved) outcomes whose verdict matches `pred`.
+    fn named_finding_count(&self, pred: impl Fn(&VerdictStatus) -> bool) -> usize {
+        self.count(|o| matches!(o, TargetOutcome::Resolved { verdict, .. } if pred(verdict)))
+    }
+    /// Vulnerable findings beyond the named targets (the resolved tree).
+    pub fn tree_vulnerable_count(&self) -> usize {
+        self.tree_finding_count(|v| matches!(v, VerdictStatus::Vulnerable(_)))
+    }
+    /// Unverifiable findings beyond the named targets (the resolved tree).
+    pub fn tree_unverifiable_count(&self) -> usize {
+        self.tree_finding_count(|v| matches!(v, VerdictStatus::Unverifiable(_)))
+    }
+    /// Count transitive tree findings whose verdict matches `pred`.
+    fn tree_finding_count(&self, pred: impl Fn(&VerdictStatus) -> bool) -> usize {
+        match &self.tree {
+            Some(TreeReport::Full { transitive, .. }) => {
+                transitive.iter().filter(|o| pred(&o.verdict)).count()
+            }
+            Some(TreeReport::NamedOnly { .. }) | None => 0,
+        }
+    }
+    pub fn skipped_count(&self) -> usize {
+        self.count(|o| matches!(o, TargetOutcome::Skipped { .. }))
+    }
+    pub fn error_count(&self) -> usize {
+        self.count(|o| matches!(o, TargetOutcome::Error { .. }))
+    }
+}
+
+/// Canonical entry for ecosystem commands (`corgea npm install …`).
+///
+/// `cmd` is everything after the ecosystem name, e.g.
+/// `["install", "axios@^1.0.0", "--save-dev"]`. An empty `cmd` execs the
+/// package manager with no arguments.
+pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOptions) -> i32 {
+    if manager == PackageManager::Uv {
+        return run_uv(cmd, opts);
+    }
+
+    if cmd.is_empty() {
+        return exec_command_for_json(manager.binary_name(), &[], opts.json);
+    }
+
+    let Some(subcommand_index) = find_package_manager_subcommand(manager, cmd) else {
+        return exec_command_for_json(manager.binary_name(), cmd, opts.json);
+    };
+    let subcommand = &cmd[subcommand_index];
+    let rest = &cmd[subcommand_index + 1..];
+
+    if manager == PackageManager::Pip && subcommand == "add" {
+        eprintln!("`pip add` is not a pip install command. Use `corgea pip install ...`.");
+        return 2;
+    }
+
+    if !manager.is_install_subcommand(subcommand) {
+        return exec_command_for_json(manager.binary_name(), cmd, opts.json);
+    }
+
+    let parsed = match parse::parse_install_args(manager, rest) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("failed to parse install args: {}", e);
+            return 2;
+        }
+    };
+
+    let json = opts.json;
+    run_parsed_install(
+        manager,
+        subcommand,
+        rest,
+        parsed,
+        || exec_command_for_json(manager.binary_name(), cmd, json),
+        opts,
+    )
+}
+
+fn find_package_manager_subcommand(manager: PackageManager, cmd: &[String]) -> Option<usize> {
+    let mut i = 0;
+    while i < cmd.len() {
+        let arg = cmd[i].as_str();
+        if !arg.starts_with('-') {
+            return Some(i);
+        }
+        if flag_takes_leading_value(manager, arg) && !arg.contains('=') {
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn flag_takes_leading_value(manager: PackageManager, flag: &str) -> bool {
+    match manager {
+        PackageManager::Npm => matches!(
+            flag,
+            "-w" | "--workspace"
+                | "--prefix"
+                | "--registry"
+                | "--tag"
+                | "--omit"
+                | "--include"
+                | "--loglevel"
+        ),
+        PackageManager::Pnpm => matches!(
+            flag,
+            "-C" | "--dir" | "--filter" | "--registry" | "--reporter" | "--loglevel"
+        ),
+        PackageManager::Yarn => matches!(
+            flag,
+            "--registry" | "--modules-folder" | "--cache-folder" | "--mutex" | "--network-timeout"
+        ),
+        PackageManager::Pip => matches!(
+            flag,
+            "--python"
+                | "--platform"
+                | "--implementation"
+                | "--abi"
+                | "--target"
+                | "-t"
+                | "--prefix"
+                | "--root"
+                | "--index-url"
+                | "-i"
+                | "--extra-index-url"
+        ),
+        PackageManager::Uv => false,
+    }
+}
+
+fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
+    let json = opts.json;
+    let exec = || exec_command_for_json("uv", cmd, json);
+
+    match parse::classify_uv_command(cmd) {
+        parse::UvCommand::InvalidInstall => {
+            eprintln!("`uv install` is not a uv dependency install command. Use `corgea uv pip install ...`.");
+            2
+        }
+        parse::UvCommand::Passthrough => exec(),
+        parse::UvCommand::PipInstall { install_args } => {
+            let parsed = match parse::parse_pip_install_args(install_args) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("failed to parse install args: {}", e);
+                    return 2;
+                }
+            };
+            run_parsed_install(
+                PackageManager::Uv,
+                "pip install",
+                install_args,
+                parsed,
+                exec,
+                opts,
+            )
+        }
+        parse::UvCommand::PipSync { sync_args } => run_parsed_install(
+            PackageManager::Uv,
+            "pip sync",
+            sync_args,
+            parse::parse_uv_pip_sync_args(sync_args),
+            exec,
+            opts,
+        ),
+        parse::UvCommand::Add { add_args } => run_parsed_install(
+            PackageManager::Uv,
+            "add",
+            add_args,
+            parse::parse_pypi_positionals_args(add_args),
+            exec,
+            opts,
+        ),
+        parse::UvCommand::Sync => run_uv_sync(cmd, opts, exec),
+    }
+}
+
+/// Gate `uv sync` from the project's `uv.lock`. The lockfile is the full
+/// locked universe (all groups/extras) — a superset of what sync installs,
+/// conservative in the blocking direction; a stale lock that sync would
+/// re-resolve is gated as written. Recency isn't checked (locked versions
+/// aren't newly chosen by this command); the verdict pass is the gate. We
+/// never run `uv lock` ourselves — locking can build sdists, which would
+/// execute package code before any verdict.
+fn run_uv_sync(cmd: &[String], opts: PrecheckOptions, exec: impl FnOnce() -> i32) -> i32 {
+    if !opts.has_vulnerability_checks() {
+        // Recency-only mode has no verdict to gate with.
+        return exec();
+    };
+    let lock = match std::fs::read_to_string("uv.lock") {
+        Ok(content) => content,
+        Err(_) => {
+            eprintln!(
+                "note: no uv.lock here — 'uv sync' is not gated; dependencies install unchecked (run 'uv lock' first to enable the gate)"
+            );
+            return exec();
+        }
+    };
+    let jobs = match parse_uv_lock(&lock) {
+        Ok(jobs) => jobs,
+        Err(e) if opts.force => {
+            eprintln!("warning: cannot verify 'uv sync' ({e}); proceeding under --force");
+            return exec();
+        }
+        Err(e) => {
+            eprintln!("error: cannot verify 'uv sync': {e} (pass --force to proceed unchecked)");
+            return 1;
+        }
+    };
+
+    let resolved_count = jobs.len();
+    let results = verdict_pool(jobs, &opts, PackageManager::Uv, VERDICT_CONCURRENCY);
+    let transitive = results
+        .into_iter()
+        .map(|(pkg, verdict)| TreeOutcome {
+            name: pkg.name,
+            version: pkg.version,
+            origin: TreeOrigin::Locked,
+            verdict,
+        })
+        .collect();
+    let report = PrecheckReport {
+        manager: PackageManager::Uv,
+        subcommand: "sync".to_string(),
+        original_args: cmd[1..].to_vec(),
+        outcomes: Vec::new(),
+        threshold: opts.threshold,
+        tree: Some(TreeReport::Full {
+            resolved_count,
+            transitive,
+        }),
+        bare_install: true,
+    };
+
+    if opts.json {
+        print_json(&report, &opts);
+    } else {
+        print_text(&report);
+    }
+    if should_block_install(&report, &opts) {
+        if !opts.json {
+            print_refusal(&report);
+        }
+        return 1;
+    }
+    exec()
+}
+
+/// Packages from `uv.lock` that `uv sync` installs from an index. Local
+/// stanzas (the project itself and path deps: editable / virtual /
+/// directory / path sources) carry no registry identity and are skipped.
+fn parse_uv_lock(content: &str) -> Result<Vec<tree::TreePackage>, String> {
+    #[derive(serde::Deserialize)]
+    struct Lock {
+        #[serde(default)]
+        package: Vec<Pkg>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Pkg {
+        name: String,
+        version: Option<String>,
+        #[serde(default)]
+        source: std::collections::BTreeMap<String, toml::Value>,
+    }
+    const LOCAL_SOURCES: [&str; 4] = ["editable", "virtual", "directory", "path"];
+
+    let lock: Lock = toml::from_str(content).map_err(|e| format!("parse uv.lock: {e}"))?;
+    Ok(lock
+        .package
+        .into_iter()
+        .filter(|p| !LOCAL_SOURCES.iter().any(|k| p.source.contains_key(*k)))
+        .filter_map(|p| {
+            Some(tree::TreePackage {
+                name: p.name,
+                version: p.version?,
+                requested: false,
+            })
+        })
+        .collect())
+}
+
+/// Post-parse verification shared by npm/yarn/pnpm/pip and uv install paths.
+fn run_parsed_install(
+    manager: PackageManager,
+    subcommand_label: &str,
+    rest: &[String],
+    parsed: parse::ParsedInstall,
+    exec: impl FnOnce() -> i32,
+    opts: PrecheckOptions,
+) -> i32 {
+    // With vulnerability checks, the tree pass resolves the full would-install
+    // set; `tree::covers_input` owns what each manager's resolver can chew on.
+    let tree_eligible =
+        opts.has_vulnerability_checks() && tree_covers_command(manager, subcommand_label, &parsed);
+    let bare_install = parsed.targets.is_empty() && parsed.requirements_files.is_empty();
+
+    if !opts.force {
+        if let Some(message) = project_guard_message(manager, subcommand_label, &parsed) {
+            eprintln!("{message} Pass --force to run it anyway.");
+            return 1;
+        }
+        if manager == PackageManager::Pip
+            && subcommand_label == "install"
+            && opts.has_vulnerability_checks()
+            && pip_externally_managed()
+            && !pip_has_environment_override(rest)
+        {
+            eprintln!("Refusing to run pip in an externally managed Python environment. Use pip's explicit override (`--break-system-packages`) or an explicit install target such as `--target`, or pass --force.");
+            return 1;
+        }
+    }
+
+    if parsed.targets.is_empty() && !tree_eligible {
+        // Only a truly bare install gets the bare note — a tokenless
+        // `-r requirements.txt` install is covered by `requirements_note`.
+        if bare_install {
+            bare_install_note(manager, subcommand_label);
+        }
+        requirements_note(&parsed);
+        return exec();
+    }
+
+    let now = Utc::now();
+    let mut outcomes: Vec<_> = parsed
+        .targets
+        .iter()
+        .map(|target| verify_one(target, &opts, &now))
+        .collect();
+
+    let tree = if tree_eligible {
+        Some(run_tree_pass(manager, rest, &parsed, &mut outcomes, &opts))
+    } else {
+        run_verdict_pass(manager, &mut outcomes, &opts); // no-op tokenless
+        None
+    };
+
+    // The mandatory loud warning when the tree pass fell back to named-only.
+    if let Some(TreeReport::NamedOnly { reason }) = &tree {
+        eprintln!(
+            "warning: transitive dependencies not checked ({reason}); only named packages were verified."
+        );
+    }
+    // The requirements note only matters when the tree pass did *not* cover
+    // those files (fallback to named-only, or recency-only mode).
+    if !matches!(&tree, Some(TreeReport::Full { .. })) {
+        requirements_note(&parsed);
+    }
+    coverage_note(&opts);
+
+    let report = PrecheckReport {
+        manager,
+        subcommand: subcommand_label.to_string(),
+        original_args: rest.to_vec(),
+        outcomes,
+        threshold: opts.threshold,
+        tree,
+        bare_install,
+    };
+
+    if opts.json {
+        print_json(&report, &opts);
+    } else {
+        print_text(&report);
+    }
+
+    if should_block_install(&report, &opts) {
+        if !opts.json {
+            print_refusal(&report);
+        }
+        return 1;
+    }
+
+    exec()
+}
+
+fn tree_covers_command(
+    manager: PackageManager,
+    subcommand_label: &str,
+    parsed: &parse::ParsedInstall,
+) -> bool {
+    if manager == PackageManager::Npm && matches!(subcommand_label, "ci" | "clean-install") {
+        return std::path::Path::new("package-lock.json").exists()
+            || std::path::Path::new("npm-shrinkwrap.json").exists();
+    }
+    tree::covers_input(manager, parsed)
+}
+
+fn project_guard_message(
+    manager: PackageManager,
+    subcommand_label: &str,
+    parsed: &parse::ParsedInstall,
+) -> Option<String> {
+    let cwd = std::path::Path::new(".");
+    let has_targets = !parsed.targets.is_empty() || !parsed.requirements_files.is_empty();
+    match manager {
+        PackageManager::Npm if has_targets && cwd.join("pnpm-lock.yaml").exists() => Some(
+            "This looks like a pnpm project. Use `corgea pnpm add ...` instead of `corgea npm ...`."
+                .to_string(),
+        ),
+        PackageManager::Npm if has_targets && cwd.join("yarn.lock").exists() => Some(
+            "This looks like a yarn project. Use `corgea yarn add ...` instead of `corgea npm ...`."
+                .to_string(),
+        ),
+        PackageManager::Pnpm
+            if (cwd.join("package-lock.json").exists() || cwd.join("npm-shrinkwrap.json").exists())
+                && !cwd.join("pnpm-lock.yaml").exists() =>
+        {
+            Some(
+                "This looks like an npm project. Use `corgea npm install ...` instead of `corgea pnpm ...`."
+                    .to_string(),
+            )
+        }
+        PackageManager::Pip if cwd.join("uv.lock").exists() => {
+            if parsed.requirements_files.is_empty() {
+                Some(
+                    "This looks like a uv project. Use `corgea uv add ...` instead of `corgea pip install ...`."
+                        .to_string(),
+                )
+            } else {
+                Some(
+                    "This looks like a uv project. Use `corgea uv pip install -r ...` instead of `corgea pip install -r ...`."
+                        .to_string(),
+                )
+            }
+        }
+        PackageManager::Uv
+            if subcommand_label == "add"
+                && cwd.join("requirements.txt").exists()
+                && !cwd.join("uv.lock").exists()
+                && parsed.requirements_files.is_empty() =>
+        {
+            Some(
+                "This looks like a requirements.txt pip project. Use `corgea pip install ...` instead of `corgea uv add ...`."
+                    .to_string(),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn pip_has_environment_override(args: &[String]) -> bool {
+    args.iter().enumerate().any(|(i, arg)| {
+        matches!(
+            arg.as_str(),
+            "--break-system-packages" | "--target" | "--prefix" | "--root"
+        ) || arg.starts_with("--target=")
+            || arg.starts_with("--prefix=")
+            || arg.starts_with("--root=")
+            || (arg == "-t" && args.get(i + 1).is_some())
+    })
+}
+
+fn pip_externally_managed() -> bool {
+    if std::env::var("CORGEA_PIP_EXTERNALLY_MANAGED")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        return true;
+    }
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            "import pathlib, sysconfig; print((pathlib.Path(sysconfig.get_path('stdlib')) / 'EXTERNALLY-MANAGED').exists())",
+        ])
+        .output();
+    matches!(output, Ok(out) if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "True")
+}
+
+/// One honest stderr line when a zero-spec install can't be gated:
+/// yarn/pnpm/uv have no safe dry-run, so a bare install pulls its whole
+/// dependency set unchecked. No-op for other managers (bare npm is gated
+/// via the tree pass; bare pip installs nothing).
+fn bare_install_note(manager: PackageManager, subcommand_label: &str) {
+    if matches!(
+        manager,
+        PackageManager::Yarn | PackageManager::Pnpm | PackageManager::Uv
+    ) {
+        eprintln!(
+            "note: bare '{} {}' is not gated (no safe dry-run) — dependencies install unchecked",
+            manager.binary_name(),
+            subcommand_label
+        );
+    }
+}
+
+/// The refusal line on stderr. When vulnerable findings exist but none sit on
+/// a named target — and no named target is unverifiable either — the block is
+/// entirely the existing tree's doing, so say that instead of implying the
+/// package the user typed is at fault. Messaging only; the block decision
+/// stays with `should_block_install`.
+fn print_refusal(report: &PrecheckReport) {
+    if refusal_blames_existing_tree(report) {
+        eprintln!(
+            "Refusing to run install: your existing dependency tree has known-vulnerable packages (none were added by this command). Fix them or pass --force."
+        );
+    } else if report.vulnerable_count() > 0
+        || report.unverifiable_count() > 0
+        || report.error_count() > 0
+    {
+        eprintln!("Refusing to run install. Pass --force to proceed despite findings.");
+    } else {
+        eprintln!("Refusing to run install. Pass --no-fail to proceed anyway.");
+    }
+}
+
+/// True when the block is entirely the existing tree's doing: vulnerable
+/// findings exist, none sit on a named target (or block as unverifiable
+/// there), and every *blocking* tree finding — vulnerable or unverifiable,
+/// since `should_block_install` refuses on both — genuinely predates this
+/// command. A `Requested` finding (pip `-r`) is added by this command and
+/// renders as `(from requirements)`; a `Transitive` finding on any install
+/// that names targets or requirements files is being pulled in by them
+/// right now. Only a truly bare install (`report.bare_install`) or
+/// manifest-declared `PreExisting` findings may blame the existing tree.
+fn refusal_blames_existing_tree(report: &PrecheckReport) -> bool {
+    let named_findings = report.named_vulnerable_count() + report.named_unverifiable_count();
+    if report.vulnerable_count() == 0 || named_findings > 0 {
+        return false;
+    }
+    let Some(TreeReport::Full { transitive, .. }) = &report.tree else {
+        return false;
+    };
+    transitive
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.verdict,
+                VerdictStatus::Vulnerable(_) | VerdictStatus::Unverifiable(_)
+            )
+        })
+        .all(|t| match t.origin {
+            // A locked pin predates the sync command that installs it.
+            TreeOrigin::PreExisting | TreeOrigin::Locked => true,
+            TreeOrigin::Requested => false,
+            TreeOrigin::Transitive => report.bare_install,
+        })
+}
+
+/// Print the "requirements files are not recency-checked" note when the
+/// install carried any `-r` files. No-op otherwise.
+fn requirements_note(parsed: &parse::ParsedInstall) {
+    if parsed.requirements_files.is_empty() {
+        return;
+    }
+    let files: Vec<String> = parsed
+        .requirements_files
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    eprintln!(
+        "note: requirements files ({}) are not recency-checked by the baseline gate",
+        files.join(", ")
+    );
+}
+
+fn coverage_note(opts: &PrecheckOptions) {
+    match opts.verdict_mode() {
+        "authenticated" => {}
+        "public" => {
+            eprintln!(
+                "warning: public vulnerability mode — known findings still block, but service outages fail open."
+            );
+        }
+        _ => {
+            eprintln!(
+                "warning: vulnerability checks disabled — known-vulnerable packages will NOT be blocked (recency-only)."
+            );
+        }
+    }
+}
+
+/// Resolve the full would-install set and verdict it. On any resolution
+/// failure, fall back to the named-only verdict pass; the caller renders the
+/// loud warning from the returned `NamedOnly` reason. Only called when
+/// `opts.verdict.is_some()`.
+fn run_tree_pass(
+    manager: PackageManager,
+    rest: &[String],
+    parsed: &parse::ParsedInstall,
+    outcomes: &mut [TargetOutcome],
+    opts: &PrecheckOptions,
+) -> TreeReport {
+    let set = match tree::resolve_tree(manager, rest, parsed) {
+        Ok(Some(set)) => set,
+        Ok(None) => {
+            run_verdict_pass(manager, outcomes, opts);
+            return TreeReport::NamedOnly {
+                reason: format!("{} has no safe dry-run", manager.binary_name()),
+            };
+        }
+        Err(reason) => {
+            run_verdict_pass(manager, outcomes, opts);
+            return TreeReport::NamedOnly { reason };
+        }
+    };
+
+    // Dedup the dry-run set (npm lockfiles repeat the same name@version at
+    // multiple nested paths), then union in the named-resolved targets — a
+    // named target already installed is absent from the dry-run delta but
+    // must still be verdicted.
+    let norm = |n: &str| manager.normalize_name(n);
+    let mut seen = std::collections::HashSet::new();
+    let mut jobs: Vec<tree::TreePackage> = Vec::with_capacity(set.len());
+    for p in set {
+        if seen.insert((norm(&p.name), p.version.clone())) {
+            jobs.push(p);
+        }
+    }
+    let resolved_count = jobs.len();
+    for o in outcomes.iter() {
+        if let TargetOutcome::Resolved { resolved, .. } = o {
+            if seen.insert((norm(&resolved.name), resolved.version.clone())) {
+                jobs.push(tree::TreePackage {
+                    name: resolved.name.clone(),
+                    version: resolved.version.clone(),
+                    requested: true,
+                });
+            }
+        }
+    }
+
+    // npm leftovers that are direct deps of the project manifest are
+    // pre-existing, not transitive. pip carries `requested` instead.
+    let direct_deps = if manager == PackageManager::Npm {
+        tree::project_direct_deps()
+    } else {
+        Default::default()
+    };
+
+    let results = verdict_pool(jobs, opts, manager, VERDICT_CONCURRENCY);
+    let transitive = apply_verdicts(manager, results, outcomes, &direct_deps);
+    TreeReport::Full {
+        resolved_count,
+        transitive,
+    }
+}
+
+/// Above this many verdict jobs, print a stderr progress line so a big tree
+/// pass doesn't look hung.
+const VERDICT_PROGRESS_THRESHOLD: usize = 8;
+
+/// Max parallel Corgea vuln-api verdict requests.
+const VERDICT_CONCURRENCY: usize = 8;
+
+#[derive(Debug, Clone)]
+enum SourceVerdict {
+    Clean,
+    Vulnerable(Vec<crate::vuln_api::VulnMatch>),
+    Unavailable(String),
+    NotChecked,
+}
+
+/// Query configured vulnerability sources and compose them into the gate's
+/// final verdict. Corgea requests are bounded-concurrent; OSV uses one
+/// querybatch call for the same package set. The two source paths run in
+/// parallel so OSV cannot slow down a healthy Corgea path unnecessarily.
+fn verdict_pool(
+    jobs: Vec<tree::TreePackage>,
+    opts: &PrecheckOptions,
+    manager: PackageManager,
+    concurrency: usize,
+) -> Vec<(tree::TreePackage, VerdictStatus)> {
+    if jobs.is_empty() {
+        return Vec::new();
+    }
+    if jobs.len() > VERDICT_PROGRESS_THRESHOLD {
+        eprintln!("checking {} packages for vulnerabilities…", jobs.len());
+    }
+
+    let corgea_jobs = jobs.clone();
+    let osv_jobs = jobs.clone();
+    let corgea_cfg = opts.verdict.clone();
+    let osv_cfg = opts.osv.clone();
+    let fail_closed = opts.fail_closed();
+
+    let (corgea_results, osv_results) = std::thread::scope(|s| {
+        let corgea = s.spawn(|| {
+            corgea_cfg
+                .as_ref()
+                .map(|cfg| corgea_verdict_pool(corgea_jobs, cfg, manager, concurrency))
+                .unwrap_or_else(|| {
+                    jobs.iter()
+                        .cloned()
+                        .map(|job| (job, SourceVerdict::NotChecked))
+                        .collect()
+                })
+        });
+        let osv = s.spawn(|| {
+            osv_cfg
+                .as_ref()
+                .map(|cfg| osv_verdict_batch(osv_jobs, cfg, manager))
+                .unwrap_or_else(|| {
+                    jobs.iter()
+                        .cloned()
+                        .map(|job| (job, SourceVerdict::NotChecked))
+                        .collect()
+                })
+        });
+        (corgea.join().unwrap(), osv.join().unwrap())
+    });
+
+    let key = |pkg: &tree::TreePackage| {
+        (
+            manager.normalize_name(&pkg.name),
+            pkg.version.clone(),
+            pkg.requested,
+        )
+    };
+    let mut osv_by_key: std::collections::HashMap<(String, String, bool), SourceVerdict> =
+        std::collections::HashMap::new();
+    for (job, verdict) in osv_results {
+        osv_by_key.insert(key(&job), verdict);
+    }
+
+    corgea_results
+        .into_iter()
+        .map(|(job, corgea)| {
+            let osv = osv_by_key
+                .remove(&key(&job))
+                .unwrap_or(SourceVerdict::NotChecked);
+            let verdict = compose_source_verdicts(corgea, osv, fail_closed);
+            (job, verdict)
+        })
+        .collect()
+}
+
+/// Bounded worker pool for Corgea vuln-api requests. Result order is not
+/// preserved; callers match by package identity.
+fn corgea_verdict_pool(
+    jobs: Vec<tree::TreePackage>,
+    cfg: &VerdictConfig,
+    manager: PackageManager,
+    concurrency: usize,
+) -> Vec<(tree::TreePackage, SourceVerdict)> {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    let client = match crate::vuln_api::http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            return jobs
+                .into_iter()
+                .map(|j| (j, SourceVerdict::Unavailable(e.clone())))
+                .collect();
+        }
+    };
+
+    let ecosystem = manager.ecosystem();
+    let workers = concurrency.min(jobs.len()).max(1);
+    let queue = Mutex::new(VecDeque::from(jobs));
+    let results = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let Some(job) = queue.lock().unwrap().pop_front() else {
+                    break;
+                };
+                // vuln-api advisories are keyed by canonical names; an
+                // alternate spelling (PEP 503: `Flask_Cors` ≡ `flask-cors`)
+                // would miss and read as clean.
+                let verdict = match crate::vuln_api::check_package_version_with_auth(
+                    &client,
+                    &cfg.base_url,
+                    cfg.token.as_deref(),
+                    ecosystem,
+                    &manager.normalize_name(&job.name),
+                    &job.version,
+                ) {
+                    Ok(resp) if resp.is_vulnerable => SourceVerdict::Vulnerable(resp.matches),
+                    Ok(_) => SourceVerdict::Clean,
+                    Err(e) => SourceVerdict::Unavailable(e.to_string()),
+                };
+                results.lock().unwrap().push((job, verdict));
+            });
+        }
+    });
+    results.into_inner().unwrap()
+}
+
+fn osv_verdict_batch(
+    jobs: Vec<tree::TreePackage>,
+    cfg: &crate::osv::OsvConfig,
+    manager: PackageManager,
+) -> Vec<(tree::TreePackage, SourceVerdict)> {
+    let client = match crate::osv::http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            return jobs
+                .into_iter()
+                .map(|j| (j, SourceVerdict::Unavailable(e.clone())))
+                .collect();
+        }
+    };
+    let ecosystem = crate::osv::ecosystem_for_osv(manager.ecosystem());
+    let packages: Vec<_> = jobs
+        .iter()
+        .map(|job| crate::osv::OsvPackage {
+            ecosystem: ecosystem.clone(),
+            name: manager.normalize_name(&job.name),
+            version: job.version.clone(),
+        })
+        .collect();
+    match crate::osv::query_batch(&client, &cfg.base_url, &packages) {
+        Ok(verdicts) => jobs
+            .into_iter()
+            .zip(verdicts)
+            .map(|(job, verdict)| {
+                let verdict = match verdict {
+                    crate::osv::OsvVerdict::Clean => SourceVerdict::Clean,
+                    crate::osv::OsvVerdict::Vulnerable(matches) => {
+                        SourceVerdict::Vulnerable(matches)
+                    }
+                };
+                (job, verdict)
+            })
+            .collect(),
+        Err(e) => jobs
+            .into_iter()
+            .map(|j| (j, SourceVerdict::Unavailable(e.clone())))
+            .collect(),
+    }
+}
+
+fn compose_source_verdicts(
+    corgea: SourceVerdict,
+    osv: SourceVerdict,
+    fail_closed: bool,
+) -> VerdictStatus {
+    let mut matches = Vec::new();
+    if let SourceVerdict::Vulnerable(mut m) = corgea.clone() {
+        matches.append(&mut m);
+    }
+    if let SourceVerdict::Vulnerable(mut m) = osv.clone() {
+        matches.append(&mut m);
+    }
+    if !matches.is_empty() {
+        return VerdictStatus::Vulnerable(matches);
+    }
+
+    if fail_closed {
+        if let SourceVerdict::Unavailable(error) = corgea {
+            return VerdictStatus::Unverifiable(error);
+        }
+        return VerdictStatus::Clean;
+    }
+
+    match (corgea, osv) {
+        (SourceVerdict::Unavailable(a), SourceVerdict::Unavailable(b)) => {
+            VerdictStatus::PublicUnavailable(format!(
+                "vulnerability coverage unavailable: Corgea: {a}; OSV: {b}"
+            ))
+        }
+        (SourceVerdict::Unavailable(error), _) => VerdictStatus::PublicUnavailable(format!(
+            "partial vulnerability coverage: Corgea unavailable: {error}"
+        )),
+        (_, SourceVerdict::Unavailable(error)) => VerdictStatus::PublicUnavailable(format!(
+            "partial vulnerability coverage: OSV unavailable: {error}"
+        )),
+        (SourceVerdict::NotChecked, SourceVerdict::NotChecked) => VerdictStatus::NotChecked,
+        _ => VerdictStatus::Clean,
+    }
+}
+
+/// Assign pooled verdicts onto matching named outcomes (by normalized
+/// name + version) and return the unmatched leftovers — the tree findings.
+/// Each leftover carries its provenance: pip's `requested` flag, membership
+/// in the project manifest's direct deps (`direct_deps`), or transitive.
+fn apply_verdicts(
+    manager: PackageManager,
+    results: Vec<(tree::TreePackage, VerdictStatus)>,
+    outcomes: &mut [TargetOutcome],
+    direct_deps: &std::collections::HashSet<String>,
+) -> Vec<TreeOutcome> {
+    let norm = |n: &str| manager.normalize_name(n);
+    // Index named outcomes by (normalized name, version) so matching the
+    // pooled results stays linear on big trees.
+    let mut named: std::collections::HashMap<(String, String), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, o) in outcomes.iter().enumerate() {
+        if let TargetOutcome::Resolved { resolved, .. } = o {
+            named
+                .entry((norm(&resolved.name), resolved.version.clone()))
+                .or_default()
+                .push(i);
+        }
+    }
+
+    let mut transitive = Vec::new();
+    for (pkg, verdict) in results {
+        if let Some(indices) = named.get(&(norm(&pkg.name), pkg.version.clone())) {
+            for &i in indices {
+                if let TargetOutcome::Resolved { verdict: v, .. } = &mut outcomes[i] {
+                    *v = verdict.clone();
+                }
+            }
+        } else {
+            let origin = if pkg.requested {
+                TreeOrigin::Requested
+            } else if direct_deps.contains(&pkg.name) {
+                TreeOrigin::PreExisting
+            } else {
+                TreeOrigin::Transitive
+            };
+            transitive.push(TreeOutcome {
+                name: pkg.name,
+                version: pkg.version,
+                origin,
+                verdict,
+            });
+        }
+    }
+    transitive
+}
+
+/// Vulnerability verdict pass over resolved targets. No-op when all
+/// vulnerability sources are disabled (test-only recency mode).
+fn run_verdict_pass(
+    manager: PackageManager,
+    outcomes: &mut [TargetOutcome],
+    opts: &PrecheckOptions,
+) {
+    if !opts.has_vulnerability_checks() {
+        return;
+    }
+
+    // One job per resolved target; jobs are 1:1 with outcomes, so
+    // `apply_verdicts` matches everything and returns no leftovers.
+    let jobs: Vec<tree::TreePackage> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            TargetOutcome::Resolved { resolved, .. } => Some(tree::TreePackage {
+                name: resolved.name.clone(),
+                version: resolved.version.clone(),
+                requested: true,
+            }),
+            _ => None,
+        })
+        .collect();
+
+    let results = verdict_pool(jobs, opts, manager, VERDICT_CONCURRENCY);
+    apply_verdicts(manager, results, outcomes, &Default::default());
+}
+
+fn should_block_install(report: &PrecheckReport, opts: &PrecheckOptions) -> bool {
+    if opts.force {
+        return false;
+    }
+    // A resolution error means no verdict was obtained for that target, so
+    // in tokened mode it fails closed like `Unverifiable` — otherwise a
+    // registry outage silently bypasses the gate.
+    report.vulnerable_count() > 0
+        || report.unverifiable_count() > 0
+        || (opts.fail_closed() && report.error_count() > 0)
+        || (!opts.no_fail && report.recent_count() > 0)
+}
+
+fn verify_one(
+    target: &InstallTarget,
+    opts: &PrecheckOptions,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> TargetOutcome {
+    use crate::verify_deps::registry;
+
+    let resolved = match &target.kind {
+        TargetKind::Unverifiable { reason } => {
+            return TargetOutcome::Skipped {
+                target: target.clone(),
+                reason: reason.clone(),
+            };
+        }
+        TargetKind::Npm(spec) => {
+            registry::npm_resolve(&target.name, spec, opts.npm_registry.as_deref())
+        }
+        TargetKind::Pypi(spec) => {
+            registry::pypi_resolve(&target.name, spec, opts.pypi_registry.as_deref())
+        }
+    };
+
+    match resolved {
+        Ok(resolved) => {
+            // Future publish dates clamp to zero — maximally recent.
+            let age = now
+                .signed_duration_since(resolved.published_at)
+                .to_std()
+                .unwrap_or_else(|_| Duration::from_secs(0));
+            TargetOutcome::Resolved {
+                target: target.clone(),
+                resolved,
+                age,
+                verdict: VerdictStatus::NotChecked,
+            }
+        }
+        Err(e) => TargetOutcome::Error {
+            target: target.clone(),
+            error: e,
+        },
+    }
+}
+
+/// Resolve `binary` on PATH. On Windows this finds `.cmd` shims. pip is the
+/// one manager with a conventional alias, so a missing `pip` retries `pip3`.
+/// The error names the binary and any fallback tried.
+fn resolve_binary(binary: &str) -> Result<std::path::PathBuf, String> {
+    if let Ok(p) = which::which(binary) {
+        return Ok(p);
+    }
+    if binary == "pip" {
+        if let Ok(p) = which::which("pip3") {
+            return Ok(p);
+        }
+        return Err("error: 'pip' not found on PATH (also tried 'pip3')".to_string());
+    }
+    Err(format!("error: '{binary}' not found on PATH"))
+}
+
+fn exec_command_for_json(binary: &str, args: &[String], json_mode: bool) -> i32 {
+    let resolved = match resolve_binary(binary) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return 127;
+        }
+    };
+
+    let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+
+    if json_mode {
+        return match Command::new(&resolved).args(&os_args).output() {
+            Ok(output) => {
+                use std::io::Write;
+                let mut stderr = std::io::stderr();
+                let _ = stderr.write_all(&output.stdout);
+                let _ = stderr.write_all(&output.stderr);
+                output.status.code().unwrap_or_else(|| {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        if let Some(sig) = output.status.signal() {
+                            return 128 + sig;
+                        }
+                    }
+                    1
+                })
+            }
+            Err(e) => {
+                eprintln!("failed to exec {}: {}", resolved.display(), e);
+                1
+            }
+        };
+    }
+
+    match Command::new(&resolved).args(&os_args).status() {
+        Ok(status) => status.code().unwrap_or_else(|| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(sig) = status.signal() {
+                    return 128 + sig;
+                }
+            }
+            1
+        }),
+        Err(e) => {
+            // Name the resolved path: it may be the pip3 fallback, not `binary`.
+            eprintln!("failed to exec {}: {}", resolved.display(), e);
+            1
+        }
+    }
+}
+
+/// Suffix for a vulnerable match line: the advisory's fix, if known.
+fn fix_note(m: &crate::vuln_api::VulnMatch) -> String {
+    match &m.fixed_version {
+        Some(v) => format!(" — fixed in {v}"),
+        None => " — no fixed version known".to_string(),
+    }
+}
+
+/// Highest of `fixes` after sort/dedup: a single distinct value is returned
+/// as-is (no parsing — preserves odd-but-unambiguous forms); several distinct
+/// values compare by lenient semver. With `all_must_parse`, one unparsable
+/// candidate among several poisons the answer (`None`); otherwise unparsable
+/// candidates are skipped.
+fn highest_fix(mut fixes: Vec<&str>, all_must_parse: bool) -> Option<String> {
+    fixes.sort_unstable();
+    fixes.dedup();
+    match fixes.as_slice() {
+        [] => None,
+        [only] => Some((*only).to_string()),
+        many => {
+            let mut best: Option<(semver::Version, &str)> = None;
+            for raw in many {
+                let v =
+                    match semver::Version::parse(&verify_deps::registry::normalize_for_semver(raw))
+                    {
+                        Ok(v) => v,
+                        Err(_) if all_must_parse => return None,
+                        Err(_) => continue,
+                    };
+                match &best {
+                    Some((cur, _)) if cur >= &v => {}
+                    _ => best = Some((v, raw)),
+                }
+            }
+            best.map(|(_, raw)| (*raw).to_string())
+        }
+    }
+}
+
+/// The one version certified to clear every match. Requires every match to
+/// carry a `fixed_version`; any match without one — or an unparsable
+/// candidate among several — means no version can be certified, so `None`.
+fn safe_version(matches: &[crate::vuln_api::VulnMatch]) -> Option<String> {
+    let fixes: Vec<&str> = matches
+        .iter()
+        .map(|m| m.fixed_version.as_deref())
+        .collect::<Option<_>>()?;
+    highest_fix(fixes, true)
+}
+
+/// Highest `fixed_version` the advisories advertise, by lenient semver.
+/// Unlike `safe_version` this is *not* a certification: matches without a
+/// fix are ignored, so the result may still be vulnerable to them. `None`
+/// only when no match advertises a fix (or no candidate parses).
+fn advertised_fix(matches: &[crate::vuln_api::VulnMatch]) -> Option<String> {
+    let fixes: Vec<&str> = matches
+        .iter()
+        .filter_map(|m| m.fixed_version.as_deref())
+        .collect();
+    highest_fix(fixes, false)
+}
+
+/// Per-match advisory lines plus the safe-version steer, shared by the
+/// named-target and transitive vulnerable render arms.
+fn print_vulnerable_matches(name: &str, matches: &[crate::vuln_api::VulnMatch]) {
+    for m in matches {
+        let source = m
+            .source
+            .as_deref()
+            .map(|s| format!(", source: {s}"))
+            .unwrap_or_default();
+        println!(
+            "      {} ({}{}){}",
+            m.advisory_id,
+            m.severity_level,
+            source,
+            fix_note(m)
+        );
+    }
+    if let Some(safe) = safe_version(matches) {
+        println!("      → safe version: {name}@{safe}");
+    }
+}
+
+/// One summary-line segment, e.g. `"2 vulnerable (2 from resolved tree)"`.
+/// The parenthetical separates findings the resolved tree carried in from
+/// findings on the targets this command names; omitted when the tree
+/// contributed none.
+fn summary_segment(total: usize, from_tree: usize, label: &str) -> String {
+    if from_tree > 0 {
+        format!("{total} {label} ({from_tree} from resolved tree)")
+    } else {
+        format!("{total} {label}")
+    }
+}
+
+/// More than this many unverifiable findings with the same error-prefix
+/// render as one collapsed line instead of one line per package.
+const UNVERIFIABLE_COLLAPSE_THRESHOLD: usize = 3;
+
+/// Group key for collapsing repeated unverifiable errors: the text before
+/// the first `(` — strips per-package detail (URLs, status codes) so one
+/// outage groups under one key.
+fn error_prefix(error: &str) -> &str {
+    match error.find('(') {
+        Some(i) => error[..i].trim_end(),
+        None => error,
+    }
+}
+
+/// Unverifiable error strings across transitive tree findings and named
+/// outcomes, in render order.
+fn unverifiable_errors(report: &PrecheckReport) -> Vec<&str> {
+    let mut errors = Vec::new();
+    if let Some(TreeReport::Full { transitive, .. }) = &report.tree {
+        for t in transitive {
+            if let VerdictStatus::Unverifiable(e) = &t.verdict {
+                errors.push(e.as_str());
+            }
+        }
+    }
+    for o in &report.outcomes {
+        if let TargetOutcome::Resolved {
+            verdict: VerdictStatus::Unverifiable(e),
+            ..
+        } = o
+        {
+            errors.push(e.as_str());
+        }
+    }
+    errors
+}
+
+/// `(prefix, count, first error)` groups of unverifiable findings large
+/// enough to collapse (> `UNVERIFIABLE_COLLAPSE_THRESHOLD` per prefix) —
+/// the vuln-api outage case, where every package fails the same way.
+/// Display-only: counts and exit codes never change.
+fn collapsed_unverifiable_groups(report: &PrecheckReport) -> Vec<(&str, usize, &str)> {
+    let mut groups: Vec<(&str, usize, &str)> = Vec::new();
+    for e in unverifiable_errors(report) {
+        let prefix = error_prefix(e);
+        match groups.iter_mut().find(|(p, _, _)| *p == prefix) {
+            Some((_, count, _)) => *count += 1,
+            None => groups.push((prefix, 1, e)),
+        }
+    }
+    groups.retain(|(_, count, _)| *count > UNVERIFIABLE_COLLAPSE_THRESHOLD);
+    groups
+}
+
+fn print_text(report: &PrecheckReport) {
+    // Build the echoed command from non-empty parts: a bare gated install
+    // (e.g. `npm install` with zero specs) has no args to append.
+    let mut command = format!("{} {}", report.manager.binary_name(), report.subcommand);
+    if !report.original_args.is_empty() {
+        command.push(' ');
+        command.push_str(&report.original_args.join(" "));
+    }
+
+    let collapsed = collapsed_unverifiable_groups(report);
+    let is_collapsed = |error: &str| {
+        collapsed
+            .iter()
+            .any(|(prefix, _, _)| *prefix == error_prefix(error))
+    };
+
+    println!(
+        "Pre-checking `{}` (threshold {})",
+        command,
+        verify_deps::format_duration(report.threshold)
+    );
+    println!(
+        "  {} ok, {} recent, {}, {}, {} skipped, {} errors",
+        report.ok_count(),
+        report.recent_count(),
+        summary_segment(
+            report.vulnerable_count(),
+            report.tree_vulnerable_count(),
+            "vulnerable"
+        ),
+        summary_segment(
+            report.unverifiable_count(),
+            report.tree_unverifiable_count(),
+            "unverifiable"
+        ),
+        report.skipped_count(),
+        report.error_count(),
+    );
+
+    match &report.tree {
+        Some(TreeReport::Full {
+            resolved_count,
+            transitive,
+            ..
+        }) => {
+            println!(
+                "  tree: {} packages resolved, {} transitive checked",
+                resolved_count,
+                transitive.len()
+            );
+            for t in transitive {
+                match &t.verdict {
+                    VerdictStatus::Vulnerable(matches) => {
+                        println!(
+                            "  ✗ {}@{} {}  known vulnerable:",
+                            t.name,
+                            t.version,
+                            t.origin.label()
+                        );
+                        print_vulnerable_matches(&t.name, matches);
+                        // A vulnerable dep the project already declares can be
+                        // bumped directly — point at the fix as a command.
+                        // When `safe_version` is `Some` it equals
+                        // `advertised_fix` and clears every advisory; otherwise
+                        // some advisory has no fix, so the "(advertised fix)"
+                        // hedge marks the bump as partial.
+                        if t.origin == TreeOrigin::PreExisting {
+                            if let Some(fix) = advertised_fix(matches) {
+                                let hedge = if safe_version(matches).is_some() {
+                                    ""
+                                } else {
+                                    " (advertised fix)"
+                                };
+                                println!(
+                                    "      fix with: corgea {} install {}@{}{}",
+                                    report.manager.binary_name(),
+                                    t.name,
+                                    fix,
+                                    hedge
+                                );
+                            }
+                        }
+                    }
+                    VerdictStatus::Unverifiable(error) => {
+                        if !is_collapsed(error) {
+                            println!(
+                                "  ⚠ {}@{} {}  could not be verified: {}",
+                                t.name,
+                                t.version,
+                                t.origin.label(),
+                                error
+                            );
+                        }
+                    }
+                    VerdictStatus::PublicUnavailable(error) => {
+                        println!(
+                            "  ⚠ {}@{} {}  vulnerability check warning: {}",
+                            t.name,
+                            t.version,
+                            t.origin.label(),
+                            error
+                        );
+                    }
+                    // Clean / not-checked tree entries stay quiet in text mode.
+                    VerdictStatus::Clean | VerdictStatus::NotChecked => {}
+                }
+            }
+        }
+        Some(TreeReport::NamedOnly { reason }) => {
+            println!("  tree: transitive dependencies NOT checked ({reason})");
+        }
+        None => {}
+    }
+
+    // One line per collapsed outage group instead of one per package.
+    for (_, count, first_error) in &collapsed {
+        println!(
+            "  ⚠ {count} packages could not be verified (vuln-api unreachable: {first_error})"
+        );
+    }
+
+    for o in &report.outcomes {
+        match o {
+            TargetOutcome::Resolved {
+                target,
+                resolved,
+                age,
+                verdict,
+            } => match verdict {
+                VerdictStatus::Vulnerable(matches) => {
+                    println!(
+                        "  ✗ {} → {}@{}  known vulnerable:",
+                        target.display, resolved.name, resolved.version,
+                    );
+                    print_vulnerable_matches(&resolved.name, matches);
+                }
+                VerdictStatus::Unverifiable(error) => {
+                    if !is_collapsed(error) {
+                        println!(
+                            "  ⚠ {} → {}@{}  could not be verified: {}",
+                            target.display, resolved.name, resolved.version, error,
+                        );
+                    }
+                }
+                VerdictStatus::PublicUnavailable(error) => {
+                    println!(
+                        "  ⚠ {} → {}@{}  vulnerability check warning: {}",
+                        target.display, resolved.name, resolved.version, error,
+                    );
+                    if report.is_recent(*age) {
+                        println!(
+                            "  ⚠ {} → {}@{}  published {} ago at {} (within threshold)",
+                            target.display,
+                            resolved.name,
+                            resolved.version,
+                            verify_deps::format_duration(*age),
+                            resolved.published_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                        );
+                    }
+                }
+                VerdictStatus::Clean | VerdictStatus::NotChecked => {
+                    if report.is_recent(*age) {
+                        println!(
+                            "  ⚠ {} → {}@{}  published {} ago at {} (within threshold)",
+                            target.display,
+                            resolved.name,
+                            resolved.version,
+                            verify_deps::format_duration(*age),
+                            resolved.published_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                        );
+                    } else {
+                        println!(
+                            "  ✓ {} → {}@{}  published {} ago",
+                            target.display,
+                            resolved.name,
+                            resolved.version,
+                            verify_deps::format_duration(*age),
+                        );
+                    }
+                }
+            },
+            TargetOutcome::Skipped { target, reason } => {
+                println!("  ? {}: {}", target.display, reason);
+            }
+            TargetOutcome::Error { target, error } => {
+                println!("  ✗ {}: {}", target.display, error);
+            }
+        }
+    }
+}
+
+/// JSON shape for a single verdict. Shared by named outcomes and tree
+/// (transitive) outcomes so both render verdicts identically.
+/// `remediation` carries the version that clears every advisory
+/// (`safe_version`); `null` when any advisory has no known fix.
+fn verdict_json(verdict: &VerdictStatus) -> serde_json::Value {
+    use serde_json::json;
+    match verdict {
+        VerdictStatus::Clean => json!({ "status": "clean" }),
+        VerdictStatus::Vulnerable(matches) => {
+            json!({
+                "status": "vulnerable",
+                "matches": matches,
+                "remediation": safe_version(matches),
+            })
+        }
+        VerdictStatus::Unverifiable(error) => {
+            json!({ "status": "unverifiable", "error": error })
+        }
+        VerdictStatus::PublicUnavailable(error) => {
+            json!({ "status": "unavailable", "fail_closed": false, "error": error })
+        }
+        VerdictStatus::NotChecked => {
+            json!({ "status": "not_checked", "reason": NO_TOKEN_REASON })
+        }
+    }
+}
+
+fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
+    use serde_json::json;
+    let outcomes: Vec<_> = report
+        .outcomes
+        .iter()
+        .map(|o| match o {
+            TargetOutcome::Resolved {
+                target,
+                resolved,
+                age,
+                verdict,
+            } => {
+                let verdict_json = verdict_json(verdict);
+                json!({
+                    "status": if report.is_recent(*age) { "recent" } else { "ok" },
+                    "spec": target.display,
+                    "name": resolved.name,
+                    "resolved_version": resolved.version,
+                    "published_at": resolved.published_at.to_rfc3339(),
+                    "age_seconds": age.as_secs(),
+                    "verdict": verdict_json,
+                })
+            }
+            TargetOutcome::Skipped { target, reason } => json!({
+                "status": "skipped",
+                "spec": target.display,
+                "name": target.name,
+                "reason": reason,
+            }),
+            TargetOutcome::Error { target, error } => json!({
+                "status": "error",
+                "spec": target.display,
+                "name": target.name,
+                "error": error,
+            }),
+        })
+        .collect();
+
+    let body = json!({
+        "manager": report.manager.binary_name(),
+        "subcommand": report.subcommand,
+        "args": report.original_args,
+        "threshold_seconds": report.threshold.as_secs(),
+        "summary": {
+            "ok": report.ok_count(),
+            "recent": report.recent_count(),
+            "vulnerable": report.vulnerable_count(),
+            "unverifiable": report.unverifiable_count(),
+            "skipped": report.skipped_count(),
+            "errors": report.error_count(),
+        },
+        "verdict_mode": opts.verdict_mode(),
+        "results": outcomes,
+        "tree": report.tree.as_ref().map(|t| match t {
+            TreeReport::Full { resolved_count, transitive } => json!({
+                "mode": "full",
+                "reason": serde_json::Value::Null,
+                "resolved_count": resolved_count,
+                "transitive": transitive.iter().map(|o| json!({
+                    "name": o.name,
+                    "version": o.version,
+                    "origin": o.origin.json_name(),
+                    "verdict": verdict_json(&o.verdict),
+                })).collect::<Vec<_>>(),
+            }),
+            TreeReport::NamedOnly { reason } => json!({
+                "mode": "named-only",
+                "reason": reason,
+                "resolved_count": 0,
+                "transitive": [],
+            }),
+        }),
+    });
+
+    println!("{}", serde_json::to_string_pretty(&body).unwrap());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_subcommand_recognition() {
+        assert!(PackageManager::Npm.is_install_subcommand("install"));
+        assert!(PackageManager::Npm.is_install_subcommand("i"));
+        assert!(PackageManager::Npm.is_install_subcommand("add"));
+        assert!(!PackageManager::Npm.is_install_subcommand("update"));
+
+        assert!(PackageManager::Yarn.is_install_subcommand("add"));
+        assert!(PackageManager::Yarn.is_install_subcommand("install"));
+
+        assert!(PackageManager::Pnpm.is_install_subcommand("add"));
+        assert!(PackageManager::Pnpm.is_install_subcommand("install"));
+        assert!(PackageManager::Pnpm.is_install_subcommand("i"));
+
+        assert!(PackageManager::Pip.is_install_subcommand("install"));
+        assert!(!PackageManager::Pip.is_install_subcommand("freeze"));
+    }
+
+    #[test]
+    fn parse_uv_lock_keeps_index_packages_and_skips_local_sources() {
+        let lock = r#"
+version = 1
+
+[[package]]
+name = "proj"
+version = "0.1.0"
+source = { editable = "." }
+
+[[package]]
+name = "evildep"
+version = "0.4.2"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "gitdep"
+version = "1.2.3"
+source = { git = "https://example.com/repo?rev=abc#abc" }
+"#;
+        let pkgs = parse_uv_lock(lock).expect("parse uv.lock");
+        let names: Vec<&str> = pkgs.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["evildep", "gitdep"]);
+        assert_eq!(pkgs[0].version, "0.4.2");
+    }
+
+    #[test]
+    fn parse_uv_lock_rejects_invalid_toml() {
+        let err = parse_uv_lock("not = [valid").expect_err("invalid toml");
+        assert!(err.contains("parse uv.lock"), "got: {err}");
+    }
+
+    /// Baseline options: pypi registry at a dead address (a port that
+    /// refuses connections — these tests never dial it), no verdict config.
+    /// Override fields per test via struct update.
+    fn stub_opts() -> PrecheckOptions {
+        PrecheckOptions {
+            threshold: Duration::from_secs(2 * 86400),
+            no_fail: false,
+            force: false,
+            json: false,
+            verdict: None,
+            osv: None,
+            npm_registry: None,
+            pypi_registry: Some("http://127.0.0.1:9".to_string()),
+        }
+    }
+
+    /// `stub_opts()` plus a verdict config pointing at `base_url`.
+    fn verdict_opts(base_url: &str) -> PrecheckOptions {
+        PrecheckOptions {
+            verdict: Some(VerdictConfig {
+                base_url: base_url.to_string(),
+                token: Some("test-token".to_string()),
+                fail_closed: true,
+            }),
+            ..stub_opts()
+        }
+    }
+
+    /// Run `run_parsed_install` for `pip install <args…>` with an exec
+    /// closure that records whether it ran (returning 42 instead of
+    /// spawning anything).
+    fn gate_pip_install(args: &[&str], opts: PrecheckOptions) -> (i32, bool) {
+        let rest: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let parsed = parse::parse_install_args(PackageManager::Pip, &rest).expect("parse");
+        let mut exec_ran = false;
+        let code = run_parsed_install(
+            PackageManager::Pip,
+            "install",
+            &rest,
+            parsed,
+            || {
+                exec_ran = true;
+                42
+            },
+            opts,
+        );
+        (code, exec_ran)
+    }
+
+    #[test]
+    fn unverifiable_target_skips_and_proceeds() {
+        // git+ spec → Skipped outcome, no registry hit, install proceeds.
+        let opts = stub_opts();
+        let (code, exec_ran) = gate_pip_install(&["git+https://github.com/psf/requests.git"], opts);
+        assert_eq!(code, 42);
+        assert!(exec_ran);
+    }
+
+    #[test]
+    fn bare_install_passes_through_without_verification() {
+        // Bare `pip install` (no targets) → straight exec, no registry hit.
+        let opts = stub_opts();
+        let (code, exec_ran) = gate_pip_install(&[], opts);
+        assert_eq!(code, 42);
+        assert!(exec_ran);
+    }
+
+    #[test]
+    fn requirements_files_note_then_exec() {
+        // `-r reqs.txt` alone → printed note, no verification, exec runs.
+        let opts = stub_opts();
+        let (code, exec_ran) = gate_pip_install(&["-r", "reqs.txt"], opts);
+        assert_eq!(code, 42);
+        assert!(exec_ran);
+    }
+
+    fn resolved_outcome(name: &str, version: &str, recent: bool) -> TargetOutcome {
+        // Recency derives from age vs `report_with`'s 2-day threshold:
+        // one hour ⇒ recent, a year ⇒ not.
+        let age = if recent {
+            Duration::from_secs(3600)
+        } else {
+            Duration::from_secs(365 * 86400)
+        };
+        TargetOutcome::Resolved {
+            target: InstallTarget {
+                name: name.to_string(),
+                display: format!("{name}=={version}"),
+                kind: TargetKind::Unverifiable {
+                    reason: "test".to_string(),
+                },
+            },
+            resolved: crate::verify_deps::registry::ResolvedPackage {
+                name: name.to_string(),
+                version: version.to_string(),
+                published_at: Utc::now() - chrono::Duration::from_std(age).unwrap(),
+            },
+            age,
+            verdict: VerdictStatus::NotChecked,
+        }
+    }
+
+    fn report_with(outcomes: Vec<TargetOutcome>) -> PrecheckReport {
+        PrecheckReport {
+            manager: PackageManager::Pip,
+            subcommand: "install".to_string(),
+            original_args: vec![],
+            outcomes,
+            threshold: Duration::from_secs(2 * 86400),
+            tree: None,
+            // Most tests model an install that named something; bare-install
+            // cases set this explicitly.
+            bare_install: false,
+        }
+    }
+
+    fn set_verdict(outcome: &mut TargetOutcome, v: VerdictStatus) {
+        if let TargetOutcome::Resolved { verdict, .. } = outcome {
+            *verdict = v;
+        }
+    }
+
+    #[test]
+    fn ecosystem_mapping() {
+        assert_eq!(PackageManager::Pip.ecosystem(), "pypi");
+        assert_eq!(PackageManager::Uv.ecosystem(), "pypi");
+        assert_eq!(PackageManager::Npm.ecosystem(), "npm");
+        assert_eq!(PackageManager::Yarn.ecosystem(), "npm");
+        assert_eq!(PackageManager::Pnpm.ecosystem(), "npm");
+    }
+
+    #[test]
+    fn normalize_name_per_manager() {
+        // pypi: PEP 503 — lowercase, separator runs collapse to one `-`.
+        assert_eq!(
+            PackageManager::Pip.normalize_name("Flask_Cors"),
+            "flask-cors"
+        );
+        assert_eq!(
+            PackageManager::Uv.normalize_name("zope.interface"),
+            "zope-interface"
+        );
+        assert_eq!(PackageManager::Pip.normalize_name("a__b"), "a-b");
+        // npm names are case-sensitive and pass through verbatim.
+        assert_eq!(PackageManager::Npm.normalize_name("Left_Pad"), "Left_Pad");
+    }
+
+    /// Full predicate matrix: force ⇒ never block; vulnerable and
+    /// unverifiable block regardless of --no-fail; recency keeps its
+    /// task-2 --no-fail demotion.
+    #[test]
+    fn block_predicate_matrix() {
+        let opts = |no_fail: bool, force: bool| PrecheckOptions {
+            no_fail,
+            force,
+            ..stub_opts()
+        };
+
+        let clean = {
+            let mut o = resolved_outcome("pkg", "1.0.0", false);
+            set_verdict(&mut o, VerdictStatus::Clean);
+            report_with(vec![o])
+        };
+        let recent = report_with(vec![resolved_outcome("pkg", "1.0.0", true)]);
+        let vulnerable = {
+            let mut o = resolved_outcome("pkg", "1.0.0", false);
+            set_verdict(&mut o, VerdictStatus::Vulnerable(vec![]));
+            report_with(vec![o])
+        };
+        let unverifiable = {
+            let mut o = resolved_outcome("pkg", "1.0.0", false);
+            set_verdict(&mut o, VerdictStatus::Unverifiable("503".to_string()));
+            report_with(vec![o])
+        };
+
+        assert!(!should_block_install(&clean, &opts(false, false)));
+        assert!(should_block_install(&recent, &opts(false, false)));
+        assert!(!should_block_install(&recent, &opts(true, false)));
+        assert!(should_block_install(&vulnerable, &opts(false, false)));
+        assert!(
+            should_block_install(&vulnerable, &opts(true, false)),
+            "--no-fail must not waive a vulnerable block"
+        );
+        assert!(
+            should_block_install(&unverifiable, &opts(true, false)),
+            "--no-fail must not waive an unverifiable block"
+        );
+        for report in [&clean, &recent, &vulnerable, &unverifiable] {
+            assert!(
+                !should_block_install(report, &opts(false, true)),
+                "--force must never block"
+            );
+            assert!(!should_block_install(report, &opts(true, true)));
+        }
+    }
+
+    /// A clean named outcome plus a vulnerable transitive tree finding must
+    /// roll into the block counts: `vulnerable_count() == 1`,
+    /// `should_block_install` true without `--force`, false with it.
+    #[test]
+    fn tree_findings_extend_block_counts() {
+        let mut named = resolved_outcome("pkg", "1.0.0", false);
+        set_verdict(&mut named, VerdictStatus::Clean);
+        let mut report = report_with(vec![named]);
+        report.tree = Some(TreeReport::Full {
+            resolved_count: 2,
+            transitive: vec![TreeOutcome {
+                name: "evildep".to_string(),
+                version: "0.4.2".to_string(),
+                origin: TreeOrigin::Transitive,
+                verdict: VerdictStatus::Vulnerable(vec![]),
+            }],
+        });
+
+        assert_eq!(report.vulnerable_count(), 1);
+        let opts = |force: bool| PrecheckOptions {
+            force,
+            ..stub_opts()
+        };
+        assert!(should_block_install(&report, &opts(false)));
+        assert!(!should_block_install(&report, &opts(true)));
+    }
+
+    /// Verdict pass against an in-process stub: vulnerable body → Vulnerable
+    /// with matches; 503 override → Unverifiable; no VerdictConfig → outcomes
+    /// keep NotChecked.
+    #[test]
+    fn verdict_pass_maps_stub_responses() {
+        use std::collections::HashMap;
+
+        let key = |name: &str| ("pypi".to_string(), name.to_string(), "1.0.0".to_string());
+        let mut checks = HashMap::new();
+        checks.insert(
+            key("evil"),
+            r#"{"ecosystem":"pypi","package_name":"evil","version":"1.0.0","is_vulnerable":true,
+                "matches":[{"advisory_id":"MAL-2024-0001","severity_level":"critical","tier":1,
+                            "vulnerable_version_range":null,"fixed_version":null}]}"#
+                .to_string(),
+        );
+        checks.insert(key("flaky"), "{}".to_string());
+        let mut statuses = HashMap::new();
+        statuses.insert(key("flaky"), 503u16);
+        let stub = crate::vuln_api_stub::spawn_with_statuses(checks, statuses);
+
+        let opts = verdict_opts(&stub.base_url);
+
+        let mut outcomes = vec![
+            resolved_outcome("evil", "1.0.0", false),
+            resolved_outcome("flaky", "1.0.0", false),
+            resolved_outcome("goodpkg", "1.0.0", false), // unknown → stub default clean
+        ];
+        run_verdict_pass(PackageManager::Pip, &mut outcomes, &opts);
+
+        let verdicts: Vec<_> = outcomes
+            .iter()
+            .map(|o| match o {
+                TargetOutcome::Resolved { verdict, .. } => verdict.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert!(
+            matches!(&verdicts[0], VerdictStatus::Vulnerable(m) if m[0].advisory_id == "MAL-2024-0001")
+        );
+        assert!(matches!(&verdicts[1], VerdictStatus::Unverifiable(_)));
+        assert!(matches!(&verdicts[2], VerdictStatus::Clean));
+
+        // Without a VerdictConfig the pass is a no-op.
+        let mut untouched = vec![resolved_outcome("evil", "1.0.0", false)];
+        let no_verdict = stub_opts();
+        run_verdict_pass(PackageManager::Pip, &mut untouched, &no_verdict);
+        assert!(matches!(
+            &untouched[0],
+            TargetOutcome::Resolved {
+                verdict: VerdictStatus::NotChecked,
+                ..
+            }
+        ));
+    }
+
+    /// The pool must verdict every job exactly once and return the flagged
+    /// job `Vulnerable` with the rest `Clean`, regardless of `concurrency`
+    /// (1 = serial, 8 > job count = all workers spawn but some drain empty).
+    #[test]
+    fn verdict_pool_returns_all_results() {
+        use std::collections::HashMap;
+
+        let key = |name: &str| ("pypi".to_string(), name.to_string(), "1.0.0".to_string());
+        let mut checks = HashMap::new();
+        checks.insert(
+            key("evil"),
+            r#"{"ecosystem":"pypi","package_name":"evil","version":"1.0.0","is_vulnerable":true,
+                "matches":[{"advisory_id":"MAL-2024-0001","severity_level":"critical","tier":1,
+                            "vulnerable_version_range":null,"fixed_version":null}]}"#
+                .to_string(),
+        );
+        let stub = crate::vuln_api_stub::spawn_with_statuses(checks, HashMap::new());
+
+        let opts = PrecheckOptions {
+            verdict: Some(VerdictConfig {
+                base_url: stub.base_url.clone(),
+                token: Some("test-token".to_string()),
+                fail_closed: true,
+            }),
+            ..stub_opts()
+        };
+
+        let jobs: Vec<tree::TreePackage> = ["a", "b", "evil", "c", "d", "e"]
+            .iter()
+            .map(|n| tree::TreePackage {
+                name: n.to_string(),
+                version: "1.0.0".to_string(),
+                requested: false,
+            })
+            .collect();
+
+        for concurrency in [1usize, 8] {
+            let results = verdict_pool(jobs.clone(), &opts, PackageManager::Pip, concurrency);
+            assert_eq!(
+                results.len(),
+                6,
+                "concurrency {concurrency}: all jobs verdicted"
+            );
+            let flagged = results
+                .iter()
+                .filter(|(_, v)| matches!(v, VerdictStatus::Vulnerable(_)))
+                .count();
+            let clean = results
+                .iter()
+                .filter(|(_, v)| matches!(v, VerdictStatus::Clean))
+                .count();
+            assert_eq!(flagged, 1, "concurrency {concurrency}: only evil flagged");
+            assert_eq!(clean, 5, "concurrency {concurrency}: rest clean");
+            let evil = results
+                .iter()
+                .find(|(p, _)| p.name == "evil")
+                .expect("evil present");
+            assert!(
+                matches!(&evil.1, VerdictStatus::Vulnerable(m) if m[0].advisory_id == "MAL-2024-0001")
+            );
+        }
+    }
+
+    fn vm(advisory: &str, fixed: Option<&str>) -> crate::vuln_api::VulnMatch {
+        crate::vuln_api::VulnMatch {
+            advisory_id: advisory.to_string(),
+            severity_level: "high".to_string(),
+            tier: 1,
+            vulnerable_version_range: None,
+            fixed_version: fixed.map(str::to_string),
+            source: None,
+        }
+    }
+
+    #[test]
+    fn safe_version_single_fix() {
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("2.0.0"))]),
+            Some("2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn safe_version_duplicate_fixes_collapse_without_parsing() {
+        // "1.0rc1" is unparsable, but a single distinct value needs no parse.
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("1.0rc1")), vm("A-2", Some("1.0rc1"))]),
+            Some("1.0rc1".to_string())
+        );
+    }
+
+    #[test]
+    fn safe_version_picks_highest_of_distinct_fixes() {
+        // Semver order, not lexical ("1.2.0" > "1.10.0" lexically).
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("1.2.0")), vm("A-2", Some("1.10.0"))]),
+            Some("1.10.0".to_string())
+        );
+    }
+
+    #[test]
+    fn safe_version_two_component_versions_normalize() {
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("4.0")), vm("A-2", Some("3.2.5"))]),
+            Some("4.0".to_string())
+        );
+    }
+
+    #[test]
+    fn safe_version_mixed_fix_and_none_is_none() {
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("2.0.0")), vm("A-2", None)]),
+            None
+        );
+    }
+
+    #[test]
+    fn safe_version_unparsable_among_distinct_is_none() {
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("2!1.0")), vm("A-2", Some("1.0.0"))]),
+            None
+        );
+    }
+
+    #[test]
+    fn safe_version_empty_matches_is_none() {
+        assert_eq!(safe_version(&[]), None);
+    }
+
+    #[test]
+    fn error_prefix_strips_parenthesized_detail() {
+        // The reqwest network-failure shape: per-package URL in parens.
+        assert_eq!(
+            error_prefix("Failed to send vuln-api request: error sending request for url (http://x/v1/packages/pypi/a/versions/1.0.0/check)"),
+            "Failed to send vuln-api request: error sending request for url"
+        );
+        assert_eq!(
+            error_prefix("vuln-api unavailable (HTTP 503)"),
+            "vuln-api unavailable"
+        );
+        assert_eq!(error_prefix("no parens here"), "no parens here");
+    }
+
+    /// Four unverifiable findings sharing a prefix collapse into one group
+    /// (named + transitive both count); three do not.
+    #[test]
+    fn collapsed_groups_require_more_than_threshold() {
+        let unverifiable = |name: &str| {
+            let mut o = resolved_outcome(name, "1.0.0", false);
+            set_verdict(
+                &mut o,
+                VerdictStatus::Unverifiable(format!("vuln-api unavailable (HTTP 503: {name})")),
+            );
+            o
+        };
+
+        let mut report = report_with(vec![
+            unverifiable("a"),
+            unverifiable("b"),
+            unverifiable("c"),
+        ]);
+        assert!(collapsed_unverifiable_groups(&report).is_empty());
+
+        report.tree = Some(TreeReport::Full {
+            resolved_count: 4,
+            transitive: vec![TreeOutcome {
+                name: "d".to_string(),
+                version: "1.0.0".to_string(),
+                verdict: VerdictStatus::Unverifiable(
+                    "vuln-api unavailable (HTTP 503: d)".to_string(),
+                ),
+                origin: TreeOrigin::Transitive,
+            }],
+        });
+        let groups = collapsed_unverifiable_groups(&report);
+        assert_eq!(groups.len(), 1);
+        let (prefix, count, first) = groups[0];
+        assert_eq!(prefix, "vuln-api unavailable");
+        assert_eq!(count, 4);
+        // Render order is transitive-first, so the tree finding leads.
+        assert_eq!(first, "vuln-api unavailable (HTTP 503: d)");
+    }
+
+    #[test]
+    fn advertised_fix_ignores_matches_without_fix() {
+        // safe_version returns None here; the advertised fix still surfaces.
+        assert_eq!(
+            advertised_fix(&[vm("A-1", Some("2.0.0")), vm("A-2", None)]),
+            Some("2.0.0".to_string())
+        );
+        assert_eq!(advertised_fix(&[vm("A-1", None)]), None);
+        assert_eq!(advertised_fix(&[]), None);
+    }
+
+    #[test]
+    fn advertised_fix_picks_highest_by_semver() {
+        assert_eq!(
+            advertised_fix(&[vm("A-1", Some("1.2.0")), vm("A-2", Some("1.10.0"))]),
+            Some("1.10.0".to_string())
+        );
+    }
+
+    /// Leftover origin assignment: pip `requested` ⇒ Requested; manifest
+    /// direct dep ⇒ PreExisting; otherwise Transitive. Requested wins over
+    /// a direct-dep hit.
+    #[test]
+    fn apply_verdicts_assigns_origins() {
+        let pkg = |name: &str, requested: bool| tree::TreePackage {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            requested,
+        };
+        let results = vec![
+            (pkg("reqdep", true), VerdictStatus::Clean),
+            (pkg("predep", false), VerdictStatus::Clean),
+            (pkg("deepdep", false), VerdictStatus::Clean),
+        ];
+        let direct_deps = std::collections::HashSet::from(["predep".to_string()]);
+        let mut outcomes = [];
+        let mut tree = apply_verdicts(PackageManager::Npm, results, &mut outcomes, &direct_deps);
+        tree.sort_by(|a, b| a.name.cmp(&b.name));
+        let origins: Vec<(&str, TreeOrigin)> =
+            tree.iter().map(|t| (t.name.as_str(), t.origin)).collect();
+        assert_eq!(
+            origins,
+            vec![
+                ("deepdep", TreeOrigin::Transitive),
+                ("predep", TreeOrigin::PreExisting),
+                ("reqdep", TreeOrigin::Requested),
+            ]
+        );
+    }
+
+    /// The existing-tree refusal fires only when every vulnerable finding
+    /// predates the command: a `Requested` finding (pip `-r`) is added by
+    /// this command, and a `Transitive` finding is being pulled in right
+    /// now unless the install is truly bare. `bare_install` is the explicit
+    /// discriminator — a requirements-only install also has no named
+    /// outcomes, but its resolved set is the command's doing.
+    #[test]
+    fn refusal_blame_respects_finding_origin() {
+        let tree_vulnerable = |origin| TreeOutcome {
+            name: "dep".to_string(),
+            version: "1.0.0".to_string(),
+            verdict: VerdictStatus::Vulnerable(vec![vm("A-1", None)]),
+            origin,
+        };
+        // (origin, named outcomes present, bare_install, expected).
+        // (origin, named=false, bare=false) is the requirements-only shape.
+        let cases = [
+            (TreeOrigin::PreExisting, false, true, true),
+            (TreeOrigin::PreExisting, false, false, true),
+            (TreeOrigin::PreExisting, true, false, true),
+            (TreeOrigin::Transitive, false, true, true),
+            (TreeOrigin::Transitive, false, false, false),
+            (TreeOrigin::Transitive, true, false, false),
+            (TreeOrigin::Requested, false, true, false),
+            (TreeOrigin::Requested, false, false, false),
+            (TreeOrigin::Requested, true, false, false),
+        ];
+        for (origin, with_named, bare_install, blames_tree) in cases {
+            let outcomes = if with_named {
+                vec![resolved_outcome("cleanpkg", "1.0.0", false)]
+            } else {
+                vec![]
+            };
+            let mut report = report_with(outcomes);
+            report.bare_install = bare_install;
+            report.tree = Some(TreeReport::Full {
+                resolved_count: 1,
+                transitive: vec![tree_vulnerable(origin)],
+            });
+            assert_eq!(
+                refusal_blames_existing_tree(&report),
+                blames_tree,
+                "origin {origin:?}, with_named {with_named}, bare {bare_install}"
+            );
+        }
+    }
+
+    /// Unverifiable tree findings block too (`should_block_install`), so
+    /// they must pass the same origin test before the refusal may blame the
+    /// existing tree: a command-added unverifiable transitive alongside a
+    /// pre-existing vulnerable dep keeps the generic refusal on a named
+    /// install, while on a bare install everything still predates the
+    /// command.
+    #[test]
+    fn refusal_blame_considers_unverifiable_tree_findings() {
+        let tree_finding = |name: &str, verdict, origin| TreeOutcome {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            verdict,
+            origin,
+        };
+        let mixed_tree = || {
+            Some(TreeReport::Full {
+                resolved_count: 2,
+                transitive: vec![
+                    tree_finding(
+                        "stickydep",
+                        VerdictStatus::Vulnerable(vec![vm("A-1", None)]),
+                        TreeOrigin::PreExisting,
+                    ),
+                    tree_finding(
+                        "newdep",
+                        VerdictStatus::Unverifiable("vuln-api unavailable".to_string()),
+                        TreeOrigin::Transitive,
+                    ),
+                ],
+            })
+        };
+
+        // Named install: the unverifiable transitive is being added by this
+        // command, so "none were added by this command" would lie.
+        let mut report = report_with(vec![resolved_outcome("cleanpkg", "1.0.0", false)]);
+        report.tree = mixed_tree();
+        assert!(!refusal_blames_existing_tree(&report));
+
+        // Bare install: nothing named, everything resolved predates the
+        // command — the mixed findings still blame the existing tree.
+        let mut report = report_with(vec![]);
+        report.bare_install = true;
+        report.tree = mixed_tree();
+        assert!(refusal_blames_existing_tree(&report));
+    }
+}
