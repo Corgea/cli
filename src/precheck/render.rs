@@ -3,8 +3,26 @@
 use crate::verify_deps;
 
 use super::{
-    parse, PrecheckOptions, PrecheckReport, TargetOutcome, TreeOrigin, TreeReport, VerdictStatus,
+    parse, PackageManager, PrecheckOptions, PrecheckReport, TargetOutcome, TreeOrigin, TreeReport,
+    VerdictStatus,
 };
+
+/// One honest stderr line when a zero-spec install can't be gated:
+/// yarn/pnpm/uv have no safe dry-run, so a bare install pulls its whole
+/// dependency set unchecked. No-op for other managers (bare npm is gated
+/// via the tree pass; bare pip installs nothing).
+pub(super) fn bare_install_note(manager: PackageManager, subcommand_label: &str) {
+    if matches!(
+        manager,
+        PackageManager::Yarn | PackageManager::Pnpm | PackageManager::Uv
+    ) {
+        eprintln!(
+            "note: bare '{} {}' is not gated (no safe dry-run) — dependencies install unchecked",
+            manager.binary_name(),
+            subcommand_label
+        );
+    }
+}
 
 /// The refusal line on stderr. Messaging only; the block decision and the
 /// choice of escape hatch live in `verdict::block_reason`.
