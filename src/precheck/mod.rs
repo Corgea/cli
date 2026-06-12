@@ -463,6 +463,20 @@ fn run_parsed_install(
     let tree_eligible = opts.verdict.is_some() && tree::covers_input(manager, &parsed);
     let bare_install = parsed.targets.is_empty() && parsed.requirements_files.is_empty();
 
+    // A BARE `npm install --prefix <other>` installs another project's whole
+    // tree, but the gate can't safely resolve that redirected root from a copy
+    // of the CWD. Nothing named verifies it either, so it would install wholly
+    // unchecked — fail closed unless `--force`. (A NAMED install still verifies
+    // its targets and degrades the tree pass to a loud named-only warning.)
+    if manager == PackageManager::Npm && bare_install && opts.verdict.is_some() && !opts.force {
+        if let Some(flag) = tree::npm_root_redirect_flag(rest) {
+            eprintln!(
+                "error: cannot verify a bare 'npm install' that redirects the project root ('{flag}'): the would-install tree is unknown (pass --force to proceed unchecked)"
+            );
+            return 1;
+        }
+    }
+
     if parsed.targets.is_empty() && !tree_eligible {
         // A `-r requirements.txt` install with verdicts disabled is only
         // noted; a truly bare install has nothing to note at all.
@@ -532,10 +546,23 @@ fn run_npm_ci(subcommand: &str, rest: &[String], opts: PrecheckOptions) -> i32 {
     let Some(cfg) = &opts.verdict else {
         return exec();
     };
+    // A root-redirect flag (`--prefix ../other`, `-C ../other`) makes npm ci
+    // install a DIFFERENT project's lockfile than the CWD one we'd verdict, so
+    // verifying the CWD lockfile would pass on the wrong project. Fail closed
+    // unless `--force`.
+    if !opts.force {
+        if let Some(flag) = tree::npm_root_redirect_flag(rest) {
+            eprintln!(
+                "error: cannot verify 'npm {subcommand}' with '{flag}': it installs a redirected project's lockfile, not this one (pass --force to proceed unchecked)"
+            );
+            return 1;
+        }
+    }
     let Some(root) = tree::npm_project_root() else {
         return exec();
     };
-    let Some(lock_path) = ["package-lock.json", "npm-shrinkwrap.json"]
+    // npm-shrinkwrap.json takes precedence over package-lock.json.
+    let Some(lock_path) = ["npm-shrinkwrap.json", "package-lock.json"]
         .iter()
         .map(|n| root.join(n))
         .find(|p| p.is_file())
