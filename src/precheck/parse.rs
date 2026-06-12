@@ -152,14 +152,22 @@ pub fn uv_subcommand(cmd: &[String]) -> &[String] {
 
 pub fn classify_uv_command(cmd: &[String]) -> UvCommand<'_> {
     match cmd.first().map(String::as_str) {
-        Some("pip") if matches!(cmd.get(1).map(String::as_str), Some("install" | "i")) => {
-            UvCommand::PipInstall {
-                install_args: &cmd[2..],
+        Some("pip") => {
+            // uv accepts flags between `pip` and its verb
+            // (`uv pip --quiet install x` is valid) — skip them like
+            // `uv_subcommand` does, or the verb lands in Passthrough
+            // ungated.
+            let rest = uv_subcommand(&cmd[1..]);
+            match rest.first().map(String::as_str) {
+                Some("install" | "i") => UvCommand::PipInstall {
+                    install_args: &rest[1..],
+                },
+                Some("sync") => UvCommand::PipSync {
+                    sync_args: &rest[1..],
+                },
+                _ => UvCommand::Passthrough,
             }
         }
-        Some("pip") if cmd.get(1).map(String::as_str) == Some("sync") => UvCommand::PipSync {
-            sync_args: &cmd[2..],
-        },
         Some("add") => UvCommand::Add {
             add_args: &cmd[1..],
         },
@@ -436,6 +444,10 @@ pub(super) fn takes_value(manager: PackageManager, flag: &str) -> bool {
                 | "--global-folder"
                 | "--link-folder"
                 | "--preferred-cache-folder"
+                // yarn-classic's monorepo dir redirect: missing it makes
+                // `yarn --cwd packages/app add x` classify the VALUE as the
+                // verb → ungated passthrough.
+                | "--cwd"
         ),
         PackageManager::Uv => matches!(
             flag,
@@ -466,6 +478,18 @@ pub(super) fn takes_value(manager: PackageManager, flag: &str) -> bool {
                 | "--project"
                 | "--config-setting"
                 | "--link-mode"
+                // uv global options: a valued flag missing here makes its
+                // VALUE classify as the subcommand → ungated passthrough
+                // (`uv --color always add x` must still gate the add).
+                | "--color"
+                | "--config-file"
+                | "--cache-dir"
+                | "--allow-insecure-host"
+                // `uv add` value flags whose bare-word values would
+                // otherwise parse as package specs.
+                | "--optional"
+                | "--bounds"
+                | "--script"
         ),
         PackageManager::Pip => matches!(
             flag,
@@ -1051,6 +1075,81 @@ mod tests {
             classify_uv_command(&["lock".to_string()]),
             UvCommand::Passthrough
         );
+    }
+
+    #[test]
+    fn uv_valued_global_flags_do_not_swallow_the_subcommand() {
+        // SECURITY: a valued global flag missing from `takes_value` makes
+        // its VALUE classify as the subcommand → silent ungated
+        // passthrough. `uv --color always add x` must still gate the add.
+        for (flag, value) in [
+            ("--color", "always"),
+            ("--config-file", "uv.toml"),
+            ("--cache-dir", "/tmp/cache"),
+            ("--allow-insecure-host", "example.com"),
+        ] {
+            let cmd = vec![
+                flag.to_string(),
+                value.to_string(),
+                "add".to_string(),
+                "requests".to_string(),
+            ];
+            let sub = uv_subcommand(&cmd);
+            assert_eq!(
+                sub.first().map(String::as_str),
+                Some("add"),
+                "{flag} must skip its value, not surface it as the verb"
+            );
+        }
+    }
+
+    #[test]
+    fn uv_pip_flags_between_pip_and_verb_still_classify() {
+        // `uv pip --quiet install x` is a valid uv invocation; the flag
+        // between `pip` and the verb must not push it to Passthrough.
+        assert!(matches!(
+            classify_uv_command(&[
+                "pip".to_string(),
+                "--quiet".to_string(),
+                "install".to_string(),
+                "requests".to_string(),
+            ]),
+            UvCommand::PipInstall { .. }
+        ));
+        assert!(matches!(
+            classify_uv_command(&[
+                "pip".to_string(),
+                "--python".to_string(),
+                "3.12".to_string(),
+                "sync".to_string(),
+                "reqs.txt".to_string(),
+            ]),
+            UvCommand::PipSync { .. }
+        ));
+    }
+
+    #[test]
+    fn uv_add_value_flags_do_not_parse_as_specs() {
+        // `uv add --optional cli rich` adds `rich` to the `cli` extra —
+        // `cli` is a flag value, not a package (it's a real PyPI name, so
+        // misparsing it would false-block or noise the report).
+        let p = extract_node_positionals(
+            PackageManager::Uv,
+            &[
+                "--optional".to_string(),
+                "cli".to_string(),
+                "rich".to_string(),
+            ],
+        );
+        assert_eq!(p.specs, vec!["rich".to_string()]);
+    }
+
+    #[test]
+    fn yarn_cwd_value_does_not_swallow_the_verb() {
+        // SECURITY: yarn-classic's `--cwd <dir>` takes a value; without it
+        // in `takes_value` the DIRECTORY becomes the verb and
+        // `yarn --cwd packages/app add lodash` execs ungated.
+        assert!(takes_value(PackageManager::Yarn, "--cwd"));
     }
 
     #[test]

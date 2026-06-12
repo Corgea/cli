@@ -205,6 +205,54 @@ fn uv_global_flags_before_subcommand_still_gate() {
 }
 
 #[test]
+fn uv_valued_global_flag_before_subcommand_still_gates() {
+    // SECURITY: `--color always` takes a value; if the value is mistaken
+    // for the subcommand, `uv --color always sync` (and `… add x`) execs
+    // as ungated passthrough. The boolean-flag test above can't catch
+    // this class.
+    let mut h = GateHarness::new()
+        .fake_recorder("uv", 0)
+        .vuln_checks(vulnerable_evildep_checks())
+        .with_project_file("uv.lock", UV_LOCK)
+        .build();
+    let out = h
+        .cmd
+        .args(["uv", "--color", "always", "sync"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a valued global flag must not swallow the subcommand: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.recorded_argv(), None, "uv must not run when blocked");
+}
+
+#[test]
+fn uv_run_prints_ungated_note() {
+    // `uv run` syncs the project environment on first run and `--with`
+    // installs packages — none of it gated. The passthrough must say so
+    // instead of staying silent (SKILL.md lists it as a limitation).
+    let mut h = GateHarness::new()
+        .fake_recorder("uv", 0)
+        .vuln_checks(HashMap::new())
+        .build();
+    let out = h
+        .cmd
+        .args(["uv", "run", "pytest"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0), "passthrough forwards to uv");
+    assert_eq!(h.recorded_argv().as_deref(), Some("run pytest"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("'uv run'") && stderr.contains("not gated"),
+        "uv run must disclose it is ungated: {stderr}"
+    );
+}
+
+#[test]
 fn uv_pip_install_in_requirements_project_is_not_wrong_manager() {
     // `uv pip install` is uv's pip-compatible interface — using it in a
     // requirements/pip project is correct, NOT a wrong-manager mistake. It is
