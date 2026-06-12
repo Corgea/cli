@@ -1,4 +1,5 @@
-//! Install wrappers: `corgea npm`, `corgea pip`.
+//! Install wrappers: `corgea npm`, `corgea yarn`, `corgea pnpm`,
+//! `corgea pip`, `corgea uv`.
 //!
 //! Wraps an install command from a supported package manager, resolves what
 //! the package manager *would* install against the public registry, and
@@ -13,10 +14,12 @@
 //! Verdict lookups are public and fail open: a vuln-api outage warns and the
 //! install continues.
 
+mod detect;
 mod exec;
 mod parse;
 mod render;
 mod tree;
+mod uv;
 mod verdict;
 
 #[cfg(test)]
@@ -31,14 +34,20 @@ use chrono::Utc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageManager {
     Npm,
+    Yarn,
+    Pnpm,
     Pip,
+    Uv,
 }
 
 impl PackageManager {
     pub fn binary_name(self) -> &'static str {
         match self {
             PackageManager::Npm => "npm",
+            PackageManager::Yarn => "yarn",
+            PackageManager::Pnpm => "pnpm",
             PackageManager::Pip => "pip",
+            PackageManager::Uv => "uv",
         }
     }
 
@@ -47,15 +56,20 @@ impl PackageManager {
     pub fn is_install_subcommand(self, sub: &str) -> bool {
         match self {
             PackageManager::Npm => matches!(sub, "install" | "i" | "add"),
+            PackageManager::Yarn => matches!(sub, "add" | "install"),
+            PackageManager::Pnpm => matches!(sub, "add" | "install" | "i"),
             PackageManager::Pip => matches!(sub, "install"),
+            PackageManager::Uv => false,
         }
     }
 
     /// vuln-api ecosystem for this manager's registry.
     pub fn ecosystem(self) -> crate::vuln_api::Ecosystem {
         match self {
-            PackageManager::Npm => crate::vuln_api::Ecosystem::Npm,
-            PackageManager::Pip => crate::vuln_api::Ecosystem::Pypi,
+            PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => {
+                crate::vuln_api::Ecosystem::Npm
+            }
+            PackageManager::Pip | PackageManager::Uv => crate::vuln_api::Ecosystem::Pypi,
         }
     }
 
@@ -304,7 +318,17 @@ impl PrecheckReport {
 /// `["install", "axios@^1.0.0", "--save-dev"]`. An empty `cmd` execs the
 /// package manager with no arguments.
 pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOptions) -> i32 {
+    if manager == PackageManager::Uv {
+        return uv::run_uv(cmd, opts);
+    }
+
     if cmd.is_empty() {
+        // Bare `yarn` IS `yarn install` — route it through the install
+        // path so the bare-install note prints instead of a silent exec.
+        if manager == PackageManager::Yarn {
+            let install = ["install".to_string()];
+            return run_install(manager, &install, opts);
+        }
         return exec::exec_command(manager.binary_name(), &[]);
     }
 
@@ -339,7 +363,15 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
     }
 
     if !manager.is_install_subcommand(subcommand) {
-        // Non-install subcommand: transparent passthrough, args untouched.
+        // Non-install subcommand: transparent passthrough, args untouched —
+        // but `yarn global add` installs from the registry, so disclose
+        // that it isn't gated rather than pass silently.
+        if manager == PackageManager::Yarn
+            && subcommand == "global"
+            && cmd.get(verb_idx + 1).map(String::as_str) == Some("add")
+        {
+            eprintln!("note: 'yarn global add' is not gated; packages install unchecked");
+        }
         return exec::exec_command(manager.binary_name(), cmd);
     }
 
@@ -352,6 +384,16 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
     };
 
     warn_registry_override(manager, rest);
+
+    // Project guard. `--force` (documented as overriding every block) is
+    // the escape hatch — a stray ancestor lockfile must not leave the
+    // command permanently refused.
+    if !opts.force {
+        if let Some(message) = detect::wrong_package_manager_message(manager, rest, &parsed) {
+            eprintln!("{message}");
+            return 1;
+        }
+    }
 
     run_parsed_install(
         manager,
@@ -418,8 +460,16 @@ fn unsupported_pip_add_message(rest: &[String]) -> String {
 /// allow-listing is future work, separate PRD.
 fn warn_registry_override(manager: PackageManager, rest: &[String]) {
     let flags: &[&str] = match manager {
-        PackageManager::Npm => &["--registry"],
-        PackageManager::Pip => &["-i", "--index-url", "--extra-index-url"],
+        PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => &["--registry"],
+        PackageManager::Pip | PackageManager::Uv => &[
+            "-i",
+            "--index-url",
+            "--extra-index-url",
+            "--index",
+            "--default-index",
+            "-f",
+            "--find-links",
+        ],
     };
     if let Some(flag) = rest.iter().find(|a| {
         flags
@@ -478,8 +528,11 @@ fn run_parsed_install(
     }
 
     if parsed.targets.is_empty() && !tree_eligible {
-        // A `-r requirements.txt` install with verdicts disabled is only
-        // noted; a truly bare install has nothing to note at all.
+        // Only a truly bare install gets the bare note. A `-r requirements.txt`
+        // install is covered by `requirements_note`.
+        if bare_install {
+            render::bare_install_note(manager, subcommand_label);
+        }
         render::requirements_note(&parsed);
         return exec();
     }
@@ -535,17 +588,82 @@ fn run_parsed_install(
     report_and_exec(&report, &opts, exec)
 }
 
+/// Gate a lockfile-pinned install (`npm ci`, `uv sync`): verdict every
+/// locked package. Recency isn't checked — locked versions aren't newly
+/// chosen by this command; the verdict pass is the gate.
+fn run_locked_install(
+    manager: PackageManager,
+    subcommand: &str,
+    original_args: Vec<String>,
+    lock: Result<Vec<tree::TreePackage>, String>,
+    opts: &PrecheckOptions,
+    exec: impl FnOnce() -> i32,
+) -> i32 {
+    let Some(cfg) = &opts.verdict else {
+        // Direct callers may still disable verdicts completely.
+        return exec();
+    };
+    let jobs = match lock {
+        Ok(jobs) => jobs,
+        Err(e) if opts.force => {
+            eprintln!(
+                "warning: cannot verify '{} {}' ({e}); proceeding under --force",
+                manager.binary_name(),
+                subcommand
+            );
+            return exec();
+        }
+        Err(e) => {
+            // The single documented bypass of the "all blocking goes through
+            // `verdict::block_reason`" invariant: an unparsable lockfile
+            // means there is no report to feed the predicate, so the gate
+            // refuses directly (--force above is the only escape).
+            eprintln!(
+                "error: cannot verify '{} {}': {e} (pass --force to proceed unchecked)",
+                manager.binary_name(),
+                subcommand
+            );
+            return 1;
+        }
+    };
+
+    let resolved_count = jobs.len();
+    let results = verdict::verdict_pool(jobs, cfg, manager);
+    let transitive = results
+        .into_iter()
+        .map(|(pkg, verdict)| TreeOutcome {
+            name: pkg.name,
+            version: pkg.version,
+            origin: TreeOrigin::Locked,
+            verdict,
+        })
+        .collect();
+    let report = PrecheckReport {
+        manager,
+        subcommand: subcommand.to_string(),
+        original_args,
+        outcomes: Vec::new(),
+        threshold: opts.threshold,
+        tree: Some(TreeReport::Full {
+            resolved_count,
+            transitive,
+        }),
+        bare_install: true,
+    };
+
+    report_and_exec(&report, opts, exec)
+}
+
 /// `npm ci` (and aliases): installs the project lockfile exactly as
 /// written, so the gate verdicts the lockfile-pinned set directly — no
-/// dry-run needed. Recency isn't checked — locked versions aren't newly
-/// chosen by this command; the verdict pass is the gate. Without a project
-/// or lockfile npm errors on its own; the gate just execs.
+/// dry-run needed. Without a project or lockfile npm errors on its own;
+/// the gate just execs.
 fn run_npm_ci(subcommand: &str, rest: &[String], opts: PrecheckOptions) -> i32 {
     let exec = || exec::exec_install_with_args(PackageManager::Npm, subcommand, rest);
 
-    let Some(cfg) = &opts.verdict else {
+    if opts.verdict.is_none() {
         return exec();
-    };
+    }
     // A root-redirect flag (`--prefix ../other`, `-C ../other`) makes npm ci
     // install a DIFFERENT project's lockfile than the CWD one we'd verdict, so
     // verifying the CWD lockfile would pass on the wrong project. Fail closed
@@ -573,49 +691,14 @@ fn run_npm_ci(subcommand: &str, rest: &[String], opts: PrecheckOptions) -> i32 {
     let lock = std::fs::read_to_string(&lock_path)
         .map_err(|e| format!("read {}: {e}", lock_path.display()))
         .and_then(|content| tree::parse_npm_lockfile(&content));
-    let jobs = match lock {
-        Ok(jobs) => jobs,
-        Err(e) if opts.force => {
-            eprintln!("warning: cannot verify 'npm {subcommand}' ({e}); proceeding under --force");
-            return exec();
-        }
-        Err(e) => {
-            // The single documented bypass of the "all blocking goes through
-            // `verdict::block_reason`" invariant: an unparsable lockfile
-            // means there is no report to feed the predicate, so the gate
-            // refuses directly (--force above is the only escape).
-            eprintln!(
-                "error: cannot verify 'npm {subcommand}': {e} (pass --force to proceed unchecked)"
-            );
-            return 1;
-        }
-    };
-
-    let resolved_count = jobs.len();
-    let results = verdict::verdict_pool(jobs, cfg, PackageManager::Npm);
-    let transitive = results
-        .into_iter()
-        .map(|(pkg, verdict)| TreeOutcome {
-            name: pkg.name,
-            version: pkg.version,
-            origin: TreeOrigin::Locked,
-            verdict,
-        })
-        .collect();
-    let report = PrecheckReport {
-        manager: PackageManager::Npm,
-        subcommand: subcommand.to_string(),
-        original_args: rest.to_vec(),
-        outcomes: Vec::new(),
-        threshold: opts.threshold,
-        tree: Some(TreeReport::Full {
-            resolved_count,
-            transitive,
-        }),
-        bare_install: true,
-    };
-
-    report_and_exec(&report, &opts, exec)
+    run_locked_install(
+        PackageManager::Npm,
+        subcommand,
+        rest.to_vec(),
+        lock,
+        &opts,
+        exec,
+    )
 }
 
 /// One verdict job (`requested: true`) per named resolved target, in
@@ -697,7 +780,9 @@ fn requirements_fallback_outcomes(
     opts: &PrecheckOptions,
     now: &chrono::DateTime<Utc>,
 ) -> Vec<TargetOutcome> {
-    if manager != PackageManager::Pip || parsed.requirements_files.is_empty() {
+    if !matches!(manager, PackageManager::Pip | PackageManager::Uv)
+        || parsed.requirements_files.is_empty()
+    {
         return Vec::new();
     }
 
@@ -770,6 +855,13 @@ mod tests {
         assert!(PackageManager::Npm.is_install_subcommand("add"));
         assert!(!PackageManager::Npm.is_install_subcommand("update"));
 
+        assert!(PackageManager::Yarn.is_install_subcommand("add"));
+        assert!(PackageManager::Yarn.is_install_subcommand("install"));
+
+        assert!(PackageManager::Pnpm.is_install_subcommand("add"));
+        assert!(PackageManager::Pnpm.is_install_subcommand("install"));
+        assert!(PackageManager::Pnpm.is_install_subcommand("i"));
+
         assert!(PackageManager::Pip.is_install_subcommand("install"));
         assert!(!PackageManager::Pip.is_install_subcommand("freeze"));
     }
@@ -827,7 +919,10 @@ mod tests {
     fn ecosystem_mapping() {
         use crate::vuln_api::Ecosystem;
         assert_eq!(PackageManager::Pip.ecosystem(), Ecosystem::Pypi);
+        assert_eq!(PackageManager::Uv.ecosystem(), Ecosystem::Pypi);
         assert_eq!(PackageManager::Npm.ecosystem(), Ecosystem::Npm);
+        assert_eq!(PackageManager::Yarn.ecosystem(), Ecosystem::Npm);
+        assert_eq!(PackageManager::Pnpm.ecosystem(), Ecosystem::Npm);
     }
 
     #[test]
@@ -836,6 +931,10 @@ mod tests {
         assert_eq!(
             PackageManager::Pip.normalize_name("Flask_Cors"),
             "flask-cors"
+        );
+        assert_eq!(
+            PackageManager::Uv.normalize_name("zope.interface"),
+            "zope-interface"
         );
         assert_eq!(PackageManager::Pip.normalize_name("a__b"), "a-b");
         // npm names are case-sensitive and pass through verbatim.
