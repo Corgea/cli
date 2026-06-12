@@ -46,11 +46,31 @@ fn detect_node_manager_from(start: &Path) -> Option<PackageManager> {
         // their own discovery the same way). A project with no manager
         // indicators of its own must not inherit a stray ancestor lockfile
         // — that would hard-refuse installs in every fresh project under it.
-        if dir.join("package.json").is_file() {
+        //
+        // EXCEPT a workspace member: its package manager is controlled by the
+        // workspace ROOT (root `workspaces` field or `pnpm-workspace.yaml`),
+        // so keep walking up to find it instead of stopping at the leaf.
+        if dir.join("package.json").is_file() && !is_inside_npm_workspace(dir) {
             return None;
         }
     }
     None
+}
+
+/// Whether `dir` is a member of an npm/yarn/pnpm workspace rooted at some
+/// ancestor — i.e. a strict ancestor carries a `pnpm-workspace.yaml` or a
+/// `package.json` with a `workspaces` field. Used to keep the wrong-manager
+/// walk going past a leaf member up to the workspace root.
+fn is_inside_npm_workspace(dir: &Path) -> bool {
+    dir.ancestors().skip(1).any(|ancestor| {
+        if ancestor.join("pnpm-workspace.yaml").is_file() {
+            return true;
+        }
+        std::fs::read_to_string(ancestor.join("package.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .is_some_and(|j| j.get("workspaces").is_some())
+    })
 }
 
 fn detect_node_manager_in_dir(dir: &Path) -> ProjectManagerDetection {
@@ -206,6 +226,38 @@ mod tests {
         let bare = root.path().join("scratch");
         std::fs::create_dir(&bare).expect("mkdir");
         assert_eq!(detect_node_manager_from(&bare), Some(PackageManager::Npm));
+    }
+
+    #[test]
+    fn node_walk_reaches_workspace_root_from_a_member() {
+        // A workspace member's own package.json has no manager indicators,
+        // but the workspace ROOT controls the manager. The walk must reach
+        // the root (here: pnpm via pnpm-lock.yaml + `workspaces`) instead of
+        // hard-stopping at the leaf.
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"monorepo","workspaces":["packages/*"]}"#,
+        )
+        .expect("write root manifest");
+        touch(&root.path().join("pnpm-lock.yaml"));
+        let member = root.path().join("packages").join("a");
+        std::fs::create_dir_all(&member).expect("mkdir");
+        std::fs::write(member.join("package.json"), r#"{"name":"a"}"#).expect("write member");
+
+        assert_eq!(
+            detect_node_manager_from(&member),
+            Some(PackageManager::Pnpm),
+            "a workspace member must resolve to the root's manager"
+        );
+
+        // A standalone project (no workspace ancestor) still stops at its leaf.
+        let standalone = tempfile::tempdir().expect("tempdir");
+        touch(&standalone.path().join("yarn.lock"));
+        let fresh = standalone.path().join("fresh");
+        std::fs::create_dir(&fresh).expect("mkdir");
+        std::fs::write(fresh.join("package.json"), "{}").expect("write manifest");
+        assert_eq!(detect_node_manager_from(&fresh), None);
     }
 
     #[test]
