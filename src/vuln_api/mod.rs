@@ -198,25 +198,54 @@ fn retry_after_seconds(response: &reqwest::blocking::Response) -> u64 {
         .unwrap_or(1)
 }
 
-fn send_package_check_with_429_retry(
+/// Send the package-check GET, retrying transient failures within a single
+/// budget of `MAX_SENDS` sends total:
+///   * any `send()` error (connect, reset, timeout) retries up to twice with
+///     500ms / 1500ms backoff — the request is an idempotent GET, so a
+///     blanket retry is safe and simpler than classifying error kinds;
+///   * HTTP 429 honors `Retry-After` (clamped 1–10s) and retries once, then
+///     surfaces the 429 to the caller's status mapping.
+///
+/// The sleeps block the calling verdict-pool worker thread. Deliberate:
+/// bounded at ≤3 sends and ≤2 sleeps per package, that costs less at CLI
+/// scale than a non-blocking reschedule would in queue machinery.
+fn send_package_check_with_retry(
     client: &reqwest::blocking::Client,
     url: &str,
     token: Option<&str>,
 ) -> Result<reqwest::blocking::Response, Box<dyn std::error::Error>> {
-    let response = build_json_get(client, url, token)
-        .send()
-        .map_err(|e| format!("Failed to send vuln-api request: {}", e))?;
+    const MAX_SENDS: usize = 3;
+    const SEND_ERROR_BACKOFF: [Duration; 2] =
+        [Duration::from_millis(500), Duration::from_millis(1500)];
 
-    if response.status().as_u16() == 429 {
-        let wait = retry_after_seconds(&response);
-        std::thread::sleep(Duration::from_secs(wait));
-        return build_json_get(client, url, token)
-            .send()
-            .map_err(|e| format!("Failed to send vuln-api request: {}", e).into());
+    let mut rate_limit_retried = false;
+    let mut sends = 0;
+    loop {
+        sends += 1;
+        match build_json_get(client, url, token).send() {
+            Ok(response) => {
+                if response.status().as_u16() == 429 && !rate_limit_retried && sends < MAX_SENDS {
+                    rate_limit_retried = true;
+                    std::thread::sleep(Duration::from_secs(retry_after_seconds(&response)));
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(e) if sends < MAX_SENDS => {
+                debug(&format!(
+                    "vuln-api send failed (attempt {}/{}), retrying: {}",
+                    sends, MAX_SENDS, e
+                ));
+                std::thread::sleep(SEND_ERROR_BACKOFF[sends - 1]);
+            }
+            Err(e) => return Err(format!("Failed to send vuln-api request: {}", e).into()),
+        }
     }
-    Ok(response)
 }
 
+/// One HTTP request per `(name, version)`. A 1000-package lockfile makes
+/// 1000 requests (through the verdict pool's bounded concurrency); the
+/// future optimization is a server-side batch endpoint, not client tricks.
 pub fn check_package_version(
     client: &reqwest::blocking::Client,
     base_url: &str,
@@ -243,7 +272,7 @@ pub fn check_package_version(
 
     debug(&format!("Sending vuln-api request to URL: {}", url));
 
-    let response = send_package_check_with_429_retry(client, &url, token)?;
+    let response = send_package_check_with_retry(client, &url, token)?;
 
     let status = response.status();
     // Fixed messages for recognized statuses — tests assert these strings,
@@ -275,7 +304,8 @@ pub fn check_package_version(
     let parsed: VulnCheckResponse = serde_json::from_str(&response_text).map_err(|e| {
         debug(&format!(
             "Failed to parse vuln-api response: {}. Body: {}",
-            e, response_text
+            e,
+            body_snippet(&response_text, ERROR_BODY_SNIPPET_LEN)
         ));
         format!("Failed to parse vuln-api response: {}", e)
     })?;
@@ -452,6 +482,55 @@ mod tests {
         )
         .expect("retry should succeed");
         assert!(resp.is_vulnerable);
+    }
+
+    /// Run a check against a stub that drops the connection (reads the
+    /// request, closes without responding) for the first `drops` hits on
+    /// lodash, then serves a vulnerable verdict.
+    fn check_with_drops(drops: usize) -> Result<VulnCheckResponse, Box<dyn std::error::Error>> {
+        let client = http_client().expect("test client");
+        let vulnerable_body = vuln_api_stub::vulnerable_body(
+            "npm",
+            "lodash",
+            "4.17.20",
+            "GHSA-drop-test",
+            Some("4.17.21"),
+        );
+        let stub = vuln_api_stub::spawn_with_drops(
+            HashMap::from([(lodash_key(), vulnerable_body)]),
+            HashMap::new(),
+            HashMap::from([(lodash_key(), drops)]),
+        );
+        check_package_version(
+            &client,
+            &stub.base_url,
+            Some("test-token"),
+            Ecosystem::Npm,
+            "lodash",
+            "4.17.20",
+        )
+    }
+
+    #[test]
+    fn check_package_version_retries_dropped_connection_then_succeeds() {
+        let resp = check_with_drops(1).expect("one dropped connection should be retried");
+        assert!(resp.is_vulnerable);
+    }
+
+    #[test]
+    fn check_package_version_retries_two_dropped_connections_then_succeeds() {
+        let resp = check_with_drops(2).expect("two dropped connections fit the 2-retry budget");
+        assert!(resp.is_vulnerable);
+    }
+
+    #[test]
+    fn check_package_version_fails_after_three_dropped_connections() {
+        let err = check_with_drops(3).expect_err("three drops exhaust the 3-send budget");
+        assert!(
+            err.to_string().contains("Failed to send vuln-api request"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]

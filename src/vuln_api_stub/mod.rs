@@ -59,7 +59,33 @@ pub fn spawn_with_retry_once(
     status_overrides: HashMap<PackageKey, u16>,
     retry_once: HashSet<PackageKey>,
 ) -> VulnApiStub {
-    spawn(package_checks, status_overrides, retry_once, None)
+    spawn(
+        package_checks,
+        status_overrides,
+        retry_once,
+        HashMap::new(),
+        None,
+    )
+}
+
+/// Like [`spawn_with_statuses`], but keys in `drops` have their first N hits
+/// answered by reading the request and closing the connection without
+/// writing a response — the client surfaces each as a `send()` error
+/// (`connection closed before message completed`). Falls through to the
+/// scripted response once the drops are spent. For exercising the client's
+/// transient-failure retry path hermetically.
+pub fn spawn_with_drops(
+    package_checks: HashMap<PackageKey, String>,
+    status_overrides: HashMap<PackageKey, u16>,
+    drops: HashMap<PackageKey, usize>,
+) -> VulnApiStub {
+    spawn(
+        package_checks,
+        status_overrides,
+        HashSet::new(),
+        drops,
+        None,
+    )
 }
 
 /// Vuln-api stub that records raw requests and answers every package check
@@ -71,6 +97,7 @@ pub fn spawn_capturing_vuln_api_stub() -> (String, std::sync::Arc<std::sync::Mut
         HashMap::new(),
         HashMap::new(),
         HashSet::new(),
+        HashMap::new(),
         Some(std::sync::Arc::clone(&requests)),
     );
     // Dropping the stub's join handle detaches the listener thread; the
@@ -82,6 +109,7 @@ fn spawn(
     package_checks: HashMap<PackageKey, String>,
     status_overrides: HashMap<PackageKey, u16>,
     retry_once: HashSet<PackageKey>,
+    drops: HashMap<PackageKey, usize>,
     capture: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 ) -> VulnApiStub {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
@@ -90,6 +118,7 @@ fn spawn(
 
     let handle = thread::spawn(move || {
         let mut pending_retries = retry_once;
+        let mut pending_drops = drops;
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else {
                 continue;
@@ -99,6 +128,7 @@ fn spawn(
                 &package_checks,
                 &status_overrides,
                 &mut pending_retries,
+                &mut pending_drops,
                 capture.as_deref(),
             );
         }
@@ -156,6 +186,7 @@ fn handle_connection(
     package_checks: &HashMap<PackageKey, String>,
     status_overrides: &HashMap<PackageKey, u16>,
     pending_retries: &mut HashSet<PackageKey>,
+    pending_drops: &mut HashMap<PackageKey, usize>,
     capture: Option<&std::sync::Mutex<Vec<String>>>,
 ) {
     let buf = read_http_request(stream);
@@ -180,6 +211,16 @@ fn handle_connection(
                     &urlencoding::decode(parts[3]).unwrap_or_default(),
                     &urlencoding::decode(parts[5]).unwrap_or_default(),
                 );
+                if let Some(remaining) = pending_drops.get_mut(&key) {
+                    // Close without writing: the request was read, so the
+                    // client sees its connection die mid-exchange — the
+                    // transient `send()` error this mode exists to script.
+                    *remaining -= 1;
+                    if *remaining == 0 {
+                        pending_drops.remove(&key);
+                    }
+                    return;
+                }
                 if pending_retries.remove(&key) {
                     (429, r#"{"error":"rate limited"}"#.to_string(), true)
                 } else {
