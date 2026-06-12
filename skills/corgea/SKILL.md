@@ -170,9 +170,9 @@ verified in that fallback. Verdict requests run in a bounded pool
 project, pip in a uv project, …) is refused with a
 `Did you mean `corgea …`?` suggestion; `--force` bypasses that guard too.
 
-Wrapper flags (`--force`, `--no-fail`, `-t`) are read between the manager
-name and the install verb (`corgea npm --force install x`); flags after the
-verb belong to the package manager and are forwarded untouched.
+Wrapper flags (`--force`, `--no-fail`, `--json`, `-t`) are read between the
+manager name and the install verb (`corgea npm --force install x`); flags
+after the verb belong to the package manager and are forwarded untouched.
 
 Blocked findings steer to the fix: each advisory line shows
 `fixed in <version>` (or `no fixed version known`). When every advisory on a
@@ -184,6 +184,7 @@ corgea pip install requests==2.31.0   # resolves, checks recency + vuln verdict,
 corgea npm install axios@^1.0.0       # same gate for npm ranges
 corgea pip --no-fail install newpkg   # demote a recency block to a warning (vuln blocks still apply)
 corgea pip --force install badpkg     # print findings but install anyway (overrides every block)
+corgea pip --json install newpkg      # machine-readable per-target report incl. verdicts
 corgea pip list                       # non-install subcommands pass straight through
 ```
 
@@ -191,7 +192,18 @@ corgea pip list                       # non-install subcommands pass straight th
 |------|-------|-------------|
 | `--threshold` | `-t` | Recency threshold (`2d`, `12h`). Younger resolved versions block. |
 | `--no-fail` | | Demote a recency block to a warning. Does NOT bypass vulnerable blocks. |
-| `--force` | | Proceed despite all findings (vulnerable, recent). Findings still print. |
+| `--force` | | Proceed despite all findings (vulnerable, recent). Findings still print. Also bypasses the wrong-package-manager refusal and unparsable-lockfile refusals on `uv sync`/`npm ci`. |
+| `--json` | | JSON report instead of text. Per-result `verdict` object + `verdict_mode` + `tree`. Stdout carries only the report; the package manager's output moves to stderr. |
+
+`--json` adds `verdict_mode` (`"public"` from the CLI; `"recency-only"` can
+only appear for library callers that disable verdicts) and a `tree` object:
+`null` when no
+tree pass ran; otherwise `mode` is `"full"` (transitive checked) or
+`"named-only"` (with a `reason`), plus `resolved_count` and a `transitive[]`
+array of `{name, version, origin, verdict}` for packages beyond the named
+targets. Vulnerable `verdict` objects carry a `remediation` field: the safe
+version covering every advisory, or `null` when any advisory has no known
+fix.
 
 Overrides for testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`,
 `CORGEA_VULN_API_URL`.

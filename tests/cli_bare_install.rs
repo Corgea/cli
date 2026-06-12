@@ -98,6 +98,37 @@ fn bare_npm_install_force_overrides_block() {
 }
 
 #[test]
+fn bare_npm_install_json_carries_tree_object() {
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("npm", "evildep", "0.4.2"),
+        vulnerable_body("npm", "evildep", "0.4.2", "MAL-2024-0002", None),
+    );
+    let mut h = GateHarness::new()
+        .fake_tree_pm("npm", NPM_LOCK, 0)
+        .oldpkg_registry()
+        .vuln_checks(checks)
+        .with_project_file("package.json", PACKAGE_JSON)
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "--json", "install"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["tree"]["mode"], "full");
+    assert_eq!(parsed["tree"]["resolved_count"], 2);
+    assert_eq!(parsed["summary"]["vulnerable"], 1);
+    assert_eq!(
+        parsed["results"].as_array().map(Vec::len),
+        Some(0),
+        "zero named targets"
+    );
+}
+
+#[test]
 fn bare_npm_resolution_failure_falls_back_with_warning() {
     // Fake npm exits 1 on `--package-lock-only`. Nothing named remains to
     // verify, so the install proceeds behind the loud fallback warning.
@@ -231,6 +262,34 @@ fn bare_ungated_managers_print_note_and_exec() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+#[test]
+fn bare_yarn_install_json_emits_empty_report() {
+    // Bare yarn has no safe dry-run — it execs behind the honest note.
+    // Under --json stdout must still carry one parseable report (empty
+    // results, null tree), with the note on stderr and yarn's own stdout
+    // moved to stderr.
+    let mut h = GateHarness::new()
+        .fake_recorder("yarn", 0)
+        .vuln_checks(HashMap::new())
+        .in_project_dir()
+        .build();
+    let out = h
+        .cmd
+        .args(["yarn", "--json", "install"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(h.recorded_argv().as_deref(), Some("install"));
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["results"].as_array().map(Vec::len), Some(0));
+    assert!(parsed["tree"].is_null(), "parsed: {parsed}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not gated"),
+        "the bare note stays on stderr"
+    );
 }
 
 #[test]

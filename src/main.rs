@@ -235,6 +235,12 @@ struct InstallWrapArgs {
     )]
     force: bool,
 
+    #[arg(
+        long,
+        help = "Output the result as JSON instead of human-readable text."
+    )]
+    json: bool,
+
     /// Arguments forwarded to the package manager (subcommand and package specs).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     cmd: Vec<String>,
@@ -245,6 +251,7 @@ fn install_wrap_options(args: &InstallWrapArgs) -> corgea::precheck::PrecheckOpt
         threshold: args.threshold,
         no_fail: args.no_fail,
         force: args.force,
+        json: args.json,
         verdict: Some(corgea::precheck::VerdictConfig {
             base_url: config::vuln_api_url(),
         }),

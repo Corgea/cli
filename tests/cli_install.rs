@@ -212,6 +212,123 @@ fn pip_resolution_error_prints_error_but_install_proceeds() {
 }
 
 #[test]
+fn pip_json_reports_fresh_pin_as_recent() {
+    let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
+    let out = h
+        .cmd
+        .args(["pip", "--json", "install", "freshpkg==9.9.9"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None);
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["results"][0]["status"], "recent");
+    assert_eq!(parsed["results"][0]["name"], "freshpkg");
+    assert_eq!(parsed["summary"]["recent"], 1);
+}
+
+#[test]
+fn pip_json_routes_package_manager_stdout_to_stderr() {
+    // The fake pip fails its tree dry-run (named-only fallback) and prints
+    // to stdout on the real install; under --json that output must move to
+    // stderr so stdout stays parseable JSON.
+    let (base_url, _hits) = spawn_registry_stub();
+    let mut h = GateHarness::new()
+        .script_with_paths("pip", |_, marker| {
+            format!(
+                "#!/bin/sh\ncase \" $* \" in *\" --dry-run \"*) exit 2;; esac\nprintf 'FAKE-PM-STDOUT\\n'\nprintf '%s' \"$*\" > '{}'\nexit 0\n",
+                marker.display()
+            )
+        })
+        .registry_env("CORGEA_PYPI_REGISTRY", &base_url)
+        .build();
+    let out = h
+        .cmd
+        .args(["pip", "--json", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg==1.0.0"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str::<serde_json::Value>(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be valid JSON ({e}): {stdout}"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("FAKE-PM-STDOUT"),
+        "pip output must land on stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn pip_json_guard_refusal_is_parseable() {
+    // Guard refusals happen before any report exists; under --json stdout
+    // must still carry one parseable document.
+    let (mut h, _hits) = wrapper_with_hits("pip", "CORGEA_PYPI_REGISTRY", 0);
+    let out = h
+        .cmd
+        .args(["pip", "--json", "add", "oldpkg"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert!(
+        parsed["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("pip does not support `add`")),
+        "parsed: {parsed}"
+    );
+}
+
+#[test]
+fn npm_json_passthrough_forwards_flag_to_manager() {
+    // A non-install subcommand produces no Corgea report, so the wrapper's
+    // `--json` belongs to npm — it must reach the manager rather than being
+    // silently swallowed.
+    let mut h = GateHarness::new().fake_recorder("npm", 0).build();
+    let out = h
+        .cmd
+        .args(["npm", "--json", "ls"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("ls --json"),
+        "the wrapper's --json must be forwarded to the manager on passthrough"
+    );
+}
+
+#[test]
+fn npm_json_after_verb_belongs_to_the_manager() {
+    // Position sensitivity: flags after the verb belong to the package
+    // manager. `corgea npm install --json x` forwards --json to npm on a
+    // gated install while the gate itself stays in text mode.
+    let mut h = wrapper("npm", "CORGEA_NPM_REGISTRY", 0);
+    let out = h
+        .cmd
+        .args(["npm", "install", "oldpkg@1.0.0", "--json"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(out.status.code(), Some(0), "clean old pin proceeds");
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("install oldpkg@1.0.0 --json"),
+        "post-verb --json must reach npm untouched"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Pre-checking"),
+        "the gate must stay in text mode: {stdout}"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&stdout).is_err(),
+        "stdout is the text report, not a JSON document"
+    );
+}
+
+#[test]
 fn pip_mixed_fresh_and_old_pins_block_without_running_install() {
     let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
     let out = h

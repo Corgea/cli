@@ -306,6 +306,32 @@ fn pip_requirements_fallback_checks_file_entries_when_tree_fails() {
 }
 
 #[test]
+fn pip_json_carries_tree_object() {
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("pypi", "evildep", "0.4.2"),
+        vulnerable_evildep_body("pypi"),
+    );
+    let mut h = tree_harness("pip", checks, HashMap::new(), TREE_REPORT);
+    let out = h
+        .cmd
+        .args(["pip", "--json", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None);
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["tree"]["mode"], "full");
+    assert_eq!(parsed["tree"]["transitive"][0]["name"], "evildep");
+    assert_eq!(
+        parsed["tree"]["transitive"][0]["verdict"]["status"],
+        "vulnerable"
+    );
+    assert_eq!(parsed["summary"]["vulnerable"], 1);
+}
+
+#[test]
 fn pip_clean_tree_proceeds() {
     // Stub default-clean (no overrides), so every resolved package is clean.
     let mut h = tree_harness("pip", HashMap::new(), HashMap::new(), TREE_REPORT);
