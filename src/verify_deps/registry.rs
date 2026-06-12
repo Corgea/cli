@@ -315,9 +315,36 @@ pub enum PypiSpec {
     Specifier(String),
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct PypiInfo {
+    #[serde(default)]
+    name: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct PypiInfoResponse {
+    /// `info.name` is PyPI's canonical spelling — the registry answers any
+    /// PEP 503-equivalent request spelling but echoes the stored name.
+    #[serde(default)]
+    info: PypiInfo,
     releases: std::collections::BTreeMap<String, Vec<PypiUrl>>,
+}
+
+/// The name a resolved pypi package should carry forward: the registry's
+/// canonical spelling when the response provides one, else the requested
+/// spelling. Vuln advisories are keyed by lowercase(canonical) — checking
+/// a user-typed variant (`Flask_Cors`) would miss the `flask-cors` row.
+/// The canonical name is accepted only when PEP 503-equivalent to the
+/// request, so a hostile mirror can't redirect the verdict to a different
+/// package's (clean) identity.
+fn canonical_pypi_name(requested: &str, info_name: Option<&str>) -> String {
+    use crate::deps::ecosystems::pypi::normalize_pypi_name;
+    match info_name {
+        Some(n) if !n.is_empty() && normalize_pypi_name(n) == normalize_pypi_name(requested) => {
+            n.to_string()
+        }
+        _ => requested.to_string(),
+    }
 }
 
 /// Resolve a `PypiSpec` against PyPI and return the concrete version plus
@@ -394,7 +421,9 @@ pub fn pypi_resolve(
         })?;
 
     Ok(ResolvedPackage {
-        name: name.to_string(),
+        // Carry the registry's canonical spelling forward so the vuln-api
+        // check hits the advisory row keyed by it (see canonical_pypi_name).
+        name: canonical_pypi_name(name, meta.info.name.as_deref()),
         version: chosen,
         published_at,
     })
@@ -521,8 +550,11 @@ fn split_pep440_prerelease(v: &str) -> Option<(&str, Option<String>)> {
 
 /// Pick the latest version using PEP 440-ish parsing as a best-effort
 /// ordering. Prereleases are excluded unless `allow_prerelease` (pip's
-/// `--pre`) is set. Falls back to the entry with the latest upload time if
-/// no candidate parses.
+/// `--pre`) is set. No upload-time fallback when nothing parses: guessing
+/// by upload time could pick a prerelease without `--pre`, and a
+/// resolution error (→ visible, ungated) beats a silent wrong pick —
+/// consistent with `pypi_resolve_specifier`, which errors rather than
+/// guesses.
 fn pick_latest_stable(
     candidates: &[PypiCandidate],
     allow_prerelease: bool,
@@ -536,7 +568,6 @@ fn pick_latest_stable(
         })
         .max_by(|(a, _), (b, _)| a.cmp(b))
         .map(|(_, c)| c)
-        .or_else(|| candidates.iter().max_by_key(|c| c.uploaded))
 }
 
 /// Best-effort PEP 440 → semver: PyPI versions are usually `X.Y.Z` or
@@ -715,6 +746,36 @@ mod tests {
             pypi_resolve_specifier(&c, ">=9.0", false).expect("parse"),
             None
         );
+    }
+
+    #[test]
+    fn canonical_pypi_name_accepts_equivalent_rejects_other() {
+        // Registry canonical spelling wins when PEP 503-equivalent…
+        assert_eq!(
+            canonical_pypi_name("Flask_Cors", Some("Flask-Cors")),
+            "Flask-Cors"
+        );
+        assert_eq!(
+            canonical_pypi_name("zope-interface", Some("zope.interface")),
+            "zope.interface"
+        );
+        // …but a non-equivalent name (hostile mirror) keeps the request.
+        assert_eq!(
+            canonical_pypi_name("flask-cors", Some("requests")),
+            "flask-cors"
+        );
+        assert_eq!(canonical_pypi_name("flask-cors", None), "flask-cors");
+        assert_eq!(canonical_pypi_name("flask-cors", Some("")), "flask-cors");
+    }
+
+    #[test]
+    fn latest_with_no_parseable_version_is_none_not_a_guess() {
+        // When nothing parses as PEP 440, guessing by upload time could
+        // pick a prerelease without --pre. None → a visible resolution
+        // error, consistent with unparseable specifiers.
+        let c = candidates(&["2!1.0", "weird-version"]);
+        assert!(pick_latest_stable(&c, false).is_none());
+        assert!(pick_latest_stable(&c, true).is_none());
     }
 
     #[test]
