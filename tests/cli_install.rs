@@ -365,40 +365,78 @@ fn npm_old_pin_runs_install_with_forwarded_args() {
 }
 
 #[test]
-fn npm_in_pnpm_lock_project_blocks_with_pnpm_add_suggestion() {
-    let (mut h, registry_hits) = wrapper_with_hits("npm", "CORGEA_NPM_REGISTRY", 0);
-    let project = TempDir::new().expect("project dir");
-    std::fs::write(project.path().join("package.json"), r#"{"name":"proj"}"#)
-        .expect("write package.json");
-    std::fs::write(
-        project.path().join("pnpm-lock.yaml"),
-        "lockfileVersion: '9.0'\n",
-    )
-    .expect("write pnpm lock");
+fn node_wrong_manager_lockfiles_block_with_suggestions() {
+    struct Case {
+        run_manager: &'static str,
+        lockfile: &'static str,
+        lock_contents: &'static str,
+        args: &'static [&'static str],
+        expected_manager: &'static str,
+        expected_suggestion: &'static str,
+    }
 
-    let out = h
-        .cmd
-        .current_dir(project.path())
-        .args(["npm", "i", "oldpkg"])
-        .output()
-        .expect("failed to run corgea");
+    let cases = [
+        Case {
+            run_manager: "npm",
+            lockfile: "pnpm-lock.yaml",
+            lock_contents: "lockfileVersion: '9.0'\n",
+            args: &["npm", "i", "oldpkg"],
+            expected_manager: "pnpm",
+            expected_suggestion: "corgea pnpm add oldpkg",
+        },
+        Case {
+            run_manager: "pnpm",
+            lockfile: "package-lock.json",
+            lock_contents: "{}",
+            args: &["pnpm", "install"],
+            expected_manager: "npm",
+            expected_suggestion: "corgea npm install",
+        },
+        Case {
+            run_manager: "npm",
+            lockfile: "yarn.lock",
+            lock_contents: "# yarn lockfile v1\n",
+            args: &["npm", "i", "oldpkg"],
+            expected_manager: "yarn",
+            expected_suggestion: "corgea yarn add oldpkg",
+        },
+    ];
 
-    assert_eq!(out.status.code(), Some(1));
-    assert_eq!(h.recorded_argv(), None, "npm must not run");
-    assert_eq!(
-        registry_hits.load(Ordering::SeqCst),
-        0,
-        "wrong-manager guard must run before registry checks"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("error: this project appears to use pnpm, but you ran npm."),
-        "stderr: {stderr}"
-    );
-    assert!(
-        stderr.contains("Did you mean `corgea pnpm add oldpkg`?"),
-        "stderr: {stderr}"
-    );
+    for case in cases {
+        let (mut h, registry_hits) = wrapper_with_hits(case.run_manager, "CORGEA_NPM_REGISTRY", 0);
+        let project = TempDir::new().expect("project dir");
+        std::fs::write(project.path().join("package.json"), r#"{"name":"proj"}"#)
+            .expect("write package.json");
+        std::fs::write(project.path().join(case.lockfile), case.lock_contents)
+            .expect("write lockfile");
+
+        let out = h
+            .cmd
+            .current_dir(project.path())
+            .args(case.args)
+            .output()
+            .expect("failed to run corgea");
+
+        assert_eq!(out.status.code(), Some(1), "case: {:?}", case.args);
+        assert_eq!(h.recorded_argv(), None, "{} must not run", case.run_manager);
+        assert_eq!(
+            registry_hits.load(Ordering::SeqCst),
+            0,
+            "wrong-manager guard must run before registry checks"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "error: this project appears to use {}, but you ran {}.",
+                case.expected_manager, case.run_manager
+            )),
+            "stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("Did you mean `{}`?", case.expected_suggestion)),
+            "stderr: {stderr}"
+        );
+    }
 }
 
 #[test]
