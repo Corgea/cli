@@ -300,7 +300,11 @@ fn pip_install_overrides_external_management(args: &[String]) -> bool {
 }
 
 fn pip_environment_is_externally_managed() -> bool {
+    // Every error arm falls open (`false`) deliberately — PEP 668 is a UX
+    // guard, not the vuln gate, and pip enforces it itself — but each is
+    // debug-traced so a silent miss is diagnosable.
     let Ok(pip) = super::exec::resolve_binary("pip") else {
+        crate::log::debug("PEP 668 check skipped: pip not resolvable");
         return false;
     };
     // PEP 668 markers live in a system interpreter's stdlib; pip inside an
@@ -311,12 +315,14 @@ fn pip_environment_is_externally_managed() -> bool {
         }
     }
     let Some(interpreter) = python_interpreter_from_shebang(&pip) else {
+        crate::log::debug("PEP 668 check skipped: no python shebang in pip");
         return false;
     };
 
     let mut command = Command::new(&interpreter[0]);
     command.args(&interpreter[1..]);
     let Ok(output) = command.arg("-c").arg(EXTERNALLY_MANAGED_PYTHON).output() else {
+        crate::log::debug("PEP 668 check skipped: python spawn failed");
         return false;
     };
     output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1"

@@ -11,8 +11,11 @@
 //!   * vuln verdict — the vuln-api knows a resolved version (named or
 //!     transitive) is vulnerable or malicious; only `--force` overrides this.
 //!
-//! Verdict lookups are public and fail open: a vuln-api outage warns and the
-//! install continues.
+//! Verdict lookups run in one of two modes: public (no token — a vuln-api
+//! outage warns and the install continues, fail-open) or authenticated
+//! (token present — outages, resolution errors, and a degraded tree pass
+//! block unless `--force`, fail-closed). `verdict::block_reason` owns the
+//! mode-aware decision.
 
 mod detect;
 mod exec;
@@ -701,6 +704,13 @@ fn run_locked_install(
         // Direct callers may still disable verdicts completely.
         return exec();
     };
+    // Same disclosure as run_parsed_install: a tokenless `npm ci`/`uv sync`
+    // runs public checks — say so rather than gate silently.
+    if verdict::public_verdict(opts).is_some_and(|cfg| cfg.public_login_hint) {
+        eprintln!(
+            "warning: using public CVE checks; login enables authenticated enforcement and private Corgea intelligence."
+        );
+    }
     let jobs = match lock {
         Ok(jobs) => jobs,
         Err(e) if opts.force => {
@@ -933,8 +943,8 @@ fn requirements_fallback_outcomes(
 
 /// Vuln-api verdict pass over resolved targets, run through the bounded
 /// worker pool. No-op without a `VerdictConfig` (recency-only callers).
-/// Any client/call failure becomes `Unverifiable`, which warns but never
-/// blocks: public lookups fail open.
+/// Any client/call failure becomes `Unverifiable` — public mode warns and
+/// fails open; authenticated mode blocks (`VerdictStatus::blocks`).
 fn run_verdict_pass(
     manager: PackageManager,
     outcomes: &mut [TargetOutcome],
