@@ -58,19 +58,85 @@ fn detect_node_manager_from(start: &Path) -> Option<PackageManager> {
 }
 
 /// Whether `dir` is a member of an npm/yarn/pnpm workspace rooted at some
-/// ancestor — i.e. a strict ancestor carries a `pnpm-workspace.yaml` or a
-/// `package.json` with a `workspaces` field. Used to keep the wrong-manager
-/// walk going past a leaf member up to the workspace root.
+/// ancestor — a strict ancestor declares workspaces (`pnpm-workspace.yaml`
+/// or a `package.json` `workspaces` field) AND `dir` matches the declared
+/// member globs. The membership check matters: a standalone project nested
+/// under an unrelated monorepo checkout (vendored repo, `examples/`) must
+/// keep its own leaf boundary, not get wrong-manager-refused against the
+/// stranger's lockfile. Used to keep the wrong-manager walk going past a
+/// leaf member up to the workspace root.
 fn is_inside_npm_workspace(dir: &Path) -> bool {
     dir.ancestors().skip(1).any(|ancestor| {
-        if ancestor.join("pnpm-workspace.yaml").is_file() {
-            return true;
-        }
-        std::fs::read_to_string(ancestor.join("package.json"))
-            .ok()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-            .is_some_and(|j| j.get("workspaces").is_some())
+        workspace_member_patterns(ancestor).is_some_and(|patterns| {
+            dir.strip_prefix(ancestor)
+                .is_ok_and(|rel| workspace_globs_match(&patterns, rel))
+        })
     })
+}
+
+/// Workspace member globs declared at `root`: `pnpm-workspace.yaml`'s
+/// `packages:` list, or `package.json`'s `workspaces` (array form or the
+/// `{packages: [...]}` object form). `None` when `root` declares no
+/// workspace at all.
+fn workspace_member_patterns(root: &Path) -> Option<Vec<String>> {
+    if let Ok(yaml) = std::fs::read_to_string(root.join("pnpm-workspace.yaml")) {
+        return Some(pnpm_workspace_packages(&yaml));
+    }
+    let raw = std::fs::read_to_string(root.join("package.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let ws = json.get("workspaces")?;
+    let arr = ws
+        .as_array()
+        .or_else(|| ws.get("packages").and_then(|p| p.as_array()))?;
+    Some(
+        arr.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+/// Minimal extraction of the `packages:` list items from a
+/// `pnpm-workspace.yaml`. Handles the standard file shape (a flat list of
+/// quoted/unquoted globs); anything more exotic yields fewer patterns,
+/// which is conservative — an unmatched member keeps its leaf boundary.
+fn pnpm_workspace_packages(yaml: &str) -> Vec<String> {
+    let mut in_packages = false;
+    let mut out = Vec::new();
+    for line in yaml.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("packages:") {
+            in_packages = true;
+            continue;
+        }
+        if in_packages {
+            if let Some(item) = trimmed.strip_prefix('-') {
+                out.push(
+                    item.trim()
+                        .trim_matches(|c| c == '"' || c == '\'')
+                        .to_string(),
+                );
+            } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Whether `rel` (a member dir relative to the workspace root) matches any
+/// declared glob. Negations (`!excluded`) are skipped — conservative toward
+/// NOT treating the dir as a member.
+fn workspace_globs_match(patterns: &[String], rel: &Path) -> bool {
+    let mut builder = globset::GlobSetBuilder::new();
+    for p in patterns {
+        if p.starts_with('!') {
+            continue;
+        }
+        if let Ok(glob) = globset::Glob::new(p) {
+            builder.add(glob);
+        }
+    }
+    builder.build().is_ok_and(|set| set.is_match(rel))
 }
 
 fn detect_node_manager_in_dir(dir: &Path) -> ProjectManagerDetection {
@@ -258,6 +324,56 @@ mod tests {
         std::fs::create_dir(&fresh).expect("mkdir");
         std::fs::write(fresh.join("package.json"), "{}").expect("write manifest");
         assert_eq!(detect_node_manager_from(&fresh), None);
+    }
+
+    #[test]
+    fn node_walk_keeps_leaf_boundary_for_non_member_under_workspace() {
+        // An ancestor declaring workspaces does NOT make every nested
+        // project a member: a standalone checkout under `vendor/` (outside
+        // the declared globs) must keep its own leaf boundary instead of
+        // being wrong-manager-refused against the monorepo's lockfile.
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"monorepo","workspaces":["packages/*"]}"#,
+        )
+        .expect("write root manifest");
+        touch(&root.path().join("pnpm-lock.yaml"));
+        let outsider = root.path().join("vendor").join("thing");
+        std::fs::create_dir_all(&outsider).expect("mkdir");
+        std::fs::write(outsider.join("package.json"), "{}").expect("write manifest");
+
+        assert_eq!(
+            detect_node_manager_from(&outsider),
+            None,
+            "a non-member nested project must not inherit the workspace root's manager"
+        );
+    }
+
+    #[test]
+    fn node_walk_reaches_pnpm_workspace_root_via_yaml_globs() {
+        // pnpm-workspace.yaml form: membership comes from its `packages:`
+        // globs, matched — not just the file's presence.
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            root.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - \"apps/*\"\n",
+        )
+        .expect("write workspace yaml");
+        touch(&root.path().join("pnpm-lock.yaml"));
+        let member = root.path().join("apps").join("web");
+        std::fs::create_dir_all(&member).expect("mkdir");
+        std::fs::write(member.join("package.json"), r#"{"name":"web"}"#).expect("write member");
+        assert_eq!(
+            detect_node_manager_from(&member),
+            Some(PackageManager::Pnpm)
+        );
+
+        // Outside the yaml's globs: leaf boundary holds.
+        let outsider = root.path().join("tools").join("x");
+        std::fs::create_dir_all(&outsider).expect("mkdir");
+        std::fs::write(outsider.join("package.json"), "{}").expect("write manifest");
+        assert_eq!(detect_node_manager_from(&outsider), None);
     }
 
     #[test]

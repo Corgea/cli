@@ -211,6 +211,10 @@ The gate is a wrapper, not an enforcement boundary. By design it cannot catch:
   unchecked behind the printed warning.
 - **Ungated managers** — bare `yarn`/`pnpm` installs run unchecked (see the
   bare-install note above); only their named targets are verified.
+- **Ungated uv/yarn subcommands** — `uv run` (project sync on first run,
+  `--with` packages), `uv tool install`/`uv tool run`, and
+  `yarn global add` install packages without a gate; each prints an
+  ungated note instead of passing silently.
 
 Hard enforcement needs org-level controls — lockfile review, registry
 allow-listing — alongside the wrapper.
