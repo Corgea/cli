@@ -230,6 +230,28 @@ fn uv_valued_global_flag_before_subcommand_still_gates() {
 }
 
 #[test]
+fn uv_json_passthrough_forwards_flag_to_manager() {
+    // uv passthrough produces no Corgea report, so the wrapper's consumed
+    // `--json` belongs to uv — `corgea uv --json tree` must reach uv's own
+    // --json instead of being silently swallowed (npm/pip already forward).
+    let mut h = GateHarness::new()
+        .fake_recorder("uv", 0)
+        .vuln_checks(HashMap::new())
+        .build();
+    let out = h
+        .cmd
+        .args(["uv", "--json", "tree"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("tree --json"),
+        "the wrapper's --json must be forwarded to uv on passthrough"
+    );
+}
+
+#[test]
 fn uv_run_prints_ungated_note() {
     // `uv run` syncs the project environment on first run and `--with`
     // installs packages — none of it gated. The passthrough must say so

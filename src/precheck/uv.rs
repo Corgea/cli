@@ -19,10 +19,12 @@ pub(super) fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
     match parse::classify_uv_command(sub) {
         // Passthrough is a transparent shim: no report, untouched stdio —
         // but uv subcommands that install packages get an honesty note
-        // first, mirroring the bare yarn/pnpm disclosure.
+        // first, mirroring the bare yarn/pnpm disclosure. The wrapper's
+        // consumed `--json` is re-forwarded to uv (passthrough_exec), so
+        // `corgea uv --json tree` still reaches uv's own --json.
         parse::UvCommand::Passthrough => {
             uv_ungated_install_note(sub);
-            exec::exec_command("uv", cmd)
+            super::passthrough_exec("uv", cmd, &opts)
         }
         parse::UvCommand::PipInstall { install_args } => {
             let parsed = match parse::parse_pip_install_args(install_args) {
@@ -54,8 +56,9 @@ pub(super) fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
             // set — gate it like `uv pip install -r reqs.txt`.
             let parsed = parse::parse_pip_sync_args(sync_args);
             if parsed.requirements_files.is_empty() {
-                // No files named: uv errors on its own.
-                return exec::exec_command("uv", cmd);
+                // No files named: uv errors on its own (--json forwarded
+                // like any other passthrough).
+                return super::passthrough_exec("uv", cmd, &opts);
             }
             super::warn_registry_override(PackageManager::Uv, sync_args);
             super::run_parsed_install(

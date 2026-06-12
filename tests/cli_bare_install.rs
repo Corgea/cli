@@ -265,6 +265,34 @@ fn bare_ungated_managers_print_note_and_exec() {
 }
 
 #[test]
+fn bare_yarn_install_json_emits_empty_report() {
+    // Bare yarn has no safe dry-run — it execs behind the honest note.
+    // Under --json stdout must still carry one parseable report (empty
+    // results, null tree), with the note on stderr and yarn's own stdout
+    // moved to stderr.
+    let mut h = GateHarness::new()
+        .fake_recorder("yarn", 0)
+        .vuln_checks(HashMap::new())
+        .in_project_dir()
+        .build();
+    let out = h
+        .cmd
+        .args(["yarn", "--json", "install"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(h.recorded_argv().as_deref(), Some("install"));
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["results"].as_array().map(Vec::len), Some(0));
+    assert!(parsed["tree"].is_null(), "parsed: {parsed}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not gated"),
+        "the bare note stays on stderr"
+    );
+}
+
+#[test]
 fn yarn_cwd_value_does_not_bypass_the_gate() {
     // SECURITY: yarn-classic's `--cwd <dir>` takes a value; if the
     // directory is mistaken for the verb, `yarn --cwd packages/app add x`

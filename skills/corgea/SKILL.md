@@ -195,7 +195,9 @@ corgea pip list                       # non-install subcommands pass straight th
 | `--force` | | Proceed despite all findings (vulnerable, recent). Findings still print. Also bypasses the wrong-package-manager refusal and unparsable-lockfile refusals on `uv sync`/`npm ci`. |
 | `--json` | | JSON report instead of text. Per-result `verdict` object + `verdict_mode` + `tree`. Stdout carries only the report; the package manager's output moves to stderr. |
 
-`--json` adds `verdict_mode` (`"public"`) and a `tree` object: `null` when no
+`--json` adds `verdict_mode` (`"public"` from the CLI; `"recency-only"` can
+only appear for library callers that disable verdicts) and a `tree` object:
+`null` when no
 tree pass ran; otherwise `mode` is `"full"` (transitive checked) or
 `"named-only"` (with a `reason`), plus `resolved_count` and a `transitive[]`
 array of `{name, version, origin, verdict}` for packages beyond the named
