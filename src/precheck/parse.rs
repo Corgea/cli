@@ -233,6 +233,10 @@ fn extract_pip_positionals(args: &[String]) -> Result<PositionalSplit, String> {
             i += 1;
             continue;
         }
+        if a.strip_prefix("--constraint=").is_some() {
+            i += 1;
+            continue;
+        }
         if let Some(rest) = a.strip_prefix("--editable=") {
             out.specs.push(format!("-e {}", rest));
             i += 1;
@@ -719,6 +723,9 @@ mod tests {
             "reqs.txt".to_string(),
             "requests==2.31.0".to_string(),
             "--requirement=other.txt".to_string(),
+            "--constraint".to_string(),
+            "constraints.txt".to_string(),
+            "--constraint=other-constraints.txt".to_string(),
             "-e".to_string(),
             "./local".to_string(),
         ];
@@ -729,5 +736,13 @@ mod tests {
         );
         assert!(p.specs.contains(&"requests==2.31.0".to_string()));
         assert!(p.specs.iter().any(|s| s.starts_with("-e ")));
+        assert!(!p.specs.contains(&"constraints.txt".to_string()));
+        assert!(!p.specs.contains(&"other-constraints.txt".to_string()));
+        assert!(!p
+            .requirements_files
+            .contains(&PathBuf::from("constraints.txt")));
+        assert!(!p
+            .requirements_files
+            .contains(&PathBuf::from("other-constraints.txt")));
     }
 }
