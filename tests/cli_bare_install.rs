@@ -234,6 +234,37 @@ fn bare_ungated_managers_print_note_and_exec() {
 }
 
 #[test]
+fn yarn_cwd_value_does_not_bypass_the_gate() {
+    // SECURITY: yarn-classic's `--cwd <dir>` takes a value; if the
+    // directory is mistaken for the verb, `yarn --cwd packages/app add x`
+    // execs as ungated passthrough. The vulnerable named target must
+    // still block.
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("npm", "oldpkg", "1.0.0"),
+        vulnerable_body("npm", "oldpkg", "1.0.0", "MAL-2024-0007", None),
+    );
+    let mut h = GateHarness::new()
+        .fake_recorder("yarn", 0)
+        .oldpkg_registry()
+        .vuln_checks(checks)
+        .in_project_dir()
+        .build();
+    let out = h
+        .cmd
+        .args(["yarn", "--cwd", "packages/app", "add", "oldpkg@1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--cwd's value must not swallow the verb: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.recorded_argv(), None, "yarn must not run when blocked");
+}
+
+#[test]
 fn yarn_named_target_does_not_print_bare_note() {
     // A named target takes the gated path: named-only warning, no bare note.
     let mut h = GateHarness::new()

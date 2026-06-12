@@ -382,7 +382,15 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
     }
 
     if !manager.is_install_subcommand(subcommand) {
-        // Non-install subcommand: transparent passthrough, args untouched.
+        // Non-install subcommand: transparent passthrough, args untouched —
+        // but `yarn global add` installs from the registry, so disclose
+        // that it isn't gated rather than pass silently.
+        if manager == PackageManager::Yarn
+            && subcommand == "global"
+            && cmd.get(verb_idx + 1).map(String::as_str) == Some("add")
+        {
+            eprintln!("note: 'yarn global add' is not gated; packages install unchecked");
+        }
         return exec::exec_command(manager.binary_name(), cmd);
     }
 
