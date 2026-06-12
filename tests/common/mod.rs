@@ -168,6 +168,7 @@ pub struct GateHarness {
     project: Option<TempDir>,
     checks: HashMap<PackageKey, String>,
     statuses: HashMap<PackageKey, u16>,
+    vuln_api: bool,
     _home: TempDir,
     _bin: TempDir,
     _vuln_stub: Option<corgea::vuln_api_stub::VulnApiStub>,
@@ -187,6 +188,7 @@ impl GateHarness {
             project: None,
             checks: HashMap::new(),
             statuses: HashMap::new(),
+            vuln_api: true,
             _home: home,
             _bin: bin,
             _vuln_stub: None,
@@ -258,7 +260,17 @@ impl GateHarness {
         self
     }
 
+    /// Skip the vuln-api stub: `CORGEA_VULN_API_URL` stays unset so tests
+    /// can exercise the no-endpoint / unreachable-endpoint behavior.
+    pub fn without_vuln_api(mut self) -> Self {
+        self.vuln_api = false;
+        self
+    }
+
     pub fn build(mut self) -> Self {
+        if !self.vuln_api {
+            return self;
+        }
         let stub = corgea::vuln_api_stub::spawn_with_statuses(
             std::mem::take(&mut self.checks),
             std::mem::take(&mut self.statuses),

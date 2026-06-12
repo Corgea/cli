@@ -6,15 +6,12 @@ use std::thread;
 pub type PackageKey = (String, String, String);
 
 /// `(ecosystem, name, version)` key for the stub's route tables. Applies the
-/// client's canonical-name rule (`Ecosystem::normalize_name`) on both the
-/// fixture and lookup sides, so a fixture keyed under an alternate pypi
-/// spelling can't silently miss and read as clean.
+/// REAL server's normalization (worker.js `normalizePackageName`: lowercase
+/// + trim, NOT PEP 503) on both the fixture and lookup sides. The stub must
+/// miss exactly when production would miss — a looser rule here would mask
+/// client/server normalization divergence in tests.
 pub fn key(eco: &str, name: &str, ver: &str) -> PackageKey {
-    let name = match eco {
-        "pypi" => crate::vuln_api::Ecosystem::Pypi.normalize_name(name),
-        _ => name.to_string(),
-    };
-    (eco.to_string(), name, ver.to_string())
+    (eco.to_string(), name.trim().to_lowercase(), ver.to_string())
 }
 
 /// Single-match vulnerable verdict body; `fixed: None` renders
@@ -255,17 +252,36 @@ mod tests {
     }
 
     #[test]
-    fn pypi_keys_normalize_alternate_spellings() {
-        // A fixture keyed `Flask_Cors` must serve a request for `flask-cors`.
+    fn pypi_keys_lowercase_like_the_server() {
+        // A fixture keyed `Flask_Cors` must serve a request for `flask_cors`:
+        // the server's rule is lowercase + trim (worker.js).
         let checks = HashMap::from([(
             key("pypi", "Flask_Cors", "4.0.0"),
-            vulnerable_body("pypi", "flask-cors", "4.0.0", "GHSA-test", None),
+            vulnerable_body("pypi", "flask_cors", "4.0.0", "GHSA-test", None),
+        )]);
+        let stub = spawn_with_statuses(checks, HashMap::new());
+        let resp = get(
+            &stub.base_url,
+            "/v1/packages/pypi/flask_cors/versions/4.0.0/check",
+        );
+        assert!(resp.contains(r#""is_vulnerable":true"#), "resp: {resp}");
+    }
+
+    #[test]
+    fn pypi_keys_do_not_collapse_separators_like_the_server() {
+        // The real server does NOT apply PEP 503: a row stored under
+        // `flask_cors` does not answer a lookup for `flask-cors`. The stub
+        // must reproduce that miss (synthesized clean), or tests would hide
+        // exactly the client/server divergence they exist to catch.
+        let checks = HashMap::from([(
+            key("pypi", "flask_cors", "4.0.0"),
+            vulnerable_body("pypi", "flask_cors", "4.0.0", "GHSA-test", None),
         )]);
         let stub = spawn_with_statuses(checks, HashMap::new());
         let resp = get(
             &stub.base_url,
             "/v1/packages/pypi/flask-cors/versions/4.0.0/check",
         );
-        assert!(resp.contains(r#""is_vulnerable":true"#), "resp: {resp}");
+        assert!(resp.contains(r#""is_vulnerable":false"#), "resp: {resp}");
     }
 }

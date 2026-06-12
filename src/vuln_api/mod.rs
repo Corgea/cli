@@ -7,8 +7,11 @@
 //!   * the shared client's `check_for_warnings` exits the process on
 //!     HTTP 410, which is wrong for per-dep CVE lookups.
 //!
-//! Lookups are public and unauthenticated: no Corgea credential is ever
-//! attached, so a user-configured host can never see one.
+//! This phase attaches no Corgea credential: the staging deployment
+//! (`VULN_API_REQUIRE_AUTH=false`) accepts anonymous checks. The
+//! production /check route requires a Corgea token — wired in with
+//! authenticated mode, and never sent to a user-configured host
+//! without explicit opt-in.
 
 use serde::Deserialize;
 use std::sync::OnceLock;
@@ -41,13 +44,25 @@ impl Ecosystem {
         }
     }
 
-    /// Canonical package name for requests and comparisons: PEP 503 for
-    /// pypi (shared with `deps`), verbatim for npm (names are
-    /// case-sensitive). The one definition of the per-ecosystem rule.
+    /// Canonical package name for IDENTITY COMPARISONS: PEP 503 for pypi
+    /// (shared with `deps`), verbatim for npm (names are case-sensitive).
+    /// Not the wire spelling — see `request_name`.
     pub fn normalize_name(self, name: &str) -> String {
         match self {
             Ecosystem::Npm => name.to_string(),
             Ecosystem::Pypi => crate::deps::ecosystems::pypi::normalize_pypi_name(name),
+        }
+    }
+
+    /// Wire spelling for the request path. The server normalizes lookups
+    /// with lowercase + trim only (worker.js `normalizePackageName`), NOT
+    /// PEP 503 — collapsing `zope.interface` to `zope-interface` here
+    /// would miss the stored advisory row and read a vulnerable package
+    /// as clean. Match the server's rule exactly.
+    pub fn request_name(self, name: &str) -> String {
+        match self {
+            Ecosystem::Npm => name.to_string(),
+            Ecosystem::Pypi => name.trim().to_lowercase(),
         }
     }
 }
@@ -124,7 +139,9 @@ pub fn source() -> String {
 }
 
 /// Build a JSON GET with the standard `Accept` / `CORGEA-SOURCE` headers.
-/// No auth header: lookups are public, and the host may be user-configured.
+/// No auth header in this phase (staging accepts anonymous checks); the
+/// token attach lands with authenticated mode, and the host may be
+/// user-configured — so nothing credential-shaped goes here by default.
 fn build_json_get(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -187,11 +204,14 @@ pub fn check_package_version(
     version: &str,
 ) -> Result<VulnCheckResponse, Box<dyn std::error::Error>> {
     let base = validated_base(base_url)?;
-    // vuln-api advisories are keyed by canonical names; an alternate
-    // spelling (PEP 503: `Flask_Cors` ≡ `flask-cors`) would miss and read
-    // as clean. The client owns request-time normalization so no caller
-    // can forget it.
-    let name = &ecosystem.normalize_name(name);
+    // The server keys advisories by lowercase+trim of the canonical
+    // registry spelling and normalizes lookups the same way — it does
+    // NOT apply PEP 503 (worker.js `normalizePackageName`). Sending a
+    // PEP 503-collapsed name would miss dotted/underscored canonical
+    // names (`zope.interface`) and read them as clean. The client owns
+    // request-time normalization so no caller can forget it; PEP 503 is
+    // reserved for the identity comparison below.
+    let name = &ecosystem.request_name(name);
     let encoded_name = encode_package_name(ecosystem, name);
     let encoded_version = urlencoding::encode(version);
     let url = format!(
@@ -255,15 +275,16 @@ pub fn check_package_version(
         )
         .into());
     }
-    // Apply the ecosystem's canonical-name rule to BOTH sides before
-    // comparing: `name` is already normalized, and a response that echoes
-    // the registry/stored spelling (`flask_cors` for a `flask-cors` request,
-    // PEP 503-equivalent) must not be a hard failure — that would fail the
-    // gate closed for valid pypi packages with `_`/`.` in their names.
+    // Apply the ecosystem's canonical-name rule (PEP 503) to BOTH sides
+    // before comparing: `name` carries the wire spelling (dots/underscores
+    // preserved), and a response that echoes the registry/stored spelling
+    // (`flask_cors` for a `flask-cors` request, PEP 503-equivalent) must
+    // not be a hard failure — that would fail the gate closed for valid
+    // pypi packages with `_`/`.` in their names.
     if !parsed.package_name.is_empty()
         && !ecosystem
             .normalize_name(&parsed.package_name)
-            .eq_ignore_ascii_case(name)
+            .eq_ignore_ascii_case(&ecosystem.normalize_name(name))
     {
         return Err(format!(
             "vuln-api response package '{}' does not match request '{}'",
@@ -329,12 +350,12 @@ mod tests {
 
     #[test]
     fn pypi_response_alternate_spelling_passes_identity_guard() {
-        // The request normalizes `Flask_Cors` → `flask-cors`; a response that
-        // echoes the stored spelling `flask_cors` is PEP 503-equivalent and
-        // must NOT trip the identity guard (which would fail the gate closed
-        // for a valid package).
-        let key = vuln_api_stub::key("pypi", "flask-cors", "1.0.0");
-        let body = r#"{"ecosystem":"PyPI","package_name":"flask_cors","version":"1.0.0","is_vulnerable":false,"matches":[]}"#;
+        // The wire name for `Flask_Cors` is `flask_cors` (lowercase + trim,
+        // the server's rule); a response that echoes a PEP 503-equivalent
+        // spelling (`Flask-Cors`) must NOT trip the identity guard (which
+        // would fail the gate closed for a valid package).
+        let key = vuln_api_stub::key("pypi", "flask_cors", "1.0.0");
+        let body = r#"{"ecosystem":"PyPI","package_name":"Flask-Cors","version":"1.0.0","is_vulnerable":false,"matches":[]}"#;
         let stub = vuln_api_stub::spawn_with_statuses(
             HashMap::from([(key, body.to_string())]),
             HashMap::new(),
@@ -352,9 +373,37 @@ mod tests {
     }
 
     #[test]
-    fn check_sends_no_auth_headers() {
-        // The host is user-configurable; the client must never attach a
-        // Corgea credential, cookie, or token header.
+    fn pypi_wire_name_is_lowercased_not_pep503_collapsed() {
+        // The server keys advisories lowercase+trim, NOT PEP 503: collapsing
+        // `Zope.Interface` to `zope-interface` on the wire would miss the
+        // stored `zope.interface` row and read a vulnerable package as
+        // clean. The request path must carry the dot.
+        let (base_url, requests) = spawn_capturing_vuln_api_stub();
+        let client = http_client().expect("test client");
+        check_package_version(
+            &client,
+            &base_url,
+            Ecosystem::Pypi,
+            "Zope.Interface",
+            "5.0.0",
+        )
+        .expect("captured request should succeed");
+        let requests = requests.lock().unwrap();
+        let path = requests[0].lines().next().unwrap_or_default().to_string();
+        assert!(
+            path.contains("/pypi/zope.interface/"),
+            "wire name must be lowercased with separators preserved; got: {path}"
+        );
+        assert!(
+            !path.contains("zope-interface"),
+            "wire name must not be PEP 503-collapsed; got: {path}"
+        );
+    }
+
+    #[test]
+    fn public_check_sends_no_auth_headers() {
+        // The host is user-configurable; without a caller-owned token the
+        // client must never attach a Corgea credential or cookie.
         let (base_url, requests) = spawn_capturing_vuln_api_stub();
         let client = http_client().expect("test client");
         check_package_version(&client, &base_url, Ecosystem::Npm, "lodash", "4.17.20")
