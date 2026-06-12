@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::{env, fs, io};
 
+pub const DEFAULT_VULN_API_URL: &str = "https://cve-worker-staging.corgea.workers.dev";
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub(crate) url: String,
@@ -117,5 +119,40 @@ impl Config {
         }
 
         self.default_agent.clone()
+    }
+}
+
+/// Base URL for the vuln-api service: `CORGEA_VULN_API_URL` env var,
+/// then the public default. Pure env/constant — no config file field.
+pub fn vuln_api_url() -> String {
+    crate::utils::generic::get_env_var_if_exists("CORGEA_VULN_API_URL")
+        .unwrap_or_else(|| DEFAULT_VULN_API_URL.to_string())
+        .trim()
+        .trim_end_matches('/')
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// All `vuln_api_url` cases in one test fn: the env-var cases
+    /// mutate process-global state, so they must not run concurrently
+    /// with each other under the parallel test harness.
+    #[test]
+    fn vuln_api_url_resolution_order() {
+        env::remove_var("CORGEA_VULN_API_URL");
+
+        // Default when the env var is unset.
+        assert_eq!(vuln_api_url(), DEFAULT_VULN_API_URL);
+
+        // Env var wins; whitespace and trailing slash trimmed.
+        env::set_var("CORGEA_VULN_API_URL", " https://env.example.com/ ");
+        assert_eq!(vuln_api_url(), "https://env.example.com");
+
+        // Empty / whitespace-only env var is treated as unset.
+        env::set_var("CORGEA_VULN_API_URL", "   ");
+        assert_eq!(vuln_api_url(), DEFAULT_VULN_API_URL);
+        env::remove_var("CORGEA_VULN_API_URL");
     }
 }
