@@ -320,13 +320,17 @@ struct PypiInfoResponse {
     releases: std::collections::BTreeMap<String, Vec<PypiUrl>>,
 }
 
-/// Resolve a `PypiSpec` against PyPI and return the concrete version
-/// + publish time. The latest non-prerelease, non-yanked release is
-///   preferred.
+/// Resolve a `PypiSpec` against PyPI and return the concrete version plus
+/// publish time. The latest non-prerelease, non-yanked release is preferred.
+///
+/// The `allow_prerelease` flag mirrors pip's `--pre`: when set, prerelease
+/// versions become eligible for `Latest`/specifier resolution so the gate
+/// verdicts the version pip would actually install, not the latest stable.
 pub fn pypi_resolve(
     name: &str,
     spec: &PypiSpec,
     registry: Option<&str>,
+    allow_prerelease: bool,
 ) -> Result<ResolvedPackage, String> {
     if name.is_empty() {
         return Err("empty package name".to_string());
@@ -343,7 +347,9 @@ pub fn pypi_resolve(
     let installable: Vec<PypiCandidate> =
         candidates.iter().filter(|c| !c.yanked).cloned().collect();
     let chosen = match spec {
-        PypiSpec::Latest => pick_latest_stable(&installable).map(|c| c.version.clone()),
+        PypiSpec::Latest => {
+            pick_latest_stable(&installable, allow_prerelease).map(|c| c.version.clone())
+        }
         // PEP 440 equality, not string equality: `==2.31` must match the
         // release key `2.31.0` (and resolve to the key, so the publish-time
         // lookup below finds it).
@@ -360,8 +366,10 @@ pub fn pypi_resolve(
                 })
                 .map(|c| c.version.clone())
         }
-        PypiSpec::Specifier(spec_str) => pypi_resolve_specifier(&installable, spec_str)
-            .map_err(|e| format!("{} for '{}'", e, name))?,
+        PypiSpec::Specifier(spec_str) => {
+            pypi_resolve_specifier(&installable, spec_str, allow_prerelease)
+                .map_err(|e| format!("{} for '{}'", e, name))?
+        }
     };
 
     let chosen = chosen.ok_or_else(|| match spec {
@@ -435,9 +443,11 @@ fn collect_pypi_candidates(meta: &PypiInfoResponse) -> Vec<PypiCandidate> {
 /// PEP 440-ish ordering key: the semver-parsed release plus its `.postN`
 /// number. Post-releases order after their base (`1.0.post1` > `1.0`) and
 /// pip installs them by default — dropping them from candidates would
-/// verdict a different version than the install. Pre/dev releases stay
-/// excluded (matching pip's defaults); epochs (`1!2.0`) remain unsupported
-/// and are skipped.
+/// verdict a different version than the install. Prereleases (`1.0rc1`,
+/// `1.0a2`, `1.0.dev3`) parse with a rank-encoded semver prerelease so they
+/// order dev < a < b < rc and all below the plain release; they are filtered
+/// out at resolution time unless `--pre` is set. Epochs (`1!2.0`) and local
+/// versions (`1.0+abc`) remain unsupported and are skipped.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PypiVersion {
     base: semver::Version,
@@ -449,14 +459,19 @@ struct PypiVersion {
 
 impl PypiVersion {
     fn parse(raw: &str) -> Option<Self> {
-        let (release, post) = match raw.find(".post") {
+        let (rest, post) = match raw.find(".post") {
             Some(idx) => {
                 let n: u64 = raw[idx + ".post".len()..].parse().ok()?;
                 (&raw[..idx], Some(n))
             }
             None => (raw, None),
         };
-        let base = semver::Version::parse(&normalize_for_semver(release)).ok()?;
+        let (release, pre) = split_pep440_prerelease(rest)?;
+        let semver_src = match &pre {
+            Some(p) => format!("{}-{}", normalize_for_semver(release), p),
+            None => normalize_for_semver(release),
+        };
+        let base = semver::Version::parse(&semver_src).ok()?;
         Some(PypiVersion { base, post })
     }
 
@@ -465,15 +480,58 @@ impl PypiVersion {
     }
 }
 
-/// Pick the latest non-prerelease version using PEP 440-ish parsing as a
-/// best-effort ordering. Falls back to the entry with the latest upload
-/// time if no candidate parses.
-fn pick_latest_stable(candidates: &[PypiCandidate]) -> Option<&PypiCandidate> {
+/// Split a PEP 440 release string into its numeric release and an optional
+/// semver-encoded prerelease identifier. The rank prefix (`0dev` < `1a` <
+/// `2b` < `3rc`) makes the derived `Ord` on the semver prerelease match PEP
+/// 440 ordering, and any prerelease sorts below the plain release.
+///
+/// Returns `(release, None)` for a plain release, `(release, Some(pre))` for
+/// a recognized prerelease, and `None` for an alpha-bearing form we don't
+/// recognize (epochs, local versions, combined pre+dev) so the candidate is
+/// skipped rather than mis-ordered — matching prior conservative behavior.
+fn split_pep440_prerelease(v: &str) -> Option<(&str, Option<String>)> {
+    let Some(idx) = v.find(|c: char| c.is_ascii_alphabetic()) else {
+        return Some((v, None));
+    };
+    let release = v[..idx].trim_end_matches(['.', '-', '_']);
+    let suffix = &v[idx..];
+    let (rank, label, rest) = if let Some(r) = suffix.strip_prefix("rc") {
+        (3, "rc", r)
+    } else if let Some(r) = suffix.strip_prefix("dev") {
+        (0, "dev", r)
+    } else if let Some(r) = suffix.strip_prefix('a') {
+        (1, "a", r)
+    } else if let Some(r) = suffix.strip_prefix('b') {
+        (2, "b", r)
+    } else if let Some(r) = suffix.strip_prefix('c') {
+        // PEP 440 spells release-candidate `c` and `rc` interchangeably.
+        (3, "rc", r)
+    } else {
+        return None;
+    };
+    let num_str = rest.trim_start_matches(['.', '-', '_']);
+    // Reject anything we didn't fully consume (combined `a1.dev2`, local
+    // `+abc`, etc.) — dropping it is safer than guessing its order.
+    if !num_str.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let num: u64 = num_str.parse().unwrap_or(0);
+    Some((release, Some(format!("{rank}{label}.{num}"))))
+}
+
+/// Pick the latest version using PEP 440-ish parsing as a best-effort
+/// ordering. Prereleases are excluded unless `allow_prerelease` (pip's
+/// `--pre`) is set. Falls back to the entry with the latest upload time if
+/// no candidate parses.
+fn pick_latest_stable(
+    candidates: &[PypiCandidate],
+    allow_prerelease: bool,
+) -> Option<&PypiCandidate> {
     candidates
         .iter()
         .filter_map(|c| {
             PypiVersion::parse(&c.version)
-                .filter(|v| !v.is_prerelease())
+                .filter(|v| allow_prerelease || !v.is_prerelease())
                 .map(|v| (v, c))
         })
         .max_by(|(a, _), (b, _)| a.cmp(b))
@@ -514,6 +572,7 @@ pub(crate) fn normalize_for_semver(v: &str) -> String {
 fn pypi_resolve_specifier(
     candidates: &[PypiCandidate],
     spec: &str,
+    allow_prerelease: bool,
 ) -> Result<Option<String>, String> {
     let parts: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
     let mut requirements: Vec<(&'static str, semver::Version)> = Vec::new();
@@ -581,7 +640,7 @@ fn pypi_resolve_specifier(
     Ok(candidates
         .iter()
         .filter_map(|c| PypiVersion::parse(&c.version).map(|v| (v, &c.version)))
-        .filter(|(v, _)| !v.is_prerelease() && satisfies(v))
+        .filter(|(v, _)| (allow_prerelease || !v.is_prerelease()) && satisfies(v))
         .max_by(|(a, _), (b, _)| a.cmp(b))
         .map(|(_, raw)| raw.clone()))
 }
@@ -618,15 +677,44 @@ mod tests {
     fn specifier_resolves_highest_match() {
         let c = candidates(&["1.0.0", "2.5.0", "3.0.0"]);
         assert_eq!(
-            pypi_resolve_specifier(&c, ">=1.0,<3").expect("parse"),
+            pypi_resolve_specifier(&c, ">=1.0,<3", false).expect("parse"),
             Some("2.5.0".to_string())
+        );
+    }
+
+    #[test]
+    fn prerelease_eligible_only_with_allow_prerelease() {
+        // `2.0.0rc1` is a prerelease. pip's default skips it; `--pre` selects
+        // it as the newest, so the gate must verdict it instead of 1.0.0.
+        let c = candidates(&["1.0.0", "2.0.0rc1"]);
+        assert_eq!(
+            pick_latest_stable(&c, false).map(|c| c.version.as_str()),
+            Some("1.0.0"),
+            "default resolution excludes the prerelease"
+        );
+        assert_eq!(
+            pick_latest_stable(&c, true).map(|c| c.version.as_str()),
+            Some("2.0.0rc1"),
+            "--pre makes the prerelease eligible"
+        );
+        // Same for specifier resolution.
+        assert_eq!(
+            pypi_resolve_specifier(&c, ">=1.0", false).expect("parse"),
+            Some("1.0.0".to_string())
+        );
+        assert_eq!(
+            pypi_resolve_specifier(&c, ">=1.0", true).expect("parse"),
+            Some("2.0.0rc1".to_string())
         );
     }
 
     #[test]
     fn specifier_with_no_match_is_ok_none() {
         let c = candidates(&["1.0.0"]);
-        assert_eq!(pypi_resolve_specifier(&c, ">=9.0").expect("parse"), None);
+        assert_eq!(
+            pypi_resolve_specifier(&c, ">=9.0", false).expect("parse"),
+            None
+        );
     }
 
     #[test]
@@ -635,7 +723,7 @@ mod tests {
         // would gate the wrong version.
         let c = candidates(&["1.0.0", "2.0.0"]);
         for spec in ["@weird", ">= not-a-version", "!=1.*"] {
-            let err = pypi_resolve_specifier(&c, spec).expect_err(spec);
+            let err = pypi_resolve_specifier(&c, spec, false).expect_err(spec);
             assert!(
                 err.contains("unsupported version specifier"),
                 "{spec}: {err}"
@@ -648,12 +736,12 @@ mod tests {
         // pip: `==4.2.*` matches the 4.2 series, highest first.
         let c = candidates(&["4.1.0", "4.2.0", "4.2.9", "4.3.0"]);
         assert_eq!(
-            pypi_resolve_specifier(&c, "==4.2.*").expect("parse"),
+            pypi_resolve_specifier(&c, "==4.2.*", false).expect("parse"),
             Some("4.2.9".to_string())
         );
         let c = candidates(&["0.9.0", "1.0.0", "1.9.0", "2.0.0"]);
         assert_eq!(
-            pypi_resolve_specifier(&c, "==1.*").expect("parse"),
+            pypi_resolve_specifier(&c, "==1.*", false).expect("parse"),
             Some("1.9.0".to_string())
         );
     }
@@ -664,13 +752,13 @@ mod tests {
         // 4.2.x, so the gate must verdict the same series.
         let c = candidates(&["4.0.0", "4.0.5", "4.2.9", "5.0.0"]);
         assert_eq!(
-            pypi_resolve_specifier(&c, "~=4.0").expect("parse"),
+            pypi_resolve_specifier(&c, "~=4.0", false).expect("parse"),
             Some("4.2.9".to_string())
         );
         // `~=1.4.5` means `>=1.4.5, <1.5.0`.
         let c = candidates(&["1.4.4", "1.4.6", "1.5.0"]);
         assert_eq!(
-            pypi_resolve_specifier(&c, "~=1.4.5").expect("parse"),
+            pypi_resolve_specifier(&c, "~=1.4.5", false).expect("parse"),
             Some("1.4.6".to_string())
         );
     }
@@ -681,20 +769,23 @@ mod tests {
         // verdict a different version than the install.
         let c = candidates(&["1.0", "1.0.post1", "0.9.0"]);
         assert_eq!(
-            pypi_resolve_specifier(&c, ">=1.0").expect("parse"),
+            pypi_resolve_specifier(&c, ">=1.0", false).expect("parse"),
             Some("1.0.post1".to_string())
         );
         assert_eq!(
-            pick_latest_stable(&c).map(|c| c.version.as_str()),
+            pick_latest_stable(&c, false).map(|c| c.version.as_str()),
             Some("1.0.post1")
         );
         // …but a plain `==1.0` pin means the base release, not its posts.
         assert_eq!(
-            pypi_resolve_specifier(&c, "==1.0").expect("parse"),
+            pypi_resolve_specifier(&c, "==1.0", false).expect("parse"),
             Some("1.0".to_string())
         );
         // PEP 440: `>V` excludes V's own post-releases.
-        assert_eq!(pypi_resolve_specifier(&c, ">1.0").expect("parse"), None);
+        assert_eq!(
+            pypi_resolve_specifier(&c, ">1.0", false).expect("parse"),
+            None
+        );
     }
 
     #[test]
@@ -719,11 +810,11 @@ mod tests {
         let installable: Vec<PypiCandidate> =
             candidates.iter().filter(|c| !c.yanked).cloned().collect();
         assert_eq!(
-            pick_latest_stable(&installable).map(|c| c.version.as_str()),
+            pick_latest_stable(&installable, false).map(|c| c.version.as_str()),
             Some("1.0.0")
         );
         assert_eq!(
-            pypi_resolve_specifier(&installable, ">=1.0").expect("parse"),
+            pypi_resolve_specifier(&installable, ">=1.0", false).expect("parse"),
             Some("1.0.0".to_string())
         );
         // …while an exact pin still finds it (pip installs it with a warning).
@@ -810,7 +901,7 @@ mod tests {
     #[test]
     #[ignore]
     fn live_pypi_resolve_latest() {
-        let r = pypi_resolve("flask", &PypiSpec::Latest, None).expect("pypi resolve latest");
+        let r = pypi_resolve("flask", &PypiSpec::Latest, None, false).expect("pypi resolve latest");
         assert_eq!(r.name, "flask");
         assert!(!r.version.is_empty());
     }
@@ -818,8 +909,13 @@ mod tests {
     #[test]
     #[ignore]
     fn live_pypi_resolve_exact() {
-        let r = pypi_resolve("requests", &PypiSpec::Exact("2.31.0".to_string()), None)
-            .expect("pypi resolve exact");
+        let r = pypi_resolve(
+            "requests",
+            &PypiSpec::Exact("2.31.0".to_string()),
+            None,
+            false,
+        )
+        .expect("pypi resolve exact");
         assert_eq!(r.version, "2.31.0");
         assert_eq!(r.published_at.format("%Y-%m-%d").to_string(), "2023-05-22");
     }
@@ -831,6 +927,7 @@ mod tests {
             "requests",
             &PypiSpec::Specifier(">=2.30,<2.32".to_string()),
             None,
+            false,
         )
         .expect("pypi resolve specifier");
         // `requests==2.31.0` is the only release in [2.30, 2.32).
