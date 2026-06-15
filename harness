@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+# Project development tasks. Bash + cargo + git only.
+# Usage: ./harness <command> [--verbose] [--min=N]
+#
+# Commands: check, fix, lint, test, audit, coverage, pre-commit, ci,
+#           post-edit, setup-hooks, suppressions, deps-skill
+# Use `./harness post-edit codex` for Codex hooks that require JSON-safe stdout.
+
+set -u
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+VERBOSE=0
+COVERAGE_MIN=13
+for arg in "$@"; do
+    case "$arg" in
+        --verbose) VERBOSE=1 ;;
+        --min=*)   COVERAGE_MIN="${arg#--min=}" ;;
+    esac
+done
+
+if [ -t 1 ]; then
+    GREEN=$'\033[32m'; RED=$'\033[31m'; BLUE=$'\033[34m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+else
+    GREEN=""; RED=""; BLUE=""; DIM=""; RESET=""
+fi
+
+# ── Runner ──────────────────────────────────────────────────────────
+# run <desc> <no_exit:0|1> -- <cmd...>
+#   Quiet by default: captures stdout+stderr, prints only on failure.
+#   --verbose streams raw output.
+#   no_exit=1 lets the caller aggregate failures (e.g. cmd_check).
+
+LAST_RC=0
+LAST_OUTPUT=""
+
+run() {
+    local desc="$1"; shift
+    local no_exit="$1"; shift
+    [ "$1" = "--" ] && shift
+
+    if [ "$VERBOSE" -eq 1 ]; then
+        printf "  %s→ %s%s\n" "$DIM" "$*" "$RESET"
+        "$@"
+        LAST_RC=$?
+        LAST_OUTPUT=""
+        if [ "$LAST_RC" -eq 0 ]; then
+            printf "  %s✓%s %s\n" "$GREEN" "$RESET" "$desc"
+            return 0
+        fi
+        printf "  %s✗%s %s\n" "$RED" "$RESET" "$desc"
+        [ "$no_exit" = "0" ] && exit "$LAST_RC"
+        return "$LAST_RC"
+    fi
+
+    local tmp; tmp="$(mktemp)"
+    "$@" >"$tmp" 2>&1
+    LAST_RC=$?
+    LAST_OUTPUT="$(cat "$tmp")"
+    rm -f "$tmp"
+    if [ "$LAST_RC" -eq 0 ]; then
+        printf "  %s✓%s %s\n" "$GREEN" "$RESET" "$desc"
+        return 0
+    fi
+    printf "  %s✗%s %s\n" "$RED" "$RESET" "$desc"
+    [ -n "$LAST_OUTPUT" ] && printf "%s\n" "$LAST_OUTPUT"
+    [ "$no_exit" = "0" ] && exit "$LAST_RC"
+    return "$LAST_RC"
+}
+
+run_with_summary() {
+    local desc="$1"; shift
+    local no_exit="$1"; shift
+    [ "$1" = "--" ] && shift
+
+    run "$desc" "$no_exit" -- "$@"
+    local rc=$?
+    [ $rc -ne 0 ] && return $rc
+
+    # Reprint last line with test summary suffix (cargo test).
+    local passed total_passed=0 duration=0
+    while IFS= read -r line; do
+        passed="$(printf "%s" "$line" | sed -nE 's/.*ok\. ([0-9]+) passed.*/\1/p')"
+        [ -n "$passed" ] && total_passed=$(( total_passed + passed ))
+        local d
+        d="$(printf "%s" "$line" | sed -nE 's/.*finished in ([0-9.]+)s.*/\1/p')"
+        if [ -n "$d" ]; then
+            awk_cmp=$(awk -v a="$d" -v b="$duration" 'BEGIN{print (a>b)?1:0}')
+            [ "$awk_cmp" = "1" ] && duration="$d"
+        fi
+    done <<<"$LAST_OUTPUT"
+    if [ "$total_passed" -gt 0 ]; then
+        # Overwrite previous OK line with summary detail.
+        printf "\033[1A\033[2K  %s✓%s %s %s(%s passed, %ss)%s\n" \
+            "$GREEN" "$RESET" "$desc" "$DIM" "$total_passed" "$duration" "$RESET"
+    fi
+    return 0
+}
+
+json_escape() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf "%s" "$value"
+}
+
+codex_system_message() {
+    printf '{"systemMessage":"%s"}\n' "$(json_escape "$1")"
+}
+
+# ── Git helpers ─────────────────────────────────────────────────────
+
+staged_rs_files() {
+    git diff --cached --name-only --diff-filter=d --relative 2>/dev/null \
+        | grep -E '\.rs$' || true
+}
+
+changed_rs_files() {
+    git status --porcelain 2>/dev/null \
+        | sed -E 's/^...//' \
+        | grep -E '\.rs$' || true
+}
+
+# ── Suppressions (report-only) ──────────────────────────────────────
+
+cmd_suppressions() {
+    printf "\n=== Suppressions ===\n\n"
+    local total=0 line_total=0 crate_total=0
+    local file
+    local tmp; tmp="$(mktemp)"
+    while IFS= read -r -d '' file; do
+        grep -oE '#!?\[allow\([^)]*\)\]' "$file" 2>/dev/null >>"$tmp" || true
+    done < <(find src -type f -name '*.rs' -print0 2>/dev/null)
+    [ -d tests ] && while IFS= read -r -d '' file; do
+        grep -oE '#!?\[allow\([^)]*\)\]' "$file" 2>/dev/null >>"$tmp" || true
+    done < <(find tests -type f -name '*.rs' -print0 2>/dev/null)
+
+    line_total=$(awk '/^#\[allow/ {n++} END{print n+0}' "$tmp")
+    crate_total=$(awk '/^#!\[allow/ {n++} END{print n+0}' "$tmp")
+    total=$(( line_total + crate_total ))
+
+    printf "Suppressions: %d total\n" "$total"
+    [ "$total" -eq 0 ] && { rm -f "$tmp"; return 0; }
+    [ "$line_total" -gt 0 ] && printf "  allow: %d\n" "$line_total"
+    [ "$crate_total" -gt 0 ] && printf "  allow_crate: %d\n" "$crate_total"
+
+    # Top 10 rules across both kinds.
+    sed -E 's/#!?\[allow\(([^)]*)\)\]/\1/' "$tmp" \
+        | tr ',' '\n' \
+        | sed -E 's/^[[:space:]]+|[[:space:]]+$//g' \
+        | grep -v '^$' \
+        | sort | uniq -c | sort -rn | head -10 \
+        | awk '{ rule=$2; for (i=3;i<=NF;i++) rule=rule" "$i; printf "    %s: %d\n", rule, $1 }'
+    rm -f "$tmp"
+    return 0
+}
+
+# ── Commands ────────────────────────────────────────────────────────
+
+cmd_fix() {
+    run "Clippy fix" 0 -- cargo clippy --fix --allow-dirty --allow-staged
+    run "Format" 0 -- cargo fmt
+}
+
+cmd_lint() {
+    run "Clippy" 0 -- cargo clippy
+    run "Format check" 0 -- cargo fmt --check
+}
+
+cmd_test() {
+    run_with_summary "Tests" 0 -- cargo test
+}
+
+cmd_deps_skill() {
+    run "Deps skill drift" 0 -- cargo run --example deps_skill -- check
+}
+
+cmd_audit() {
+    _cmd_audit_inner 0
+}
+
+_cmd_audit_inner() {
+    local strict="$1"
+    if cargo audit --version >/dev/null 2>&1; then
+        run "Dep audit" 0 -- cargo audit
+        return
+    fi
+    if [ "$strict" = "1" ]; then
+        printf "  %s✗%s Dep audit (cargo-audit not installed)\n" "$RED" "$RESET"
+        exit 1
+    fi
+    printf "  %s⊘ Dep audit skipped (install: cargo install cargo-audit)%s\n" "$DIM" "$RESET"
+}
+
+cmd_coverage() {
+    printf "\n%s[coverage]%s min=%s%%\n\n" "$BLUE" "$RESET" "$COVERAGE_MIN"
+    if ! cargo llvm-cov --version >/dev/null 2>&1; then
+        printf "  %s✗%s Coverage (cargo-llvm-cov not installed)\n" "$RED" "$RESET"
+        printf "  %sInstall:%s cargo install cargo-llvm-cov\n" "$DIM" "$RESET"
+        exit 1
+    fi
+    run "Coverage (min ${COVERAGE_MIN}%)" 0 -- \
+        cargo llvm-cov --summary-only --fail-under-lines "$COVERAGE_MIN"
+    run "HTML report" 0 -- cargo llvm-cov report --html
+    printf "  %sHTML:%s %s/target/llvm-cov/html/index.html\n" \
+        "$DIM" "$RESET" "$ROOT"
+}
+
+cmd_post_edit() {
+    local codex=0
+    local hook_input=""
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            codex) codex=1 ;;
+            "")
+                ;;
+            *)
+                printf "Unknown post-edit option: %s\n" "$arg" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    if [ ! -t 0 ]; then
+        hook_input="$(cat || true)"
+        if printf "%s" "$hook_input" | grep -qE '"hook_event_name"[[:space:]]*:'; then
+            codex=1
+        fi
+    fi
+
+    local changed; changed="$(changed_rs_files)"
+    [ -z "$changed" ] && return 0
+
+    if [ "$codex" -eq 1 ]; then
+        local tmp; tmp="$(mktemp)"
+        cargo fmt >"$tmp" 2>&1
+        local rc=$?
+        local output; output="$(tail -40 "$tmp")"
+        rm -f "$tmp"
+
+        [ "$rc" -eq 0 ] && return 0
+
+        if [ -n "$output" ]; then
+            codex_system_message "cargo fmt failed:
+$output"
+        else
+            codex_system_message "cargo fmt failed without output."
+        fi
+        return 0
+    fi
+
+    # Never fail the Stop hook.
+    run "Format" 1 -- cargo fmt || true
+    return 0
+}
+
+cmd_pre_commit() {
+    local staged; staged="$(staged_rs_files)"
+    if [ -z "$staged" ]; then
+        printf "No staged Rust files — skipping checks\n"
+        return 0
+    fi
+    printf "\n%s[pre-commit]%s\n\n" "$BLUE" "$RESET"
+    # Check-only: never rewrite the working tree behind the commit.
+    # Mirrors the CI gate so anything that passes here passes there.
+    run "Clippy (strict)" 0 -- cargo clippy -- -D warnings
+    run "Format check" 0 -- cargo fmt --check
+    cmd_test
+}
+
+cmd_check() {
+    local start; start=$(date +%s)
+    printf "\n%s[check]%s Running pre-flight checks...\n\n" "$BLUE" "$RESET"
+
+    local passed=0 failed=0
+    run "Clippy fix" 1 -- cargo clippy --fix --allow-dirty --allow-staged
+    [ $? -eq 0 ] && passed=$(( passed + 1 )) || failed=$(( failed + 1 ))
+    run "Format" 1 -- cargo fmt
+    [ $? -eq 0 ] && passed=$(( passed + 1 )) || failed=$(( failed + 1 ))
+    run "Clippy (strict)" 1 -- cargo clippy -- -D warnings
+    [ $? -eq 0 ] && passed=$(( passed + 1 )) || failed=$(( failed + 1 ))
+    run_with_summary "Tests" 1 -- cargo test
+    [ $? -eq 0 ] && passed=$(( passed + 1 )) || failed=$(( failed + 1 ))
+    run "Deps skill drift" 1 -- cargo run --example deps_skill -- check
+    [ $? -eq 0 ] && passed=$(( passed + 1 )) || failed=$(( failed + 1 ))
+
+    cmd_suppressions
+
+    local elapsed=$(( $(date +%s) - start ))
+    printf "\n"
+    if [ "$failed" -gt 0 ]; then
+        printf "%sFAIL%s %d passed, %d failed %s(%ds)%s\n" \
+            "$RED" "$RESET" "$passed" "$failed" "$DIM" "$elapsed" "$RESET"
+        exit 1
+    fi
+    printf "%sOK%s %d passed %s(%ds)%s\n" \
+        "$GREEN" "$RESET" "$passed" "$DIM" "$elapsed" "$RESET"
+}
+
+cmd_ci() {
+    printf "\n%s[ci]%s\n\n" "$BLUE" "$RESET"
+    run "Clippy (strict)" 0 -- cargo clippy -- -D warnings
+    run "Format check" 0 -- cargo fmt --check
+    _cmd_audit_inner 1
+    if ! cargo llvm-cov --version >/dev/null 2>&1; then
+        printf "  %s✗%s Coverage (cargo-llvm-cov not installed)\n" "$RED" "$RESET"
+        printf "  %sInstall:%s cargo install cargo-llvm-cov\n" "$DIM" "$RESET"
+        exit 1
+    fi
+    run_with_summary "Tests + coverage (min ${COVERAGE_MIN}%)" 0 -- \
+        cargo llvm-cov --summary-only --fail-under-lines "$COVERAGE_MIN"
+}
+
+cmd_setup_hooks() {
+    local hook_dir="$ROOT/.git/hooks"
+    local hook="$hook_dir/pre-commit"
+    mkdir -p "$hook_dir"
+    cat >"$hook" <<'EOF'
+#!/bin/sh
+exec "$(git rev-parse --show-toplevel)/harness" pre-commit
+EOF
+    chmod +x "$hook"
+    printf "Installed pre-commit hook at %s\n" "$hook"
+}
+
+# ── Dispatch ────────────────────────────────────────────────────────
+
+cmd="${1:-check}"
+case "$cmd" in
+    check)        cmd_check ;;
+    fix)          cmd_fix ;;
+    lint)         cmd_lint ;;
+    test)         cmd_test ;;
+    audit)        cmd_audit ;;
+    coverage)     cmd_coverage ;;
+    pre-commit)   cmd_pre_commit ;;
+    ci)           cmd_ci ;;
+    post-edit)    cmd_post_edit "${@:2}" ;;
+    setup-hooks)  cmd_setup_hooks ;;
+    suppressions) cmd_suppressions ;;
+    deps-skill)    cmd_deps_skill ;;
+    -h|--help|help)
+        printf "Usage: ./harness <command> [--verbose] [--min=N]\n\n"
+        printf "Commands: check, fix, lint, test, audit, coverage, pre-commit,\n"
+        printf "          ci, post-edit, setup-hooks, suppressions, deps-skill\n"
+        printf "\nCodex hook mode: ./harness post-edit codex\n"
+        ;;
+    *)
+        printf "Unknown command: %s\n" "$cmd" >&2
+        exit 1
+        ;;
+esac

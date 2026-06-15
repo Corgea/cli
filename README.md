@@ -26,6 +26,29 @@ Once the binary is installed, login with your token from the Corgea app.
 corgea login <token>
 ```
 
+## Dependency Inventory (offline)
+
+`corgea deps` builds a dependency inventory from npm, Python, and Java manifests
+and lockfiles, then evaluates a pinning policy (DEP rules). Runs fully offline —
+no token or network required.
+
+```bash
+corgea deps scan                       # table report for the current directory
+corgea deps scan --format agent        # compact TSV for coding agents
+corgea deps scan --format json         # JSON inventory on stdout
+corgea deps scan --format quiet        # no stdout; exit code still applies
+corgea deps scan --fail-on high        # exit 1 if any finding is >= high
+corgea deps scan --out-format json     # machine-readable (json or sarif)
+corgea deps graph --format json        # print the resolved dependency graph
+corgea deps explain <package> --format agent  # show why a package is present
+corgea deps diff --base origin/main --format json
+corgea deps sbom --format cyclonedx    # emit a CycloneDX SBOM
+corgea deps policy init --exist-ok     # write starter policy, or keep existing file
+```
+
+`corgea deps` defaults to `--format agent` when an agent environment is detected (`AI_AGENT`, `CODEX_SANDBOX`, `CLAUDECODE`, and related agent variables). Use `--format human` to force the normal terminal output.
+
+See [Dependency Scanning (CLI)](https://docs.corgea.app/cli/deps) for the full flag and exit-code reference.
 
 ## Development Setup
 

@@ -1,20 +1,19 @@
-use crate::utils;
 use crate::config::Config;
 use crate::targets;
+use crate::utils;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::error::Error;
-use std::thread;
 use std::env;
+use std::error::Error;
 use std::fs;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use uuid::Uuid;
 
-
-
+#[allow(clippy::too_many_arguments)]
 pub fn run(
-    config: &Config, 
-    fail_on: Option<String>, 
-    fail: &bool, 
+    config: &Config,
+    fail_on: Option<String>,
+    fail: &bool,
     only_uncommitted: &bool,
     scan_type: Option<String>,
     policy: Option<String>,
@@ -26,50 +25,46 @@ pub fn run(
 ) {
     // Validate that only_uncommitted and target are not used together
     if *only_uncommitted && target.is_some() {
-        eprintln!("--only_uncommitted and --target cannot be used together.");
+        log::error!("--only_uncommitted and --target cannot be used together.");
         std::process::exit(1);
     }
 
     if *only_uncommitted {
         match utils::generic::is_git_repo("./") {
             Ok(false) => {
-                eprintln!("This is not a git repository. Without a git repository Corgea CLI can't determine which files have been modified or added thus only a full scan is possible.");
+                log::error!("This is not a git repository. Without a git repository Corgea CLI can't determine which files have been modified or added thus only a full scan is possible.");
                 std::process::exit(1);
-            },
+            }
             Err(e) => {
-                eprintln!("Error checking git repository information: {}. Without a git repository Corgea CLI can't determine which files have been modified or added thus only a full scan is possible.", e);
+                log::error!("Error checking git repository information: {}. Without a git repository Corgea CLI can't determine which files have been modified or added thus only a full scan is possible.", e);
                 std::process::exit(1);
-            },
+            }
             Ok(true) => {
                 // Continue with the git repo logic
             }
         }
     }
-    println!(
-        "\nScanning with BLAST 🚀🚀🚀"
-    );
+    println!("\nScanning with BLAST 🚀🚀🚀");
 
     if let Some(scan_type) = &scan_type {
         println!("Running Scan Type: {}", scan_type);
     }
     if let Some(policy) = &policy {
-        println!("Including only specified policies for policy scan: {}", policy);
+        println!(
+            "Including only specified policies for policy scan: {}",
+            policy
+        );
     }
     println!("\n\n");
     let temp_dir = env::temp_dir().join(format!("corgea/tmp/{}", Uuid::new_v4()));
     fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
     let project_name = utils::generic::determine_project_name(project_name.as_deref());
     let zip_path = format!("{}/{}.zip", temp_dir.display(), project_name);
-    let repo_info = match utils::generic::get_repo_info("./") {
-        Ok(info) => info,
-        Err(_) => {
-            None
-        }
-    };
+    let repo_info = utils::generic::get_repo_info("./").unwrap_or_default();
     match utils::generic::create_path_if_not_exists(&temp_dir) {
         Ok(_) => (),
         Err(e) => {
-            eprintln!(
+            log::error!(
                 "\n\nOops! Something went wrong while creating the directory at '{}'.\nPlease check if you have the necessary permissions or if the path is valid.\nError details:\n{}\n\n", 
                 temp_dir.display(), e
             );
@@ -80,7 +75,10 @@ pub fn run(
     let stop_signal = Arc::new(Mutex::new(false));
     let stop_signal_clone = Arc::clone(&stop_signal);
     let packaging_thread = thread::spawn(move || {
-        utils::terminal::show_loading_message("Packaging your project... ([T]s)", stop_signal_clone);
+        utils::terminal::show_loading_message(
+            "Packaging your project... ([T]s)",
+            stop_signal_clone,
+        );
     });
 
     let target_str: Option<&str> = if *only_uncommitted {
@@ -99,18 +97,25 @@ pub fn run(
                 if result.files.is_empty() {
                     *stop_signal.lock().unwrap() = true;
                     let _ = packaging_thread.join();
-                    print!("\r{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset));
-                    eprintln!("\n\nError: target resolved to zero files.\n");
-                    eprintln!("Target value: {}\n", target_value);
-                    eprintln!("Segment results:");
+                    print!(
+                        "\r{}",
+                        utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
+                    );
+                    log::error!("\n\nError: target resolved to zero files.\n");
+                    log::error!("Target value: {}\n", target_value);
+                    log::error!("Segment results:");
                     for segment_result in &result.segments {
                         if let Some(ref error) = segment_result.error {
-                            eprintln!("  {}: ERROR - {}", segment_result.segment, error);
+                            log::error!("  {}: ERROR - {}", segment_result.segment, error);
                         } else {
-                            eprintln!("  {}: {} matches", segment_result.segment, segment_result.matches);
+                            log::error!(
+                                "  {}: {} matches",
+                                segment_result.segment,
+                                segment_result.matches
+                            );
                         }
                     }
-                    eprintln!("\nPlease check your target specification and try again.\n");
+                    log::error!("\nPlease check your target specification and try again.\n");
                     std::process::exit(1);
                 }
 
@@ -118,7 +123,9 @@ pub fn run(
                 if *only_uncommitted {
                     println!("\rFiles to be submitted for partial scan:\n");
                     for (index, file) in result.files.iter().enumerate() {
-                        if let Ok(relative) = file.strip_prefix(std::env::current_dir().unwrap_or_default()) {
+                        if let Ok(relative) =
+                            file.strip_prefix(std::env::current_dir().unwrap_or_default())
+                        {
                             println!("{}: {}", index + 1, relative.display());
                         } else {
                             println!("{}: {}", index + 1, file.display());
@@ -127,10 +134,12 @@ pub fn run(
                     println!();
                 } else {
                     println!("Scanning {} files (target mode)", file_count);
-                    
+
                     let display_count = std::cmp::min(20, file_count);
                     for file in result.files.iter().take(display_count) {
-                        if let Ok(relative) = file.strip_prefix(std::env::current_dir().unwrap_or_default()) {
+                        if let Ok(relative) =
+                            file.strip_prefix(std::env::current_dir().unwrap_or_default())
+                        {
                             println!("  {}", relative.display());
                         } else {
                             println!("  {}", file.display());
@@ -145,8 +154,11 @@ pub fn run(
             Err(e) => {
                 *stop_signal.lock().unwrap() = true;
                 let _ = packaging_thread.join();
-                print!("\r{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset));
-                eprintln!("\n\nError resolving targets: {}\n", e);
+                print!(
+                    "\r{}",
+                    utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
+                );
+                log::error!("\n\nError resolving targets: {}\n", e);
                 std::process::exit(1);
             }
         }
@@ -157,24 +169,28 @@ pub fn run(
             if added_files.is_empty() {
                 *stop_signal.lock().unwrap() = true;
                 let _ = packaging_thread.join();
-                print!("\r{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset));
+                print!(
+                    "\r{}",
+                    utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
+                );
                 if *only_uncommitted {
-                    eprintln!(
+                    log::error!(
                         "\n\nOops! It seems there are no scannable uncommitted changes in your project.\nYou may have uncommitted changes, but none match the types of files we can scan.\n\n"
                     );
                 } else {
-                    eprintln!(
-                        "\n\nOops! No valid files found to scan after filtering.\n\n"
-                    );
+                    log::error!("\n\nOops! No valid files found to scan after filtering.\n\n");
                 }
                 std::process::exit(1);
             }
-        },
+        }
         Err(e) => {
             *stop_signal.lock().unwrap() = true;
             let _ = packaging_thread.join();
-            print!("\r{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset));
-            eprintln!(
+            print!(
+                "\r{}",
+                utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
+            );
+            log::error!(
                 "\n\nUh-oh! We couldn't package your project at '{}'.\nThis might be due to insufficient permissions, invalid file paths, or a file system error.\nPlease check the directory and try again.\nError details:\n{}\n\n", 
                 zip_path, e
             );
@@ -183,12 +199,22 @@ pub fn run(
     }
     *stop_signal.lock().unwrap() = true;
     let _ = packaging_thread.join();
-    print!("\r{}Project packaged successfully.\n", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Green));
+    print!(
+        "\r{}Project packaged successfully.\n",
+        utils::terminal::set_text_color("", utils::terminal::TerminalColor::Green)
+    );
     println!("\n\nSubmitting scan to Corgea:");
-    let upload_result = match utils::api::upload_zip(&zip_path, &config.get_url(), &project_name, repo_info, scan_type, policy) {
+    let upload_result = match utils::api::upload_zip(
+        &zip_path,
+        &config.get_url(),
+        &project_name,
+        repo_info,
+        scan_type,
+        policy,
+    ) {
         Ok(result) => result,
         Err(e) => {
-            eprintln!("\n\nOh no! We encountered an issue while uploading the zip file '{}' to the server.\nPlease ensure that:
+            log::error!("\n\nOh no! We encountered an issue while uploading the zip file '{}' to the server.\nPlease ensure that:
     - Blast is enabled on your Corgea account.
     - Your network connection is stable.
     - The server URL '{}' is correct.
@@ -202,13 +228,18 @@ pub fn run(
                 e
             );
             std::process::exit(1);
-        },
+        }
     };
 
     let scan_id = upload_result.scan_id;
     let scan_url = match &upload_result.project_id {
         Some(pid) => format!("{}/project/{}/?scan_id={}", config.get_url(), pid, scan_id),
-        None => format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id),
+        None => format!(
+            "{}/project/{}?scan_id={}",
+            config.get_url(),
+            project_name,
+            scan_id
+        ),
     };
 
     let _ = utils::generic::delete_directory(&temp_dir);
@@ -227,7 +258,10 @@ pub fn run(
     let stop_signal = Arc::new(Mutex::new(false));
     let stop_signal_clone = Arc::clone(&stop_signal);
     let results_thread = thread::spawn(move || {
-        utils::terminal::show_loading_message("Collecting scan results... ([T]s)", stop_signal_clone);
+        utils::terminal::show_loading_message(
+            "Collecting scan results... ([T]s)",
+            stop_signal_clone,
+        );
     });
 
     let classifications = match report_scan_status(&config.get_url(), &project_name) {
@@ -239,11 +273,11 @@ pub fn run(
                 utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
             );
             issues_classes
-        },
+        }
         Err(e) => {
             *stop_signal.lock().unwrap() = true;
             let _ = results_thread.join();
-            eprintln!(
+            log::error!(
                 "\r{}\n\n{}\n\n\
                 However, the scan results may still be accessible at the following link:\n\n\
                 {}\n\n\
@@ -252,7 +286,10 @@ pub fn run(
                 - Error details: {}\n",
                 utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset),
                 utils::terminal::set_text_color(
-                    &format!("Failed to report the scan status for project: '{}'.", project_name),
+                    &format!(
+                        "Failed to report the scan status for project: '{}'.",
+                        project_name
+                    ),
                     utils::terminal::TerminalColor::Red
                 ),
                 utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Blue),
@@ -263,13 +300,14 @@ pub fn run(
         }
     };
     if *fail {
-        let blocking_rules = match utils::api::check_blocking_rules(&config.get_url(), &scan_id, None) {
-            Ok(rules) => rules,
-            Err(e) => {
-                eprintln!("Failed to check blocking rules: {}", e);
-                std::process::exit(1);
-            }
-        };
+        let blocking_rules =
+            match utils::api::check_blocking_rules(&config.get_url(), &scan_id, None) {
+                Ok(rules) => rules,
+                Err(e) => {
+                    log::error!("Failed to check blocking rules: {}", e);
+                    std::process::exit(1);
+                }
+            };
         if blocking_rules.block {
             println!("\nExiting with error code 1 due to some issues violating some blocking rules defined for this project.\nfor more details, please check the scan results at the link: {}\nAlternatively, you can run {} to view the issues list on your local machine.",
             utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green),
@@ -287,39 +325,52 @@ pub fn run(
             let stop_signal = Arc::new(Mutex::new(false));
             let stop_signal_clone = Arc::clone(&stop_signal);
             let results_thread = thread::spawn(move || {
-                utils::terminal::show_loading_message("Generating scan report... ([T]s)", stop_signal_clone);
+                utils::terminal::show_loading_message(
+                    "Generating scan report... ([T]s)",
+                    stop_signal_clone,
+                );
             });
 
             if out_format == "json" {
-                let issues = match utils::api::get_all_issues(&config.get_url(), &project_name, Some(scan_id.clone())) {
+                let issues = match utils::api::get_all_issues(
+                    &config.get_url(),
+                    &project_name,
+                    Some(scan_id.clone()),
+                ) {
                     Ok(issues) => issues,
                     Err(e) => {
-                        eprintln!("\n\nFailed to fetch issues: {}\n\n", e);
+                        log::error!("\n\nFailed to fetch issues: {}\n\n", e);
                         std::process::exit(1);
                     }
                 };
-                let sca_issues = match utils::api::get_all_sca_issues(&config.get_url(), &project_name, Some(scan_id.clone())) {
+                let sca_issues = match utils::api::get_all_sca_issues(
+                    &config.get_url(),
+                    &project_name,
+                    Some(scan_id.clone()),
+                ) {
                     Ok(issues) => issues,
                     Err(e) => {
-                        eprintln!("\n\nFailed to fetch SCA issues: {}\n\n", e);
+                        log::error!("\n\nFailed to fetch SCA issues: {}\n\n", e);
                         std::process::exit(1);
                     }
                 };
                 let json = serde_json::to_string_pretty(&issues).unwrap();
                 let sca_json = serde_json::to_string_pretty(&sca_issues).unwrap();
-                let report_json= serde_json::to_string_pretty(&classifications).unwrap();
-                let results_json = format!("{{\"issues\": {}, \"sca_issues\": {}, \"report\": {}}}", json, sca_json, report_json);
+                let report_json = serde_json::to_string_pretty(&classifications).unwrap();
+                let results_json = format!(
+                    "{{\"issues\": {}, \"sca_issues\": {}, \"report\": {}}}",
+                    json, sca_json, report_json
+                );
                 *stop_signal.lock().unwrap() = true;
                 let _ = results_thread.join();
                 fs::write(out_file.clone(), results_json).expect("Failed to write JSON file, check if the file path is valid and you have the necessary permissions to write to it.");
                 utils::terminal::clear_previous_line();
                 println!("\n\nScan results written to: {}\n\n", out_file.clone());
-            }
-            else if out_format == "html" {
+            } else if out_format == "html" {
                 let report = match utils::api::get_scan_report(&config.get_url(), &scan_id, None) {
                     Ok(html) => html,
                     Err(e) => {
-                        eprintln!("\n\nFailed to fetch scan report: {}\n\n", e);
+                        log::error!("\n\nFailed to fetch scan report: {}\n\n", e);
                         std::process::exit(1);
                     }
                 };
@@ -328,26 +379,29 @@ pub fn run(
                 fs::write(out_file.clone(), report).expect("\n\nFailed to write HTML file, check if the file path is valid and you have the necessary permissions to write to it.");
                 utils::terminal::clear_previous_line();
                 println!("\n\nScan report written to: {}\n\n", out_file.clone());
-            }
-            else if out_format == "sarif" {
-                let report = match utils::api::get_scan_report(&config.get_url(), &scan_id, Some("sarif")) {
-                    Ok(sarif) => sarif,
-                    Err(e) => {
-                        eprintln!("\n\nFailed to fetch SARIF report: {}\n\n", e);
-                        std::process::exit(1);
-                    }
-                };
+            } else if out_format == "sarif" {
+                let report =
+                    match utils::api::get_scan_report(&config.get_url(), &scan_id, Some("sarif")) {
+                        Ok(sarif) => sarif,
+                        Err(e) => {
+                            log::error!("\n\nFailed to fetch SARIF report: {}\n\n", e);
+                            std::process::exit(1);
+                        }
+                    };
                 *stop_signal.lock().unwrap() = true;
                 let _ = results_thread.join();
                 fs::write(out_file.clone(), report).expect("\n\nFailed to write SARIF file, check if the file path is valid and you have the necessary permissions to write to it.");
                 utils::terminal::clear_previous_line();
                 println!("\n\nScan report written to: {}\n\n", out_file.clone());
-            }
-            else if out_format == "markdown" {
-                let report = match utils::api::get_scan_report(&config.get_url(), &scan_id, Some("markdown")) {
+            } else if out_format == "markdown" {
+                let report = match utils::api::get_scan_report(
+                    &config.get_url(),
+                    &scan_id,
+                    Some("markdown"),
+                ) {
                     Ok(markdown) => markdown,
                     Err(e) => {
-                        eprintln!("\n\nFailed to fetch Markdown report: {}\n\n", e);
+                        log::error!("\n\nFailed to fetch Markdown report: {}\n\n", e);
                         std::process::exit(1);
                     }
                 };
@@ -364,100 +418,96 @@ pub fn run(
 
     if let Some(fail_on) = fail_on {
         match fail_on.as_str() {
-            "LO" => {
-                if classifications.values().any(|&count| count > 0) {
-                    std::process::exit(1);
-                }
-            },
-            "ME" => {
-                if classifications.get("ME").map_or(false, |&count| count > 0) ||
-                   classifications.get("HI").map_or(false, |&count| count > 0) {
-                    std::process::exit(1);
-                }
-            },
-            "HI" => {
-                if classifications.get("CR").map_or(false, |&count| count > 0) ||
-                    classifications.get("HI").map_or(false, |&count| count > 0) {
-                    std::process::exit(1);
-                }
-            },
+            "LO" if classifications.values().any(|&count| count > 0) => {
+                std::process::exit(1);
+            }
+            "ME" if (classifications.get("ME").is_some_and(|&count| count > 0)
+                || classifications.get("HI").is_some_and(|&count| count > 0)) =>
+            {
+                std::process::exit(1);
+            }
+            "HI" if (classifications.get("CR").is_some_and(|&count| count > 0)
+                || classifications.get("HI").is_some_and(|&count| count > 0)) =>
+            {
+                std::process::exit(1);
+            }
             "CR" => {
                 if let Some(cr_count) = classifications.get("CR") {
                     if *cr_count > 0 {
                         std::process::exit(1);
                     }
                 }
-            },
+            }
             _ => (),
         }
     }
-
-
 }
 
 pub fn wait_for_scan(config: &Config, scan_id: &str) {
-        // Create loading animation
-        let stop_signal = Arc::new(Mutex::new(false));
+    // Create loading animation
+    let stop_signal = Arc::new(Mutex::new(false));
 
-        // Spawn a new thread for the spinner animation
-        let stop_signal_clone = Arc::clone(&stop_signal);
-        thread::spawn(move || {
-            utils::terminal::show_loading_message("Scanning... The Hunt Is On! ([T]s)", stop_signal_clone);
-        });
-    
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            match check_scan_status(&scan_id, &config.get_url()) {
-                Ok(true) => {
-                    *stop_signal.lock().unwrap() = true;
-                    break;
-                },
-                Ok(false) => { },
-                Err(e) => {
-                    eprintln!(
-            "\n\nUnable to check the scan status for scan ID '{}'.\nPlease verify that:
+    // Spawn a new thread for the spinner animation
+    let stop_signal_clone = Arc::clone(&stop_signal);
+    thread::spawn(move || {
+        utils::terminal::show_loading_message(
+            "Scanning... The Hunt Is On! ([T]s)",
+            stop_signal_clone,
+        );
+    });
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        match check_scan_status(scan_id, &config.get_url()) {
+            Ok(true) => {
+                *stop_signal.lock().unwrap() = true;
+                break;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                log::error!(
+                    "\n\nUnable to check the scan status for scan ID '{}'.\nPlease verify that:
             - The server URL '{}' is reachable.
             - Your authentication token is valid.
             - The scan ID '{}' exists and is correct.
 
             Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli
             
-            Error details:\n{}", 
-                        scan_id,
-                        config.get_url(),
-                        scan_id,
-                        e
-                    );
-                    std::process::exit(1);
-                }
+            Error details:\n{}",
+                    scan_id,
+                    config.get_url(),
+                    scan_id,
+                    e
+                );
+                std::process::exit(1);
             }
         }
-        print!("{}", utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset));
-        println!(
-            "\r╭────────────────────────────────────────────╮\n\
+    }
+    print!(
+        "{}",
+        utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
+    );
+    println!(
+        "\r╭────────────────────────────────────────────╮\n\
              │ {: <42} │\n\
              │   🎉🎉 Scan Completed Successfully! 🎉🎉   │\n\
              │ {: <42} │\n\
              ╰────────────────────────────────────────────╯\n",
-            " ", 
-            " "
-        );
-    
-
-    
-    
+        " ", " "
+    );
 }
-
 
 pub fn check_scan_status(scan_id: &str, url: &str) -> Result<bool, Box<dyn Error>> {
     match utils::api::get_scan(url, scan_id) {
         Ok(scan) => Ok(scan.status == "complete"),
-        Err(e) => Err(e)
+        Err(e) => Err(e),
     }
 }
 
-
-pub fn fetch_and_group_scan_issues(url: &str, project: &str) -> Result<HashMap<String, usize>, Box<dyn std::error::Error>> {
+pub fn fetch_and_group_scan_issues(
+    url: &str,
+    project: &str,
+) -> Result<HashMap<String, usize>, Box<dyn std::error::Error>> {
     let issues = match utils::api::get_all_issues(url, project, None) {
         Ok(issues) => issues,
         Err(err) => {
@@ -467,13 +517,18 @@ pub fn fetch_and_group_scan_issues(url: &str, project: &str) -> Result<HashMap<S
     let mut classification_counts: HashMap<String, usize> = HashMap::new();
     if !issues.is_empty() {
         for issue in &issues {
-            *classification_counts.entry(issue.urgency.clone()).or_insert(0) += 1;
+            *classification_counts
+                .entry(issue.urgency.clone())
+                .or_insert(0) += 1;
         }
     }
     Ok(classification_counts)
 }
 
-pub fn report_scan_status(url: &str, project: &str) ->  Result<HashMap<String, usize>, Box<dyn std::error::Error>>{
+pub fn report_scan_status(
+    url: &str,
+    project: &str,
+) -> Result<HashMap<String, usize>, Box<dyn std::error::Error>> {
     let classification_counts = match fetch_and_group_scan_issues(url, project) {
         Ok(counts) => counts,
         Err(e) => {
@@ -484,8 +539,8 @@ pub fn report_scan_status(url: &str, project: &str) ->  Result<HashMap<String, u
     let total_issues = classification_counts.values().sum::<usize>();
     utils::terminal::clear_previous_line();
     println!("\rScan Results:-\n");
-    println!("{:<20} | {}", "Classification", "Count");
-    println!("{:-<20} | {}", "", "");
+    println!("{:<20} | Count", "Classification");
+    println!("{:-<20} | ", "");
 
     let order = vec!["CR", "HI", "ME", "LO"];
     for classification in order {
@@ -496,8 +551,7 @@ pub fn report_scan_status(url: &str, project: &str) ->  Result<HashMap<String, u
         }
     }
 
-    println!("{:-<20} | {}", "", "");
+    println!("{:-<20} | ", "");
     println!("{:<20} | {}", "Total", total_issues);
-    return Ok(classification_counts);
+    Ok(classification_counts)
 }
-
