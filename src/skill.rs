@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::utils;
 use crate::utils::terminal::{set_text_color, TerminalColor};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Supported agents and where their skills are installed.
 ///
@@ -55,8 +55,8 @@ pub fn resolve_skill_dir(
     agent: Option<&str>,
     scope: &str,
     dir: Option<&str>,
-    cwd: &PathBuf,
-    home: &PathBuf,
+    cwd: &Path,
+    home: &Path,
 ) -> Result<PathBuf, String> {
     let base = if let Some(custom) = dir {
         PathBuf::from(custom)

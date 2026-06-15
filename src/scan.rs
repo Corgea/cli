@@ -322,22 +322,18 @@ pub fn upload_scan(
                 Ok(res) => {
                     if !res.status().is_success() {
                         true
-                    } else {
-                        if let Some(server_offset) = res.headers().get("Upload-Offset") {
-                            let expected_offset = offset + chunk.len();
-                            if let Ok(server_offset_str) = server_offset.to_str() {
-                                if let Ok(server_offset_val) = server_offset_str.parse::<usize>() {
-                                    if server_offset_val != expected_offset {
-                                        log::error!(
-                                            "Upload offset mismatch on chunk {}/{}: server has {} bytes but expected {}. \
-                                            This may indicate that chunks are being routed to different server instances. \
-                                            Please contact support.",
-                                            index + 1, total_chunks, server_offset_val, expected_offset
-                                        );
-                                        true
-                                    } else {
-                                        false
-                                    }
+                    } else if let Some(server_offset) = res.headers().get("Upload-Offset") {
+                        let expected_offset = offset + chunk.len();
+                        if let Ok(server_offset_str) = server_offset.to_str() {
+                            if let Ok(server_offset_val) = server_offset_str.parse::<usize>() {
+                                if server_offset_val != expected_offset {
+                                    log::error!(
+                                        "Upload offset mismatch on chunk {}/{}: server has {} bytes but expected {}. \
+                                        This may indicate that chunks are being routed to different server instances. \
+                                        Please contact support.",
+                                        index + 1, total_chunks, server_offset_val, expected_offset
+                                    );
+                                    true
                                 } else {
                                     false
                                 }
@@ -347,6 +343,8 @@ pub fn upload_scan(
                         } else {
                             false
                         }
+                    } else {
+                        false
                     }
                 }
                 Err(_) => true,
