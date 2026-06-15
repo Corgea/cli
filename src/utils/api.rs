@@ -615,6 +615,92 @@ pub fn get_issue(url: &str, issue: &str) -> Result<FullIssueResponse, Box<dyn st
     }
 }
 
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+pub struct SkillInfo {
+    pub name: String,
+    pub slug: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub is_installable: bool,
+    #[serde(default)]
+    pub latest_approved_version: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct SkillVersionInfo {
+    pub version: String,
+    pub status: String,
+    #[serde(default)]
+    pub is_installable: bool,
+    #[serde(default)]
+    pub security_concerns: String,
+    #[serde(default)]
+    pub content: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+pub struct SkillResponse {
+    #[serde(default)]
+    pub status: String,
+    pub skill: SkillInfo,
+    #[serde(default)]
+    pub version: Option<SkillVersionInfo>,
+}
+
+/// Fetch a single skill (optionally a specific version) for installation.
+///
+/// Returns `Ok(None)` when no skill/version matches (HTTP 404), `Ok(Some(..))`
+/// on success, and `Err(..)` for auth or other failures.
+pub fn get_skill(
+    url: &str,
+    slug: &str,
+    version: Option<&str>,
+) -> Result<Option<SkillResponse>, Box<dyn Error>> {
+    let mut request_url = format!("{}{}/skills/{}", url, API_BASE, slug);
+    if let Some(v) = version {
+        request_url = format!("{}?version={}", request_url, v);
+    }
+
+    let client = http_client();
+    debug(&format!("Sending request to URL: {}", request_url));
+
+    let response = client
+        .get(&request_url)
+        .send()
+        .map_err(|e| format!("Failed to send request: {}", e))?;
+
+    check_for_warnings(response.headers(), response.status());
+
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if status == StatusCode::UNAUTHORIZED {
+        return Err("Authentication failed. Please run 'corgea login'.".into());
+    }
+    if status == StatusCode::FORBIDDEN {
+        return Err("Permission denied: you do not have access to skills.".into());
+    }
+    if !status.is_success() {
+        return Err(format!("Unable to fetch skill. Status code: {}", status).into());
+    }
+
+    let response_text = response.text()?;
+    let skill_response: SkillResponse = serde_json::from_str(&response_text).map_err(|e| {
+        debug(&format!(
+            "Failed to parse response: {}. Response body: {}",
+            e, response_text
+        ));
+        format!("Failed to parse response: {}", e)
+    })?;
+    Ok(Some(skill_response))
+}
+
 pub fn query_scan_list(
     url: &str,
     project: Option<&str>,
