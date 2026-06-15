@@ -123,6 +123,12 @@ enum Commands {
 
         #[arg(
             long,
+            help = "Exclude files matching glob patterns from the scan. Accepts comma-separated glob patterns. Examples: 'tests/**', 'src/**/*.test.ts,**/*.spec.js', '*.md'."
+        )]
+        exclude: Option<String>,
+
+        #[arg(
+            long,
             help = "The name of the Corgea project. Defaults to git repository name if found, otherwise to the current directory name."
         )]
         project_name: Option<String>,
@@ -398,6 +404,7 @@ fn main() {
             out_format,
             out_file,
             target,
+            exclude,
             project_name,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
@@ -483,6 +490,11 @@ fn main() {
                     ::log::warn!("\nWarning: you didn't specify an only policy scan, so all other types of scans will run as well.");
                 }
             }
+            if exclude.is_some() && *scanner != Scanner::Blast {
+                ::log::error!("exclude is only supported with blast scanner.");
+                std::process::exit(1);
+            }
+
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config, project_name.clone()),
                 Scanner::Semgrep => scan::run_semgrep(&corgea_config, project_name.clone()),
@@ -496,6 +508,7 @@ fn main() {
                     out_format.clone(),
                     out_file.clone(),
                     target.clone(),
+                    exclude.clone(),
                     project_name.clone(),
                 ),
             }
