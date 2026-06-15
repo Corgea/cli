@@ -61,7 +61,7 @@ static SHARED_CLIENT: std::sync::LazyLock<reqwest::blocking::Client> =
             debug(&format!("https_proxy detected: {}", https_proxy));
 
             if std::env::var("CORGEA_ACCEPT_CERT").is_ok() {
-                debug(&format!("Skipping CA cert validation"));
+                debug("Skipping CA cert validation");
                 builder = builder.danger_accept_invalid_certs(true);
             }
         }
@@ -173,6 +173,19 @@ pub fn http_client() -> HttpClient {
     }
 }
 
+/// Returns true when the `warning` header carries an RFC 7234 code `299`,
+/// which Corgea uses to signal a deprecated CLI version.
+fn should_warn_deprecated(headers: &HeaderMap) -> bool {
+    headers
+        .get("warning")
+        .and_then(|v| v.to_str().ok())
+        .map(|text| {
+            text.split(',')
+                .any(|w| w.trim().split(' ').next() == Some("299"))
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(not(test))]
 const RETRY_BACKOFF_SECS: &[u64] = &[1, 2, 4, 8, 16, 32];
 
@@ -189,7 +202,7 @@ where
             Ok(result) => return Ok(result),
             Err(e) if (e.is_connect() || e.is_timeout()) && attempt < RETRY_BACKOFF_SECS.len() => {
                 let delay = RETRY_BACKOFF_SECS[attempt];
-                eprintln!(
+                log::warn!(
                     "Network error during {}: {}. Retrying in {}s... ({}/{})",
                     operation,
                     e,
@@ -206,17 +219,11 @@ where
 }
 
 fn check_for_warnings(headers: &HeaderMap, status: StatusCode) {
-    if let Some(warning) = headers.get("warning") {
-        let warnings = warning.to_str().unwrap().split(',');
-        for warning in warnings {
-            let code = warning.trim().split(' ').next().unwrap();
-            if code == "299" {
-                eprintln!("This version of the Corgea plugin is deprecated. Please upgrade to the latest version to ensure continued support and better performance.");
-            }
-        }
+    if should_warn_deprecated(headers) {
+        log::warn!("This version of the Corgea plugin is deprecated. Please upgrade to the latest version to ensure continued support and better performance.");
     }
     if status == StatusCode::GONE {
-        eprintln!("Support for this extension version has dropped. Please upgrade Corgea extension immediately to continue using it.");
+        log::error!("Support for this extension version has dropped. Please upgrade Corgea extension immediately to continue using it.");
         std::process::exit(1);
     }
 }
@@ -406,7 +413,7 @@ pub fn upload_zip(
 
         if bytes_read < CHUNK_SIZE {
             utils::terminal::show_progress_bar(1.0);
-            print!("\n");
+            println!();
             let body: HashMap<String, Value> = response.json()?;
             if let Some(scan_id_value) = body.get("scan_id") {
                 let scan_id = scan_id_value.as_str().unwrap().to_string();
@@ -596,7 +603,7 @@ pub fn get_issue(url: &str, issue: &str) -> Result<FullIssueResponse, Box<dyn st
         Err(e) => return Err(format!("Failed to send request: {}", e).into()),
     };
     let response_text = response.text()?;
-    return match serde_json::from_str::<FullIssueResponse>(&response_text) {
+    match serde_json::from_str::<FullIssueResponse>(&response_text) {
         Ok(body) => Ok(body),
         Err(e) => {
             debug(&format!(
@@ -605,7 +612,7 @@ pub fn get_issue(url: &str, issue: &str) -> Result<FullIssueResponse, Box<dyn st
             ));
             Err(format!("Failed to parse response: {}", e).into())
         }
-    };
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -785,7 +792,7 @@ pub fn verify_token(corgea_url: &str) -> Result<bool, Box<dyn Error>> {
                     "Failed to parse response as JSON: {}. Response body: {}",
                     e, body_text
                 ));
-                return Err(format!("Failed to parse response").into());
+                return Err("Failed to parse response".to_string().into());
             }
         };
 
@@ -1116,6 +1123,89 @@ pub struct SCAIssuesResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn is_jwt_accepts_three_dot_separated_non_empty_parts() {
+        assert!(is_jwt("aaa.bbb.ccc"));
+        assert!(is_jwt("header.payload.signature"));
+    }
+
+    #[test]
+    fn is_jwt_rejects_wrong_part_count() {
+        assert!(!is_jwt("aaa.bbb"));
+        assert!(!is_jwt("aaa.bbb.ccc.ddd"));
+        assert!(!is_jwt("plainstring"));
+        assert!(!is_jwt(""));
+    }
+
+    #[test]
+    fn is_jwt_rejects_when_any_part_is_empty() {
+        assert!(!is_jwt("aaa..ccc"));
+        assert!(!is_jwt(".bbb.ccc"));
+        assert!(!is_jwt("aaa.bbb."));
+    }
+
+    #[test]
+    fn auth_headers_uses_bearer_for_jwt_tokens() {
+        let headers = auth_headers("aaa.bbb.ccc");
+
+        assert_eq!(
+            headers.get("Authorization").map(|v| v.to_str().unwrap()),
+            Some("Bearer aaa.bbb.ccc")
+        );
+        assert!(headers.get("CORGEA-TOKEN").is_none());
+        assert!(headers.get("CORGEA-SOURCE").is_some());
+    }
+
+    #[test]
+    fn auth_headers_uses_corgea_token_header_for_opaque_tokens() {
+        let headers = auth_headers("opaque-token-xyz");
+
+        assert_eq!(
+            headers.get("CORGEA-TOKEN").map(|v| v.to_str().unwrap()),
+            Some("opaque-token-xyz")
+        );
+        assert!(headers.get("Authorization").is_none());
+        assert!(headers.get("CORGEA-SOURCE").is_some());
+    }
+
+    #[test]
+    fn should_warn_deprecated_false_when_no_warning_header() {
+        let headers = HeaderMap::new();
+        assert!(!should_warn_deprecated(&headers));
+    }
+
+    #[test]
+    fn should_warn_deprecated_false_for_non_299_codes() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "warning",
+            HeaderValue::from_static("199 - \"misc warning\""),
+        );
+        assert!(!should_warn_deprecated(&headers));
+    }
+
+    #[test]
+    fn should_warn_deprecated_true_for_single_299() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "warning",
+            HeaderValue::from_static("299 host \"deprecated\""),
+        );
+        assert!(should_warn_deprecated(&headers));
+    }
+
+    #[test]
+    fn should_warn_deprecated_true_when_299_in_comma_separated_list() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "warning",
+            HeaderValue::from_static("199 host \"first\", 299 host \"deprecated\""),
+        );
+        assert!(should_warn_deprecated(&headers));
+    }
+
     use std::cell::Cell;
     use std::net::TcpListener;
     use std::thread;

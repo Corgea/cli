@@ -1,0 +1,34 @@
+[[package]]
+name = "alpha"
+version = "1.0.1"
+optional = false
+python-versions = ">=3.8"
+
+[package.dependencies]
+gamma = ">=3,<4"
+
+[[package]]
+name = "beta"
+version = "2.0.1"
+optional = false
+python-versions = ">=3.8"
+
+[package.dependencies]
+delta = "^4.0"
+
+[[package]]
+name = "gamma"
+version = "3.2.1"
+optional = false
+python-versions = ">=3.8"
+
+[[package]]
+name = "delta"
+version = "4.1.0"
+optional = false
+python-versions = ">=3.8"
+
+[metadata]
+lock-version = "2.0"
+python-versions = "^3.12"
+content-hash = "0000000000000000000000000000000000000000000000000000000000000000"

@@ -1,0 +1,350 @@
+use crate::deps::ecosystems::classify_constraint;
+use crate::deps::model::{ConstraintKind, Ecosystem::Npm};
+
+#[test]
+fn npm_classify_exact_version() {
+    assert_eq!(classify_constraint(Npm, "4.18.2"), ConstraintKind::Exact);
+}
+
+#[test]
+fn npm_classify_caret_is_bounded_range() {
+    assert_eq!(
+        classify_constraint(Npm, "^4.18.2"),
+        ConstraintKind::BoundedRange
+    );
+}
+
+#[test]
+fn npm_classify_wildcard_is_unbounded() {
+    assert_eq!(classify_constraint(Npm, "*"), ConstraintKind::Unbounded);
+}
+
+#[test]
+fn npm_classify_latest_is_unbounded() {
+    assert_eq!(
+        classify_constraint(Npm, "latest"),
+        ConstraintKind::Unbounded
+    );
+}
+
+#[test]
+fn npm_classify_git_branch_is_mutable_ref() {
+    assert_eq!(
+        classify_constraint(Npm, "git+https://github.com/acme/x.git#main"),
+        ConstraintKind::GitRef { mutable: true }
+    );
+}
+
+#[test]
+fn npm_classify_git_commit_sha_is_immutable_ref() {
+    let sha = "git+https://github.com/acme/x.git#0bc1a2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9";
+    assert_eq!(
+        classify_constraint(Npm, sha),
+        ConstraintKind::GitRef { mutable: false }
+    );
+}
+
+use super::common::scan_fixture;
+use crate::deps::explain::explain;
+use crate::deps::model::{PackageId, Scope, Severity, SourceType};
+use crate::deps::policy::Policy;
+use crate::deps::scan;
+
+#[test]
+fn npm_graph_classifies_express_as_direct_production() {
+    let inv = scan_fixture("node-app");
+    let express = inv.node("express").expect("express node missing");
+    assert!(express.is_direct());
+    assert_eq!(express.scope(), Scope::Production);
+    assert_eq!(express.version(), Some("4.18.2"));
+}
+
+#[test]
+fn npm_graph_classifies_qs_as_transitive() {
+    let inv = scan_fixture("node-app");
+    let qs = inv.node("qs").expect("qs node missing");
+    assert!(!qs.is_direct());
+    assert!(qs.depth() >= 2);
+}
+
+#[test]
+fn npm_graph_classifies_jest_as_development_scope() {
+    let inv = scan_fixture("node-app");
+    assert_eq!(
+        inv.node("jest").expect("jest node missing").scope(),
+        Scope::Development
+    );
+}
+
+#[test]
+fn npm_graph_marks_git_dep_source_type() {
+    let inv = scan_fixture("node-app");
+    let git_dep = inv
+        .node("internal-utils")
+        .expect("internal-utils node missing");
+    assert_eq!(git_dep.source_type(), SourceType::GitBranch);
+}
+
+#[test]
+fn npm_purl_identity_is_canonical() {
+    let inv = scan_fixture("node-app");
+    assert_eq!(
+        *inv.node("lodash").unwrap().id(),
+        PackageId("pkg:npm/lodash@4.17.21".into())
+    );
+}
+
+#[test]
+fn npm_caret_direct_dep_is_dep003() {
+    let inv = scan_fixture("node-app");
+    assert!(
+        !inv.findings_for("express").is_empty()
+            && inv.findings_for("express").iter().any(|f| f.id == "DEP003")
+    );
+}
+
+#[test]
+fn npm_exact_dev_dep_has_no_pinning_finding() {
+    let inv = scan_fixture("node-app");
+    assert!(inv
+        .findings_for("jest")
+        .iter()
+        .all(|f| f.id != "DEP003" && f.id != "DEP004"));
+}
+
+#[test]
+fn npm_wildcard_direct_dep_is_dep004_high() {
+    let inv = scan_fixture("node-app");
+    let f = inv
+        .findings_for("lodash")
+        .into_iter()
+        .find(|f| f.id == "DEP004")
+        .expect("lodash `*` must raise DEP004");
+    assert_eq!(f.severity, Severity::High);
+}
+
+#[test]
+fn npm_latest_direct_dep_is_dep004() {
+    let inv = scan_fixture("node-app");
+    assert!(
+        inv.findings_for("left-pad")
+            .iter()
+            .any(|f| f.id == "DEP004"),
+        "left-pad `latest` must raise DEP004"
+    );
+}
+
+#[test]
+fn npm_git_branch_dep_is_dep005() {
+    let inv = scan_fixture("node-app");
+    let f = inv
+        .findings_for("internal-utils")
+        .into_iter()
+        .find(|f| f.id == "DEP005")
+        .expect("internal-utils @ #main is DEP005");
+    assert_eq!(f.severity, Severity::High);
+}
+
+#[test]
+fn git_commit_sha_is_not_dep005() {
+    let pinned = "git+https://github.com/acme/x.git#0bc1a2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9";
+    assert_eq!(
+        classify_constraint(Npm, pinned),
+        ConstraintKind::GitRef { mutable: false }
+    );
+}
+
+#[test]
+fn npm_url_dep_without_checksum_is_dep006() {
+    assert_eq!(
+        classify_constraint(Npm, "https://example.com/pkg/foo-1.0.0.tgz"),
+        ConstraintKind::Url { checksum: false }
+    );
+}
+
+#[test]
+fn npm_lock_entry_without_integrity_is_dep008() {
+    let inv = scan_fixture("node-app");
+    assert!(
+        inv.findings_for("left-pad")
+            .iter()
+            .any(|f| f.id == "DEP008"),
+        "left-pad lacks integrity — DEP008"
+    );
+}
+
+#[test]
+fn npm_lock_entry_with_integrity_no_dep008() {
+    let inv = scan_fixture("node-app");
+    for pkg in ["express", "qs", "lodash"] {
+        assert!(
+            inv.findings_for(pkg).iter().all(|f| f.id != "DEP008"),
+            "{pkg} has integrity — no DEP008"
+        );
+    }
+}
+
+#[test]
+fn npm_lock_entry_preserves_artifact_evidence() {
+    let inv = scan_fixture("node-app");
+    let express = inv.node("express").expect("express node missing");
+    assert_eq!(
+        express.lock_resolved.as_deref(),
+        Some("https://registry.npmjs.org/express/-/express-4.18.2.tgz")
+    );
+    assert_eq!(
+        express.lock_integrity_hash.as_deref(),
+        Some("sha512-5/PsL6iGPdfQ/lKM1UuielYgv3BUoJfz1aUwU9vHZ+J7gyvwdQXFEBIEIaxeGf0GIcreATNyBExtalisDbuMqQ==")
+    );
+}
+
+#[test]
+fn node_manifest_dep_missing_from_lock_is_dep002() {
+    let inv = scan_fixture("node-stale");
+    let f = inv.with_code("DEP002");
+    assert!(!f.is_empty(), "manifest/lock drift must raise DEP002");
+    assert_eq!(f[0].severity, Severity::High);
+}
+
+#[test]
+fn node_app_lock_in_sync_no_dep002() {
+    let inv = scan_fixture("node-app");
+    assert!(inv.with_code("DEP002").is_empty());
+}
+
+#[test]
+fn npm_graph_uses_generic_lockfile_edges() {
+    let inv = scan_fixture("node-transitive");
+    let child = inv.node("child-lib").expect("child-lib node missing");
+    assert!(!child.is_direct());
+    let explanation = explain(&inv.graph, "child-lib").expect("child-lib explain");
+    let paths: Vec<Vec<String>> = explanation
+        .paths
+        .iter()
+        .map(|path| path.iter().map(|p| p.name().to_string()).collect())
+        .collect();
+    assert!(
+        paths
+            .iter()
+            .any(|path| path == &["root", "parent-lib", "child-lib"]),
+        "expected parent-lib -> child-lib path, got {paths:?}"
+    );
+}
+
+#[test]
+fn npm_scoped_transitive_package_keeps_full_name() {
+    let inv = scan_fixture("node-transitive");
+    let node = inv.node("@types/node").expect("@types/node node missing");
+    assert_eq!(node.name(), "@types/node");
+    assert_eq!(node.id().name(), "@types/node");
+    assert_eq!(*node.id(), PackageId("pkg:npm/@types/node@18.19.0".into()));
+}
+
+#[test]
+fn yarn_lock_is_explicitly_unsupported_without_stale_noise() {
+    let inv = scan_fixture("node-yarn");
+    assert!(!inv.with_code("DEP019").is_empty());
+    assert!(inv.with_code("DEP002").is_empty());
+}
+
+#[test]
+fn pnpm_lock_is_explicitly_unsupported_without_stale_noise() {
+    let inv = scan_fixture("node-pnpm");
+    assert!(!inv.with_code("DEP019").is_empty());
+    assert!(inv.with_code("DEP002").is_empty());
+}
+
+#[test]
+fn npm_manifest_without_lockfile_is_dep001_not_dep002() {
+    let tmp = tempfile::TempDir::new().expect("temp project");
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{
+  "name": "npm-no-lock",
+  "version": "1.0.0",
+  "dependencies": {
+    "left-pad": "*"
+  }
+}
+"#,
+    )
+    .expect("write package.json");
+
+    let inv = scan(tmp.path(), &Policy::default()).expect("scan");
+
+    assert!(!inv.with_code("DEP001").is_empty());
+    assert!(inv.with_code("DEP002").is_empty());
+    assert!(!inv.with_code("DEP004").is_empty());
+}
+
+#[test]
+fn npm_lock_preserves_duplicate_transitive_versions() {
+    let tmp = tempfile::TempDir::new().expect("temp project");
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{
+  "name": "npm-duplicates",
+  "version": "1.0.0",
+  "dependencies": {
+    "a": "1.0.0",
+    "b": "1.0.0"
+  }
+}
+"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        tmp.path().join("package-lock.json"),
+        r#"{
+  "name": "npm-duplicates",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "name": "npm-duplicates",
+      "version": "1.0.0",
+      "dependencies": {
+        "a": "1.0.0",
+        "b": "1.0.0"
+      }
+    },
+    "node_modules/a": {
+      "version": "1.0.0",
+      "integrity": "sha512-a",
+      "dependencies": {
+        "foo": "1.0.0"
+      }
+    },
+    "node_modules/b": {
+      "version": "1.0.0",
+      "integrity": "sha512-b",
+      "dependencies": {
+        "foo": "2.0.0"
+      }
+    },
+    "node_modules/a/node_modules/foo": {
+      "version": "1.0.0",
+      "integrity": "sha512-foo1"
+    },
+    "node_modules/b/node_modules/foo": {
+      "version": "2.0.0",
+      "integrity": "sha512-foo2"
+    }
+  }
+}
+"#,
+    )
+    .expect("write package-lock.json");
+
+    let inv = scan(tmp.path(), &Policy::default()).expect("scan");
+    let mut versions: Vec<String> = inv
+        .graph
+        .nodes_named("foo")
+        .into_iter()
+        .filter_map(|node| node.version().map(str::to_string))
+        .collect();
+    versions.sort();
+
+    assert_eq!(versions, vec!["1.0.0".to_string(), "2.0.0".to_string()]);
+    assert!(!inv.with_code("DEP014").is_empty());
+}

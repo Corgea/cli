@@ -1,8 +1,6 @@
-use dirs;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::{env, fs, io};
-use toml;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -15,10 +13,8 @@ pub struct Config {
 
 impl Config {
     fn config_path() -> io::Result<PathBuf> {
-        let mut dir_path = dirs::home_dir().ok_or(io::Error::new(
-            io::ErrorKind::Other,
-            "Unable to get home directory",
-        ))?;
+        let mut dir_path =
+            dirs::home_dir().ok_or(io::Error::other("Unable to get home directory"))?;
 
         dir_path.push(".corgea");
 
@@ -98,14 +94,14 @@ impl Config {
             return corgea_token;
         }
 
-        return self.token.clone();
+        self.token.clone()
     }
     pub fn get_debug(&self) -> i8 {
         if let Ok(corgea_debug) = env::var("CORGEA_DEBUG") {
             return corgea_debug.parse::<i8>().unwrap_or(0);
         }
 
-        return self.debug;
+        self.debug
     }
 
     pub fn set_default_agent(&mut self, agent: String) -> io::Result<()> {

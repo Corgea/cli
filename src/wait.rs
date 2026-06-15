@@ -1,29 +1,29 @@
-use crate::utils;
 use crate::config::Config;
 use crate::scanners::blast;
-
+use crate::utils;
 
 pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>) {
     let project_name = match utils::generic::get_current_working_directory() {
         Some(name) => name,
         None => {
-            eprintln!("Unable to retrieve the current working directory. Please check your permissions and try again.");
+            log::error!("Unable to retrieve the current working directory. Please check your permissions and try again.");
             std::process::exit(1);
         }
     };
 
-    let scans_result = utils::api::query_scan_list(&config.get_url(), Some(&project_name), Some(1), None);
+    let scans_result =
+        utils::api::query_scan_list(&config.get_url(), Some(&project_name), Some(1), None);
     let scans: Vec<utils::api::ScanResponse> = match scans_result {
         Ok(result) => result.scans.unwrap_or_default(),
         Err(e) => {
-            eprintln!(
+            log::error!(
                 "Unable to query the scan list. Please check your connection and ensure that:
                 - The server URL is reachable.
                 - Your authentication token is valid.
 
                 Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli
 
-                Error details: {}", 
+                Error details: {}",
                 e
             );
             std::process::exit(1);
@@ -34,28 +34,31 @@ pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>)
             let processed = match blast::check_scan_status(&scan_id, &config.get_url()) {
                 Ok(processed) => processed,
                 Err(_) => {
-                    eprintln!(
+                    log::error!(
                         "\nOops! Something went wrong. Please try again later or check your setup.\n"
                     );
                     std::process::exit(1);
                 }
             };
             (scan_id.to_string(), processed)
-        },
-        None => {
-            match scans.get(0) {
-                Some(scan) => (scan.id.clone(), scan.status == "Complete"),
-                None => {
-                    eprintln!("Error querying scan list");
-                    std::process::exit(1);
-                }
-            }
         }
+        None => match scans.first() {
+            Some(scan) => (scan.id.clone(), scan.status == "Complete"),
+            None => {
+                log::error!("Error querying scan list");
+                std::process::exit(1);
+            }
+        },
     };
 
     let scan_url = match &project_id {
         Some(pid) => format!("{}/project/{}/?scan_id={}", config.get_url(), pid, scan_id),
-        None => format!("{}/project/{}?scan_id={}", config.get_url(), project_name, scan_id),
+        None => format!(
+            "{}/project/{}?scan_id={}",
+            config.get_url(),
+            project_name,
+            scan_id
+        ),
     };
 
     if !processed {
@@ -70,7 +73,7 @@ pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>)
         );
         blast::wait_for_scan(config, &scan_id);
     } else {
-        print!("Scan has been processed successfully!\n");
+        println!("Scan has been processed successfully!");
     }
 
     match blast::report_scan_status(&config.get_url(), &project_name) {
@@ -79,9 +82,9 @@ pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>)
                 "\n\nYou can view the scan results at the following link:\n{}",
                 utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
             );
-        },
+        }
         Err(e) => {
-            eprintln!(
+            log::error!(
                 "\n\n{}\n\n\
                 However, the scan results may still be accessible at the following link:\n\n\
                 {}\n\n\
@@ -89,7 +92,10 @@ pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>)
                 - Server URL: {}\n\
                 - Error details: {}\n",
                 utils::terminal::set_text_color(
-                    &format!("Failed to report the scan status for project: '{}'.", project_name),
+                    &format!(
+                        "Failed to report the scan status for project: '{}'.",
+                        project_name
+                    ),
                     utils::terminal::TerminalColor::Red
                 ),
                 utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Blue),

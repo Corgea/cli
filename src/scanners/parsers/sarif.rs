@@ -1,29 +1,38 @@
-use serde_json::Value;
+use super::{ParseResult, ScanParser};
 use crate::log::debug;
-use super::{ScanParser, ParseResult};
+use serde_json::Value;
 
 pub struct SarifParser;
 
 impl ScanParser for SarifParser {
     fn detect(&self, input: &str) -> bool {
         if let Ok(data) = serde_json::from_str::<Value>(input) {
-            let schema = data.get("$schema").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let schema = data
+                .get("$schema")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             schema.contains("sarif")
         } else {
             false
         }
     }
-    
+
     fn parse(&self, input: &str) -> Option<ParseResult> {
         debug("Detected sarif schema");
-        
+
         let data: Value = match serde_json::from_str(input) {
             Ok(data) => data,
             Err(_) => return None,
         };
-        
-        let run = data.get("runs").and_then(|v| v.as_array()).and_then(|v| v.get(0));
-        let driver = run.and_then(|v| v.get("tool")).and_then(|v| v.get("driver")).and_then(|v| v.get("name"));
+
+        let run = data
+            .get("runs")
+            .and_then(|v| v.as_array())
+            .and_then(|v| v.first());
+        let driver = run
+            .and_then(|v| v.get("tool"))
+            .and_then(|v| v.get("driver"))
+            .and_then(|v| v.get("name"));
         let tool = driver.and_then(|v| v.as_str()).unwrap_or("unknown");
 
         let scanner = match tool {
@@ -36,7 +45,7 @@ impl ScanParser for SarifParser {
                 "codeql".to_string()
             }
             _ => {
-                eprintln!("{} is not supported at this time.", tool);
+                log::error!("{} is not supported at this time.", tool);
                 return None;
             }
         };
@@ -46,12 +55,15 @@ impl ScanParser for SarifParser {
             for run in runs {
                 if let Some(results) = run.get("results").and_then(|v| v.as_array()) {
                     for result in results {
-                        if let Some(locations) = result.get("locations").and_then(|v| v.as_array()) {
+                        if let Some(locations) = result.get("locations").and_then(|v| v.as_array())
+                        {
                             for location in locations {
-                                if let Some(uri) = location.get("physicalLocation")
+                                if let Some(uri) = location
+                                    .get("physicalLocation")
                                     .and_then(|v| v.get("artifactLocation"))
                                     .and_then(|v| v.get("uri"))
-                                    .and_then(|v| v.as_str()) {
+                                    .and_then(|v| v.as_str())
+                                {
                                     paths.push(uri.to_string());
                                 }
                             }
@@ -60,11 +72,50 @@ impl ScanParser for SarifParser {
                 }
             }
         }
-        
+
         Some(ParseResult { paths, scanner })
     }
-    
+
     fn scanner_name(&self) -> &str {
         "sarif"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_returns_none_for_unsupported_tool() {
+        // Valid JSON but an unsupported driver name hits the `_` arm
+        // (`log::error!("{} is not supported…")`) and returns `None`.
+        let input = r#"{"runs":[{"tool":{"driver":{"name":"FortifyXYZ"}}}]}"#;
+        assert!(SarifParser.parse(input).is_none());
+    }
+
+    #[test]
+    fn parse_returns_none_for_malformed_json() {
+        assert!(SarifParser.parse("{not valid json").is_none());
+    }
+
+    #[test]
+    fn parse_returns_paths_for_supported_tool() {
+        let input = r#"{
+            "runs": [{
+                "tool": {"driver": {"name": "SnykCode"}},
+                "results": [{
+                    "locations": [{
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": "src/app.py"}
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+        let result = SarifParser
+            .parse(input)
+            .expect("expected Some(ParseResult)");
+        assert_eq!(result.scanner, "snyk");
+        assert_eq!(result.paths, vec!["src/app.py".to_string()]);
     }
 }

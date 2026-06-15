@@ -1,0 +1,8 @@
+dependency_policy:
+  require_lockfile: true
+  fail_on_missing_lockfile: true
+  fail_on_stale_lockfile: true
+  direct_dependencies:
+    fail_on_wildcard: true
+    fail_on_latest: true
+    warn_on_semver_range: true
