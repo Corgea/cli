@@ -1,11 +1,12 @@
 //! Corgea vuln-api client.
 //!
-//! Deliberately independent of `utils::api::SHARED_CLIENT` because:
-//!   * the vuln-api host is user-configurable via `CORGEA_VULN_API_URL`,
-//!     so we must never silently replay Corgea cookies or auth headers
-//!     via redirect following or the shared cookie jar.
-//!   * the shared client's `check_for_warnings` exits the process on
-//!     HTTP 410, which is wrong for per-dep CVE lookups.
+//! Deliberately separate from `utils::api::SHARED_CLIENT`, not duplication
+//! by accident: the vuln-api host is user-configurable via
+//! `CORGEA_VULN_API_URL`, so this client must never replay Corgea
+//! credentials there. It attaches no auth, uses no cookie jar, follows no
+//! redirects, and returns HTTP errors instead of exiting on 410 like the
+//! shared client. `public_check_sends_no_auth_headers` guards the
+//! no-credential invariant.
 //!
 //! This phase attaches no Corgea credential: the staging deployment
 //! (`VULN_API_REQUIRE_AUTH=false`) accepts anonymous checks. The
