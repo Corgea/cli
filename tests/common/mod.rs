@@ -284,3 +284,22 @@ impl GateHarness {
         std::fs::read_to_string(&self.marker).ok()
     }
 }
+
+/// `corgea` wired to the wildcard pypi registry stub (every package
+/// published 2020 → recency never blocks), a fake pip recording its argv
+/// to a marker, and a vuln-api stub. Every block in a `pip_harness` test
+/// is the verdict's doing.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn pip_harness(
+    checks: HashMap<PackageKey, String>,
+    statuses: HashMap<PackageKey, u16>,
+    pip_exit_code: i32,
+) -> GateHarness {
+    GateHarness::new()
+        .fake_recorder("pip", pip_exit_code)
+        .wildcard_pypi_registry()
+        .vuln_checks(checks)
+        .vuln_statuses(statuses)
+        .build()
+}

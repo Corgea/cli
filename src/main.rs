@@ -199,6 +199,57 @@ enum Commands {
         #[command(subcommand)]
         command: corgea::deps::run::DepsSubcommand,
     },
+    /// Wrap `npm` commands: gate install targets on recency + vuln verdicts, then run npm.
+    Npm(InstallWrapArgs),
+    /// Wrap `pip` commands: gate install targets on recency + vuln verdicts, then run pip.
+    Pip(InstallWrapArgs),
+}
+
+/// Shared flags for the install-wrapper subcommands (`corgea npm|pip`).
+#[derive(clap::Args, Debug, Clone)]
+struct InstallWrapArgs {
+    #[arg(
+        long,
+        short = 't',
+        default_value = "2d",
+        value_parser = corgea::verify_deps::parse_threshold,
+        help = "Recency threshold. Resolved versions younger than this are blocked. e.g. '2d', '12h'."
+    )]
+    threshold: std::time::Duration,
+
+    #[arg(
+        long,
+        help = "Demote a recency block to a printed warning. The install still runs."
+    )]
+    no_fail: bool,
+
+    #[arg(
+        long,
+        help = "Proceed with the install despite vulnerable or recent findings. Findings are still printed."
+    )]
+    force: bool,
+
+    /// Arguments forwarded to the package manager (subcommand and package specs).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    cmd: Vec<String>,
+}
+
+fn install_wrap_options(args: &InstallWrapArgs) -> corgea::precheck::PrecheckOptions {
+    corgea::precheck::PrecheckOptions {
+        threshold: args.threshold,
+        no_fail: args.no_fail,
+        force: args.force,
+        verdict: Some(corgea::precheck::VerdictConfig {
+            base_url: config::vuln_api_url(),
+        }),
+        npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
+        pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
+    }
+}
+
+fn run_install_wrap_command(manager: corgea::precheck::PackageManager, args: &InstallWrapArgs) {
+    let code = corgea::precheck::run_install(manager, &args.cmd, install_wrap_options(args));
+    std::process::exit(code);
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -504,7 +555,19 @@ fn main() {
             // Offline: no token / network. Exit code propagates fail-on policy.
             std::process::exit(i32::from(corgea::deps::run::run(command.clone())));
         }
+        // Install wrappers: no auth gate. Public CVE checks run without a
+        // token and fail open on lookup outages.
+        Some(Commands::Npm(args)) => {
+            run_install_wrap_command(corgea::precheck::PackageManager::Npm, args)
+        }
+        Some(Commands::Pip(args)) => {
+            run_install_wrap_command(corgea::precheck::PackageManager::Pip, args)
+        }
         None => {
+            if let Some(message) = corgea::precheck::pip3_alias_message(&cli.args) {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }
             utils::terminal::show_welcome_message();
             let _ = Cli::command().print_help();
             println!();
