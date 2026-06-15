@@ -539,6 +539,18 @@ mod tests {
     use tokio::runtime::Runtime;
     use tokio::time::{timeout, Duration};
 
+    // Serializes tests that bind ephemeral ports. `cargo test` runs the module's
+    // tests on parallel threads; without this lock one test's just-freed port can
+    // be handed to another between a `drop` and a re-check, which made
+    // `port_is_available_reflects_current_port_usage` flake.
+    static PORT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_ports() -> std::sync::MutexGuard<'static, ()> {
+        PORT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn reserve_ephemeral_port() -> u16 {
         let listener = StdTcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
         listener
@@ -624,6 +636,7 @@ mod tests {
 
     #[test]
     fn port_is_available_reflects_current_port_usage() {
+        let _guard = lock_ports();
         let listener = StdTcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
         let port = listener
             .local_addr()
@@ -637,6 +650,7 @@ mod tests {
 
     #[test]
     fn find_available_port_skips_ports_that_are_in_use() {
+        let _guard = lock_ports();
         let listener = StdTcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
         let occupied_port = listener
             .local_addr()
@@ -650,7 +664,12 @@ mod tests {
 
     #[tokio::test]
     async fn start_callback_server_returns_without_waiting_for_second_connection() {
-        let port = reserve_ephemeral_port();
+        // Reserve under the lock so the :0 probe can't race the sync port tests;
+        // the guard drops before the await, so no lock is held across `.await`.
+        let port = {
+            let _guard = lock_ports();
+            reserve_ephemeral_port()
+        };
         let auth_code = Arc::new(Mutex::new(Some("test-code".to_string())));
 
         let returned_code = timeout(
@@ -666,6 +685,7 @@ mod tests {
 
     #[test]
     fn start_callback_server_returns_bind_error_if_port_is_occupied() {
+        let _guard = lock_ports();
         let listener = StdTcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
         let occupied_port = listener
             .local_addr()
@@ -684,6 +704,7 @@ mod tests {
 
     #[test]
     fn callback_server_serves_waiting_error_and_success_pages_then_returns_code() {
+        let _guard = lock_ports();
         let port = reserve_ephemeral_port();
         let auth_code = Arc::new(Mutex::new(None::<String>));
         let result_rx = spawn_callback_server(port, auth_code);

@@ -367,7 +367,10 @@ fn exact_version_from_declared(name: &str, declared: &str) -> Option<String> {
     Some(declared.trim_start_matches('=').trim().to_string())
 }
 
-fn normalize_pypi_name(name: &str) -> String {
+/// PEP 503 name normalization: lowercase, runs of `-`/`_`/`.` collapse to `-`.
+/// Also used by the vuln-api client (`vuln_api`) so both features share one
+/// canonical pypi name form.
+pub(crate) fn normalize_pypi_name(name: &str) -> String {
     let mut out = String::new();
     let mut last_was_separator = false;
     for c in name.trim().chars() {

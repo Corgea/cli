@@ -344,6 +344,7 @@ version = "1.9.0"
 dependencies = [
  "chrono",
  "clap",
+ "corgea",
  "dirs",
  "env_logger",
  "git2",

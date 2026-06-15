@@ -18,8 +18,9 @@ use std::path::Path;
 const CHUNK_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 const API_BASE: &str = "/api/v1";
 
-fn get_source() -> String {
-    std::env::var("CORGEA_SOURCE").unwrap_or_else(|_| "cli".to_string())
+fn get_source() -> &'static str {
+    // One definition of the CORGEA-SOURCE value (cached there).
+    corgea::vuln_api::source()
 }
 
 fn is_jwt(token: &str) -> bool {
