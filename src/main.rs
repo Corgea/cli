@@ -6,6 +6,7 @@ mod list;
 mod log;
 mod scan;
 mod setup_hooks;
+mod skill;
 mod wait;
 mod scanners {
     pub mod blast;
@@ -122,6 +123,12 @@ enum Commands {
 
         #[arg(
             long,
+            help = "Exclude files matching glob patterns from the scan. Accepts comma-separated glob patterns. Examples: 'tests/**', 'src/**/*.test.ts,**/*.spec.js', '*.md'."
+        )]
+        exclude: Option<String>,
+
+        #[arg(
+            long,
             help = "The name of the Corgea project. Defaults to git repository name if found, otherwise to the current directory name."
         )]
         project_name: Option<String>,
@@ -194,10 +201,54 @@ enum Commands {
         )]
         default_config: bool,
     },
+    /// Manage agent skills from the Corgea registry
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommands,
+    },
     /// Offline dependency inventory: scan, graph, explain, diff, sbom, policy
     Deps {
         #[command(subcommand)]
         command: corgea::deps::run::DepsSubcommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillCommands {
+    /// Install an approved skill into your agent's skills directory
+    Install {
+        #[arg(help = "Skill name, optionally with a version: name or name@version")]
+        name: String,
+
+        #[arg(
+            long,
+            help = "Agent to install for (e.g. cursor, claude-code, codex). Defaults to the configured default agent."
+        )]
+        agent: Option<String>,
+
+        #[arg(
+            long,
+            default_value = "project",
+            help = "Installation scope: project or user."
+        )]
+        scope: String,
+
+        #[arg(
+            long,
+            help = "Install to a custom directory (overrides --agent and --scope)."
+        )]
+        dir: Option<String>,
+
+        #[arg(
+            long,
+            help = "Persist the provided --agent as the default for future installs."
+        )]
+        set_default: bool,
+    },
+    /// Configure the default agent used when --agent is not provided
+    SetDefaultAgent {
+        #[arg(help = "Agent id (e.g. cursor, claude-code, codex).")]
+        agent: String,
     },
 }
 
@@ -353,6 +404,7 @@ fn main() {
             out_format,
             out_file,
             target,
+            exclude,
             project_name,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
@@ -438,6 +490,11 @@ fn main() {
                     ::log::warn!("\nWarning: you didn't specify an only policy scan, so all other types of scans will run as well.");
                 }
             }
+            if exclude.is_some() && *scanner != Scanner::Blast {
+                ::log::error!("exclude is only supported with blast scanner.");
+                std::process::exit(1);
+            }
+
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config, project_name.clone()),
                 Scanner::Semgrep => scan::run_semgrep(&corgea_config, project_name.clone()),
@@ -451,6 +508,7 @@ fn main() {
                     out_format.clone(),
                     out_file.clone(),
                     target.clone(),
+                    exclude.clone(),
                     project_name.clone(),
                 ),
             }
@@ -500,6 +558,28 @@ fn main() {
         Some(Commands::SetupHooks { default_config }) => {
             setup_hooks::setup_pre_commit_hook(*default_config);
         }
+        Some(Commands::Skill { command }) => match command {
+            SkillCommands::Install {
+                name,
+                agent,
+                scope,
+                dir,
+                set_default,
+            } => {
+                verify_token_and_exit_when_fail(&corgea_config);
+                skill::run_install(
+                    &mut corgea_config,
+                    name,
+                    agent.clone(),
+                    scope,
+                    dir.clone(),
+                    *set_default,
+                );
+            }
+            SkillCommands::SetDefaultAgent { agent } => {
+                skill::run_set_default_agent(&mut corgea_config, agent);
+            }
+        },
         Some(Commands::Deps { command }) => {
             // Offline: no token / network. Exit code propagates fail-on policy.
             std::process::exit(i32::from(corgea::deps::run::run(command.clone())));
