@@ -127,6 +127,22 @@ pub fn spawn_wildcard_pypi_stub() -> String {
     })
 }
 
+/// npm analog of `spawn_wildcard_pypi_stub`: serves a packument at `/<name>`
+/// for any single-segment (unscoped) name, always version 1.0.0 published
+/// 2020 → never recent. Everything else 404s.
+#[allow(dead_code)]
+pub fn spawn_wildcard_npm_stub() -> String {
+    spawn_http_stub(|path| {
+        let name = path
+            .strip_prefix("/")
+            .filter(|n| !n.is_empty() && !n.contains('/'));
+        match name {
+            Some(_) => ("200 OK", npm_packument("1.0.0", OLD_TS)),
+            None => ("404 Not Found", NOT_FOUND_JSON.to_string()),
+        }
+    })
+}
+
 /// Write `script` as the executable `dir/binary`.
 #[cfg(unix)]
 #[allow(dead_code)]
@@ -229,6 +245,12 @@ impl GateHarness {
         self
     }
 
+    pub fn wildcard_npm_registry(mut self) -> Self {
+        let url = spawn_wildcard_npm_stub();
+        self.cmd.env("CORGEA_NPM_REGISTRY", &url);
+        self
+    }
+
     pub fn registry_env(mut self, var: &str, url: &str) -> Self {
         self.cmd.env(var, url);
         self
@@ -299,6 +321,25 @@ pub fn pip_harness(
     GateHarness::new()
         .fake_recorder("pip", pip_exit_code)
         .wildcard_pypi_registry()
+        .vuln_checks(checks)
+        .vuln_statuses(statuses)
+        .build()
+}
+
+/// npm counterpart of `pip_harness`: a fake `npm` recording its argv, the
+/// wildcard npm registry stub (every package published 2020 → recency never
+/// blocks), and a vuln-api stub. Every block in an `npm_harness` test is the
+/// verdict's doing.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn npm_harness(
+    checks: HashMap<PackageKey, String>,
+    statuses: HashMap<PackageKey, u16>,
+    npm_exit_code: i32,
+) -> GateHarness {
+    GateHarness::new()
+        .fake_recorder("npm", npm_exit_code)
+        .wildcard_npm_registry()
         .vuln_checks(checks)
         .vuln_statuses(statuses)
         .build()

@@ -45,6 +45,12 @@ pub(super) fn exec_command(binary: &str, args: &[String]) -> i32 {
 
     let mut command = Command::new(&resolved);
     command.args(&os_args);
+    // No timeout here on purpose: this is the user's real `pip`/`npm install`,
+    // which can legitimately run for minutes (large downloads, native builds),
+    // and force-killing it would corrupt the install. The gate's own network
+    // work — registry resolution and the vuln-api verdict — is what could hang
+    // a precheck, and both already cap at a 30s REQUEST_TIMEOUT before we ever
+    // reach this exec.
     match command.status() {
         Ok(status) => status.code().unwrap_or_else(|| {
             #[cfg(unix)]

@@ -169,8 +169,14 @@ corgea pip list                       # non-install subcommands pass straight th
 | `--no-fail` | | Demote a recency block to a warning. Does NOT bypass vulnerable blocks. |
 | `--force` | | Proceed despite all findings (vulnerable, recent). Findings still print. |
 
-Overrides for testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`,
-`CORGEA_VULN_API_URL`.
+Overrides for testing — each takes a base URL the gate dials instead of the
+default:
+
+| Env var | Expects | Default |
+|---------|---------|---------|
+| `CORGEA_PYPI_REGISTRY` | PyPI JSON API base (queried at `<base>/pypi/<name>/json`) | `https://pypi.org` |
+| `CORGEA_NPM_REGISTRY` | npm registry base (queried at `<base>/<name>`) | `https://registry.npmjs.org` |
+| `CORGEA_VULN_API_URL` | Corgea vuln-api base | staging worker |
 
 #### Limitations
 
