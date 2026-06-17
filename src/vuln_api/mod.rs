@@ -1,11 +1,12 @@
 //! Corgea vuln-api client.
 //!
-//! Deliberately independent of `utils::api::SHARED_CLIENT` because:
-//!   * the vuln-api host is user-configurable via `CORGEA_VULN_API_URL`,
-//!     so we must never silently replay Corgea cookies or auth headers
-//!     via redirect following or the shared cookie jar.
-//!   * the shared client's `check_for_warnings` exits the process on
-//!     HTTP 410, which is wrong for per-dep CVE lookups.
+//! Deliberately separate from `utils::api::SHARED_CLIENT`, not duplication
+//! by accident: the vuln-api host is user-configurable via
+//! `CORGEA_VULN_API_URL`, so this client must never replay Corgea
+//! credentials there. It attaches no auth, uses no cookie jar, follows no
+//! redirects, and returns HTTP errors instead of exiting on 410 like the
+//! shared client. `public_check_sends_no_auth_headers` guards the
+//! no-credential invariant.
 //!
 //! This phase attaches no Corgea credential: the staging deployment
 //! (`VULN_API_REQUIRE_AUTH=false`) accepts anonymous checks. The
@@ -45,8 +46,10 @@ impl Ecosystem {
     }
 
     /// Canonical package name for IDENTITY COMPARISONS: PEP 503 for pypi
-    /// (shared with `deps`), verbatim for npm (names are case-sensitive).
-    /// Not the wire spelling — see `request_name`.
+    /// (shared with `deps`), verbatim for npm. The server lowercases every
+    /// ecosystem for lookup (worker.js `normalizePackageName`) and the
+    /// identity check below compares case-insensitively, so npm casing is
+    /// not load-bearing. Not the wire spelling — see `request_name`.
     pub fn normalize_name(self, name: &str) -> String {
         match self {
             Ecosystem::Npm => name.to_string(),
@@ -80,7 +83,7 @@ pub struct VulnCheckResponse {
 pub struct VulnMatch {
     pub advisory_id: String,
     pub severity_level: String,
-    pub tier: u8,
+    pub tier: Option<u8>,
     pub vulnerable_version_range: Option<String>,
     pub fixed_version: Option<String>,
 }
@@ -108,14 +111,20 @@ pub fn http_client() -> Result<reqwest::blocking::Client, String> {
 }
 
 /// URL-encode an npm package name for a URL path segment. Scoped names
-/// contain `@` and `/`; the latter must be encoded as `%2f`.
+/// (`@scope/pkg`) keep the readable `@…%2f…` shape, but every component is
+/// percent-encoded so a name carrying other reserved characters can't break
+/// out of its path segment (pypi already encodes the whole segment).
 pub(crate) fn encode_npm_name(name: &str) -> String {
     if let Some(stripped) = name.strip_prefix('@') {
         if let Some((scope, pkg)) = stripped.split_once('/') {
-            return format!("@{}%2f{}", scope, pkg);
+            return format!(
+                "@{}%2f{}",
+                urlencoding::encode(scope),
+                urlencoding::encode(pkg)
+            );
         }
     }
-    name.to_string()
+    urlencoding::encode(name).into_owned()
 }
 
 /// Encode package name for the vuln-api path segment.
@@ -128,14 +137,14 @@ fn encode_package_name(ecosystem: Ecosystem, name: &str) -> String {
 }
 
 /// Value for the `CORGEA-SOURCE` header: the `CORGEA_SOURCE` env override,
-/// otherwise `cli`. Read once and cached — it's attached per request from
-/// concurrent pool workers, and `std::env::var` takes the process-global
-/// env lock.
-pub fn source() -> String {
+/// otherwise `cli`. Read once and cached, then borrowed (no per-request
+/// clone) — it's attached per request from concurrent pool workers, and
+/// `std::env::var` takes the process-global env lock.
+pub fn source() -> &'static str {
     static SOURCE: OnceLock<String> = OnceLock::new();
     SOURCE
         .get_or_init(|| std::env::var("CORGEA_SOURCE").unwrap_or_else(|_| "cli".to_string()))
-        .clone()
+        .as_str()
 }
 
 /// Build a JSON GET with the standard `Accept` / `CORGEA-SOURCE` headers.
@@ -155,8 +164,8 @@ fn build_json_get(
 /// Validate the per-call preconditions shared by every vuln-api request:
 /// a non-empty (trailing-slash-normalized) base URL. Returns the normalized
 /// base so callers don't re-derive it.
-fn validated_base(base_url: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let base = base_url.trim_end_matches('/').to_string();
+fn validated_base(base_url: &str) -> Result<&str, Box<dyn std::error::Error>> {
+    let base = base_url.trim_end_matches('/');
     if base.is_empty() {
         return Err("vuln-api base URL is empty".into());
     }
@@ -260,9 +269,12 @@ pub fn check_package_version(
     })?;
 
     // Confused-deputy guard: refuse to attribute advisories to a different
-    // (name, version, ecosystem) than what we asked about. The server is
-    // allowed to be silent on identity, but if it answers, it must match.
-    // Comparisons are case-insensitive: staging spells pypi "PyPI".
+    // (name, version, ecosystem) than what we asked about. The current
+    // server echoes ecosystem/name/version verbatim from the request path
+    // (worker.js `packageVersionCheckCliHandler`), so this can only fire on
+    // a tampering or misbehaving intermediary — defense in depth, not a live
+    // server contract. Comparisons stay case-insensitive to tolerate a
+    // future server that echoes a stored spelling/casing instead.
     if !parsed.ecosystem.is_empty()
         && !parsed
             .ecosystem
@@ -300,13 +312,17 @@ pub fn check_package_version(
         .into());
     }
 
-    // is_vulnerable=true with no matches is contradictory — treat as an
-    // error so the caller can surface it rather than silently demoting
-    // the dep to "clean".
-    if parsed.is_vulnerable && parsed.matches.is_empty() {
-        return Err(
-            "vuln-api reported is_vulnerable=true with no matches; refusing to interpret".into(),
-        );
+    // `is_vulnerable` must agree with the presence of matches in BOTH
+    // directions. true+empty is a contradictory verdict; false+non-empty is
+    // the dangerous one — a caller keying "clean" off `is_vulnerable` would
+    // silently drop real advisories. Refuse either rather than guess.
+    if parsed.is_vulnerable == parsed.matches.is_empty() {
+        return Err(format!(
+            "vuln-api verdict is contradictory (is_vulnerable={}, matches={}); refusing to interpret",
+            parsed.is_vulnerable,
+            parsed.matches.len()
+        )
+        .into());
     }
 
     Ok(parsed)
@@ -567,7 +583,7 @@ mod tests {
         assert!(parsed.is_vulnerable);
         assert_eq!(parsed.matches.len(), 1);
         assert_eq!(parsed.matches[0].advisory_id, "GHSA-xxxx-yyyy-zzzz");
-        assert_eq!(parsed.matches[0].tier, 1);
+        assert_eq!(parsed.matches[0].tier, Some(1));
     }
 
     #[test]
@@ -620,7 +636,7 @@ mod tests {
         let m = &parsed.matches[0];
         assert_eq!(m.advisory_id, "GHSA-xxxx-yyyy-zzzz");
         assert_eq!(m.severity_level, "high");
-        assert_eq!(m.tier, 1);
+        assert_eq!(m.tier, Some(1));
         assert_eq!(m.vulnerable_version_range.as_deref(), Some(">=3.2,<3.2.5"));
         assert_eq!(m.fixed_version.as_deref(), Some("3.2.5"));
     }

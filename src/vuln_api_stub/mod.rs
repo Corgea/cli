@@ -7,9 +7,9 @@ pub type PackageKey = (String, String, String);
 
 /// `(ecosystem, name, version)` key for the stub's route tables. Applies the
 /// REAL server's normalization (worker.js `normalizePackageName`: lowercase
-/// + trim, NOT PEP 503) on both the fixture and lookup sides. The stub must
-/// miss exactly when production would miss — a looser rule here would mask
-/// client/server normalization divergence in tests.
+/// and trim, NOT PEP 503) on both the fixture and lookup sides. The stub
+/// must miss exactly when production would miss — a looser rule here would
+/// mask client/server normalization divergence in tests.
 pub fn key(eco: &str, name: &str, ver: &str) -> PackageKey {
     (eco.to_string(), name.trim().to_lowercase(), ver.to_string())
 }

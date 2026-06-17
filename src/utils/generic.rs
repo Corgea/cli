@@ -36,10 +36,12 @@ const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
 /// - If `target` is `None`, performs a full repository scan (equivalent to scanning all files).
 /// - If `target` is `Some(target_str)`, resolves the target using the targets module and creates zip from those files.
 ///   The target string can be a comma-separated list of files, directories, globs, or git selectors.
+/// - `user_exclude` is an optional comma-separated list of glob patterns from `--exclude`.
 pub fn create_zip_from_target<P: AsRef<Path>>(
     target: Option<&str>,
     output_zip: P,
     exclude_globs: Option<&[&str]>,
+    user_exclude: Option<&str>,
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let exclude_globs = exclude_globs.unwrap_or(DEFAULT_EXCLUDE_GLOBS);
 
@@ -49,9 +51,12 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     }
     let glob_set = glob_builder.build()?;
 
+    let user_exclude_glob_set = crate::targets::build_user_exclude_glob_set(user_exclude)
+        .map_err(|e| format!("Failed to build exclude patterns: {}", e))?;
+
     let files_to_zip: Vec<(PathBuf, PathBuf)> = if let Some(target_str) = target {
         let current_dir = env::current_dir()?;
-        let result = crate::targets::resolve_targets(target_str)
+        let result = crate::targets::resolve_targets_with_exclude(target_str, user_exclude)
             .map_err(|e| format!("Failed to resolve targets: {}", e))?;
 
         result
@@ -78,6 +83,15 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
 
             if path.is_file() || path.is_dir() {
                 let relative_path = path.strip_prefix(directory)?;
+                if path.is_file()
+                    && crate::targets::is_file_excluded(
+                        relative_path,
+                        Path::new(""),
+                        &user_exclude_glob_set,
+                    )
+                {
+                    continue;
+                }
                 files.push((path.to_path_buf(), relative_path.to_path_buf()));
             }
         }
@@ -342,7 +356,7 @@ mod tests {
         // which would exclude *everything*. The filter + warn path under test
         // is identical either way.
         let excludes: &[&str] = &["**/node_modules/**"];
-        let added = create_zip_from_target(Some(&target), &output_zip, Some(excludes))
+        let added = create_zip_from_target(Some(&target), &output_zip, Some(excludes), None)
             .expect("zip creation should succeed");
 
         assert!(

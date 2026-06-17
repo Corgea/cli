@@ -9,6 +9,8 @@ pub struct Config {
     pub(crate) url: String,
     pub(crate) debug: i8,
     pub(crate) token: String,
+    #[serde(default)]
+    pub(crate) default_agent: Option<String>,
 }
 
 impl Config {
@@ -36,6 +38,7 @@ impl Config {
                 url: "https://www.corgea.app".to_string(),
                 debug: 0,
                 token: "".to_string(),
+                default_agent: None,
             };
 
             let toml = toml::to_string(&config).expect("Failed to serialize config");
@@ -101,6 +104,21 @@ impl Config {
         }
 
         self.debug
+    }
+
+    pub fn set_default_agent(&mut self, agent: String) -> io::Result<()> {
+        self.default_agent = Some(agent);
+        self.save()
+    }
+
+    pub fn get_default_agent(&self) -> Option<String> {
+        if let Ok(agent) = env::var("CORGEA_DEFAULT_AGENT") {
+            if !agent.trim().is_empty() {
+                return Some(agent);
+            }
+        }
+
+        self.default_agent.clone()
     }
 }
 
