@@ -268,7 +268,7 @@ cmd_pre_commit() {
     printf "\n%s[pre-commit]%s\n\n" "$BLUE" "$RESET"
     # Check-only: never rewrite the working tree behind the commit.
     # Mirrors the CI gate so anything that passes here passes there.
-    run "Clippy (strict)" 0 -- cargo clippy -- -D warnings
+    run "Clippy (strict)" 0 -- cargo clippy --all-targets -- -D warnings
     run "Format check" 0 -- cargo fmt --check
     cmd_test
 }
@@ -282,7 +282,7 @@ cmd_check() {
     [ $? -eq 0 ] && passed=$(( passed + 1 )) || failed=$(( failed + 1 ))
     run "Format" 1 -- cargo fmt
     [ $? -eq 0 ] && passed=$(( passed + 1 )) || failed=$(( failed + 1 ))
-    run "Clippy (strict)" 1 -- cargo clippy -- -D warnings
+    run "Clippy (strict)" 1 -- cargo clippy --all-targets -- -D warnings
     [ $? -eq 0 ] && passed=$(( passed + 1 )) || failed=$(( failed + 1 ))
     run_with_summary "Tests" 1 -- cargo test
     [ $? -eq 0 ] && passed=$(( passed + 1 )) || failed=$(( failed + 1 ))
@@ -304,7 +304,7 @@ cmd_check() {
 
 cmd_ci() {
     printf "\n%s[ci]%s\n\n" "$BLUE" "$RESET"
-    run "Clippy (strict)" 0 -- cargo clippy -- -D warnings
+    run "Clippy (strict)" 0 -- cargo clippy --all-targets -- -D warnings
     run "Format check" 0 -- cargo fmt --check
     _cmd_audit_inner 1
     if ! cargo llvm-cov --version >/dev/null 2>&1; then

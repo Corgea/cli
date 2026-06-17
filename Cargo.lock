@@ -340,10 +340,11 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "corgea"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "chrono",
  "clap",
+ "corgea",
  "dirs",
  "env_logger",
  "git2",

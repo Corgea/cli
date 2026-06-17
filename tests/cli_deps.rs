@@ -898,8 +898,15 @@ fn commit_all(repo: &std::path::Path, message: &str) {
 }
 
 fn run_git(repo: &std::path::Path, args: &[&str]) {
+    // Scrub the GIT_* env a parent git process injects (e.g. when these
+    // tests run from a pre-commit hook): an inherited GIT_DIR would point
+    // `git init` at the developer's repo instead of `repo`.
     let output = Command::new("git")
         .current_dir(repo)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
         .args(args)
         .output()
         .expect("run git");

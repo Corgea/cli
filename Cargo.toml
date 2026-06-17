@@ -1,9 +1,22 @@
 [package]
 name = "corgea"
-version = "1.9.0"
+version = "1.9.1"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "corgea"
+path = "src/main.rs"
+
+[features]
+# Compiles the in-crate vuln-api test stub (`vuln_api_stub`). Enabled for all
+# test builds via the self dev-dependency below; never part of release builds.
+test-stub = []
+
+[dev-dependencies]
+corgea = { path = ".", features = ["test-stub"] }
+tempfile = "3.12.0"
 
 [dependencies]
 clap = { version = "4.4.13", features = ["derive"] }
@@ -45,6 +58,3 @@ serde_yaml_ng = "0.10"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
-
-[dev-dependencies]
-tempfile = "3.12.0"
