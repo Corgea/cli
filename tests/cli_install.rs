@@ -277,6 +277,38 @@ fn npm_install_verb_behind_global_flags_is_still_gated() {
 }
 
 #[test]
+fn npm_install_aliases_are_gated_not_passed_through() {
+    // npm accepts many install aliases (and tolerates the typo `isntall`).
+    // Each must route through the GATE, not the ungated passthrough: a
+    // fresh-pinned package blocks (exit 1, npm never runs). If the alias
+    // slipped past the gate, npm would run the fresh package instead.
+    for alias in ["isntall", "in", "ins"] {
+        let mut h = wrapper("npm", "CORGEA_NPM_REGISTRY", 0);
+        let out = h
+            .cmd
+            .args(["npm", alias, "freshpkg@9.9.9"])
+            .output()
+            .expect("failed to run corgea");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "alias `{alias}` must be gated; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            h.recorded_argv(),
+            None,
+            "alias `{alias}`: npm must not run when blocked"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("Refusing to run install"),
+            "alias `{alias}` stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
 fn wrapper_forwards_package_manager_exit_code() {
     let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 7);
     let out = h

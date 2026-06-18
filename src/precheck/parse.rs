@@ -140,13 +140,16 @@ fn parse_requirement_file_targets_inner(
 }
 
 /// First format-control directive (`--no-binary` / `--only-binary`) found in
-/// any of `files`, following nested `-r` includes. pip applies file-level
-/// format-control AFTER command-line options (the file parser mutates the
-/// shared FormatControl object post-CLI-parse), so a `--no-binary :all:`
-/// line inside a requirements file overrides the tree pass's trailing
-/// `--only-binary :all:` guard and would build sdists — executing package
-/// code — during the dry-run. The tree pass must refuse to dry-run such
-/// files. Returns `(file, directive)` of the first hit.
+/// any of `files`, following nested `-r`/`--requirement` AND `-c`/`--constraint`
+/// includes. pip applies file-level format-control AFTER command-line options
+/// (the file parser mutates the shared FormatControl object post-CLI-parse), so
+/// a `--no-binary :all:` line inside a requirements file overrides the tree
+/// pass's trailing `--only-binary :all:` guard and would build sdists —
+/// executing package code — during the dry-run. pip reads and applies
+/// format-control from nested constraint (`-c`) files too, not just requirement
+/// (`-r`) includes, so both kinds of include must be followed. The tree pass
+/// must refuse to dry-run such files. Returns `(file, directive)` of the first
+/// hit.
 pub(super) fn requirements_format_control_directive(
     files: &[PathBuf],
 ) -> Option<(PathBuf, String)> {
@@ -186,9 +189,13 @@ fn format_control_scan(
         {
             return Some((path.to_path_buf(), first.to_string()));
         }
-        if let Some(include) = requirement_flag_value(line, "-r", "--requirement") {
-            if let Some(hit) = format_control_scan(&base.join(include), seen) {
-                return Some(hit);
+        // pip applies file-level format-control from both `-r` requirement
+        // includes and `-c` constraint includes, so follow both.
+        for (short, long) in [("-r", "--requirement"), ("-c", "--constraint")] {
+            if let Some(include) = requirement_flag_value(line, short, long) {
+                if let Some(hit) = format_control_scan(&base.join(include), seen) {
+                    return Some(hit);
+                }
             }
         }
     }
@@ -1181,6 +1188,27 @@ mod tests {
                 .expect("directive must be found through the include");
         assert!(file.ends_with("outer.txt") || file.ends_with("inner.txt"));
         assert_eq!(directive, "--no-binary");
+
+        // SECURITY: pip reads nested `-c` constraint includes and applies
+        // their format-control too, so a --no-binary hidden behind a `-c`
+        // include must also be found transitively.
+        std::fs::write(
+            dir.path().join("constraint_inner.txt"),
+            "# comment\n--no-binary :all:\n",
+        )
+        .expect("write constraint inner");
+        std::fs::write(
+            dir.path().join("constraint_outer.txt"),
+            "flask==1.0\n-c constraint_inner.txt\n",
+        )
+        .expect("write constraint outer");
+        let (c_file, c_directive) =
+            requirements_format_control_directive(&[dir.path().join("constraint_outer.txt")])
+                .expect("directive must be found through the -c constraint include");
+        assert!(
+            c_file.ends_with("constraint_outer.txt") || c_file.ends_with("constraint_inner.txt")
+        );
+        assert_eq!(c_directive, "--no-binary");
 
         // Attached `=` form counts too.
         std::fs::write(dir.path().join("eq.txt"), "--only-binary=:none:\n").expect("write eq");
