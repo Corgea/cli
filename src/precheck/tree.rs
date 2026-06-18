@@ -8,9 +8,19 @@
 //! `--only-binary` line refuses the dry-run (named-only fallback) instead.
 //! npm: `--ignore-scripts` guards npm/cli#2787.
 
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use super::PackageManager;
+
+/// Upper bound on a single tree resolution (pip dry-run / npm lockfile gen).
+/// Generous on purpose: a large dependency tree legitimately takes tens of
+/// seconds to resolve against a registry. The point is only to keep a hung
+/// or stalled pip/npm from hanging the install the gate sits in front of —
+/// on overrun the resolver errs and the caller degrades to named-only.
+const TREE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreePackage {
@@ -86,6 +96,63 @@ fn stderr_tail(output: &std::process::Output) -> String {
         .to_string()
 }
 
+/// Run `cmd` to completion, capturing stdout/stderr, but kill it if it
+/// outruns `timeout`. The resolvers shell out to pip/npm, which can stall on
+/// a slow or unreachable registry; the gate runs before the real install, so
+/// an unbounded wait would hang the user's command. On overrun the child is
+/// killed and an `Err` is returned, which the callers route to the named-only
+/// fallback.
+///
+/// stdout/stderr are drained on threads rather than read after exit because
+/// pip's `--report -` JSON can exceed the OS pipe buffer; an unread full pipe
+/// would block the child before it exits, so a bare wait-with-timeout on the
+/// handle would deadlock instead of timing out.
+fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<std::process::Output, String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn: {e}"))?;
+
+    let mut out_pipe = child.stdout.take().ok_or("no stdout pipe")?;
+    let mut err_pipe = child.stderr.take().ok_or("no stderr pipe")?;
+    let out_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let err_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = err_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().map_err(|e| format!("wait: {e}"))? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "resolution exceeded {}s timeout",
+                    timeout.as_secs()
+                ));
+            }
+            None => thread::sleep(Duration::from_millis(50)),
+        }
+    };
+
+    let stdout = out_reader.join().map_err(|_| "stdout reader panicked")?;
+    let stderr = err_reader.join().map_err(|_| "stderr reader panicked")?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn resolve_pip_tree(
     binary: &str,
     install_args: &[String],
@@ -115,13 +182,13 @@ fn resolve_pip_tree(
     // user `--no-binary :all:` / `--only-binary :none:` placed in install_args
     // must not re-enable sdist builds (which would run package code during the
     // report step, violating this file's safety invariant).
-    let output = Command::new(resolved)
-        .arg("install")
+    let mut cmd = Command::new(resolved);
+    cmd.arg("install")
         .args(["--dry-run", "--quiet", "--report", "-"])
         .args(install_args)
-        .args(["--only-binary", ":all:"])
-        .output()
-        .map_err(|e| format!("run pip dry-run: {e}"))?;
+        .args(["--only-binary", ":all:"]);
+    let output =
+        run_bounded(cmd, TREE_RESOLVE_TIMEOUT).map_err(|e| format!("run pip dry-run: {e}"))?;
     if !output.status.success() {
         return Err(format!("pip dry-run failed: {}", stderr_tail(&output)));
     }
@@ -228,8 +295,8 @@ fn resolve_npm_tree(binary: &str, install_args: &[String]) -> Result<Vec<TreePac
                 .map_err(|e| format!("copy {manifest}: {e}"))?;
         }
     }
-    let output = Command::new(&resolved)
-        .arg("install")
+    let mut cmd = Command::new(&resolved);
+    cmd.arg("install")
         .args(install_args)
         .args([
             "--package-lock-only",
@@ -237,8 +304,8 @@ fn resolve_npm_tree(binary: &str, install_args: &[String]) -> Result<Vec<TreePac
             "--no-audit",
             "--no-fund",
         ])
-        .current_dir(work.path())
-        .output()
+        .current_dir(work.path());
+    let output = run_bounded(cmd, TREE_RESOLVE_TIMEOUT)
         .map_err(|e| format!("run npm lockfile resolution: {e}"))?;
     if !output.status.success() {
         return Err(format!(
@@ -355,6 +422,30 @@ fn name_from_lock_path(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_bounded_kills_a_child_that_outruns_the_timeout() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30"]);
+        let start = Instant::now();
+        let err = run_bounded(cmd, Duration::from_millis(200)).expect_err("should time out");
+        assert!(err.contains("timeout"), "unexpected error: {err}");
+        // Killed promptly, not after the full sleep — proves the gate can't hang.
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "child not killed promptly: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_bounded_captures_output_of_a_fast_child() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf hello"]);
+        let out = run_bounded(cmd, Duration::from_secs(10)).expect("fast child ok");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+    }
 
     const OK_REPORT: &str = r#"{"version":"1","pip_version":"24.0","install":[
         {"metadata":{"name":"oldpkg","version":"1.0.0"},"requested":true},
