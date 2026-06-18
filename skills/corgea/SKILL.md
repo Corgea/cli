@@ -131,6 +131,91 @@ Agent environments default to compact TSV; force output with `--format human|age
 Notes: `deps scan --out-format table|json|sarif` is the report/export selector; do not combine it with `deps scan --format`.
 <!-- END GENERATED CORGEA DEPS SKILL -->
 
+### Install Wrappers — `corgea pip|npm <args...>`
+
+Run a package manager through Corgea's install gate. Install commands with
+named targets are resolved against the public registry first, then gated
+twice: a version published within `--threshold` (default `2d`) blocks
+(exit 1), and each resolved version is checked against Corgea's vuln-api —
+known-vulnerable or malicious versions block. CVE checks are public and need
+no token; vuln-api lookup outages warn and continue (fail-open). Everything
+else passes through with the package manager's own exit code. Git/URL/path
+specs (including `pip install .`, PEP 508 `name @ url` direct references, and
+npm GitHub shorthand `user/repo`) are noted, never blocked. The install verb
+is found behind global flags (`npm --loglevel silent install x` is still
+gated). Bare installs (no named targets) and `-r requirements.txt` files are
+noted, not gated. `npm ci` passes through ungated.
+
+Wrapper flags (`--force`, `--no-fail`, `-t`) are read between the manager
+name and the install verb (`corgea npm --force install x`); flags after the
+verb belong to the package manager and are forwarded untouched.
+
+Blocked findings steer to the fix: each advisory line shows
+`fixed in <version>` (or `no fixed version known`). When every advisory on a
+package has a fix, the gate prints `→ safe version: <name>@<version>` — the
+highest fix covering every advisory. Install that version instead.
+
+```bash
+corgea pip install requests==2.31.0   # resolves, checks recency + vuln verdict, then runs pip
+corgea npm install axios@^1.0.0       # same gate for npm ranges
+corgea pip --no-fail install newpkg   # demote a recency block to a warning (vuln blocks still apply)
+corgea pip --force install badpkg     # print findings but install anyway (overrides every block)
+corgea pip list                       # non-install subcommands pass straight through
+```
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--threshold` | `-t` | Recency threshold (`2d`, `12h`). Younger resolved versions block. |
+| `--no-fail` | | Demote a recency block to a warning. Does NOT bypass vulnerable blocks. |
+| `--force` | | Proceed despite all findings (vulnerable, recent). Findings still print. |
+
+Overrides for testing — each takes a base URL the gate dials instead of the
+default:
+
+| Env var | Expects | Default |
+|---------|---------|---------|
+| `CORGEA_PYPI_REGISTRY` | PyPI JSON API base (queried at `<base>/pypi/<name>/json`) | `https://pypi.org` |
+| `CORGEA_NPM_REGISTRY` | npm registry base (queried at `<base>/<name>`) | `https://registry.npmjs.org` |
+| `CORGEA_VULN_API_URL` | Corgea vuln-api base | staging worker |
+
+#### Limitations
+
+The gate is a wrapper, not an enforcement boundary. By design it cannot catch:
+
+- **Direct invocation** — running the package manager itself (`pip`, `npm`,
+  `python -m pip`) skips the gate entirely.
+- **Custom indexes/registries** — `--index-url`, `--registry`, and `.npmrc`/
+  `pip.conf` overrides change where packages resolve from. The gate still
+  verdicts each `name@version`, but it cannot vouch that a substituted
+  registry serves the same artifact those advisories describe.
+- **Transitive dependencies** — only the named install targets are verified;
+  the rest of the resolved tree installs unchecked.
+- **Bare installs and lockfiles** — `npm install` with no targets, `npm ci`,
+  and `-r requirements.txt` files run unchecked after a note.
+
+Hard enforcement needs org-level controls — lockfile review, registry
+allow-listing — alongside the wrapper.
+
+#### Testing the gate
+
+The staging vuln-api (`https://cve-worker-staging.corgea.workers.dev`) is the
+current default endpoint and serves deterministic verdicts for dogfooding.
+Known-vulnerable targets:
+
+| Ecosystem | Target | Verdict |
+|-----------|--------|---------|
+| npm | `axios@0.21.0` | vulnerable — fixed in 0.21.2 |
+| npm | `minimist@0.0.8` | vulnerable — fixed in 1.2.2 |
+| npm | `node-fetch@2.6.0` | vulnerable — fixed in 2.6.7 |
+| PyPI | `mezzanine==6.0.0` | vulnerable — no fixed version known |
+
+Verify the gate end-to-end:
+
+```bash
+corgea npm install axios@0.21.0      # exit 1, names CVE-2021-3749, steers to 0.21.2
+corgea pip install mezzanine==6.0.0  # exit 1, no fixed version known
+```
+
 ## Common Workflows
 
 ### Scan full project

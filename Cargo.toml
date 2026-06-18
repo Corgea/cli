@@ -1,6 +1,6 @@
 [package]
 name = "corgea"
-version = "1.9.1"
+version = "1.9.2"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -24,6 +24,7 @@ dirs = "5.0.1"
 reqwest = { version = "0.12.23", default-features = false, features = [
     "blocking",
     "cookies",
+    "gzip",
     "json",
     "multipart",
     "native-tls",
@@ -32,6 +33,7 @@ reqwest = { version = "0.12.23", default-features = false, features = [
 toml = "0.8.8"
 log = "0.4"
 env_logger = "0.11"
+semver = "1"
 serde = { version = "1.0.195", features = ["derive"] }
 serde_json = "1.0.111"
 serde_derive = "1.0.195"
