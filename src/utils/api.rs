@@ -19,16 +19,6 @@ use std::path::Path;
 const CHUNK_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 const API_BASE: &str = "/api/v1";
 
-fn get_source() -> &'static str {
-    // One definition of the CORGEA-SOURCE value (cached there).
-    corgea::vuln_api::source()
-}
-
-fn is_jwt(token: &str) -> bool {
-    let parts: Vec<&str> = token.splitn(4, '.').collect();
-    parts.len() == 3 && parts.iter().all(|p| !p.is_empty())
-}
-
 fn auth_headers(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     let (name, value) = auth_header(token);
