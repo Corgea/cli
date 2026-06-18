@@ -92,7 +92,7 @@ pub(crate) fn vm(advisory: &str, fixed: Option<&str>) -> crate::vuln_api::VulnMa
     crate::vuln_api::VulnMatch {
         advisory_id: advisory.to_string(),
         severity_level: "high".to_string(),
-        tier: 1,
+        tier: Some(1),
         vulnerable_version_range: None,
         fixed_version: fixed.map(str::to_string),
     }
