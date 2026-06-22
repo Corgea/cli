@@ -602,11 +602,12 @@ fn run_parsed_install(
             "warning: transitive dependencies not checked ({reason}); only named packages were verified."
         );
     }
-    // The requirements note only matters when the tree pass did *not* cover
-    // those files (fallback to named-only, or verdicts disabled).
-    if !matches!(&tree, Some(TreeReport::Full { .. })) {
-        render::requirements_note(&parsed);
-    }
+    // The note is recency-specific, and recency never covers requirements-file
+    // packages: even under a Full tree pass they are verdicted but become
+    // `TreeOutcome`s with no `age` (recency only blocks named CLI targets), so
+    // the caveat applies in every path. `requirements_note` self-guards when
+    // there are no `-r` files.
+    render::requirements_note(&parsed);
 
     let report = PrecheckReport {
         manager,
