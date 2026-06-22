@@ -579,6 +579,21 @@ fn run_parsed_install(
     if parsed.targets.is_empty() && !tree_eligible {
         // A `-r requirements.txt` install with verdicts disabled is only
         // noted; a truly bare install has nothing to note at all.
+        //
+        // One bare-npm case lands here not because there's nothing to gate but
+        // because the project root couldn't be resolved at all: an unreadable
+        // CWD makes `npm_project_root()` (via `find_up`) return None, so
+        // `covers_input` is false. Say so loudly instead of skipping the gate
+        // silently. (npm will most likely fail on the same unreadable CWD; the
+        // warning explains why nothing was verified.)
+        if manager == PackageManager::Npm
+            && opts.verdict.is_some()
+            && std::env::current_dir().is_err()
+        {
+            eprintln!(
+                "warning: cannot determine the npm project (current directory is unreadable); proceeding without tree verification."
+            );
+        }
         render::requirements_note(&parsed);
         return exec();
     }
