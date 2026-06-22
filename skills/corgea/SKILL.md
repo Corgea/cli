@@ -1,6 +1,6 @@
 ---
 name: corgea
-description: Scans code for security vulnerabilities using Corgea's AI-powered BLAST scanner and third-party tools, manages findings, and displays AI-generated fixes. Use when the user needs to scan for security issues, upload scan reports, list or inspect vulnerabilities, view fixes, or integrate security scanning into CI/CD.
+description: Scans code for security vulnerabilities using Corgea's AI-powered BLAST scanner and third-party tools, gates `pip` and `npm` package installs against vulnerable and suspiciously-recent dependencies (including transitive), manages findings, and displays AI-generated fixes. Use when the user needs to install pip/npm packages safely, scan for security issues, upload scan reports, list or inspect vulnerabilities, view fixes, or integrate security scanning into CI/CD.
 allowed-tools: Shell, Read, Grep, Glob, StrReplace
 ---
 
@@ -130,6 +130,77 @@ Agent environments default to compact TSV; force output with `--format human|age
 
 Notes: `deps scan --out-format table|json|sarif` is the report/export selector; do not combine it with `deps scan --format`.
 <!-- END GENERATED CORGEA DEPS SKILL -->
+
+### Install Wrappers — `corgea pip|npm <args...>`
+
+Run a package manager through Corgea's install gate. Install commands with
+named targets are resolved against the public registry first, then gated
+twice: a version published within `--threshold` (default `2d`) blocks
+(exit 1), and each resolved version is checked against Corgea's vuln-api —
+known-vulnerable or malicious versions block. CVE checks are public and need
+no token; vuln-api lookup outages warn and continue (fail-open). Everything
+else passes through with the package manager's own exit code. Git/URL/path
+specs (including `pip install .`, PEP 508 `name @ url` direct references, and
+npm GitHub shorthand `user/repo`) are noted, never blocked. The install verb
+is found behind global flags (`npm --loglevel silent install x` is still
+gated). Bare `npm install` (zero specs, project `package.json` found like npm
+finds it — nearest ancestor) is gated too: the full lockfile-resolved tree is
+verdicted, so a vulnerable lockfile blocks. `npm ci` (and aliases) is gated
+from the project lockfile directly.
+
+The vuln check covers the **full would-install set**, not just the named
+targets: `pip` and `npm` resolve the complete tree (named + transitive) via a
+safe dry-run (`pip install --dry-run …`; an isolated
+`npm install --package-lock-only` in a temp dir, never touching your
+lockfile); every resolved package is verdicted, so a flagged **transitive**
+dependency blocks the install too, labeled by provenance (`(transitive)`,
+`(from requirements)`, `(already in package.json)`, `(locked)`). Whenever a
+dry-run fails or an npm flag redirects the project root (`--prefix`, `-g`),
+the gate falls back to named-only and prints
+`warning: transitive dependencies not checked (…); only named packages were verified.`
+— for pip, entries of `-r requirements.txt` files are still parsed and
+verified in that fallback. Verdict requests run in a bounded pool
+(8 parallel).
+
+Wrapper flags (`--force`, `--no-fail`, `-t`) are read between the manager
+name and the install verb (`corgea npm --force install x`); flags after the
+verb belong to the package manager and are forwarded untouched.
+
+Blocked findings steer to the fix: each advisory line shows
+`fixed in <version>` (or `no fixed version known`). When every advisory on a
+package has a fix, the gate prints `→ safe version: <name>@<version>` — the
+highest fix covering every advisory. Install that version instead.
+
+```bash
+corgea pip install requests==2.31.0   # resolves, checks recency + vuln verdict, then runs pip
+corgea npm install axios@^1.0.0       # same gate for npm ranges
+corgea pip --no-fail install newpkg   # demote a recency block to a warning (vuln blocks still apply)
+corgea pip --force install badpkg     # print findings but install anyway (overrides every block)
+corgea pip list                       # non-install subcommands pass straight through
+```
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--threshold` | `-t` | Recency threshold (`2d`, `12h`). Younger resolved versions block. |
+| `--no-fail` | | Demote a recency block to a warning. Does NOT bypass vulnerable blocks. |
+| `--force` | | Proceed despite all findings (vulnerable, recent). Findings still print. |
+
+Overrides for testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`,
+`CORGEA_VULN_API_URL`.
+
+#### Limitations
+
+The gate is a wrapper, not an enforcement boundary. By design it cannot catch:
+
+- **Direct invocation** — running the package manager itself (`pip`, `npm`,
+  `python -m pip`) skips the gate entirely.
+- **Custom indexes/registries** — `--index-url`, `--registry`, and `.npmrc`/
+  `pip.conf` overrides change where packages resolve from. The gate still
+  verdicts each `name@version`, but it cannot vouch that a substituted
+  registry serves the same artifact those advisories describe.
+- **Named-only fallback** — when a dry-run fails (old pip, broken resolution)
+  or `--prefix`/`-g` redirects npm's root, transitive dependencies install
+  unchecked behind the printed warning.
 
 ## Common Workflows
 
