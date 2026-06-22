@@ -209,6 +209,32 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<std::process::Outp
     })
 }
 
+/// Drop any user-supplied `--report <file>` / `--report=<file>` from the pip
+/// dry-run args. pip's `--report` is last-wins, so a user value would redirect
+/// the JSON the gate parses off stdout into a file, leaving stdout empty and
+/// silently degrading the tree pass to named-only. The user's real install
+/// (exec'd separately with the original args) still honors their `--report`.
+fn strip_pip_report_flag(install_args: &[String]) -> Vec<&String> {
+    let mut out = Vec::with_capacity(install_args.len());
+    let mut skip_value = false;
+    for arg in install_args {
+        if skip_value {
+            // The value token following a bare `--report`.
+            skip_value = false;
+            continue;
+        }
+        if arg == "--report" {
+            skip_value = true;
+            continue;
+        }
+        if arg.starts_with("--report=") {
+            continue;
+        }
+        out.push(arg);
+    }
+    out
+}
+
 fn resolve_pip_tree(
     binary: &str,
     install_args: &[String],
@@ -238,10 +264,12 @@ fn resolve_pip_tree(
     // user `--no-binary :all:` / `--only-binary :none:` placed in install_args
     // must not re-enable sdist builds (which would run package code during the
     // report step, violating this file's safety invariant).
+    // Strip the user's `--report` (if any) so it can't redirect the dry-run
+    // JSON off stdout — the gate needs it there to parse the would-install set.
     let mut cmd = Command::new(resolved);
     cmd.arg("install")
         .args(["--dry-run", "--quiet", "--report", "-"])
-        .args(install_args)
+        .args(strip_pip_report_flag(install_args))
         .args(["--only-binary", ":all:"]);
     let output =
         run_bounded(cmd, TREE_RESOLVE_TIMEOUT).map_err(|e| format!("run pip dry-run: {e}"))?;
@@ -518,6 +546,33 @@ mod tests {
             "run_bounded blocked on a grandchild-held pipe: {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn strip_pip_report_flag_drops_user_report_but_keeps_rest() {
+        let argv = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        fn got(args: &[String]) -> Vec<&str> {
+            strip_pip_report_flag(args)
+                .iter()
+                .map(|s| s.as_str())
+                .collect()
+        }
+        // `--report <file>` (value token also dropped) and `--report=<file>`.
+        let a = argv(&[
+            "requests",
+            "--report",
+            "out.json",
+            "--quiet",
+            "--report=x.json",
+            "flask",
+        ]);
+        assert_eq!(got(&a), vec!["requests", "--quiet", "flask"]);
+        // A bare trailing `--report` (no value) is dropped without panicking.
+        let b = argv(&["pkg", "--report"]);
+        assert_eq!(got(&b), vec!["pkg"]);
+        // No `--report` → args pass through untouched (incl. our own `-`).
+        let c = argv(&["a", "-r", "reqs.txt"]);
+        assert_eq!(got(&c), vec!["a", "-r", "reqs.txt"]);
     }
 
     const OK_REPORT: &str = r#"{"version":"1","pip_version":"24.0","install":[
