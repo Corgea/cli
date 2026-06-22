@@ -92,6 +92,79 @@ fn npm_ci_clean_lockfile_json_summary_counts_the_tree() {
 }
 
 #[test]
+fn npm_ci_no_project_json_emits_single_empty_report() {
+    // `npm ci` in a directory with no package.json: npm errors on its own,
+    // but under --json stdout must still be exactly one parseable Corgea
+    // document (an empty report) — not empty, and not the manager's stdout.
+    let mut h = GateHarness::new()
+        .fake_recorder("npm", 0)
+        .vuln_checks(HashMap::new())
+        .in_project_dir()
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "--json", "ci"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(h.recorded_argv().as_deref(), Some("ci"), "npm still runs");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be one JSON document");
+    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(parsed["summary"]["tree"]["resolved_count"], 0);
+}
+
+#[test]
+fn npm_ci_no_lockfile_json_emits_single_empty_report() {
+    // package.json but no package-lock.json: same one-document contract as
+    // the no-project case above.
+    let mut h = GateHarness::new()
+        .fake_recorder("npm", 0)
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "--json", "ci"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(h.recorded_argv().as_deref(), Some("ci"), "npm still runs");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be one JSON document");
+    assert_eq!(parsed["schema_version"], 1);
+}
+
+#[test]
+fn npm_ci_json_missing_binary_after_report_is_single_doc() {
+    // A clean lockfile prints its report, then npm is missing from PATH (no
+    // fake recorder). The missing-binary error must stay on stderr and exit
+    // 127 — never append a second {"error"} JSON document onto the report.
+    let mut h = GateHarness::new()
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .with_project_file("package-lock.json", NPM_LOCK)
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "--json", "ci"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(127), "missing npm exits 127");
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("stdout must be exactly one JSON document, not two concatenated");
+    assert_eq!(parsed["schema_version"], 1);
+    // The report (not an error doc) is what's on stdout; the binary-missing
+    // message goes to stderr.
+    assert_eq!(parsed["summary"]["tree"]["clean"], 2);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not found on PATH"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn npm_ci_unparsable_lockfile_refuses_without_force() {
     let mut h = GateHarness::new()
         .fake_recorder("npm", 0)
