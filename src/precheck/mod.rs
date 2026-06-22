@@ -740,19 +740,23 @@ fn run_locked_install(
             return exec();
         }
         Err(e) => {
-            // The single documented bypass of the "all blocking goes through
-            // `verdict::block_reason`" invariant: an unparsable lockfile
-            // means there is no report to feed the predicate, so the gate
-            // refuses directly (--force above is the only escape).
-            eprintln!(
-                "error: cannot verify '{} {}': {e} (pass --force to proceed unchecked)",
+            // A pre-report refusal: an unparsable lockfile leaves no report to
+            // feed `block_reason`, so the gate refuses directly through the
+            // shared `refuse_unverifiable` helper (--force above is the only
+            // escape). That helper enumerates the full set of these deliberate
+            // exceptions to the single-block-predicate rule.
+            return refuse_unverifiable(&format!(
+                "'{} {}': {e}",
                 manager.binary_name(),
                 subcommand
-            );
-            return 1;
+            ));
         }
     };
 
+    // Lockfiles repeat the same name@version across nested node_modules paths
+    // (npm v2/v3) and diamond deps (v1 tree); collapse to one verdict job each
+    // so the vuln-api is hit — and each package counted — exactly once.
+    let jobs = dedup_packages(manager, jobs);
     let resolved_count = jobs.len();
     let results = verdict::verdict_pool(jobs, cfg, manager);
     let transitive = results
@@ -787,6 +791,8 @@ fn run_locked_install(
 fn run_npm_ci(subcommand: &str, rest: &[String], opts: PrecheckOptions) -> i32 {
     let exec = || exec::exec_install_with_args(PackageManager::Npm, subcommand, rest);
 
+    if opts.verdict.is_none() {
+        return exec();
     }
     // Resolve the project root once and reuse it for both the registry-override
     // warning (its `.npmrc` lookup) and the lockfile read below.

@@ -36,7 +36,7 @@ pub(super) fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
             // pip-compatible interface, so using it in a requirements/pip
             // project is correct, not a wrong-manager mistake — and it is
             // fully gated by the tree pass below regardless.
-            super::warn_registry_override(PackageManager::Uv, install_args);
+            super::warn_registry_override(PackageManager::Uv, install_args, None);
             super::run_parsed_install(
                 PackageManager::Uv,
                 "pip install",
@@ -54,7 +54,7 @@ pub(super) fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
                 // No files named: uv errors on its own.
                 return exec::exec_command("uv", cmd);
             }
-            super::warn_registry_override(PackageManager::Uv, sync_args);
+            super::warn_registry_override(PackageManager::Uv, sync_args, None);
             super::run_parsed_install(
                 PackageManager::Uv,
                 "pip sync",
@@ -68,7 +68,7 @@ pub(super) fn run_uv(cmd: &[String], opts: PrecheckOptions) -> i32 {
             // `uv add` is project management (writes pyproject); using it in a
             // pip/requirements project IS a wrong-manager mistake.
             let parsed = parse::parse_pypi_positionals_args(add_args);
-            super::warn_registry_override(PackageManager::Uv, add_args);
+            super::warn_registry_override(PackageManager::Uv, add_args, None);
             if !opts.force {
                 if let Some(message) =
                     detect::wrong_package_manager_message(PackageManager::Uv, add_args, &parsed)
