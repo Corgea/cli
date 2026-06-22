@@ -60,19 +60,44 @@ pub(super) fn npm_project_root() -> Option<std::path::PathBuf> {
     Some(find_up("package.json")?.parent()?.to_path_buf())
 }
 
+/// The lockfile npm would read from `dir`, preferring `npm-shrinkwrap.json`
+/// over `package-lock.json` (npm gives the shrinkwrap precedence). `None`
+/// when `dir` holds neither. Shared by `npm ci` (reads the project lockfile)
+/// and the tree pass (reads the one npm just generated).
+pub(super) fn npm_lockfile_in(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    ["npm-shrinkwrap.json", "package-lock.json"]
+        .iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.is_file())
+}
+
 /// The npm flag that redirects the project root (`--prefix`, `-C`, `-g`,
-/// `--global`, `--location`), if present. The gate can't safely resolve or
-/// verify the redirected project from a throwaway copy of the CWD, so the
-/// callers fail closed (bare install / `npm ci`) or degrade to named-only.
+/// `--global`), if present. The gate can't safely resolve or verify the
+/// redirected project from a throwaway copy of the CWD, so the callers fail
+/// closed (bare install / `npm ci`) or degrade to named-only.
+///
+/// `--location` is *not* an unconditional redirect: per npm v10/v11 only
+/// `--location=global` (equivalent to `-g`) changes the install root.
+/// `--location=project` / `--location=user` merely select which config layer
+/// is read/written and leave what installs untouched, so only the `global`
+/// value counts — in both `--location=global` and `--location global` forms.
 pub(super) fn npm_root_redirect_flag(args: &[String]) -> Option<String> {
-    const ROOT_REDIRECT_FLAGS: [&str; 5] = ["--prefix", "-C", "--global", "-g", "--location"];
-    args.iter()
-        .find(|a| {
-            ROOT_REDIRECT_FLAGS
-                .iter()
-                .any(|f| a.as_str() == *f || a.starts_with(&format!("{f}=")))
-        })
-        .cloned()
+    const ROOT_REDIRECT_FLAGS: [&str; 4] = ["--prefix", "-C", "--global", "-g"];
+    for (i, a) in args.iter().enumerate() {
+        if ROOT_REDIRECT_FLAGS
+            .iter()
+            .any(|f| a.as_str() == *f || a.starts_with(&format!("{f}=")))
+        {
+            return Some(a.clone());
+        }
+        if a == "--location=global" {
+            return Some(a.clone());
+        }
+        if a == "--location" && args.get(i + 1).is_some_and(|v| v == "global") {
+            return Some("--location global".to_string());
+        }
+    }
+    None
 }
 
 /// `Err(reason)`: no safe dry-run for this manager, or the dry-run failed —
@@ -102,6 +127,13 @@ fn stderr_tail(output: &std::process::Output) -> String {
         .to_string()
 }
 
+/// Grace past the overall deadline allowed for the reader threads to drain
+/// after the direct child has exited. In the common case they EOF the instant
+/// the child closes its pipe ends, so this is never spent; it only bounds the
+/// pathological case where a grandchild inherited the pipe write-end and is
+/// still holding it open (so `read_to_end` never sees EOF).
+const READER_DRAIN_GRACE: Duration = Duration::from_secs(3);
+
 /// Run `cmd` to completion, capturing stdout/stderr, but kill it if it
 /// outruns `timeout`. The resolvers shell out to pip/npm, which can stall on
 /// a slow or unreachable registry; the gate runs before the real install, so
@@ -113,6 +145,14 @@ fn stderr_tail(output: &std::process::Output) -> String {
 /// pip's `--report -` JSON can exceed the OS pipe buffer; an unread full pipe
 /// would block the child before it exits, so a bare wait-with-timeout on the
 /// handle would deadlock instead of timing out.
+///
+/// The reader joins are themselves bounded: a grandchild that inherited the
+/// pipe write-end keeps `read_to_end` from ever seeing EOF even after the
+/// direct child is reaped, so an unbounded `join()` here would hang past the
+/// deadline this function exists to enforce. If the readers don't drain within
+/// `READER_DRAIN_GRACE` of the deadline they are abandoned (the leaked thread
+/// and FD die with this short-lived CLI moments later) and an `Err` is
+/// returned, which the callers route to the named-only fallback.
 fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<std::process::Output, String> {
     let mut child = cmd
         .stdin(Stdio::null())
@@ -150,6 +190,22 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<std::process::Outp
         }
     };
 
+    // The child is reaped, but a grandchild may still hold the pipe write-end,
+    // so the readers can outlive it. Bound the wait: poll `is_finished()`
+    // (never `join()` before it is finished, which would block unbounded)
+    // against a short grace past the deadline.
+    let drain_deadline = deadline + READER_DRAIN_GRACE;
+    while !(out_reader.is_finished() && err_reader.is_finished()) {
+        if Instant::now() >= drain_deadline {
+            return Err(
+                "output readers did not drain (resolver may have left a background process)"
+                    .to_string(),
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Both readers are finished, so these joins return immediately.
     let stdout = out_reader.join().map_err(|_| "stdout reader panicked")?;
     let stderr = err_reader.join().map_err(|_| "stderr reader panicked")?;
     Ok(std::process::Output {
@@ -157,6 +213,32 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<std::process::Outp
         stdout,
         stderr,
     })
+}
+
+/// Drop any user-supplied `--report <file>` / `--report=<file>` from the pip
+/// dry-run args. pip's `--report` is last-wins, so a user value would redirect
+/// the JSON the gate parses off stdout into a file, leaving stdout empty and
+/// silently degrading the tree pass to named-only. The user's real install
+/// (exec'd separately with the original args) still honors their `--report`.
+fn strip_pip_report_flag(install_args: &[String]) -> Vec<&String> {
+    let mut out = Vec::with_capacity(install_args.len());
+    let mut skip_value = false;
+    for arg in install_args {
+        if skip_value {
+            // The value token following a bare `--report`.
+            skip_value = false;
+            continue;
+        }
+        if arg == "--report" {
+            skip_value = true;
+            continue;
+        }
+        if arg.starts_with("--report=") {
+            continue;
+        }
+        out.push(arg);
+    }
+    out
 }
 
 fn resolve_pip_tree(
@@ -188,10 +270,12 @@ fn resolve_pip_tree(
     // user `--no-binary :all:` / `--only-binary :none:` placed in install_args
     // must not re-enable sdist builds (which would run package code during the
     // report step, violating this file's safety invariant).
+    // Strip the user's `--report` (if any) so it can't redirect the dry-run
+    // JSON off stdout — the gate needs it there to parse the would-install set.
     let mut cmd = Command::new(resolved);
     cmd.arg("install")
         .args(["--dry-run", "--quiet", "--report", "-"])
-        .args(install_args)
+        .args(strip_pip_report_flag(install_args))
         .args(["--only-binary", ":all:"]);
     let output =
         run_bounded(cmd, TREE_RESOLVE_TIMEOUT).map_err(|e| format!("run pip dry-run: {e}"))?;
@@ -434,13 +518,8 @@ fn resolve_npm_tree(binary: &str, install_args: &[String]) -> Result<Vec<TreePac
             stderr_tail(&output)
         ));
     }
-    // npm gives `npm-shrinkwrap.json` precedence over `package-lock.json`,
-    // so read whichever it actually produced/used, preferring the shrinkwrap.
-    let lock_path = ["npm-shrinkwrap.json", "package-lock.json"]
-        .iter()
-        .map(|n| work.path().join(n))
-        .find(|p| p.is_file())
-        .ok_or("npm produced no lockfile to verify")?;
+    // Read whichever lockfile npm actually produced/used (shrinkwrap wins).
+    let lock_path = npm_lockfile_in(work.path()).ok_or("npm produced no lockfile to verify")?;
     let lock = std::fs::read_to_string(&lock_path)
         .map_err(|e| format!("read generated {}: {e}", lock_path.display()))?;
     parse_npm_lockfile(&lock)
@@ -566,6 +645,55 @@ mod tests {
         let out = run_bounded(cmd, Duration::from_secs(10)).expect("fast child ok");
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+    }
+
+    #[test]
+    fn run_bounded_does_not_hang_when_a_grandchild_holds_the_pipe() {
+        // The direct `sh` exits 0 immediately, but backgrounds a `sleep 30`
+        // that inherits the stdout/stderr pipe write-end. `read_to_end` never
+        // sees EOF while that grandchild lives, so an unbounded join on the
+        // success path would block for the full 30s. The bounded drain must
+        // return (Ok with partial output OR Err) well before then — proving
+        // the gate can't hang past its deadline even on the exit path.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30 & exit 0"]);
+        let start = Instant::now();
+        // Small timeout: the child exits at once, so the drain bound is
+        // `timeout + READER_DRAIN_GRACE` (~3.2s here) — far under the 30s the
+        // grandchild stays alive, and under the 10s assertion below.
+        let _ = run_bounded(cmd, Duration::from_millis(200));
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "run_bounded blocked on a grandchild-held pipe: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn strip_pip_report_flag_drops_user_report_but_keeps_rest() {
+        let argv = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        fn got(args: &[String]) -> Vec<&str> {
+            strip_pip_report_flag(args)
+                .iter()
+                .map(|s| s.as_str())
+                .collect()
+        }
+        // `--report <file>` (value token also dropped) and `--report=<file>`.
+        let a = argv(&[
+            "requests",
+            "--report",
+            "out.json",
+            "--quiet",
+            "--report=x.json",
+            "flask",
+        ]);
+        assert_eq!(got(&a), vec!["requests", "--quiet", "flask"]);
+        // A bare trailing `--report` (no value) is dropped without panicking.
+        let b = argv(&["pkg", "--report"]);
+        assert_eq!(got(&b), vec!["pkg"]);
+        // No `--report` → args pass through untouched (incl. our own `-`).
+        let c = argv(&["a", "-r", "reqs.txt"]);
+        assert_eq!(got(&c), vec!["a", "-r", "reqs.txt"]);
     }
 
     const OK_REPORT: &str = r#"{"version":"1","pip_version":"24.0","install":[
@@ -749,5 +877,72 @@ mod tests {
         assert!(direct_deps_from_manifest("not json").is_empty());
         assert!(direct_deps_from_manifest(r#"{"name":"proj"}"#).is_empty());
         assert!(direct_deps_from_manifest(r#"{"dependencies":[]}"#).is_empty());
+    }
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn npm_root_redirect_flag_unconditional_redirects() {
+        // These always redirect npm's install root, regardless of value.
+        assert_eq!(
+            npm_root_redirect_flag(&args(&["install", "--prefix", "/x", "lodash"])).as_deref(),
+            Some("--prefix")
+        );
+        assert_eq!(
+            npm_root_redirect_flag(&args(&["install", "--prefix=/x", "lodash"])).as_deref(),
+            Some("--prefix=/x")
+        );
+        assert_eq!(
+            npm_root_redirect_flag(&args(&["install", "-C", "/x", "lodash"])).as_deref(),
+            Some("-C")
+        );
+        assert_eq!(
+            npm_root_redirect_flag(&args(&["install", "-g", "lodash"])).as_deref(),
+            Some("-g")
+        );
+        assert_eq!(
+            npm_root_redirect_flag(&args(&["install", "--global", "lodash"])).as_deref(),
+            Some("--global")
+        );
+    }
+
+    #[test]
+    fn npm_root_redirect_flag_only_location_global_redirects() {
+        // Only `--location=global` (≡ `-g`) redirects the install root.
+        assert_eq!(
+            npm_root_redirect_flag(&args(&["install", "--location=global", "lodash"])).as_deref(),
+            Some("--location=global")
+        );
+        assert_eq!(
+            npm_root_redirect_flag(&args(&["install", "--location", "global", "lodash"]))
+                .as_deref(),
+            Some("--location global")
+        );
+    }
+
+    #[test]
+    fn npm_root_redirect_flag_non_global_location_is_not_a_redirect() {
+        // project/user only pick a config layer — they do NOT change what
+        // installs, so the gate must resolve the tree, not refuse it.
+        assert!(
+            npm_root_redirect_flag(&args(&["install", "--location", "project", "lodash"]))
+                .is_none()
+        );
+        assert!(
+            npm_root_redirect_flag(&args(&["install", "--location=project", "lodash"])).is_none()
+        );
+        assert!(
+            npm_root_redirect_flag(&args(&["install", "--location", "user", "lodash"])).is_none()
+        );
+        assert!(npm_root_redirect_flag(&args(&["install", "--location=user", "lodash"])).is_none());
+        // A bare trailing `--location` (no value) is not a redirect either.
+        assert!(npm_root_redirect_flag(&args(&["install", "lodash", "--location"])).is_none());
+    }
+
+    #[test]
+    fn npm_root_redirect_flag_plain_install_has_no_redirect() {
+        assert!(npm_root_redirect_flag(&args(&["install", "lodash"])).is_none());
     }
 }
