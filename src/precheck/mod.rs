@@ -47,10 +47,10 @@ impl PackageManager {
     pub fn is_install_subcommand(self, sub: &str) -> bool {
         match self {
             // npm's install command accepts a wide alias set (and tolerates
-            // common typos like `isntall`). Match all of them so none falls
-            // through to the ungated passthrough. `npm ci` and its aliases
-            // are gated separately, *before* this check (see `run_install`),
-            // so they are intentionally absent here.
+            // common typos). Mirror npm's own `lib/utils/cmd-list.js` exactly
+            // so none falls through to the ungated passthrough. `npm ci` and
+            // its aliases are gated separately, *before* this check (see
+            // `run_install`), so they are intentionally absent here.
             PackageManager::Npm => matches!(
                 sub,
                 "install"
@@ -60,9 +60,11 @@ impl PackageManager {
                     | "inst"
                     | "insta"
                     | "instal"
+                    | "innit"
                     | "isnt"
+                    | "isnta"
+                    | "isntal"
                     | "isntall"
-                    | "installation"
                     | "add"
             ),
             PackageManager::Pip => matches!(sub, "install"),
@@ -369,7 +371,7 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
         }
     };
 
-    warn_registry_override(manager, rest);
+    warn_registry_override(manager, rest, None);
 
     run_parsed_install(
         manager,
@@ -438,7 +440,11 @@ fn unsupported_pip_add_message(rest: &[String]) -> String {
 ///
 /// pip config-file (`pip.conf`) and `PIP_INDEX_URL`-style env detection is
 /// future work: only pip CLI index flags are inspected here.
-fn warn_registry_override(manager: PackageManager, rest: &[String]) {
+fn warn_registry_override(
+    manager: PackageManager,
+    rest: &[String],
+    npm_root: Option<&std::path::Path>,
+) {
     let flags: &[&str] = match manager {
         PackageManager::Npm => &["--registry"],
         PackageManager::Pip => &["-i", "--index-url", "--extra-index-url"],
@@ -460,7 +466,7 @@ fn warn_registry_override(manager: PackageManager, rest: &[String]) {
     // would still be against the default advisory universe with no flag in
     // `rest` to catch. Warn on it so the redirect isn't silent.
     if manager == PackageManager::Npm {
-        if let Some(path) = npmrc_registry_override_path() {
+        if let Some(path) = npmrc_registry_override_path(npm_root) {
             eprintln!(
                 "warning: '{}' sets a custom registry; the gate resolves and verdicts against the default registry and cannot vouch the installed artifact matches.",
                 path.display()
@@ -472,12 +478,19 @@ fn warn_registry_override(manager: PackageManager, rest: &[String]) {
 /// The first `.npmrc` (CWD, then the npm project root) holding a `registry=`
 /// or `@<scope>:registry=` line, if any. Best-effort: an absent or unreadable
 /// `.npmrc` yields `None` — it can't redirect resolution if it can't be read.
-fn npmrc_registry_override_path() -> Option<std::path::PathBuf> {
+///
+/// `npm_root` lets a caller that already resolved the project root pass it in
+/// so `tree::npm_project_root()` isn't walked twice (e.g. `run_npm_ci`); `None`
+/// resolves it here.
+fn npmrc_registry_override_path(npm_root: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
     let cwd = std::env::current_dir().ok();
     // CWD first, then the project root npm would actually operate on; skip the
     // root when it equals the CWD so the same file isn't checked twice.
     let mut candidates: Vec<std::path::PathBuf> = cwd.iter().map(|d| d.join(".npmrc")).collect();
-    if let Some(root) = tree::npm_project_root() {
+    let root = npm_root
+        .map(std::path::Path::to_path_buf)
+        .or_else(tree::npm_project_root);
+    if let Some(root) = root {
         if cwd.as_deref() != Some(root.as_path()) {
             candidates.push(root.join(".npmrc"));
         }
@@ -620,11 +633,14 @@ fn run_npm_ci(subcommand: &str, rest: &[String], opts: PrecheckOptions) -> i32 {
     let Some(cfg) = &opts.verdict else {
         return exec();
     };
+    // Resolve the project root once and reuse it for both the registry-override
+    // warning (its `.npmrc` lookup) and the lockfile read below.
+    let root = tree::npm_project_root();
     // `npm ci --registry <url>` (or a project `.npmrc` `registry=` line) pulls
     // tarballs from an override while the gate verdicts the lockfile against
     // the default registry — same false-assurance gap as the named-install
     // path, so warn here too.
-    warn_registry_override(PackageManager::Npm, rest);
+    warn_registry_override(PackageManager::Npm, rest, root.as_deref());
     // A root-redirect flag (`--prefix ../other`, `-C ../other`) makes npm ci
     // install a DIFFERENT project's lockfile than the CWD one we'd verdict, so
     // verifying the CWD lockfile would pass on the wrong project. Fail closed
@@ -637,7 +653,7 @@ fn run_npm_ci(subcommand: &str, rest: &[String], opts: PrecheckOptions) -> i32 {
             return 1;
         }
     }
-    let Some(root) = tree::npm_project_root() else {
+    let Some(root) = root else {
         return exec();
     };
     let Some(lock_path) = tree::npm_lockfile_in(&root) else {
@@ -874,18 +890,10 @@ mod tests {
     fn install_subcommand_recognition() {
         // The full npm install alias set (including common typos) must gate;
         // none may fall through to the ungated passthrough.
+        // The full npm install alias set per `lib/utils/cmd-list.js`.
         for alias in [
-            "install",
-            "i",
-            "in",
-            "ins",
-            "inst",
-            "insta",
-            "instal",
-            "isnt",
-            "isntall",
-            "installation",
-            "add",
+            "install", "i", "in", "ins", "inst", "insta", "instal", "innit", "isnt", "isnta",
+            "isntal", "isntall", "add",
         ] {
             assert!(
                 PackageManager::Npm.is_install_subcommand(alias),
@@ -893,6 +901,8 @@ mod tests {
             );
         }
         assert!(!PackageManager::Npm.is_install_subcommand("update"));
+        // `installation` is NOT a real npm alias — must not be recognized.
+        assert!(!PackageManager::Npm.is_install_subcommand("installation"));
         // `npm ci` aliases are gated by a separate dispatch that runs before
         // this check, so they must NOT be recognized here.
         for ci_alias in [
