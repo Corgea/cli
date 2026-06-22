@@ -585,6 +585,19 @@ fn report_and_exec(
     exec()
 }
 
+/// Refuse an install the gate cannot verify *before* it can build a
+/// `PrecheckReport` — so the decision can't run through `block_reason`. Prints a
+/// uniform `cannot verify … (pass --force …)` line and exits 1; `--force` is the
+/// single escape. These pre-report refusals are the deliberate, enumerated
+/// exceptions to the "all blocking goes through `block_reason`" rule. Callers:
+/// the bare-`npm install` and `npm ci` root-redirect guards (a redirected
+/// project's tree can't be resolved from a copy of the CWD) and the `npm ci`
+/// unparsable-lockfile guard (no lockfile to verdict).
+fn refuse_unverifiable(detail: &str) -> i32 {
+    eprintln!("error: cannot verify {detail} (pass --force to proceed unchecked)");
+    1
+}
+
 /// Collapse a tree-resolution thread's join into the resolver's own `Result`.
 /// A panic in the spawned thread becomes a resolution `Err` (which the caller
 /// routes to the named-only fallback with a loud warning) instead of
@@ -619,10 +632,9 @@ fn run_parsed_install(
     // its targets and degrades the tree pass to a loud named-only warning.)
     if manager == PackageManager::Npm && bare_install && opts.verdict.is_some() && !opts.force {
         if let Some(flag) = tree::npm_root_redirect_flag(rest) {
-            eprintln!(
-                "error: cannot verify a bare 'npm install' that redirects the project root ('{flag}'): the would-install tree is unknown (pass --force to proceed unchecked)"
-            );
-            return 1;
+            return refuse_unverifiable(&format!(
+                "a bare 'npm install' that redirects the project root ('{flag}'): the would-install tree is unknown"
+            ));
         }
     }
 
@@ -728,16 +740,16 @@ fn run_locked_install(
             return exec();
         }
         Err(e) => {
-            // The single documented bypass of the "all blocking goes through
-            // `verdict::block_reason`" invariant: an unparsable lockfile
-            // means there is no report to feed the predicate, so the gate
-            // refuses directly (--force above is the only escape).
-            eprintln!(
-                "error: cannot verify '{} {}': {e} (pass --force to proceed unchecked)",
+            // A pre-report refusal: an unparsable lockfile leaves no report to
+            // feed `block_reason`, so the gate refuses directly through the
+            // shared `refuse_unverifiable` helper (--force above is the only
+            // escape). That helper enumerates the full set of these deliberate
+            // exceptions to the single-block-predicate rule.
+            return refuse_unverifiable(&format!(
+                "'{} {}': {e}",
                 manager.binary_name(),
                 subcommand
-            );
-            return 1;
+            ));
         }
     };
 
@@ -796,10 +808,9 @@ fn run_npm_ci(subcommand: &str, rest: &[String], opts: PrecheckOptions) -> i32 {
     // unless `--force`.
     if !opts.force {
         if let Some(flag) = tree::npm_root_redirect_flag(rest) {
-            eprintln!(
-                "error: cannot verify 'npm {subcommand}' with '{flag}': it installs a redirected project's lockfile, not this one (pass --force to proceed unchecked)"
-            );
-            return 1;
+            return refuse_unverifiable(&format!(
+                "'npm {subcommand}' with '{flag}': it installs a redirected project's lockfile, not this one"
+            ));
         }
     }
     let Some(root) = root else {
