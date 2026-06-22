@@ -60,7 +60,6 @@ impl PackageManager {
                     | "inst"
                     | "insta"
                     | "instal"
-                    | "innit"
                     | "isnt"
                     | "isnta"
                     | "isntal"
@@ -892,8 +891,8 @@ mod tests {
         // none may fall through to the ungated passthrough.
         // The full npm install alias set per `lib/utils/cmd-list.js`.
         for alias in [
-            "install", "i", "in", "ins", "inst", "insta", "instal", "innit", "isnt", "isnta",
-            "isntal", "isntall", "add",
+            "install", "i", "in", "ins", "inst", "insta", "instal", "isnt", "isnta", "isntal",
+            "isntall", "add",
         ] {
             assert!(
                 PackageManager::Npm.is_install_subcommand(alias),
@@ -901,8 +900,10 @@ mod tests {
             );
         }
         assert!(!PackageManager::Npm.is_install_subcommand("update"));
-        // `installation` is NOT a real npm alias — must not be recognized.
+        // `installation` is not a real npm alias, and `innit` maps to npm
+        // `init` (not `install`) — neither must be treated as an install.
         assert!(!PackageManager::Npm.is_install_subcommand("installation"));
+        assert!(!PackageManager::Npm.is_install_subcommand("innit"));
         // `npm ci` aliases are gated by a separate dispatch that runs before
         // this check, so they must NOT be recognized here.
         for ci_alias in [
