@@ -225,7 +225,7 @@ fn pip_json_reports_fresh_pin_as_recent() {
         serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
     assert_eq!(parsed["results"][0]["status"], "recent");
     assert_eq!(parsed["results"][0]["name"], "freshpkg");
-    assert_eq!(parsed["summary"]["recent"], 1);
+    assert_eq!(parsed["summary"]["named"]["recent"], 1);
 }
 
 #[test]

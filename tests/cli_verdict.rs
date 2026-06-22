@@ -189,7 +189,7 @@ fn json_carries_verdict_object_and_mode() {
         parsed["results"][0]["verdict"]["matches"][0]["fixed_version"],
         "2.0.0"
     );
-    assert_eq!(parsed["summary"]["vulnerable"], 1);
+    assert_eq!(parsed["summary"]["named"]["vulnerable"], 1);
 }
 
 #[test]

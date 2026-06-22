@@ -65,6 +65,33 @@ fn npm_ci_clean_lockfile_proceeds() {
 }
 
 #[test]
+fn npm_ci_clean_lockfile_json_summary_counts_the_tree() {
+    // A lockfile install has no named outcomes, so a clean `npm ci` must
+    // report its checked packages under `summary.tree`, not as an all-zero
+    // summary. `named` stays empty; `tree` reconciles against the lockfile.
+    let mut h = GateHarness::new()
+        .fake_recorder("npm", 0)
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .with_project_file("package-lock.json", NPM_LOCK)
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "--json", "ci"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0), "clean lockfile must proceed");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    let summary = &parsed["summary"];
+    assert_eq!(summary["tree"]["resolved_count"], 2);
+    assert_eq!(summary["tree"]["clean"], 2);
+    assert_eq!(summary["tree"]["vulnerable"], 0);
+    assert_eq!(summary["named"]["ok"], 0);
+    assert_eq!(summary["named"]["clean"], 0);
+}
+
+#[test]
 fn npm_ci_unparsable_lockfile_refuses_without_force() {
     let mut h = GateHarness::new()
         .fake_recorder("npm", 0)

@@ -328,7 +328,7 @@ fn pip_json_carries_tree_object() {
         parsed["tree"]["transitive"][0]["verdict"]["status"],
         "vulnerable"
     );
-    assert_eq!(parsed["summary"]["vulnerable"], 1);
+    assert_eq!(parsed["summary"]["tree"]["vulnerable"], 1);
 }
 
 #[test]
