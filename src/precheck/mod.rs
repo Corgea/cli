@@ -58,7 +58,26 @@ impl PackageManager {
     /// — the only ones we need to verify before running.
     pub fn is_install_subcommand(self, sub: &str) -> bool {
         match self {
-            PackageManager::Npm => matches!(sub, "install" | "i" | "add"),
+            // npm's install command accepts a wide alias set (and tolerates
+            // common typos). Mirror npm's own `lib/utils/cmd-list.js` exactly
+            // so none falls through to the ungated passthrough. `npm ci` and
+            // its aliases are gated separately, *before* this check (see
+            // `run_install`), so they are intentionally absent here.
+            PackageManager::Npm => matches!(
+                sub,
+                "install"
+                    | "i"
+                    | "in"
+                    | "ins"
+                    | "inst"
+                    | "insta"
+                    | "instal"
+                    | "isnt"
+                    | "isnta"
+                    | "isntal"
+                    | "isntall"
+                    | "add"
+            ),
             PackageManager::Yarn => matches!(sub, "add" | "install"),
             PackageManager::Pnpm => matches!(sub, "add" | "install" | "i"),
             PackageManager::Pip => matches!(sub, "install"),
@@ -424,7 +443,7 @@ pub fn run_install(manager: PackageManager, cmd: &[String], opts: PrecheckOption
         }
     };
 
-    warn_registry_override(manager, rest);
+    warn_registry_override(manager, rest, None);
 
     // Project guards. `--force` (documented as overriding every block) is
     // the escape hatch — a stray ancestor lockfile must not leave the
@@ -526,13 +545,21 @@ fn unsupported_pip_add_message(rest: &[String]) -> String {
     )
 }
 
-/// Warn when a custom registry/index flag is forwarded: the gate resolves
-/// and verdicts against the default (env/public) registry, so it cannot
-/// vouch that the artifact the manager pulls from the override matches the
-/// advisory universe. Resolving against the override (and multi-index cases
-/// like `--extra-index-url`) is a documented limitation — registry
-/// allow-listing is future work, separate PRD.
-fn warn_registry_override(manager: PackageManager, rest: &[String]) {
+/// Warn when a custom registry/index is selected — via CLI flag or, for npm,
+/// the project `.npmrc`. The gate resolves and verdicts against the default
+/// (env/public) registry, so it cannot vouch that the artifact the manager
+/// pulls from the override matches the advisory universe. Resolving against
+/// the override (and multi-index cases like `--extra-index-url`) is a
+/// documented limitation — registry allow-listing is future work, separate
+/// PRD.
+///
+/// pip config-file (`pip.conf`) and `PIP_INDEX_URL`-style env detection is
+/// future work: only pip CLI index flags are inspected here.
+fn warn_registry_override(
+    manager: PackageManager,
+    rest: &[String],
+    npm_root: Option<&std::path::Path>,
+) {
     let flags: &[&str] = match manager {
         PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => &["--registry"],
         PackageManager::Pip | PackageManager::Uv => &[
@@ -555,6 +582,65 @@ fn warn_registry_override(manager: PackageManager, rest: &[String]) {
             manager.binary_name()
         );
     }
+
+    // A project `.npmrc` `registry=` / `@scope:registry=` line redirects
+    // resolution just like the CLI flag, but silently — the tree pass copies
+    // the `.npmrc` into its temp dir so resolution honours it, so the verdict
+    // would still be against the default advisory universe with no flag in
+    // `rest` to catch. Warn on it so the redirect isn't silent.
+    if manager == PackageManager::Npm {
+        if let Some(path) = npmrc_registry_override_path(npm_root) {
+            eprintln!(
+                "warning: '{}' sets a custom registry; the gate resolves and verdicts against the default registry and cannot vouch the installed artifact matches.",
+                path.display()
+            );
+        }
+    }
+}
+
+/// The first `.npmrc` (CWD, then the npm project root) holding a `registry=`
+/// or `@<scope>:registry=` line, if any. Best-effort: an absent or unreadable
+/// `.npmrc` yields `None` — it can't redirect resolution if it can't be read.
+///
+/// `npm_root` lets a caller that already resolved the project root pass it in
+/// so `tree::npm_project_root()` isn't walked twice (e.g. `run_npm_ci`); `None`
+/// resolves it here.
+fn npmrc_registry_override_path(npm_root: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok();
+    // CWD first, then the project root npm would actually operate on; skip the
+    // root when it equals the CWD so the same file isn't checked twice.
+    let mut candidates: Vec<std::path::PathBuf> = cwd.iter().map(|d| d.join(".npmrc")).collect();
+    let root = npm_root
+        .map(std::path::Path::to_path_buf)
+        .or_else(tree::npm_project_root);
+    if let Some(root) = root {
+        if cwd.as_deref() != Some(root.as_path()) {
+            candidates.push(root.join(".npmrc"));
+        }
+    }
+    candidates.into_iter().find(|path| {
+        std::fs::read_to_string(path)
+            .map(|c| npmrc_has_registry_override(&c))
+            .unwrap_or(false)
+    })
+}
+
+/// Does this `.npmrc` content select a custom registry? True when an
+/// uncommented line's key is `registry` or ends with `:registry` (the
+/// `@<scope>:registry=...` form). `.npmrc` is INI-ish `key=value`; lines
+/// starting with `;` or `#` are comments.
+fn npmrc_has_registry_override(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            return false;
+        }
+        let Some((key, _)) = line.split_once('=') else {
+            return false;
+        };
+        let key = key.trim();
+        key == "registry" || key.ends_with(":registry")
+    })
 }
 
 /// Shared tail of every gated path: render the report, refuse (exit 1) when
@@ -579,6 +665,36 @@ fn report_and_exec(
     exec()
 }
 
+/// Refuse an install the gate cannot verify *before* it can build a
+/// `PrecheckReport` — so the decision can't run through `block_reason`. Emits a
+/// uniform `cannot verify … (pass --force …)` line and exits 1; `--force` is the
+/// single escape. These pre-report refusals are the deliberate, enumerated
+/// exceptions to the "all blocking goes through `block_reason`" rule. Callers:
+/// the bare-`npm install` and `npm ci` root-redirect guards (a redirected
+/// project's tree can't be resolved from a copy of the CWD) and the `npm ci`
+/// unparsable-lockfile guard (no lockfile to verdict). Routes through
+/// `refuse_guard` so `--json` still gets a parseable `{"error": …}` document.
+fn refuse_unverifiable(opts: &PrecheckOptions, detail: &str) -> i32 {
+    refuse_guard(
+        opts,
+        format!("error: cannot verify {detail} (pass --force to proceed unchecked)"),
+        1,
+    )
+}
+
+/// Collapse a tree-resolution thread's join into the resolver's own `Result`.
+/// A panic in the spawned thread becomes a resolution `Err` (which the caller
+/// routes to the named-only fallback with a loud warning) instead of
+/// re-panicking on the main thread. The gate's verdict path fails open, so an
+/// unexpected resolver bug must degrade coverage, never abort the user's
+/// install. (We join the handle, so `thread::scope` treats the panic as handled
+/// and does not re-propagate it.)
+fn tree_resolution_from_join(
+    join: std::thread::Result<Result<Vec<tree::TreePackage>, String>>,
+) -> Result<Vec<tree::TreePackage>, String> {
+    join.unwrap_or_else(|_| Err("tree resolution panicked".to_string()))
+}
+
 /// Post-parse verification shared by the npm and pip install paths.
 fn run_parsed_install(
     manager: PackageManager,
@@ -600,10 +716,11 @@ fn run_parsed_install(
     // its targets and degrades the tree pass to a loud named-only warning.)
     if manager == PackageManager::Npm && bare_install && opts.verdict.is_some() && !opts.force {
         if let Some(flag) = tree::npm_root_redirect_flag(rest) {
-            return refuse_guard(
+            return refuse_unverifiable(
                 &opts,
-                format!("error: cannot verify a bare 'npm install' that redirects the project root ('{flag}'): the would-install tree is unknown (pass --force to proceed unchecked)"),
-                1,
+                &format!(
+                    "a bare 'npm install' that redirects the project root ('{flag}'): the would-install tree is unknown"
+                ),
             );
         }
     }
@@ -613,6 +730,20 @@ fn run_parsed_install(
         // install is covered by `requirements_note`.
         if bare_install {
             render::bare_install_note(manager, subcommand_label);
+        }
+        // One bare-npm case lands here not because there's nothing to gate but
+        // because the project root couldn't be resolved at all: an unreadable
+        // CWD makes `npm_project_root()` (via `find_up`) return None, so
+        // `covers_input` is false. Say so loudly instead of skipping the gate
+        // silently. (npm will most likely fail on the same unreadable CWD; the
+        // warning explains why nothing was verified.)
+        if manager == PackageManager::Npm
+            && opts.verdict.is_some()
+            && std::env::current_dir().is_err()
+        {
+            eprintln!(
+                "warning: cannot determine the npm project (current directory is unreadable); proceeding without tree verification."
+            );
         }
         render::requirements_note(&parsed);
         // Under --json (bare yarn/pnpm install) stdout must still carry one
@@ -641,7 +772,7 @@ fn run_parsed_install(
         let outcomes = verdict::verify_all(&parsed.targets, &opts, &now, parsed.allow_prerelease);
         (
             outcomes,
-            tree.map(|handle| handle.join().expect("tree resolution thread panicked")),
+            tree.map(|handle| tree_resolution_from_join(handle.join())),
         )
     });
 
@@ -665,11 +796,12 @@ fn run_parsed_install(
             "warning: transitive dependencies not checked ({reason}); only named packages were verified."
         );
     }
-    // The requirements note only matters when the tree pass did *not* cover
-    // those files (fallback to named-only, or verdicts disabled).
-    if !matches!(&tree, Some(TreeReport::Full { .. })) {
-        render::requirements_note(&parsed);
-    }
+    // The note is recency-specific, and recency never covers requirements-file
+    // packages: even under a Full tree pass they are verdicted but become
+    // `TreeOutcome`s with no `age` (recency only blocks named CLI targets), so
+    // the caveat applies in every path. `requirements_note` self-guards when
+    // there are no `-r` files.
+    render::requirements_note(&parsed);
     if verdict::public_verdict(&opts).is_some_and(|cfg| cfg.public_login_hint) {
         eprintln!(
             "warning: using public CVE checks; login enables authenticated enforcement and private Corgea intelligence."
@@ -735,24 +867,23 @@ fn run_locked_install(
             return exec();
         }
         Err(e) => {
-            // The single documented bypass of the "all blocking goes through
-            // `verdict::block_reason`" invariant: an unparsable lockfile
-            // means there is no report to feed the predicate, so the gate
-            // refuses directly (--force above is the only escape). Route it
-            // through `refuse_guard` so `--json` still emits a parseable
-            // `{"error": …}` document instead of bare stderr.
-            return refuse_guard(
+            // A pre-report refusal: an unparsable lockfile leaves no report to
+            // feed `block_reason`, so the gate refuses directly through the
+            // shared `refuse_unverifiable` helper (--force above is the only
+            // escape). That helper enumerates the full set of these deliberate
+            // exceptions to the single-block-predicate rule and, under `--json`,
+            // still emits a parseable `{"error": …}` document.
+            return refuse_unverifiable(
                 opts,
-                format!(
-                    "error: cannot verify '{} {}': {e} (pass --force to proceed unchecked)",
-                    manager.binary_name(),
-                    subcommand
-                ),
-                1,
+                &format!("'{} {}': {e}", manager.binary_name(), subcommand),
             );
         }
     };
 
+    // Lockfiles repeat the same name@version across nested node_modules paths
+    // (npm v2/v3) and diamond deps (v1 tree); collapse to one verdict job each
+    // so the vuln-api is hit — and each package counted — exactly once.
+    let jobs = dedup_packages(manager, jobs);
     let resolved_count = jobs.len();
     let results = verdict::verdict_pool(jobs, cfg, manager);
     let transitive = results
@@ -791,28 +922,32 @@ fn run_npm_ci(subcommand: &str, rest: &[String], opts: PrecheckOptions) -> i32 {
     if opts.verdict.is_none() {
         return exec();
     }
+    // Resolve the project root once and reuse it for both the registry-override
+    // warning (its `.npmrc` lookup) and the lockfile read below.
+    let root = tree::npm_project_root();
+    // `npm ci --registry <url>` (or a project `.npmrc` `registry=` line) pulls
+    // tarballs from an override while the gate verdicts the lockfile against
+    // the default registry — same false-assurance gap as the named-install
+    // path, so warn here too.
+    warn_registry_override(PackageManager::Npm, rest, root.as_deref());
     // A root-redirect flag (`--prefix ../other`, `-C ../other`) makes npm ci
     // install a DIFFERENT project's lockfile than the CWD one we'd verdict, so
     // verifying the CWD lockfile would pass on the wrong project. Fail closed
     // unless `--force`.
     if !opts.force {
         if let Some(flag) = tree::npm_root_redirect_flag(rest) {
-            return refuse_guard(
+            return refuse_unverifiable(
                 &opts,
-                format!("error: cannot verify 'npm {subcommand}' with '{flag}': it installs a redirected project's lockfile, not this one (pass --force to proceed unchecked)"),
-                1,
+                &format!(
+                    "'npm {subcommand}' with '{flag}': it installs a redirected project's lockfile, not this one"
+                ),
             );
         }
     }
-    let Some(root) = tree::npm_project_root() else {
+    let Some(root) = root else {
         return exec();
     };
-    // npm-shrinkwrap.json takes precedence over package-lock.json.
-    let Some(lock_path) = ["npm-shrinkwrap.json", "package-lock.json"]
-        .iter()
-        .map(|n| root.join(n))
-        .find(|p| p.is_file())
-    else {
+    let Some(lock_path) = tree::npm_lockfile_in(&root) else {
         return exec();
     };
 
@@ -827,6 +962,22 @@ fn run_npm_ci(subcommand: &str, rest: &[String], opts: PrecheckOptions) -> i32 {
         &opts,
         exec,
     )
+}
+
+/// Collapse repeated packages to one verdict job each, keyed on
+/// `(normalize_name(name), version)`, preserving first-seen order. npm
+/// lockfiles repeat the same name@version across nested `node_modules` paths
+/// (v2/v3) and diamond deps (v1 `dependencies` tree), so verdicting the raw
+/// parse would hit the vuln-api — and count the package — once per copy.
+fn dedup_packages(manager: PackageManager, jobs: Vec<tree::TreePackage>) -> Vec<tree::TreePackage> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(jobs.len());
+    for p in jobs {
+        if seen.insert((manager.normalize_name(&p.name), p.version.clone())) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 /// One verdict job (`requested: true`) per named resolved target, in
@@ -868,15 +1019,28 @@ fn run_tree_pass(
     // named target already installed is absent from the dry-run delta but
     // must still be verdicted.
     let norm = |n: &str| manager.normalize_name(n);
-    let mut seen = std::collections::HashSet::new();
-    let mut jobs: Vec<tree::TreePackage> = Vec::with_capacity(set.len());
-    for p in set {
-        if seen.insert((norm(&p.name), p.version.clone())) {
-            jobs.push(p);
-        }
-    }
+    let mut jobs = dedup_packages(manager, set);
     let resolved_count = jobs.len();
+    let mut seen: std::collections::HashSet<(String, String)> = jobs
+        .iter()
+        .map(|p| (norm(&p.name), p.version.clone()))
+        .collect();
+    // Names the pip dry-run already covers as `requested` (the user named
+    // them). When pip backtracked one to a different version than the CLI's
+    // `pypi_resolve` picked, the dry-run's installed version is authoritative;
+    // `apply_verdicts` collapses it onto the named outcome. Unioning the CLI
+    // version in too would queue a redundant job that re-matches and could
+    // clobber that authoritative verdict, so skip it. npm jobs are never
+    // `requested`, so this set is empty and the npm union is unchanged.
+    let requested_names: std::collections::HashSet<String> = jobs
+        .iter()
+        .filter(|p| p.requested)
+        .map(|p| norm(&p.name))
+        .collect();
     for p in resolved_jobs(outcomes) {
+        if requested_names.contains(&norm(&p.name)) {
+            continue;
+        }
         if seen.insert((norm(&p.name), p.version.clone())) {
             jobs.push(p);
         }
@@ -978,10 +1142,37 @@ mod tests {
 
     #[test]
     fn install_subcommand_recognition() {
-        assert!(PackageManager::Npm.is_install_subcommand("install"));
-        assert!(PackageManager::Npm.is_install_subcommand("i"));
-        assert!(PackageManager::Npm.is_install_subcommand("add"));
+        // The full npm install alias set (including common typos) must gate;
+        // none may fall through to the ungated passthrough.
+        // The full npm install alias set per `lib/utils/cmd-list.js`.
+        for alias in [
+            "install", "i", "in", "ins", "inst", "insta", "instal", "isnt", "isnta", "isntal",
+            "isntall", "add",
+        ] {
+            assert!(
+                PackageManager::Npm.is_install_subcommand(alias),
+                "npm `{alias}` must route through the gate"
+            );
+        }
         assert!(!PackageManager::Npm.is_install_subcommand("update"));
+        // `installation` is not a real npm alias, and `innit` maps to npm
+        // `init` (not `install`) — neither must be treated as an install.
+        assert!(!PackageManager::Npm.is_install_subcommand("installation"));
+        assert!(!PackageManager::Npm.is_install_subcommand("innit"));
+        // `npm ci` aliases are gated by a separate dispatch that runs before
+        // this check, so they must NOT be recognized here.
+        for ci_alias in [
+            "ci",
+            "ic",
+            "clean-install",
+            "install-clean",
+            "isntall-clean",
+        ] {
+            assert!(
+                !PackageManager::Npm.is_install_subcommand(ci_alias),
+                "npm `{ci_alias}` is handled by run_npm_ci, not this check"
+            );
+        }
 
         assert!(PackageManager::Yarn.is_install_subcommand("add"));
         assert!(PackageManager::Yarn.is_install_subcommand("install"));
@@ -1054,6 +1245,77 @@ mod tests {
     }
 
     #[test]
+    fn diamond_lockfile_parse_then_dedup_counts_each_package_once() {
+        // A v1 `dependencies` tree where the same package@version is nested
+        // under two parents (a DIAMOND): `parent-a` and `parent-b` both pull
+        // `shared@2.0.0`. parse_npm_lockfile returns it once per parent — the
+        // dedup the npm-ci path applies is what collapses it. Without dedup
+        // the shared package would be verdicted (and counted) twice.
+        const DIAMOND: &str = r#"{
+            "name": "proj", "lockfileVersion": 1,
+            "dependencies": {
+                "parent-a": {"version": "1.0.0", "dependencies": {
+                    "shared": {"version": "2.0.0"}
+                }},
+                "parent-b": {"version": "1.0.0", "dependencies": {
+                    "shared": {"version": "2.0.0"}
+                }}
+            }
+        }"#;
+
+        // parse_npm_lockfile returns duplicates by design (one row per tree
+        // position): `shared@2.0.0` appears twice.
+        let parsed = tree::parse_npm_lockfile(DIAMOND).expect("parse v1 diamond lock");
+        let shared_in_parse = parsed
+            .iter()
+            .filter(|p| p.name == "shared" && p.version == "2.0.0")
+            .count();
+        assert_eq!(shared_in_parse, 2, "parse keeps one row per tree position");
+
+        // Dedup (the run_npm_ci path) collapses it to a single verdict job, so
+        // `resolved_count` and the verdict list count it once.
+        let jobs = dedup_packages(PackageManager::Npm, parsed);
+        assert_eq!(
+            jobs.iter()
+                .filter(|p| p.name == "shared" && p.version == "2.0.0")
+                .count(),
+            1,
+            "dedup yields the diamond package exactly once"
+        );
+        assert_eq!(jobs.len(), 3, "parent-a, parent-b, shared — no duplicates");
+    }
+
+    #[test]
+    fn npmrc_registry_override_detection() {
+        // A bare `registry=` line is an override.
+        assert!(npmrc_has_registry_override(
+            "registry=https://evil.example/\n"
+        ));
+        // The scoped form `@<scope>:registry=` is too.
+        assert!(npmrc_has_registry_override(
+            "@acme:registry=https://evil.example/\n"
+        ));
+        // Surrounding config lines and whitespace don't hide it.
+        assert!(npmrc_has_registry_override(
+            "save-exact=true\n  registry = https://evil.example/\nfund=false\n"
+        ));
+        // Commented-out lines (; and #) don't count.
+        assert!(!npmrc_has_registry_override(
+            "; registry=https://evil.example/\n# @acme:registry=https://evil.example/\n"
+        ));
+        // No registry directive at all.
+        assert!(!npmrc_has_registry_override(
+            "save-exact=true\nfund=false\n"
+        ));
+        // A key that merely contains "registry" but isn't `registry` /
+        // `:registry` (e.g. npm's auth keys) must not trip the warning.
+        assert!(!npmrc_has_registry_override(
+            "//evil.example/:_authToken=abc\nregistry-other=x\n"
+        ));
+        assert!(!npmrc_has_registry_override(""));
+    }
+
+    #[test]
     fn normalize_name_per_manager() {
         // pypi: PEP 503 — lowercase, separator runs collapse to one `-`.
         assert_eq!(
@@ -1067,5 +1329,21 @@ mod tests {
         assert_eq!(PackageManager::Pip.normalize_name("a__b"), "a-b");
         // npm names are case-sensitive and pass through verbatim.
         assert_eq!(PackageManager::Npm.normalize_name("Left_Pad"), "Left_Pad");
+    }
+
+    #[test]
+    fn tree_resolution_panic_becomes_err_not_abort() {
+        // A panicking tree-resolution thread must degrade to a resolution Err
+        // (→ named-only fallback), never re-panic on the caller.
+        let panicked = std::thread::spawn(|| -> Result<Vec<tree::TreePackage>, String> {
+            panic!("simulated resolver bug");
+        });
+        assert_eq!(
+            tree_resolution_from_join(panicked.join()),
+            Err("tree resolution panicked".to_string())
+        );
+        // A normal result passes straight through.
+        let ok = std::thread::spawn(|| Ok(Vec::new()));
+        assert_eq!(tree_resolution_from_join(ok.join()), Ok(Vec::new()));
     }
 }

@@ -120,7 +120,7 @@ fn bare_npm_install_json_carries_tree_object() {
         serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
     assert_eq!(parsed["tree"]["mode"], "full");
     assert_eq!(parsed["tree"]["resolved_count"], 2);
-    assert_eq!(parsed["summary"]["vulnerable"], 1);
+    assert_eq!(parsed["summary"]["tree"]["vulnerable"], 1);
     assert_eq!(
         parsed["results"].as_array().map(Vec::len),
         Some(0),

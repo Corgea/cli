@@ -417,6 +417,30 @@ fn verdict_json(verdict: &VerdictStatus) -> serde_json::Value {
     }
 }
 
+/// Verdict tallies for one scope, keyed identically so each summary
+/// sub-object reconciles against its own array (`named` ↔ `results`,
+/// `tree` ↔ `tree.transitive`).
+#[derive(Default)]
+struct VerdictCounts {
+    clean: usize,
+    vulnerable: usize,
+    unverifiable: usize,
+    not_checked: usize,
+}
+
+fn verdict_counts<'a>(verdicts: impl Iterator<Item = &'a VerdictStatus>) -> VerdictCounts {
+    let mut c = VerdictCounts::default();
+    for v in verdicts {
+        match v {
+            VerdictStatus::Clean => c.clean += 1,
+            VerdictStatus::Vulnerable(_) => c.vulnerable += 1,
+            VerdictStatus::Unverifiable(_) => c.unverifiable += 1,
+            VerdictStatus::NotChecked => c.not_checked += 1,
+        }
+    }
+    c
+}
+
 pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
     use serde_json::json;
     let verdict_mode = match opts.verdict.as_ref().map(|cfg| &cfg.mode) {
@@ -460,18 +484,41 @@ pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
         })
         .collect();
 
+    // Summary counts are split by scope so each sub-object reconciles
+    // against its own array: `named` covers the targets this command
+    // adds (the `results` array), `tree` covers the resolved would-install
+    // set beyond them (`tree.transitive`). A flat summary mixed the two —
+    // e.g. `npm ci` has no named outcomes, so a clean lockfile read as
+    // all-zero despite a fully-checked tree.
+    let named_counts = verdict_counts(report.named_verdicts());
+    let tree_counts = verdict_counts(report.tree_verdicts());
+    let tree_resolved = match &report.tree {
+        Some(TreeReport::Full { resolved_count, .. }) => *resolved_count,
+        Some(TreeReport::NamedOnly { .. }) | None => 0,
+    };
     let body = json!({
         "manager": report.manager.binary_name(),
         "subcommand": report.subcommand,
         "args": report.original_args,
         "threshold_seconds": report.threshold.as_secs(),
         "summary": {
-            "ok": report.ok_count(),
-            "recent": report.recent_count(),
-            "vulnerable": report.vulnerable_count(),
-            "unverifiable": report.unverifiable_count(),
-            "skipped": report.skipped_count(),
-            "errors": report.error_count(),
+            "named": {
+                "ok": report.ok_count(),
+                "recent": report.recent_count(),
+                "vulnerable": named_counts.vulnerable,
+                "unverifiable": named_counts.unverifiable,
+                "clean": named_counts.clean,
+                "not_checked": named_counts.not_checked,
+                "skipped": report.skipped_count(),
+                "errors": report.error_count(),
+            },
+            "tree": {
+                "resolved_count": tree_resolved,
+                "vulnerable": tree_counts.vulnerable,
+                "unverifiable": tree_counts.unverifiable,
+                "clean": tree_counts.clean,
+                "not_checked": tree_counts.not_checked,
+            },
         },
         "verdict_mode": verdict_mode,
         "results": outcomes,

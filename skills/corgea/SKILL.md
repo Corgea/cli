@@ -1,6 +1,6 @@
 ---
 name: corgea
-description: Scans code for security vulnerabilities using Corgea's AI-powered BLAST scanner and third-party tools, manages findings, and displays AI-generated fixes. Use when the user needs to scan for security issues, upload scan reports, list or inspect vulnerabilities, view fixes, or integrate security scanning into CI/CD.
+description: Scans code for security vulnerabilities using Corgea's AI-powered BLAST scanner and third-party tools, gates `pip` and `npm` package installs against vulnerable and suspiciously-recent dependencies (including transitive), manages findings, and displays AI-generated fixes. Use when the user needs to install pip/npm packages safely, scan for security issues, upload scan reports, list or inspect vulnerabilities, view fixes, or integrate security scanning into CI/CD.
 allowed-tools: Shell, Read, Grep, Glob, StrReplace
 ---
 
@@ -233,29 +233,6 @@ The gate is a wrapper, not an enforcement boundary. By design it cannot catch:
   `--with` packages), `uv tool install`/`uv tool run`, and
   `yarn global add` install packages without a gate; each prints an
   ungated note instead of passing silently.
-
-Hard enforcement needs org-level controls — lockfile review, registry
-allow-listing — alongside the wrapper.
-
-#### Testing the gate
-
-The staging vuln-api (`https://cve-worker-staging.corgea.workers.dev`) is the
-current default endpoint and serves deterministic verdicts for dogfooding.
-Known-vulnerable targets:
-
-| Ecosystem | Target | Verdict |
-|-----------|--------|---------|
-| npm | `axios@0.21.0` | vulnerable — fixed in 0.21.2 |
-| npm | `minimist@0.0.8` | vulnerable — fixed in 1.2.2 |
-| npm | `node-fetch@2.6.0` | vulnerable — fixed in 2.6.7 |
-| PyPI | `mezzanine==6.0.0` | vulnerable — no fixed version known |
-
-Verify the gate end-to-end:
-
-```bash
-corgea npm install axios@0.21.0      # exit 1, names CVE-2021-3749, steers to 0.21.2
-corgea pip install mezzanine==6.0.0  # exit 1, no fixed version known
-```
 
 ## Common Workflows
 

@@ -115,6 +115,20 @@ fn pooled_map<T: Sync, R: Send>(
 /// name + version) and return the unmatched leftovers — the tree findings.
 /// Each leftover carries its provenance: pip's `requested` flag, membership
 /// in the project manifest's direct deps (`direct_deps`), or transitive.
+///
+/// pip backtracking reconciliation: pip's resolver may install a named
+/// target at a different version than the CLI's independent `pypi_resolve`
+/// picked (e.g. `pip install flask werkzeug` where werkzeug constrains flask
+/// below latest). The named outcome then holds the CLI version while the
+/// dry-run carries pip's `requested:true` entry at the installed version, so
+/// the exact `(name, version)` match misses. Such a leftover is the SAME
+/// package the user named, not a transitive finding — collapse it onto the
+/// named outcome, verdicted at the installed version (which is what actually
+/// installs), instead of emitting a duplicate `(from requirements)` finding.
+/// This can never mis-collapse an npm multi-version package: npm's lockfile
+/// never sets `requested` (`TreePackage::requested` is always false for npm),
+/// so the requested branch below is unreachable for npm and its same-name /
+/// different-version copies stay distinct findings.
 pub(super) fn apply_verdicts(
     manager: PackageManager,
     results: Vec<(tree::TreePackage, VerdictStatus)>,
@@ -122,14 +136,21 @@ pub(super) fn apply_verdicts(
     direct_deps: &std::collections::HashSet<String>,
 ) -> Vec<TreeOutcome> {
     let norm = |n: &str| manager.normalize_name(n);
-    // Index named outcomes by (normalized name, version) so matching the
-    // pooled results stays linear on big trees.
+    // Index named outcomes by (normalized name, version) for exact matches,
+    // and by name alone for the pip-backtracking reconciliation below. Both
+    // keep result matching linear on big trees.
     let mut named: std::collections::HashMap<(String, String), Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut named_by_name: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();
     for (i, o) in outcomes.iter().enumerate() {
         if let TargetOutcome::Resolved { resolved, .. } = o {
             named
                 .entry((norm(&resolved.name), resolved.version.clone()))
+                .or_default()
+                .push(i);
+            named_by_name
+                .entry(norm(&resolved.name))
                 .or_default()
                 .push(i);
         }
@@ -140,6 +161,28 @@ pub(super) fn apply_verdicts(
         if let Some(indices) = named.get(&(norm(&pkg.name), pkg.version.clone())) {
             for &i in indices {
                 if let TargetOutcome::Resolved { verdict: v, .. } = &mut outcomes[i] {
+                    *v = verdict.clone();
+                }
+            }
+        } else if let Some(indices) = pkg
+            .requested
+            .then(|| named_by_name.get(&norm(&pkg.name)))
+            .flatten()
+        {
+            // pip backtracked this named target to a different version. Adopt
+            // the installed version on the named row (honesty: the named row
+            // must show what installs) and verdict it there. `age` /
+            // `resolved.published_at` still reflect the CLI-resolved version —
+            // a one-minor-version drift, left as-is rather than re-fetching on
+            // the gate's critical path; recency stays driven by that age.
+            for &i in indices {
+                if let TargetOutcome::Resolved {
+                    resolved,
+                    verdict: v,
+                    ..
+                } = &mut outcomes[i]
+                {
+                    resolved.version = pkg.version.clone();
                     *v = verdict.clone();
                 }
             }
@@ -626,5 +669,122 @@ mod tests {
                 ("reqdep", TreeOrigin::Requested),
             ]
         );
+    }
+
+    fn pkg(name: &str, version: &str, requested: bool) -> tree::TreePackage {
+        tree::TreePackage {
+            name: name.to_string(),
+            version: version.to_string(),
+            requested,
+        }
+    }
+
+    fn named_version(outcome: &TargetOutcome) -> &str {
+        match outcome {
+            TargetOutcome::Resolved { resolved, .. } => resolved.version.as_str(),
+            _ => unreachable!("expected a resolved outcome"),
+        }
+    }
+
+    fn named_verdict(outcome: &TargetOutcome) -> &VerdictStatus {
+        match outcome {
+            TargetOutcome::Resolved { verdict, .. } => verdict,
+            _ => unreachable!("expected a resolved outcome"),
+        }
+    }
+
+    /// pip backtracking: the CLI's `pypi_resolve` picked flask 3.0.3 but
+    /// werkzeug constrains it, so pip's dry-run installs flask 3.0.2 with
+    /// `requested:true`. The exact `(name, version)` match misses, but the
+    /// leftover is the SAME named package — it must collapse onto the named
+    /// outcome (verdicted at the installed 3.0.2, the named row showing what
+    /// installs), with NO duplicate `(from requirements)` finding.
+    #[test]
+    fn apply_verdicts_collapses_pip_backtracked_named_target() {
+        let mut outcomes = vec![resolved_outcome("flask", "3.0.3", false)];
+        let results = vec![(
+            pkg("flask", "3.0.2", true),
+            VerdictStatus::Vulnerable(vec![vm("CVE-1", None)]),
+        )];
+        let direct_deps = std::collections::HashSet::new();
+
+        let transitive = apply_verdicts(PackageManager::Pip, results, &mut outcomes, &direct_deps);
+
+        assert!(
+            transitive.is_empty(),
+            "no transitive (from requirements) duplicate for a named package"
+        );
+        assert_eq!(
+            named_version(&outcomes[0]),
+            "3.0.2",
+            "named row shows the version pip installs, not the CLI-resolved one"
+        );
+        assert!(
+            matches!(named_verdict(&outcomes[0]), VerdictStatus::Vulnerable(_)),
+            "named outcome verdicted at the installed version"
+        );
+
+        // The package appears exactly once: one named outcome, zero tree
+        // findings — counts reflect a single package.
+        let report = report_with(outcomes);
+        let report = PrecheckReport {
+            tree: Some(TreeReport::Full {
+                resolved_count: 1,
+                transitive,
+            }),
+            ..report
+        };
+        assert_eq!(report.vulnerable_count(), 1, "flask counted once");
+    }
+
+    /// An exact `(name, version)` match still collapses onto the named
+    /// outcome unchanged — the version is untouched and the verdict lands.
+    #[test]
+    fn apply_verdicts_exact_named_match_unchanged() {
+        let mut outcomes = vec![resolved_outcome("flask", "3.0.3", false)];
+        let results = vec![(
+            pkg("flask", "3.0.3", true),
+            VerdictStatus::Vulnerable(vec![vm("CVE-1", None)]),
+        )];
+        let direct_deps = std::collections::HashSet::new();
+
+        let transitive = apply_verdicts(PackageManager::Pip, results, &mut outcomes, &direct_deps);
+
+        assert!(transitive.is_empty());
+        assert_eq!(named_version(&outcomes[0]), "3.0.3");
+        assert!(matches!(
+            named_verdict(&outcomes[0]),
+            VerdictStatus::Vulnerable(_)
+        ));
+    }
+
+    /// npm multi-version must NOT collapse: the same name legitimately
+    /// appears at two versions in one tree (nested node_modules). Neither is
+    /// a named-and-requested pip target (npm never sets `requested`), so both
+    /// stay distinct tree findings rather than folding into one.
+    #[test]
+    fn apply_verdicts_keeps_npm_multi_version_distinct() {
+        // A named outcome shares the name to prove name-only matching is NOT
+        // used for npm: the by-name index exists, but the requested guard
+        // keeps both copies out of it.
+        let mut outcomes = vec![resolved_outcome("lodash", "4.17.21", false)];
+        let results = vec![
+            (pkg("lodash", "4.17.20", false), VerdictStatus::Clean),
+            (pkg("lodash", "3.10.1", false), VerdictStatus::Clean),
+        ];
+        let direct_deps = std::collections::HashSet::new();
+
+        let mut transitive =
+            apply_verdicts(PackageManager::Npm, results, &mut outcomes, &direct_deps);
+        transitive.sort_by(|a, b| a.version.cmp(&b.version));
+
+        let versions: Vec<&str> = transitive.iter().map(|t| t.version.as_str()).collect();
+        assert_eq!(
+            versions,
+            vec!["3.10.1", "4.17.20"],
+            "both npm copies stay distinct findings"
+        );
+        // The named lodash@4.17.21 keeps its own version untouched.
+        assert_eq!(named_version(&outcomes[0]), "4.17.21");
     }
 }

