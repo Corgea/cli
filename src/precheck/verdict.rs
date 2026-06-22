@@ -225,7 +225,11 @@ pub(super) fn block_reason(report: &PrecheckReport, opts: &PrecheckOptions) -> O
     }
     // A resolution error means no verdict was obtained for that target, so
     // in authenticated mode it fails closed like `Unverifiable` — otherwise a
-    // registry outage silently bypasses the gate.
+    // registry outage silently bypasses the gate. A `Skipped` outcome is a
+    // git/URL/path direct reference with no registry `name@version` to check
+    // at all; authenticated mode blocks that unverifiable target too, so the
+    // org guarantee can't be sidestepped with `pip install git+https://…`.
+    // `--force` is the escape for all of these.
     let fail_closed = authenticated_verdict(opts);
     // Authenticated mode also fails closed when a manager that HAS a tree
     // resolver (pip/npm/uv) degraded to `NamedOnly`: the whole transitive set
@@ -235,7 +239,8 @@ pub(super) fn block_reason(report: &PrecheckReport, opts: &PrecheckOptions) -> O
     let tree_degraded_unchecked = report.manager.has_tree_resolver()
         && matches!(report.tree, Some(TreeReport::NamedOnly { .. }));
     if report.verdicts().any(|v| v.blocks(fail_closed))
-        || (fail_closed && (report.error_count() > 0 || tree_degraded_unchecked))
+        || (fail_closed
+            && (report.error_count() > 0 || report.skipped_count() > 0 || tree_degraded_unchecked))
     {
         return Some(if blames_existing_tree(report, opts) {
             BlockReason::ExistingTree
@@ -382,6 +387,19 @@ mod tests {
             },
             error: "registry unavailable".to_string(),
         }]);
+        // A git/URL/path direct reference: verified to `Skipped`, no registry
+        // `name@version` to look up. Public mode notes it; authenticated mode
+        // blocks it.
+        let skipped = report_with(vec![TargetOutcome::Skipped {
+            target: InstallTarget {
+                name: "pkg".to_string(),
+                display: "git+https://example.test/pkg.git".to_string(),
+                kind: TargetKind::Unverifiable {
+                    reason: "git/URL/path reference".to_string(),
+                },
+            },
+            reason: "git/URL/path reference".to_string(),
+        }]);
 
         assert!(!should_block_install(&clean, &public_opts(false, false)));
         assert!(should_block_install(&recent, &public_opts(false, false)));
@@ -410,12 +428,21 @@ mod tests {
             should_block_install(&resolution_error, &authenticated_opts(false, false)),
             "authenticated mode must fail closed when no verdict can be obtained"
         );
+        assert!(
+            !should_block_install(&skipped, &public_opts(false, false)),
+            "public mode must let a skipped direct reference through"
+        );
+        assert!(
+            should_block_install(&skipped, &authenticated_opts(false, false)),
+            "authenticated mode must fail closed on an unverifiable direct reference"
+        );
         for report in [
             &clean,
             &recent,
             &vulnerable,
             &unverifiable,
             &resolution_error,
+            &skipped,
         ] {
             assert!(
                 !should_block_install(report, &public_opts(false, true)),

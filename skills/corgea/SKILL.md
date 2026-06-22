@@ -140,11 +140,12 @@ twice: a version published within `--threshold` (default `2d`) blocks
 Baseline public CVE checks need no token: known-vulnerable or malicious
 versions block, but vuln-api lookup outages warn and continue because public
 mode is fail-open. A Corgea token on the default vuln-api enables
-authenticated enforcement; in that mode, verdict lookup failures and
-resolution errors also block (fail-closed). Everything else passes through
-with the package manager's own exit code. Git/URL/path
-specs (including `pip install .`, PEP 508 `name @ url` direct references, and
-npm GitHub shorthand `user/repo`) are noted, never blocked. The install verb
+authenticated enforcement; in that mode, verdict lookup failures, resolution
+errors, and unverifiable git/URL/path specs (including `pip install .`, PEP
+508 `name @ url` direct references, and npm GitHub shorthand `user/repo`) all
+block (fail-closed) unless `--force`. In public mode those same specs are
+noted, never blocked, and everything else passes through with the package
+manager's own exit code. The install verb
 is found behind global flags (`npm --loglevel silent install x` is still
 gated). Bare `npm install` (zero specs, project `package.json` found like npm
 finds it — nearest ancestor) is gated too: the full lockfile-resolved tree is
