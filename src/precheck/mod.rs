@@ -585,6 +585,19 @@ fn report_and_exec(
     exec()
 }
 
+/// Collapse a tree-resolution thread's join into the resolver's own `Result`.
+/// A panic in the spawned thread becomes a resolution `Err` (which the caller
+/// routes to the named-only fallback with a loud warning) instead of
+/// re-panicking on the main thread. The gate's verdict path fails open, so an
+/// unexpected resolver bug must degrade coverage, never abort the user's
+/// install. (We join the handle, so `thread::scope` treats the panic as handled
+/// and does not re-propagate it.)
+fn tree_resolution_from_join(
+    join: std::thread::Result<Result<Vec<tree::TreePackage>, String>>,
+) -> Result<Vec<tree::TreePackage>, String> {
+    join.unwrap_or_else(|_| Err("tree resolution panicked".to_string()))
+}
+
 /// Post-parse verification shared by the npm and pip install paths.
 fn run_parsed_install(
     manager: PackageManager,
@@ -619,6 +632,20 @@ fn run_parsed_install(
         if bare_install {
             render::bare_install_note(manager, subcommand_label);
         }
+        // One bare-npm case lands here not because there's nothing to gate but
+        // because the project root couldn't be resolved at all: an unreadable
+        // CWD makes `npm_project_root()` (via `find_up`) return None, so
+        // `covers_input` is false. Say so loudly instead of skipping the gate
+        // silently. (npm will most likely fail on the same unreadable CWD; the
+        // warning explains why nothing was verified.)
+        if manager == PackageManager::Npm
+            && opts.verdict.is_some()
+            && std::env::current_dir().is_err()
+        {
+            eprintln!(
+                "warning: cannot determine the npm project (current directory is unreadable); proceeding without tree verification."
+            );
+        }
         render::requirements_note(&parsed);
         return exec();
     }
@@ -631,7 +658,7 @@ fn run_parsed_install(
         let outcomes = verdict::verify_all(&parsed.targets, &opts, &now, parsed.allow_prerelease);
         (
             outcomes,
-            tree.map(|handle| handle.join().expect("tree resolution thread panicked")),
+            tree.map(|handle| tree_resolution_from_join(handle.join())),
         )
     });
 
@@ -655,11 +682,12 @@ fn run_parsed_install(
             "warning: transitive dependencies not checked ({reason}); only named packages were verified."
         );
     }
-    // The requirements note only matters when the tree pass did *not* cover
-    // those files (fallback to named-only, or verdicts disabled).
-    if !matches!(&tree, Some(TreeReport::Full { .. })) {
-        render::requirements_note(&parsed);
-    }
+    // The note is recency-specific, and recency never covers requirements-file
+    // packages: even under a Full tree pass they are verdicted but become
+    // `TreeOutcome`s with no `age` (recency only blocks named CLI targets), so
+    // the caveat applies in every path. `requirements_note` self-guards when
+    // there are no `-r` files.
+    render::requirements_note(&parsed);
 
     let report = PrecheckReport {
         manager,
@@ -1159,5 +1187,21 @@ mod tests {
         assert_eq!(PackageManager::Pip.normalize_name("a__b"), "a-b");
         // npm names are case-sensitive and pass through verbatim.
         assert_eq!(PackageManager::Npm.normalize_name("Left_Pad"), "Left_Pad");
+    }
+
+    #[test]
+    fn tree_resolution_panic_becomes_err_not_abort() {
+        // A panicking tree-resolution thread must degrade to a resolution Err
+        // (→ named-only fallback), never re-panic on the caller.
+        let panicked = std::thread::spawn(|| -> Result<Vec<tree::TreePackage>, String> {
+            panic!("simulated resolver bug");
+        });
+        assert_eq!(
+            tree_resolution_from_join(panicked.join()),
+            Err("tree resolution panicked".to_string())
+        );
+        // A normal result passes straight through.
+        let ok = std::thread::spawn(|| Ok(Vec::new()));
+        assert_eq!(tree_resolution_from_join(ok.join()), Ok(Vec::new()));
     }
 }

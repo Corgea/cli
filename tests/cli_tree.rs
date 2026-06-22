@@ -324,6 +324,29 @@ fn pip_clean_tree_proceeds() {
 }
 
 #[test]
+fn pip_full_tree_still_notes_requirements_skip_recency() {
+    // A successful (Full) tree pass verdicts the `-r` packages but never
+    // recency-checks them, so the "not recency-checked" note must still print —
+    // it was previously suppressed whenever the tree pass was Full.
+    let cwd = TempDir::new().expect("temp cwd");
+    std::fs::write(cwd.path().join("requirements.txt"), "oldpkg==1.0.0\n")
+        .expect("write requirements.txt");
+    let mut h = tree_harness("pip", HashMap::new(), HashMap::new(), TREE_REPORT);
+    let out = h
+        .cmd
+        .current_dir(cwd.path())
+        .args(["pip", "install", "-r", "requirements.txt"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0), "clean tree must proceed");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("requirements.txt") && stderr.contains("not recency-checked"),
+        "Full tree pass with -r must still note recency is skipped: {stderr}"
+    );
+}
+
+#[test]
 fn npm_root_redirect_flag_degrades_to_named_only() {
     // `--prefix` overrides npm's project root regardless of cwd, so the
     // throwaway-dir resolution would write the REAL lockfile at that path.
