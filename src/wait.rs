@@ -76,7 +76,7 @@ pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>)
         println!("Scan has been processed successfully!");
     }
 
-    match blast::report_scan_status(&config.get_url(), &project_name) {
+    match blast::report_scan_status(&config.get_url(), &project_name, &scan_id) {
         Ok(_) => {
             println!(
                 "\n\nYou can view the scan results at the following link:\n{}",
