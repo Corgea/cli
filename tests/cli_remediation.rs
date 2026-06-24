@@ -26,7 +26,7 @@ fn no_fix_body() -> String {
 fn fixed_match_blocks_and_names_safe_version() {
     let mut checks = HashMap::new();
     checks.insert(key("pypi", "oldpkg", "1.0.0"), fixed_body());
-    let mut h = pip_harness(checks, HashMap::new(), 0);
+    let mut h = pip_harness(checks, HashMap::new(), None, 0);
     let out = h
         .cmd
         .args(["pip", "install", "oldpkg==1.0.0"])
@@ -50,7 +50,7 @@ fn fixed_match_blocks_and_names_safe_version() {
 fn json_remediation_carries_safe_version() {
     let mut checks = HashMap::new();
     checks.insert(key("pypi", "oldpkg", "1.0.0"), fixed_body());
-    let mut h = pip_harness(checks, HashMap::new(), 0);
+    let mut h = pip_harness(checks, HashMap::new(), None, 0);
     let out = h
         .cmd
         .args(["pip", "--json", "install", "oldpkg==1.0.0"])
@@ -70,7 +70,7 @@ fn json_remediation_carries_safe_version() {
 fn json_remediation_null_when_no_fix() {
     let mut checks = HashMap::new();
     checks.insert(key("pypi", "oldpkg", "1.0.0"), no_fix_body());
-    let mut h = pip_harness(checks, HashMap::new(), 0);
+    let mut h = pip_harness(checks, HashMap::new(), None, 0);
     let out = h
         .cmd
         .args(["pip", "--json", "install", "oldpkg==1.0.0"])
@@ -95,7 +95,7 @@ fn json_remediation_null_when_no_fix() {
 fn no_fix_match_reports_no_fixed_version_known() {
     let mut checks = HashMap::new();
     checks.insert(key("pypi", "oldpkg", "1.0.0"), no_fix_body());
-    let mut h = pip_harness(checks, HashMap::new(), 0);
+    let mut h = pip_harness(checks, HashMap::new(), None, 0);
     let out = h
         .cmd
         .args(["pip", "install", "oldpkg==1.0.0"])

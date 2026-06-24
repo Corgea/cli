@@ -29,7 +29,8 @@ fn check(
     version: &str,
 ) -> Result<VulnCheckResponse, Box<dyn std::error::Error>> {
     let client = http_client().expect("client");
-    check_package_version(&client, base_url, ecosystem, name, version)
+    // Contract tests run the public (tokenless) mode.
+    check_package_version(&client, base_url, None, ecosystem, name, version)
 }
 
 fn fixture_body(name: &str) -> String {

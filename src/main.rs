@@ -258,22 +258,57 @@ struct InstallWrapArgs {
     cmd: Vec<String>,
 }
 
-fn install_wrap_options(args: &InstallWrapArgs) -> corgea::precheck::PrecheckOptions {
+fn install_wrap_options(
+    args: &InstallWrapArgs,
+    config: &Config,
+) -> corgea::precheck::PrecheckOptions {
+    let token = config.get_token();
+    let token = token.trim();
+    let base_url = config::vuln_api_url();
+    let custom_vuln_api_url = base_url != config::DEFAULT_VULN_API_URL;
+    let send_token_to_custom =
+        utils::generic::get_env_var_if_exists("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL")
+            .is_some_and(|v| v.trim() == "1");
+    let mode = select_verdict_mode(token, custom_vuln_api_url, send_token_to_custom);
     corgea::precheck::PrecheckOptions {
         threshold: args.threshold,
         no_fail: args.no_fail,
         force: args.force,
         json: args.json,
         verdict: Some(corgea::precheck::VerdictConfig {
-            base_url: config::vuln_api_url(),
+            base_url,
+            mode,
+            public_login_hint: token.is_empty(),
         }),
         npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
         pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
     }
 }
 
-fn run_install_wrap_command(manager: corgea::precheck::PackageManager, args: &InstallWrapArgs) {
-    let code = corgea::precheck::run_install(manager, &args.cmd, install_wrap_options(args));
+/// A token enables authenticated (fail-closed) verdicts — but never against
+/// a custom vuln-api URL unless the user explicitly opts in to sending the
+/// token there.
+fn select_verdict_mode(
+    token: &str,
+    custom_vuln_api_url: bool,
+    send_token_to_custom: bool,
+) -> corgea::precheck::VerdictMode {
+    if !token.is_empty() && (!custom_vuln_api_url || send_token_to_custom) {
+        corgea::precheck::VerdictMode::Authenticated {
+            token: token.to_string(),
+        }
+    } else {
+        corgea::precheck::VerdictMode::Public
+    }
+}
+
+fn run_install_wrap_command(
+    manager: corgea::precheck::PackageManager,
+    args: &InstallWrapArgs,
+    config: &Config,
+) {
+    let code =
+        corgea::precheck::run_install(manager, &args.cmd, install_wrap_options(args, config));
     std::process::exit(code);
 }
 
@@ -651,19 +686,19 @@ fn main() {
         // Install wrappers: no auth gate. Public CVE checks run without a
         // token and fail open on lookup outages.
         Some(Commands::Npm(args)) => {
-            run_install_wrap_command(corgea::precheck::PackageManager::Npm, args)
+            run_install_wrap_command(corgea::precheck::PackageManager::Npm, args, &corgea_config)
         }
         Some(Commands::Yarn(args)) => {
-            run_install_wrap_command(corgea::precheck::PackageManager::Yarn, args)
+            run_install_wrap_command(corgea::precheck::PackageManager::Yarn, args, &corgea_config)
         }
         Some(Commands::Pnpm(args)) => {
-            run_install_wrap_command(corgea::precheck::PackageManager::Pnpm, args)
+            run_install_wrap_command(corgea::precheck::PackageManager::Pnpm, args, &corgea_config)
         }
         Some(Commands::Pip(args)) => {
-            run_install_wrap_command(corgea::precheck::PackageManager::Pip, args)
+            run_install_wrap_command(corgea::precheck::PackageManager::Pip, args, &corgea_config)
         }
         Some(Commands::Uv(args)) => {
-            run_install_wrap_command(corgea::precheck::PackageManager::Uv, args)
+            run_install_wrap_command(corgea::precheck::PackageManager::Uv, args, &corgea_config)
         }
         None => {
             if let Some(message) = corgea::precheck::pip3_alias_message(&cli.args) {
@@ -687,5 +722,28 @@ mod tests {
         assert_eq!(default_log_level(0), "info");
         assert_eq!(default_log_level(2), "info"); // only ==1 means debug
         assert_eq!(default_log_level(-1), "info");
+    }
+
+    #[test]
+    fn verdict_mode_selection_matrix() {
+        use corgea::precheck::VerdictMode;
+
+        assert_eq!(
+            select_verdict_mode("token", false, false),
+            VerdictMode::Authenticated {
+                token: "token".to_string()
+            }
+        );
+        assert_eq!(select_verdict_mode("", false, false), VerdictMode::Public);
+        assert_eq!(
+            select_verdict_mode("token", true, false),
+            VerdictMode::Public
+        );
+        assert_eq!(
+            select_verdict_mode("token", true, true),
+            VerdictMode::Authenticated {
+                token: "token".to_string()
+            }
+        );
     }
 }

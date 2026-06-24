@@ -136,12 +136,16 @@ Notes: `deps scan --out-format table|json|sarif` is the report/export selector; 
 Run a package manager through Corgea's install gate. Install commands with
 named targets are resolved against the public registry first, then gated
 twice: a version published within `--threshold` (default `2d`) blocks
-(exit 1), and each resolved version is checked against Corgea's vuln-api —
-known-vulnerable or malicious versions block. CVE checks are public and need
-no token; vuln-api lookup outages warn and continue (fail-open). Everything
-else passes through with the package manager's own exit code. Git/URL/path
-specs (including `pip install .`, PEP 508 `name @ url` direct references, and
-npm GitHub shorthand `user/repo`) are noted, never blocked. The install verb
+(exit 1), and each resolved version is checked against Corgea's vuln-api.
+Baseline public CVE checks need no token: known-vulnerable or malicious
+versions block, but vuln-api lookup outages warn and continue because public
+mode is fail-open. A Corgea token on the default vuln-api enables
+authenticated enforcement; in that mode, verdict lookup failures, resolution
+errors, and unverifiable git/URL/path specs (including `pip install .`, PEP
+508 `name @ url` direct references, and npm GitHub shorthand `user/repo`) all
+block (fail-closed) unless `--force`. In public mode those same specs are
+noted, never blocked, and everything else passes through with the package
+manager's own exit code. The install verb
 is found behind global flags (`npm --loglevel silent install x` is still
 gated). Bare `npm install` (zero specs, project `package.json` found like npm
 finds it — nearest ancestor) is gated too: the full lockfile-resolved tree is
@@ -191,22 +195,25 @@ corgea pip list                       # non-install subcommands pass straight th
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--threshold` | `-t` | Recency threshold (`2d`, `12h`). Younger resolved versions block. |
-| `--no-fail` | | Demote a recency block to a warning. Does NOT bypass vulnerable blocks. |
-| `--force` | | Proceed despite all findings (vulnerable, recent). Findings still print. Also bypasses the wrong-package-manager refusal and unparsable-lockfile refusals on `uv sync`/`npm ci`. |
+| `--no-fail` | | Demote a recency block to a warning. Does NOT bypass vulnerable blocks or authenticated unverifiable blocks. |
+| `--force` | | Proceed despite all findings (vulnerable, unverifiable, recent). Findings still print. Also bypasses the wrong-package-manager and PEP 668 refusals, and unparsable-lockfile refusals on `uv sync`/`npm ci`. |
 | `--json` | | JSON report instead of text. Per-result `verdict` object + `verdict_mode` + `tree`. Stdout carries only the report; the package manager's output moves to stderr. |
 
-`--json` adds `verdict_mode` (`"public"` from the CLI; `"recency-only"` can
-only appear for library callers that disable verdicts) and a `tree` object:
-`null` when no
-tree pass ran; otherwise `mode` is `"full"` (transitive checked) or
-`"named-only"` (with a `reason`), plus `resolved_count` and a `transitive[]`
-array of `{name, version, origin, verdict}` for packages beyond the named
-targets. Vulnerable `verdict` objects carry a `remediation` field: the safe
-version covering every advisory, or `null` when any advisory has no known
-fix.
+`--json` adds `verdict_mode` (`"public"` or `"authenticated"` from the CLI;
+`"recency-only"` can only appear for library callers that disable verdicts)
+and a `tree` object: `null` when no tree pass ran; otherwise `mode` is
+`"full"` (transitive checked) or `"named-only"` (with a `reason`), plus
+`resolved_count` and a `transitive[]` array of `{name, version, origin,
+verdict}` for packages beyond the named targets. Vulnerable `verdict`
+objects carry a `remediation` field: the safe version covering every
+advisory, or `null` when any advisory has no known fix.
 
-Overrides for testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`,
-`CORGEA_VULN_API_URL`.
+Recency gating and baseline CVE checks need no token. The default vuln-api
+uses `CORGEA_TOKEN` (or the `corgea login` token) when present. A custom
+`CORGEA_VULN_API_URL` is public by default, even when a token exists; set
+`CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` to send the token to that
+custom URL and make lookup failures fail closed. Overrides for testing:
+`CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`, `CORGEA_VULN_API_URL`.
 
 #### Limitations
 
