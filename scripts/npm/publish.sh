@@ -5,18 +5,42 @@
 set -euo pipefail
 PKG="@corgea/cli"
 VERSION="${PACKAGE_VERSION:?PACKAGE_VERSION is required}"
+DRY_RUN="${DRY_RUN:-false}"
 
 if [[ "$VERSION" == *-* ]]; then DIST_TAG="beta"; PRE=1; else DIST_TAG="latest"; PRE=0; fi
 # Safety: never cross the streams.
 if [[ "$PRE" -eq 1 && "$DIST_TAG" == "latest" ]]; then echo "REFUSING: pre-release $VERSION -> latest" >&2; exit 1; fi
 if [[ "$PRE" -eq 0 && "$DIST_TAG" == "beta"   ]]; then echo "REFUSING: final $VERSION -> beta" >&2; exit 1; fi
-echo "version=$VERSION dist-tag=$DIST_TAG dry_run=${DRY_RUN:-false}"
+echo "version=$VERSION dist-tag=$DIST_TAG dry_run=$DRY_RUN"
 [[ "${RESOLVE_ONLY:-false}" == "true" ]] && exit 0
 
 # Idempotency: query the CORRECT scoped package at the exact version.
-if npm view "${PKG}@${VERSION}" version >/dev/null 2>&1; then
+# Skipped under DRY_RUN so a rehearsal always exercises the real publish path.
+if [[ "$DRY_RUN" != "true" ]] && npm view "${PKG}@${VERSION}" version >/dev/null 2>&1; then
   echo "${PKG}@${VERSION} already exists on npm, skipping."; exit 0
 fi
 ARGS=(publish --access public --tag "$DIST_TAG")
-[[ "${DRY_RUN:-false}" == "true" ]] && ARGS+=(--dry-run)
+[[ "$DRY_RUN" == "true" ]] && ARGS+=(--dry-run)
 npm "${ARGS[@]}"
+
+# A dry-run writes nothing to verify.
+[[ "$DRY_RUN" == "true" ]] && { echo "dry-run complete (nothing published)."; exit 0; }
+
+# Post-publish gate: prove the registry actually accepted it. A hard failure
+# (e.g. @corgea/cli@1.9.0's E404 token-scope error) already fails `npm publish`
+# above; this gate covers the quieter mode where npm exits 0 but the version is
+# not actually live under the expected dist-tag (registry lag, partial publish,
+# dist-tag not applied). Assert from the public registry with retries.
+echo "Verifying ${PKG}@${VERSION} is live with dist-tag ${DIST_TAG}..."
+ok=0
+for attempt in 1 2 3 4 5 6; do
+  got="$(npm view "${PKG}" "dist-tags.${DIST_TAG}" 2>/dev/null || true)"
+  if [[ "$got" == "$VERSION" ]]; then ok=1; break; fi
+  echo "  dist-tag ${DIST_TAG}=${got:-<unset>} (attempt ${attempt}/6); waiting for registry..."
+  sleep 10
+done
+if [[ "$ok" -ne 1 ]]; then
+  echo "ERROR: after publish, ${PKG} dist-tag ${DIST_TAG} != ${VERSION}; the registry never confirmed the publish." >&2
+  exit 1
+fi
+echo "OK: ${PKG}@${VERSION} live; dist-tag ${DIST_TAG} -> ${VERSION}."

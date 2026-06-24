@@ -12,8 +12,11 @@ The npm publish derives its version from the **tag** (`tag minus the leading v`)
 the PyPI publish derives its version from **`Cargo.toml`** (maturin). If those two
 drift, npm and PyPI ship different versions off one tag. Two guards protect this:
 
-- `version-guard` (`release.yml`, tag-gated) fails the **release** if the tag and
-  `Cargo.toml` version disagree.
+- `version-guard` (`release.yml`, tag-gated) fails the **release** if the tag is
+  not `v`-prefixed or if it disagrees with the `Cargo.toml` version. The `v`
+  check matters: a non-`v` tag (e.g. `1.8.8`) would ship to PyPI here while
+  `npm-publish` — which only handles `v*` — silently skips it, drifting the
+  channels apart. `release-binaries.yml` carries the same `v*` guard.
 - `version-bump-check` (`test.yml`, PR-gated) fails a **PR** whose `Cargo.toml`
   version still equals the latest released tag — i.e. the version wasn't moved
   past what's already published. The first PR after each release must bump.
@@ -71,7 +74,9 @@ ignores pre-releases and stays on the latest stable.
    Release (flagged `prerelease` for betas), and the `finalize-release` job sets
    the notes/disclaimer once.
 6. On its `completed` event, `npm-publish.yml` downloads those zips, bundles them
-   into `vendor/`, and publishes `@corgea/cli` with the resolved dist-tag.
+   into `vendor/`, and publishes `@corgea/cli` with the resolved dist-tag, then
+   re-reads the public registry to confirm the version is live under that
+   dist-tag (the post-publish gate fails loudly on a silent publish failure).
 7. `release.yml` builds wheels + sdist and (tag-gated, after `version-guard`)
    publishes to PyPI.
 
@@ -108,3 +113,29 @@ RESOLVE_ONLY=true PACKAGE_VERSION=1.10.0        ./scripts/npm/publish.sh   # dis
 rename `[Unreleased]` to a dated `[X.Y.Z]` section, add its compare link, and open a
 fresh empty `[Unreleased]` pointing `vX.Y.Z...HEAD`. Betas need no changelog edit —
 their notes come from the GitHub prerelease body and auto-generated commit notes.
+
+## Troubleshooting: npm publish fails with `E404 ... PUT @corgea/cli`
+
+```
+npm error 404 Not Found - PUT https://registry.npmjs.org/@corgea%2fcli - Not found
+npm error 404  '@corgea/cli@X.Y.Z' is not in this registry.
+```
+
+An **E404 on a PUT** to an existing scoped package is npm's deliberately-vague way
+of saying *the authenticated identity is not allowed to publish here* (it returns
+404 rather than 403 to avoid leaking package existence). It is an **auth/scope**
+problem, not a packaging one — `npm publish --dry-run`, `npm pack`, and artifact
+builds all pass while the real publish fails, so only an actual publish (or the
+post-publish gate above) surfaces it.
+
+Checklist when this happens:
+- The `NPM_TOKEN` repo secret must be a **read-write** token (Granular Access Token
+  with read+write on `@corgea/cli`, or a classic **Automation** token, which also
+  bypasses publish-time 2FA) belonging to a maintainer of `@corgea/cli`
+  (`npm owner ls @corgea/cli`).
+- Granular tokens **expire** (90 days by default). A token that worked at setup can
+  start returning E404/E401 months later with no other change.
+- Prefer a dedicated CI npm account added as a maintainer (`npm owner add <ci-acct>
+  @corgea/cli`) so the token is not tied to a person who may rotate or leave.
+- After updating the secret, re-verify with a disposable beta tag and confirm
+  `npm view @corgea/cli@<version> version` from a clean shell.
