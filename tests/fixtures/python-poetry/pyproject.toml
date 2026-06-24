@@ -1,3 +1,8 @@
+[project]
+name = "fixture-poetry"
+version = "0.0.1"
+dependencies = []
+
 [tool.poetry]
 name = "python-poetry-app"
 version = "0.1.0"
