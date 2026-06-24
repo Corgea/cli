@@ -692,7 +692,7 @@ fn report_and_exec(
     render::warn_public_lookup_failures(report, opts);
     if let Some(reason) = verdict::block_reason(report, opts) {
         if !opts.json {
-            render::print_refusal(reason);
+            render::print_refusal(reason, report);
         }
         return 1;
     }

@@ -34,7 +34,13 @@ pub(super) fn bare_install_note(manager: PackageManager, subcommand_label: &str)
 
 /// The refusal line on stderr. Messaging only; the block decision and the
 /// choice of escape hatch live in `verdict::block_reason`.
-pub(super) fn print_refusal(reason: super::verdict::BlockReason) {
+///
+/// Each block also prints the concrete escape invocation (`corgea npm --force
+/// install …`). Wrapper flags are read *between* the manager and the verb, so a
+/// `--force` typed after the verb is swallowed by clap's trailing-var-arg and
+/// forwarded to the package manager — the gate never sees it. When that
+/// misplacement is detected, a `note:` line spells out why the flag had no effect.
+pub(super) fn print_refusal(reason: super::verdict::BlockReason, report: &PrecheckReport) {
     use super::verdict::BlockReason;
     match reason {
         BlockReason::ExistingTree => eprintln!(
@@ -47,6 +53,50 @@ pub(super) fn print_refusal(reason: super::verdict::BlockReason) {
             eprintln!("Refusing to run install. Pass --no-fail to proceed anyway.")
         }
     }
+    print_escape_hint(reason, report);
+}
+
+/// Spell out the concrete escape command, and — when the escape flag was typed
+/// after the install verb — explain that the package manager, not Corgea,
+/// received it. `--force` clears every block; `--no-fail` only the recency one
+/// (so `--force` is accepted there too).
+fn print_escape_hint(reason: super::verdict::BlockReason, report: &PrecheckReport) {
+    use super::verdict::BlockReason;
+    let (canonical, accepted): (&str, &[&str]) = match reason {
+        BlockReason::ExistingTree | BlockReason::Findings => ("--force", &["--force"]),
+        BlockReason::RecencyOnly => ("--no-fail", &["--no-fail", "--force"]),
+    };
+    // An accepted escape sitting in the forwarded args was typed after the
+    // verb — clap handed it to the package manager, not us.
+    let misplaced = accepted
+        .iter()
+        .copied()
+        .find(|f| report.original_args.iter().any(|a| a.as_str() == *f));
+    let flag = misplaced.unwrap_or(canonical);
+
+    let manager = report.manager.binary_name();
+    if let Some(typed) = misplaced {
+        eprintln!("  note: `{typed}` after the verb was passed to {manager}, not corgea.");
+    }
+    // Rebuild the command with the escape in the slot Corgea reads — between
+    // the manager and the verb — dropping a misplaced copy from the tail.
+    let rest: Vec<&str> = report
+        .original_args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| *a != flag)
+        .collect();
+    let mut corrected = format!("corgea {manager} {flag} {}", report.subcommand);
+    if !rest.is_empty() {
+        corrected.push(' ');
+        corrected.push_str(&rest.join(" "));
+    }
+    let action = if flag == "--force" {
+        "bypass the gate with"
+    } else {
+        "proceed anyway with"
+    };
+    eprintln!("  {action}: {corrected}");
 }
 
 /// Print the "requirements files are not recency-checked" note when the
