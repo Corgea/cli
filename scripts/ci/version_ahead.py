@@ -15,9 +15,12 @@ import sys
 
 
 def precedence_key(version):
-    version = version.split("+", 1)[0]
+    version = version.strip().split("+", 1)[0]
     core, _, pre = version.partition("-")
-    nums = [int(part) for part in core.split(".")]
+    parts = core.split(".")
+    if not all(part.isdigit() for part in parts):
+        raise ValueError(f"not a numeric SemVer core: {core!r}")
+    nums = [int(part) for part in parts]
     while len(nums) < 3:
         nums.append(0)
     if not pre:
@@ -37,7 +40,13 @@ def main(argv):
         print(f"usage: {argv[0]} <candidate> <baseline>", file=sys.stderr)
         return 2
     candidate, baseline = argv[1], argv[2]
-    if precedence_key(candidate) > precedence_key(baseline):
+    try:
+        candidate_key = precedence_key(candidate)
+        baseline_key = precedence_key(baseline)
+    except ValueError as exc:
+        print(f"::error::cannot compare versions: {exc}", file=sys.stderr)
+        return 2
+    if candidate_key > baseline_key:
         print(f"OK: {candidate} is ahead of {baseline}.")
         return 0
     print(

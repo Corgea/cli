@@ -47,7 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           CARGO_VER="$(grep -m1 '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
-          LAST_TAG="$(git tag --sort=-v:refname | grep -E '^v' | head -1 || true)"
+          LAST_TAG="$(git tag --sort=-v:refname | grep -E '^v[0-9]' | head -1 || true)"
           LAST_VER="${LAST_TAG#v}"
           if [ -z "$LAST_VER" ]; then
             echo "No release tag found; skipping version check."
