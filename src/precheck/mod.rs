@@ -490,12 +490,46 @@ fn refuse_guard(opts: &PrecheckOptions, message: String, code: i32) -> i32 {
     if opts.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "error": message }))
-                .expect("static JSON shape")
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": render::SCHEMA_VERSION,
+                "error": message,
+            }))
+            .expect("static JSON shape")
         );
     }
     eprintln!("{message}");
     code
+}
+
+/// Proceed without gating while honoring the `--json` contract. Some paths
+/// can't gate but should still run the manager (bare yarn/pnpm, `npm ci`
+/// with no project/lockfile, `uv sync` with no lock). Under `--json` stdout
+/// must still carry exactly one Corgea document, so emit an empty report —
+/// `report_and_exec` then runs the exec, which moves the manager's own
+/// stdout to stderr. Without `--json`, exec transparently. Centralizing this
+/// keeps every ungated path from leaving stdout empty or printing a second
+/// document on top of the report.
+fn proceed_ungated(
+    manager: PackageManager,
+    subcommand: &str,
+    original_args: &[String],
+    bare_install: bool,
+    opts: &PrecheckOptions,
+    exec: impl FnOnce() -> i32,
+) -> i32 {
+    if opts.json {
+        let report = PrecheckReport {
+            manager,
+            subcommand: subcommand.to_string(),
+            original_args: original_args.to_vec(),
+            outcomes: Vec::new(),
+            threshold: opts.threshold,
+            tree: None,
+            bare_install,
+        };
+        return report_and_exec(&report, opts, exec);
+    }
+    exec()
 }
 
 /// Index of the first non-flag token in `cmd` — the subcommand verb.
@@ -746,22 +780,9 @@ fn run_parsed_install(
             );
         }
         render::requirements_note(&parsed);
-        // Under --json (bare yarn/pnpm install) stdout must still carry one
-        // parseable document — an empty report; the notes stay on stderr and
-        // the exec moves the manager's stdout to stderr.
-        if opts.json {
-            let report = PrecheckReport {
-                manager,
-                subcommand: subcommand_label.to_string(),
-                original_args: rest.to_vec(),
-                outcomes: Vec::new(),
-                threshold: opts.threshold,
-                tree: None,
-                bare_install,
-            };
-            return report_and_exec(&report, &opts, exec);
-        }
-        return exec();
+        // Nothing to gate (bare yarn/pnpm install, or an unresolvable npm
+        // root) — proceed, keeping stdout a single document under --json.
+        return proceed_ungated(manager, subcommand_label, rest, bare_install, &opts, exec);
     }
 
     // The named-target registry lookups and the tree dry-run are independent
@@ -857,6 +878,7 @@ fn run_locked_install(
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": render::SCHEMA_VERSION,
                         "warning": message,
                         "proceeded": true,
                     }))
@@ -914,13 +936,13 @@ fn run_locked_install(
 /// `npm ci` (and aliases): installs the project lockfile exactly as
 /// written, so the gate verdicts the lockfile-pinned set directly — no
 /// dry-run needed. Without a project or lockfile npm errors on its own;
-/// the gate just execs.
+/// the gate proceeds via `proceed_ungated` so stdout stays one document.
 fn run_npm_ci(subcommand: &str, rest: &[String], opts: PrecheckOptions) -> i32 {
     let json = opts.json;
     let exec = || exec::exec_install_with_args(PackageManager::Npm, subcommand, rest, json);
 
     if opts.verdict.is_none() {
-        return exec();
+        return proceed_ungated(PackageManager::Npm, subcommand, rest, true, &opts, exec);
     }
     // Resolve the project root once and reuse it for both the registry-override
     // warning (its `.npmrc` lookup) and the lockfile read below.
@@ -944,11 +966,14 @@ fn run_npm_ci(subcommand: &str, rest: &[String], opts: PrecheckOptions) -> i32 {
             );
         }
     }
+    // No npm project or no lockfile here: npm errors on its own, but under
+    // --json stdout must still be one Corgea document, so proceed through the
+    // shared empty-report path rather than a bare stdout-redirecting exec.
     let Some(root) = root else {
-        return exec();
+        return proceed_ungated(PackageManager::Npm, subcommand, rest, true, &opts, exec);
     };
     let Some(lock_path) = tree::npm_lockfile_in(&root) else {
-        return exec();
+        return proceed_ungated(PackageManager::Npm, subcommand, rest, true, &opts, exec);
     };
 
     let lock = std::fs::read_to_string(&lock_path)

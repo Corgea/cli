@@ -150,6 +150,38 @@ fn uv_sync_without_lockfile_execs_with_note() {
 }
 
 #[test]
+fn uv_sync_without_lockfile_json_emits_single_empty_report() {
+    // No uv.lock: uv sync proceeds, but under --json stdout must still be
+    // exactly one parseable Corgea document (an empty report). Forwarding
+    // --json to `uv sync` (which has no such flag) would break the command,
+    // so the gate keeps stdout and moves uv's own output to stderr.
+    let mut h = GateHarness::new()
+        .fake_recorder("uv", 0)
+        .vuln_checks(HashMap::new())
+        .in_project_dir()
+        .build();
+    let out = h
+        .cmd
+        .args(["uv", "--json", "sync"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("sync"),
+        "uv still runs, with --json not forwarded to it"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be one JSON document");
+    assert_eq!(parsed["schema_version"], 1);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("'uv sync' is not gated"),
+        "the ungated note still goes to stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn uv_sync_malformed_lockfile_fails_closed() {
     let mut h = GateHarness::new()
         .fake_recorder("uv", 0)

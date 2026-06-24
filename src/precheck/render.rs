@@ -10,6 +10,11 @@ use super::{
 /// Reason recorded on resolved targets when no verdict pass ran.
 const NO_VERDICT_REASON: &str = "vulnerability verdict not checked";
 
+/// Version stamped on every `--json` document Corgea owns on stdout — the
+/// report body and every blocking `{"error"}` / `{"warning"}` document — so
+/// machine consumers can branch on the shape across install-gate phases.
+pub(super) const SCHEMA_VERSION: u32 = 1;
+
 /// One honest stderr line when a zero-spec install can't be gated:
 /// yarn/pnpm/uv have no safe dry-run, so a bare install pulls its whole
 /// dependency set unchecked. No-op for other managers (bare npm is gated
@@ -497,6 +502,7 @@ pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
         Some(TreeReport::NamedOnly { .. }) | None => 0,
     };
     let body = json!({
+        "schema_version": SCHEMA_VERSION,
         "manager": report.manager.binary_name(),
         "subcommand": report.subcommand,
         "args": report.original_args,

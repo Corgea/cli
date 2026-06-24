@@ -128,7 +128,7 @@ fn uv_ungated_install_note(sub: &[String]) {
 fn run_uv_sync(sub: &[String], opts: PrecheckOptions, exec: impl FnOnce() -> i32) -> i32 {
     if opts.verdict.is_none() {
         // Direct callers may still disable verdicts completely.
-        return exec();
+        return super::proceed_ungated(PackageManager::Uv, "sync", &sub[1..], true, &opts, exec);
     }
     // uv discovers the project by walking up from the CWD — find `uv.lock`
     // the same way, so a sync run from a project subdirectory stays gated.
@@ -136,7 +136,11 @@ fn run_uv_sync(sub: &[String], opts: PrecheckOptions, exec: impl FnOnce() -> i32
         eprintln!(
             "note: no uv.lock here — 'uv sync' is not gated; dependencies install unchecked (run 'uv lock' first to enable the gate)"
         );
-        return exec();
+        // No lock to verdict: uv sync proceeds, but under --json stdout must
+        // still be one Corgea document, so route through the shared empty-report
+        // path. Forwarding --json to `uv sync` (it has no such flag) would
+        // instead break the command.
+        return super::proceed_ungated(PackageManager::Uv, "sync", &sub[1..], true, &opts, exec);
     };
     let lock = std::fs::read_to_string(&lock_path)
         .map_err(|e| format!("read {}: {e}", lock_path.display()))

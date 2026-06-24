@@ -39,8 +39,10 @@ pub(super) fn exec_command(binary: &str, args: &[String]) -> i32 {
 
 /// `stdout_to_stderr` keeps stdout machine-readable under `--json`: the
 /// package manager's own output moves to stderr so stdout carries only the
-/// Corgea report — including a `{"error": …}` document when the binary
-/// itself is missing, so exit 127 still yields one parseable document.
+/// Corgea report. Every caller that passes `true` here prints its report (the
+/// full report or an empty one via `proceed_ungated`) *before* this exec, so a
+/// missing binary must not print a second JSON document — it stays on stderr
+/// and exits 127, leaving the already-printed report as the one document.
 pub(super) fn exec_command_with_stdio(
     binary: &str,
     args: &[String],
@@ -49,13 +51,6 @@ pub(super) fn exec_command_with_stdio(
     let resolved = match resolve_binary(binary) {
         Ok(p) => p,
         Err(msg) => {
-            if stdout_to_stderr {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({ "error": msg }))
-                        .expect("static JSON shape")
-                );
-            }
             eprintln!("{msg}");
             return 127;
         }
