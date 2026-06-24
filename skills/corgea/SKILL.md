@@ -206,7 +206,7 @@ verdict}` for packages beyond the named targets. Vulnerable `verdict`
 objects carry a `remediation` field: the safe version covering every
 advisory, or `null` when any advisory has no known fix.
 
-Recency gating and baseline CVE checks need no token. The default vuln-api
+Baseline CVE checks need no token. The default vuln-api
 uses `CORGEA_TOKEN` (or the `corgea login` token) when present. A custom
 `CORGEA_VULN_API_URL` is public by default, even when a token exists; set
 `CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` to send the token to that

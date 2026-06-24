@@ -121,8 +121,7 @@ fn uv_ungated_install_note(sub: &[String]) {
 /// Gate `uv sync` from the project's `uv.lock`. The lockfile is the full
 /// locked universe (all groups/extras) — a superset of what sync installs,
 /// conservative in the blocking direction; a stale lock that sync would
-/// re-resolve is gated as written. Recency isn't checked (locked versions
-/// aren't newly chosen by this command); the verdict pass is the gate. We
+/// re-resolve is gated as written. The verdict pass is the gate. We
 /// never run `uv lock` ourselves — locking can build sdists, which would
 /// execute package code before any verdict.
 fn run_uv_sync(sub: &[String], opts: PrecheckOptions, exec: impl FnOnce() -> i32) -> i32 {

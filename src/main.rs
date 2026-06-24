@@ -211,15 +211,15 @@ enum Commands {
         #[command(subcommand)]
         command: corgea::deps::run::DepsSubcommand,
     },
-    /// Wrap `npm` commands: gate install targets on recency + vuln verdicts, then run npm.
+    /// Wrap `npm` commands: gate install targets on Corgea's vuln verdicts, then run npm.
     Npm(InstallWrapArgs),
-    /// Wrap `yarn` commands: gate install targets on recency + vuln verdicts, then run yarn.
+    /// Wrap `yarn` commands: gate install targets on Corgea's vuln verdicts, then run yarn.
     Yarn(InstallWrapArgs),
-    /// Wrap `pnpm` commands: gate install targets on recency + vuln verdicts, then run pnpm.
+    /// Wrap `pnpm` commands: gate install targets on Corgea's vuln verdicts, then run pnpm.
     Pnpm(InstallWrapArgs),
-    /// Wrap `pip` commands: gate install targets on recency + vuln verdicts, then run pip.
+    /// Wrap `pip` commands: gate install targets on Corgea's vuln verdicts, then run pip.
     Pip(InstallWrapArgs),
-    /// Wrap `uv` commands: gate install targets on recency + vuln verdicts, then run uv.
+    /// Wrap `uv` commands: gate install targets on Corgea's vuln verdicts, then run uv.
     Uv(InstallWrapArgs),
 }
 

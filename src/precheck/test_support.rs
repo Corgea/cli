@@ -72,7 +72,7 @@ pub(crate) fn resolved_outcome(name: &str, version: &str) -> TargetOutcome {
             version: version.to_string(),
             published_at: Utc::now() - chrono::Duration::from_std(age).unwrap(),
         },
-        age,
+        age: Some(age),
         verdict: VerdictStatus::NotChecked,
     }
 }

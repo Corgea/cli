@@ -218,11 +218,13 @@ pub enum TargetKind {
 #[derive(Debug, Clone)]
 pub enum TargetOutcome {
     /// Resolved cleanly. `age` is the time since publish, shown for
-    /// provenance alongside `resolved.published_at`.
+    /// provenance alongside `resolved.published_at`. `None` when the
+    /// installed version was adjusted after resolution (pip backtracking),
+    /// so the resolved-version provenance no longer describes what installs.
     Resolved {
         target: InstallTarget,
         resolved: crate::verify_deps::registry::ResolvedPackage,
-        age: Duration,
+        age: Option<Duration>,
         verdict: VerdictStatus,
     },
     /// We deliberately couldn't verify this target (URL / git / etc.).
@@ -824,8 +826,7 @@ fn run_parsed_install(
 }
 
 /// Gate a lockfile-pinned install (`npm ci`, `uv sync`): verdict every
-/// locked package. Recency isn't checked — locked versions aren't newly
-/// chosen by this command; the verdict pass is the gate.
+/// locked package. The verdict pass is the gate.
 fn run_locked_install(
     manager: PackageManager,
     subcommand: &str,

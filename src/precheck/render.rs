@@ -365,16 +365,23 @@ pub(super) fn print_text(report: &PrecheckReport) {
                         );
                     }
                 }
-                VerdictStatus::Clean | VerdictStatus::NotChecked => {
-                    println!(
+                // `age` is `None` when pip backtracked the named target to a
+                // version we never resolved — its publish date is unknown, so
+                // show the version without a (wrong) provenance line.
+                VerdictStatus::Clean | VerdictStatus::NotChecked => match age {
+                    Some(age) => println!(
                         "  ✓ {} → {}@{}  published {} ago at {}",
                         target.display,
                         resolved.name,
                         resolved.version,
                         verify_deps::format_duration(*age),
                         resolved.published_at.format("%Y-%m-%d %H:%M:%S UTC"),
-                    );
-                }
+                    ),
+                    None => println!(
+                        "  ✓ {} → {}@{}  publish date unavailable",
+                        target.display, resolved.name, resolved.version,
+                    ),
+                },
             },
             TargetOutcome::Skipped { target, reason } => {
                 println!("  ? {}: {}", target.display, reason);
@@ -469,13 +476,23 @@ pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
                 verdict,
             } => {
                 let verdict_json = verdict_json(verdict);
+                // `null` when pip backtracked to a version we never resolved:
+                // the publish date belonged to the CLI-resolved version, not
+                // what installs, so we drop it rather than report a wrong one.
+                let (published_at, age_seconds) = match age {
+                    Some(age) => (
+                        json!(resolved.published_at.to_rfc3339()),
+                        json!(age.as_secs()),
+                    ),
+                    None => (serde_json::Value::Null, serde_json::Value::Null),
+                };
                 json!({
                     "status": "ok",
                     "spec": target.display,
                     "name": resolved.name,
                     "resolved_version": resolved.version,
-                    "published_at": resolved.published_at.to_rfc3339(),
-                    "age_seconds": age.as_secs(),
+                    "published_at": published_at,
+                    "age_seconds": age_seconds,
                     "verdict": verdict_json,
                 })
             }

@@ -172,17 +172,21 @@ pub(super) fn apply_verdicts(
             // pip backtracked this named target to a different version. Adopt
             // the installed version on the named row (honesty: the named row
             // must show what installs) and verdict it there. `age` /
-            // `resolved.published_at` still reflect the CLI-resolved version —
-            // a one-minor-version drift, left as-is rather than re-fetching on
-            // the gate's critical path; the published-date display keeps that age.
+            // `resolved.published_at` belonged to the CLI-resolved version, so
+            // they no longer describe what installs — drop the provenance
+            // (`age = None`) rather than re-fetch on the gate's critical path
+            // or print a publish date for the wrong version. Render omits the
+            // publish line for these rows.
             for &i in indices {
                 if let TargetOutcome::Resolved {
                     resolved,
+                    age,
                     verdict: v,
                     ..
                 } = &mut outcomes[i]
                 {
                     resolved.version = pkg.version.clone();
+                    *age = None;
                     *v = verdict.clone();
                 }
             }
@@ -327,7 +331,7 @@ fn verify_one(
             TargetOutcome::Resolved {
                 target: target.clone(),
                 resolved,
-                age,
+                age: Some(age),
                 verdict: VerdictStatus::NotChecked,
             }
         }
@@ -701,15 +705,30 @@ mod tests {
         }
     }
 
+    fn named_age(outcome: &TargetOutcome) -> Option<Duration> {
+        match outcome {
+            TargetOutcome::Resolved { age, .. } => *age,
+            _ => unreachable!("expected a resolved outcome"),
+        }
+    }
+
     /// pip backtracking: the CLI's `pypi_resolve` picked flask 3.0.3 but
     /// werkzeug constrains it, so pip's dry-run installs flask 3.0.2 with
     /// `requested:true`. The exact `(name, version)` match misses, but the
     /// leftover is the SAME named package — it must collapse onto the named
     /// outcome (verdicted at the installed 3.0.2, the named row showing what
-    /// installs), with NO duplicate `(from requirements)` finding.
+    /// installs), with NO duplicate `(from requirements)` finding. The
+    /// provenance (`age` / publish date) belonged to 3.0.3, so it must be
+    /// dropped rather than reported against the installed 3.0.2.
     #[test]
     fn apply_verdicts_collapses_pip_backtracked_named_target() {
         let mut outcomes = vec![resolved_outcome("flask", "3.0.3")];
+        // The CLI-resolved 3.0.3 carried a publish date; the installed 3.0.2
+        // has a different one we never fetched.
+        assert!(
+            named_age(&outcomes[0]).is_some(),
+            "CLI-resolved row starts with provenance"
+        );
         let results = vec![(
             pkg("flask", "3.0.2", true),
             VerdictStatus::Vulnerable(vec![vm("CVE-1", None)]),
@@ -730,6 +749,11 @@ mod tests {
         assert!(
             matches!(named_verdict(&outcomes[0]), VerdictStatus::Vulnerable(_)),
             "named outcome verdicted at the installed version"
+        );
+        assert_eq!(
+            named_age(&outcomes[0]),
+            None,
+            "the 3.0.3 publish date must not be reported against the installed 3.0.2"
         );
 
         // The package appears exactly once: one named outcome, zero tree
@@ -764,6 +788,10 @@ mod tests {
             named_verdict(&outcomes[0]),
             VerdictStatus::Vulnerable(_)
         ));
+        assert!(
+            named_age(&outcomes[0]).is_some(),
+            "an exact match keeps the resolved version's provenance"
+        );
     }
 
     /// npm multi-version must NOT collapse: the same name legitimately
