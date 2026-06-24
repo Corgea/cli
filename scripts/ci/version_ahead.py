@@ -18,11 +18,9 @@ def precedence_key(version):
     version = version.strip().split("+", 1)[0]
     core, _, pre = version.partition("-")
     parts = core.split(".")
-    if not all(part.isdigit() for part in parts):
-        raise ValueError(f"not a numeric SemVer core: {core!r}")
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        raise ValueError(f"not a MAJOR.MINOR.PATCH SemVer core: {core!r}")
     nums = [int(part) for part in parts]
-    while len(nums) < 3:
-        nums.append(0)
     if not pre:
         # No pre-release ranks above any pre-release of the same core version.
         return (nums, (1,))
