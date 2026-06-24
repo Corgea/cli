@@ -54,8 +54,7 @@ jobs:
             exit 0
           fi
           echo "Cargo.toml=$CARGO_VER  last release=$LAST_TAG"
-          if [ "$CARGO_VER" = "$LAST_VER" ]; then
-            echo "::error file=Cargo.toml::Cargo.toml version $CARGO_VER matches the last release ($LAST_TAG). Bump [package].version before merging."
-            exit 1
-          fi
-          echo "OK: $CARGO_VER is ahead of the last release ($LAST_TAG)."
+          # SemVer precedence (not string equality): blocks an unchanged version
+          # AND a regression, and gets pre-release ordering right (e.g. the
+          # 1.10.0-beta.1 -> 1.10.0 bump must pass). See scripts/ci/version_ahead.py.
+          python3 scripts/ci/version_ahead.py "$CARGO_VER" "$LAST_VER"

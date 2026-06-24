@@ -14,23 +14,31 @@ if [[ "$PRE" -eq 0 && "$DIST_TAG" == "beta"   ]]; then echo "REFUSING: final $VE
 echo "version=$VERSION dist-tag=$DIST_TAG dry_run=$DRY_RUN"
 [[ "${RESOLVE_ONLY:-false}" == "true" ]] && exit 0
 
-# Idempotency: query the CORRECT scoped package at the exact version.
-# Skipped under DRY_RUN so a rehearsal always exercises the real publish path.
+# Idempotency: if the exact version is already on npm, skip re-publishing — but
+# still fall through to the dist-tag verification below, so dist-tag drift is
+# caught instead of masked by an early exit. (The whole check is skipped under
+# DRY_RUN so a rehearsal always exercises the real publish path.)
+already=0
 if [[ "$DRY_RUN" != "true" ]] && npm view "${PKG}@${VERSION}" version >/dev/null 2>&1; then
-  echo "${PKG}@${VERSION} already exists on npm, skipping."; exit 0
+  echo "${PKG}@${VERSION} already on npm; skipping publish, verifying dist-tag."
+  already=1
 fi
-ARGS=(publish --access public --tag "$DIST_TAG")
-[[ "$DRY_RUN" == "true" ]] && ARGS+=(--dry-run)
-npm "${ARGS[@]}"
+if [[ "$already" -eq 0 ]]; then
+  ARGS=(publish --access public --tag "$DIST_TAG")
+  [[ "$DRY_RUN" == "true" ]] && ARGS+=(--dry-run)
+  npm "${ARGS[@]}"
+fi
 
 # A dry-run writes nothing to verify.
 [[ "$DRY_RUN" == "true" ]] && { echo "dry-run complete (nothing published)."; exit 0; }
 
-# Post-publish gate: prove the registry actually accepted it. A hard failure
+# Post-publish gate: prove the registry has the version under the expected
+# dist-tag, for a fresh publish AND the already-exists path (the latter catches
+# dist-tag drift the idempotency skip would otherwise hide). A hard failure
 # (e.g. @corgea/cli@1.9.0's E404 token-scope error) already fails `npm publish`
-# above; this gate covers the quieter mode where npm exits 0 but the version is
-# not actually live under the expected dist-tag (registry lag, partial publish,
-# dist-tag not applied). Assert from the public registry with retries.
+# above; this covers the quieter mode where npm exits 0 but the version is not
+# live under the expected tag. We verify rather than `npm dist-tag add` to
+# repair: re-pointing here would regress `latest` on a re-dispatch of an older tag.
 echo "Verifying ${PKG}@${VERSION} is live with dist-tag ${DIST_TAG}..."
 ok=0
 for attempt in 1 2 3 4 5 6; do
@@ -40,7 +48,7 @@ for attempt in 1 2 3 4 5 6; do
   sleep 10
 done
 if [[ "$ok" -ne 1 ]]; then
-  echo "ERROR: after publish, ${PKG} dist-tag ${DIST_TAG} != ${VERSION}; the registry never confirmed the publish." >&2
+  echo "ERROR: ${PKG} dist-tag ${DIST_TAG} != ${VERSION}; the registry never confirmed the publish or the dist-tag has drifted." >&2
   exit 1
 fi
 echo "OK: ${PKG}@${VERSION} live; dist-tag ${DIST_TAG} -> ${VERSION}."

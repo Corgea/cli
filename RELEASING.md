@@ -90,14 +90,22 @@ gh release view vX.Y.Z-beta.N --json isPrerelease,assets   # prerelease true + 6
 
 ## npm dry-run dispatch contract
 
-Rehearse the npm publish path without writing to the registry. It downloads an
-**existing** release's six zips, bundles them, and runs `npm publish --dry-run`:
+Rehearse the npm publish path without writing to the registry. It downloads the
+target tag's six zips, bundles them, and runs `npm publish --dry-run`:
 
 ```
-gh workflow run npm-publish.yml --ref <branch> -f tag=v1.9.0 -f dry_run=true
+gh workflow run npm-publish.yml --ref main -f tag=<vX.Y.Z[-beta.N]> -f dry_run=true
 ```
 
-`dry_run` is empty on the automatic `workflow_run` trigger, where the script's
+**The tag must already contain `scripts/npm/publish.sh`.** The publish job checks
+out `refs/tags/<tag>` and runs *that tag's* copy of the script, so the rehearsal
+only works against tags cut after this machinery merged — not older tags such as
+`v1.9.0`, whose tree predates the script (the run would fail at `chmod` before
+ever reaching `npm publish --dry-run`). Before the first such tag exists, validate
+the publish path locally instead with `RESOLVE_ONLY` (below) and `npm pack` to
+inspect the tarball.
+
+`dry_run` is empty on the automatic `workflow_run` trigger, where the step's
 `DRY_RUN: ${{ inputs.dry_run || 'false' }}` resolves to `"false"` — so real
 releases always publish. The beta dist-tag selection itself is unit-testable
 locally with no network:

@@ -21,9 +21,10 @@ notes; the two surfaces are complementary and never collide.
   non-beta release. See [RELEASING.md](RELEASING.md) for the cut procedure.
 - Release-version guards: `version-guard` fails a release whose tag is not
   `v`-prefixed or disagrees with the `Cargo.toml` version; `version-bump-check`
-  fails a PR whose `Cargo.toml` version still matches the latest released tag.
-  Both `release.yml` and `release-binaries.yml` reject non-`v` tags to stop
-  npm/PyPI channel drift.
+  fails a PR whose `Cargo.toml` version is not SemVer-ahead of the latest
+  released tag (catches both an unchanged version and a regression, with correct
+  pre-release ordering). Both `release.yml` and `release-binaries.yml` reject
+  non-`v` tags and tag/`Cargo.toml` mismatches to stop npm/PyPI channel drift.
 - npm post-publish gate: `publish.sh` re-reads the public registry after
   publishing and fails if the version isn't live under the expected dist-tag,
   so a silent publish failure (e.g. a token-scope `E404`) no longer passes as
