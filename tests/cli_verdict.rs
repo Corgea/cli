@@ -163,6 +163,36 @@ fn verdict_503_warns_and_fails_open() {
 }
 
 #[test]
+fn json_carries_verdict_object_and_mode() {
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("pypi", "oldpkg", "1.0.0"),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0")),
+    );
+    let mut h = pip_harness(checks, HashMap::new(), 0);
+    let out = h
+        .cmd
+        .args(["pip", "--json", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None);
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["verdict_mode"], "public");
+    assert_eq!(parsed["results"][0]["verdict"]["status"], "vulnerable");
+    assert_eq!(
+        parsed["results"][0]["verdict"]["matches"][0]["advisory_id"],
+        "MAL-2024-0001"
+    );
+    assert_eq!(
+        parsed["results"][0]["verdict"]["matches"][0]["fixed_version"],
+        "2.0.0"
+    );
+    assert_eq!(parsed["summary"]["named"]["vulnerable"], 1);
+}
+
+#[test]
 fn vuln_api_outage_warns_but_installs() {
     let mut h = pip_harness(HashMap::new(), HashMap::new(), 0);
     // Point the gate at a dead vuln-api: connection refused on every check.

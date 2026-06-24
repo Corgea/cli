@@ -213,8 +213,14 @@ enum Commands {
     },
     /// Wrap `npm` commands: gate install targets on recency + vuln verdicts, then run npm.
     Npm(InstallWrapArgs),
+    /// Wrap `yarn` commands: gate install targets on recency + vuln verdicts, then run yarn.
+    Yarn(InstallWrapArgs),
+    /// Wrap `pnpm` commands: gate install targets on recency + vuln verdicts, then run pnpm.
+    Pnpm(InstallWrapArgs),
     /// Wrap `pip` commands: gate install targets on recency + vuln verdicts, then run pip.
     Pip(InstallWrapArgs),
+    /// Wrap `uv` commands: gate install targets on recency + vuln verdicts, then run uv.
+    Uv(InstallWrapArgs),
 }
 
 /// Shared flags for the install-wrapper subcommands (`corgea npm|pip`).
@@ -241,6 +247,12 @@ struct InstallWrapArgs {
     )]
     force: bool,
 
+    #[arg(
+        long,
+        help = "Output the result as JSON instead of human-readable text."
+    )]
+    json: bool,
+
     /// Arguments forwarded to the package manager (subcommand and package specs).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     cmd: Vec<String>,
@@ -251,6 +263,7 @@ fn install_wrap_options(args: &InstallWrapArgs) -> corgea::precheck::PrecheckOpt
         threshold: args.threshold,
         no_fail: args.no_fail,
         force: args.force,
+        json: args.json,
         verdict: Some(corgea::precheck::VerdictConfig {
             base_url: config::vuln_api_url(),
         }),
@@ -640,8 +653,17 @@ fn main() {
         Some(Commands::Npm(args)) => {
             run_install_wrap_command(corgea::precheck::PackageManager::Npm, args)
         }
+        Some(Commands::Yarn(args)) => {
+            run_install_wrap_command(corgea::precheck::PackageManager::Yarn, args)
+        }
+        Some(Commands::Pnpm(args)) => {
+            run_install_wrap_command(corgea::precheck::PackageManager::Pnpm, args)
+        }
         Some(Commands::Pip(args)) => {
             run_install_wrap_command(corgea::precheck::PackageManager::Pip, args)
+        }
+        Some(Commands::Uv(args)) => {
+            run_install_wrap_command(corgea::precheck::PackageManager::Uv, args)
         }
         None => {
             if let Some(message) = corgea::precheck::pip3_alias_message(&cli.args) {

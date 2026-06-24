@@ -33,13 +33,15 @@ pub struct TreePackage {
 }
 
 /// Whether this manager's resolver has anything to resolve for the parsed
-/// install. pip's dry-run also reads `-r` requirements files, so those make
-/// an install eligible even with no named targets. npm's lockfile resolution
-/// reads `package.json`, so a bare `npm install` is eligible whenever the
-/// project (found like npm finds it — nearest ancestor manifest) has one.
+/// install. pip's dry-run and uv's compile also read `-r` requirements
+/// files, so those make an install eligible even with no named targets.
+/// npm's lockfile resolution reads `package.json`, so a bare `npm install`
+/// is eligible whenever the project (found like npm finds it — nearest
+/// ancestor manifest) has one.
 pub fn covers_input(manager: PackageManager, parsed: &super::parse::ParsedInstall) -> bool {
     !parsed.targets.is_empty()
-        || (manager == PackageManager::Pip && !parsed.requirements_files.is_empty())
+        || (matches!(manager, PackageManager::Pip | PackageManager::Uv)
+            && !parsed.requirements_files.is_empty())
         || (manager == PackageManager::Npm && npm_project_root().is_some())
 }
 
@@ -98,8 +100,8 @@ pub(super) fn npm_root_redirect_flag(args: &[String]) -> Option<String> {
     None
 }
 
-/// `Err(reason)`: the dry-run failed — the caller falls back to named-only
-/// and its warning carries `reason`.
+/// `Err(reason)`: no safe dry-run for this manager, or the dry-run failed —
+/// the caller falls back to named-only and its warning carries `reason`.
 pub fn resolve_tree(
     manager: PackageManager,
     install_args: &[String],
@@ -108,6 +110,10 @@ pub fn resolve_tree(
     match manager {
         PackageManager::Pip => resolve_pip_tree(manager.binary_name(), install_args, parsed),
         PackageManager::Npm => resolve_npm_tree(manager.binary_name(), install_args),
+        PackageManager::Uv => resolve_uv_tree(parsed),
+        PackageManager::Yarn | PackageManager::Pnpm => {
+            Err(format!("{} has no safe dry-run", manager.binary_name()))
+        }
     }
 }
 
@@ -277,6 +283,121 @@ fn resolve_pip_tree(
         return Err(format!("pip dry-run failed: {}", stderr_tail(&output)));
     }
     parse_pip_report(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Resolve uv's would-install set with `uv pip compile` — uv's own
+/// resolver, run without executing package code (`--only-binary :all:`
+/// blocks sdist builds, mirroring the pip dry-run guard). Compile takes
+/// requirements files rather than bare specs, so named registry specs and
+/// absolutized `-r` includes are written to a temp `.in` file.
+/// Unverifiable targets (URL / git / editable / path) are excluded — they
+/// are already surfaced as skipped warnings. Index selection comes from
+/// uv's env/config; index flags on the wrapped command don't carry over.
+fn resolve_uv_tree(parsed: &super::parse::ParsedInstall) -> Result<Vec<TreePackage>, String> {
+    let uv = super::exec::resolve_binary("uv")?;
+    let mut input = String::new();
+    for t in &parsed.targets {
+        if !matches!(t.kind, super::TargetKind::Unverifiable { .. }) {
+            input.push_str(&t.display);
+            input.push('\n');
+        }
+    }
+    for f in &parsed.requirements_files {
+        let abs = std::fs::canonicalize(f).map_err(|e| format!("read {}: {e}", f.display()))?;
+        input.push_str(&format!("-r {}\n", abs.display()));
+    }
+    if input.is_empty() {
+        return Err("nothing uv pip compile can resolve (all targets are URL/path refs)".into());
+    }
+
+    let work = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
+    let in_file = work.path().join("corgea-gate.in");
+    std::fs::write(&in_file, &input).map_err(|e| format!("write compile input: {e}"))?;
+    let output = Command::new(&uv)
+        .args([
+            "pip",
+            "compile",
+            "--only-binary",
+            ":all:",
+            "--no-header",
+            "--no-annotate",
+            "--quiet",
+        ])
+        .arg(&in_file)
+        .output()
+        .map_err(|e| format!("run uv pip compile: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("uv pip compile failed: {}", stderr_tail(&output)));
+    }
+    parse_compiled_requirements(
+        &String::from_utf8_lossy(&output.stdout),
+        &requested_names(parsed),
+    )
+}
+
+/// PEP 503-normalized names the user asked for — named CLI targets plus
+/// entries of `-r` files — so tree findings label "(from requirements)" like
+/// pip's `requested` report flag. Best-effort line parse; anything unparsed
+/// just labels "(transitive)".
+fn requested_names(parsed: &super::parse::ParsedInstall) -> std::collections::HashSet<String> {
+    let norm = |n: &str| crate::vuln_api::Ecosystem::Pypi.normalize_name(n);
+    let mut out: std::collections::HashSet<String> = parsed
+        .targets
+        .iter()
+        .filter(|t| !matches!(t.kind, super::TargetKind::Unverifiable { .. }))
+        .map(|t| norm(&t.name))
+        .collect();
+    for f in &parsed.requirements_files {
+        let Ok(content) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with(['#', '-']) || line.contains("://") {
+                continue;
+            }
+            let name = super::parse::pypi_name_part(line);
+            if !name.is_empty() {
+                out.insert(norm(name));
+            }
+        }
+    }
+    out
+}
+
+/// Parse `uv pip compile` stdout (requirements.txt-format `name==version`
+/// pins) into the would-install set. Any line that isn't a pin is an error —
+/// silently skipping could hide part of the tree.
+fn parse_compiled_requirements(
+    out: &str,
+    requested: &std::collections::HashSet<String>,
+) -> Result<Vec<TreePackage>, String> {
+    let mut pkgs = Vec::new();
+    for line in out.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(['#', '-']) {
+            continue;
+        }
+        // Strip env markers and trailing comments: `pkg==1.0 ; marker  # via`.
+        let line = line.split(';').next().unwrap_or(line).trim();
+        let line = line.split(" #").next().unwrap_or(line).trim();
+        let Some((name, version)) = line.split_once("==") else {
+            return Err(format!(
+                "unexpected line in uv pip compile output: '{line}'"
+            ));
+        };
+        // Strip extras: `celery[redis]==5.3.4`.
+        let name = super::parse::pypi_name_part(name).to_string();
+        pkgs.push(TreePackage {
+            requested: requested.contains(&crate::vuln_api::Ecosystem::Pypi.normalize_name(&name)),
+            name,
+            version: version.trim().to_string(),
+        });
+    }
+    if pkgs.is_empty() {
+        return Err("uv pip compile produced no packages".to_string());
+    }
+    Ok(pkgs)
 }
 
 fn parse_pip_report(json: &str) -> Result<Vec<TreePackage>, String> {

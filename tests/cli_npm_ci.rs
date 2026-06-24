@@ -65,6 +65,106 @@ fn npm_ci_clean_lockfile_proceeds() {
 }
 
 #[test]
+fn npm_ci_clean_lockfile_json_summary_counts_the_tree() {
+    // A lockfile install has no named outcomes, so a clean `npm ci` must
+    // report its checked packages under `summary.tree`, not as an all-zero
+    // summary. `named` stays empty; `tree` reconciles against the lockfile.
+    let mut h = GateHarness::new()
+        .fake_recorder("npm", 0)
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .with_project_file("package-lock.json", NPM_LOCK)
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "--json", "ci"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0), "clean lockfile must proceed");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    let summary = &parsed["summary"];
+    assert_eq!(summary["tree"]["resolved_count"], 2);
+    assert_eq!(summary["tree"]["clean"], 2);
+    assert_eq!(summary["tree"]["vulnerable"], 0);
+    assert_eq!(summary["named"]["ok"], 0);
+    assert_eq!(summary["named"]["clean"], 0);
+}
+
+#[test]
+fn npm_ci_no_project_json_emits_single_empty_report() {
+    // `npm ci` in a directory with no package.json: npm errors on its own,
+    // but under --json stdout must still be exactly one parseable Corgea
+    // document (an empty report) — not empty, and not the manager's stdout.
+    let mut h = GateHarness::new()
+        .fake_recorder("npm", 0)
+        .vuln_checks(HashMap::new())
+        .in_project_dir()
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "--json", "ci"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(h.recorded_argv().as_deref(), Some("ci"), "npm still runs");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be one JSON document");
+    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(parsed["summary"]["tree"]["resolved_count"], 0);
+}
+
+#[test]
+fn npm_ci_no_lockfile_json_emits_single_empty_report() {
+    // package.json but no package-lock.json: same one-document contract as
+    // the no-project case above.
+    let mut h = GateHarness::new()
+        .fake_recorder("npm", 0)
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "--json", "ci"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(h.recorded_argv().as_deref(), Some("ci"), "npm still runs");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be one JSON document");
+    assert_eq!(parsed["schema_version"], 1);
+}
+
+#[test]
+fn npm_ci_json_missing_binary_after_report_is_single_doc() {
+    // A clean lockfile prints its report, then npm is missing from PATH (no
+    // fake recorder). The missing-binary error must stay on stderr and exit
+    // 127 — never append a second {"error"} JSON document onto the report.
+    let mut h = GateHarness::new()
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .with_project_file("package-lock.json", NPM_LOCK)
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "--json", "ci"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(127), "missing npm exits 127");
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("stdout must be exactly one JSON document, not two concatenated");
+    assert_eq!(parsed["schema_version"], 1);
+    // The report (not an error doc) is what's on stdout; the binary-missing
+    // message goes to stderr.
+    assert_eq!(parsed["summary"]["tree"]["clean"], 2);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not found on PATH"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn npm_ci_unparsable_lockfile_refuses_without_force() {
     let mut h = GateHarness::new()
         .fake_recorder("npm", 0)
@@ -101,6 +201,62 @@ fn npm_ci_unparsable_lockfile_force_proceeds() {
         String::from_utf8_lossy(&out.stderr).contains("proceeding under --force"),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn npm_ci_unparsable_lockfile_force_json_emits_proceed_doc() {
+    // --force over an unparsable lockfile proceeds — but under --json
+    // stdout must still carry one parseable document (a warning/proceeded
+    // doc), not be left empty for a CI consumer to choke on.
+    let mut h = GateHarness::new()
+        .fake_recorder("npm", 0)
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .with_project_file("package-lock.json", "not json")
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "--json", "--force", "ci"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0), "--force proceeds unchecked");
+    assert_eq!(h.recorded_argv().as_deref(), Some("ci"));
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["proceeded"], true, "parsed: {parsed}");
+    assert!(
+        parsed["warning"]
+            .as_str()
+            .is_some_and(|w| w.contains("cannot verify")),
+        "parsed: {parsed}"
+    );
+}
+
+#[test]
+fn npm_ci_unparsable_lockfile_json_refusal_is_parseable() {
+    // The unparsable-lockfile refusal must emit a parseable {"error": …}
+    // document under --json, not bare stderr.
+    let mut h = GateHarness::new()
+        .fake_recorder("npm", 0)
+        .vuln_checks(HashMap::new())
+        .with_project_file("package.json", PACKAGE_JSON)
+        .with_project_file("package-lock.json", "not json")
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "--json", "ci"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None, "npm must not run");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert!(
+        parsed["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("cannot verify 'npm ci'")),
+        "parsed: {parsed}"
     );
 }
 

@@ -3,8 +3,34 @@
 use crate::verify_deps;
 
 use super::{
-    parse, PrecheckOptions, PrecheckReport, TargetOutcome, TreeOrigin, TreeReport, VerdictStatus,
+    parse, PackageManager, PrecheckOptions, PrecheckReport, TargetOutcome, TreeOrigin, TreeReport,
+    VerdictStatus,
 };
+
+/// Reason recorded on resolved targets when no verdict pass ran.
+const NO_VERDICT_REASON: &str = "vulnerability verdict not checked";
+
+/// Version stamped on every `--json` document Corgea owns on stdout — the
+/// report body and every blocking `{"error"}` / `{"warning"}` document — so
+/// machine consumers can branch on the shape across install-gate phases.
+pub(super) const SCHEMA_VERSION: u32 = 1;
+
+/// One honest stderr line when a zero-spec install can't be gated:
+/// yarn/pnpm/uv have no safe dry-run, so a bare install pulls its whole
+/// dependency set unchecked. No-op for other managers (bare npm is gated
+/// via the tree pass; bare pip installs nothing).
+pub(super) fn bare_install_note(manager: PackageManager, subcommand_label: &str) {
+    if matches!(
+        manager,
+        PackageManager::Yarn | PackageManager::Pnpm | PackageManager::Uv
+    ) {
+        eprintln!(
+            "note: bare '{} {}' is not gated (no safe dry-run) — dependencies install unchecked",
+            manager.binary_name(),
+            subcommand_label
+        );
+    }
+}
 
 /// The refusal line on stderr. Messaging only; the block decision and the
 /// choice of escape hatch live in `verdict::block_reason`.
@@ -359,6 +385,171 @@ pub(super) fn print_text(report: &PrecheckReport) {
             }
         }
     }
+}
+
+impl TreeOrigin {
+    fn json_name(self) -> &'static str {
+        match self {
+            TreeOrigin::Transitive => "transitive",
+            TreeOrigin::Requested => "requested",
+            TreeOrigin::PreExisting => "pre-existing",
+            TreeOrigin::Locked => "locked",
+        }
+    }
+}
+
+/// JSON shape for a single verdict. Shared by named outcomes and tree
+/// (transitive) outcomes so both render verdicts identically.
+/// `remediation` carries the version that clears every advisory
+/// (`safe_version`); `null` when any advisory has no known fix.
+fn verdict_json(verdict: &VerdictStatus) -> serde_json::Value {
+    use serde_json::json;
+    match verdict {
+        VerdictStatus::Clean => json!({ "status": "clean" }),
+        VerdictStatus::Vulnerable(matches) => {
+            json!({
+                "status": "vulnerable",
+                "matches": matches,
+                "remediation": safe_version(matches),
+            })
+        }
+        VerdictStatus::Unverifiable(error) => {
+            json!({ "status": "unverifiable", "error": error })
+        }
+        VerdictStatus::NotChecked => {
+            json!({ "status": "not_checked", "reason": NO_VERDICT_REASON })
+        }
+    }
+}
+
+/// Verdict tallies for one scope, keyed identically so each summary
+/// sub-object reconciles against its own array (`named` ↔ `results`,
+/// `tree` ↔ `tree.transitive`).
+#[derive(Default)]
+struct VerdictCounts {
+    clean: usize,
+    vulnerable: usize,
+    unverifiable: usize,
+    not_checked: usize,
+}
+
+fn verdict_counts<'a>(verdicts: impl Iterator<Item = &'a VerdictStatus>) -> VerdictCounts {
+    let mut c = VerdictCounts::default();
+    for v in verdicts {
+        match v {
+            VerdictStatus::Clean => c.clean += 1,
+            VerdictStatus::Vulnerable(_) => c.vulnerable += 1,
+            VerdictStatus::Unverifiable(_) => c.unverifiable += 1,
+            VerdictStatus::NotChecked => c.not_checked += 1,
+        }
+    }
+    c
+}
+
+pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
+    use serde_json::json;
+    let verdict_mode = if opts.verdict.is_some() {
+        "public"
+    } else {
+        "recency-only"
+    };
+    let outcomes: Vec<_> = report
+        .outcomes
+        .iter()
+        .map(|o| match o {
+            TargetOutcome::Resolved {
+                target,
+                resolved,
+                age,
+                verdict,
+            } => {
+                let verdict_json = verdict_json(verdict);
+                json!({
+                    "status": if report.is_recent(*age) { "recent" } else { "ok" },
+                    "spec": target.display,
+                    "name": resolved.name,
+                    "resolved_version": resolved.version,
+                    "published_at": resolved.published_at.to_rfc3339(),
+                    "age_seconds": age.as_secs(),
+                    "verdict": verdict_json,
+                })
+            }
+            TargetOutcome::Skipped { target, reason } => json!({
+                "status": "skipped",
+                "spec": target.display,
+                "name": target.name,
+                "reason": reason,
+            }),
+            TargetOutcome::Error { target, error } => json!({
+                "status": "error",
+                "spec": target.display,
+                "name": target.name,
+                "error": error,
+            }),
+        })
+        .collect();
+
+    // Summary counts are split by scope so each sub-object reconciles
+    // against its own array: `named` covers the targets this command
+    // adds (the `results` array), `tree` covers the resolved would-install
+    // set beyond them (`tree.transitive`). A flat summary mixed the two —
+    // e.g. `npm ci` has no named outcomes, so a clean lockfile read as
+    // all-zero despite a fully-checked tree.
+    let named_counts = verdict_counts(report.named_verdicts());
+    let tree_counts = verdict_counts(report.tree_verdicts());
+    let tree_resolved = match &report.tree {
+        Some(TreeReport::Full { resolved_count, .. }) => *resolved_count,
+        Some(TreeReport::NamedOnly { .. }) | None => 0,
+    };
+    let body = json!({
+        "schema_version": SCHEMA_VERSION,
+        "manager": report.manager.binary_name(),
+        "subcommand": report.subcommand,
+        "args": report.original_args,
+        "threshold_seconds": report.threshold.as_secs(),
+        "summary": {
+            "named": {
+                "ok": report.ok_count(),
+                "recent": report.recent_count(),
+                "vulnerable": named_counts.vulnerable,
+                "unverifiable": named_counts.unverifiable,
+                "clean": named_counts.clean,
+                "not_checked": named_counts.not_checked,
+                "skipped": report.skipped_count(),
+                "errors": report.error_count(),
+            },
+            "tree": {
+                "resolved_count": tree_resolved,
+                "vulnerable": tree_counts.vulnerable,
+                "unverifiable": tree_counts.unverifiable,
+                "clean": tree_counts.clean,
+                "not_checked": tree_counts.not_checked,
+            },
+        },
+        "verdict_mode": verdict_mode,
+        "results": outcomes,
+        "tree": report.tree.as_ref().map(|t| match t {
+            TreeReport::Full { resolved_count, transitive } => json!({
+                "mode": "full",
+                "reason": serde_json::Value::Null,
+                "resolved_count": resolved_count,
+                "transitive": transitive.iter().map(|o| json!({
+                    "name": o.name,
+                    "version": o.version,
+                    "origin": o.origin.json_name(),
+                    "verdict": verdict_json(&o.verdict),
+                })).collect::<Vec<_>>(),
+            }),
+            TreeReport::NamedOnly { reason } => json!({
+                "mode": "named-only",
+                "reason": reason,
+                "resolved_count": 0,
+                "transitive": [],
+            }),
+        }),
+    });
+
+    println!("{}", serde_json::to_string_pretty(&body).unwrap());
 }
 
 #[cfg(test)]

@@ -22,6 +22,23 @@ pub struct ParsedInstall {
     pub allow_prerelease: bool,
 }
 
+/// `pip install` / `uv pip install` argument list (everything after the
+/// verb). Carries the `--pre` flag through so prerelease resolution applies
+/// to both pip and uv pip install.
+pub fn parse_pip_install_args(args: &[String]) -> Result<ParsedInstall, String> {
+    let mut parsed = build_parsed_install(extract_pip_positionals(args)?, parse_pypi_spec);
+    parsed.allow_prerelease = pip_allows_prerelease(args);
+    Ok(parsed)
+}
+
+/// `uv add` argument list (everything after `add`).
+pub fn parse_pypi_positionals_args(args: &[String]) -> ParsedInstall {
+    build_parsed_install(
+        extract_node_positionals(PackageManager::Uv, args),
+        parse_pypi_spec,
+    )
+}
+
 fn build_parsed_install(
     positionals: PositionalSplit,
     parse_spec: impl Fn(&str) -> InstallTarget,
@@ -78,18 +95,97 @@ pub fn parse_install_args(
     args: &[String],
 ) -> Result<ParsedInstall, String> {
     match manager {
-        PackageManager::Pip => {
-            let mut parsed = build_parsed_install(extract_pip_positionals(args)?, parse_pypi_spec);
-            parsed.allow_prerelease = pip_allows_prerelease(args);
-            Ok(parsed)
-        }
-        PackageManager::Npm => {
+        PackageManager::Pip => parse_pip_install_args(args),
+        PackageManager::Npm | PackageManager::Yarn | PackageManager::Pnpm => {
             let default_tag = npm_default_tag(args);
             Ok(build_parsed_install(
                 extract_node_positionals(manager, args),
                 |raw| parse_npm_spec(raw, default_tag.as_deref()),
             ))
         }
+        PackageManager::Uv => unreachable!("uv uses classify_uv_command"),
+    }
+}
+
+/// Install-shaped `uv` invocations we know how to verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UvCommand<'a> {
+    Passthrough,
+    PipInstall {
+        install_args: &'a [String],
+    },
+    /// `uv pip sync reqs.txt` — installs exactly the given requirements
+    /// set; gated like `uv pip install -r reqs.txt`.
+    PipSync {
+        sync_args: &'a [String],
+    },
+    Add {
+        add_args: &'a [String],
+    },
+    /// `uv sync` — installs the locked project environment; gated from
+    /// `uv.lock`. (`uv lock` stays passthrough: it installs nothing.)
+    Sync,
+}
+
+/// Skip leading uv global flags (and their values) to where the uv
+/// subcommand starts, so install-shaped commands behind global flags
+/// (`uv --project ./app sync`, `uv --quiet add x`) classify as the
+/// subcommand instead of falling through to `Passthrough` ungated.
+pub fn uv_subcommand(cmd: &[String]) -> &[String] {
+    let mut i = 0;
+    while i < cmd.len() {
+        let a = &cmd[i];
+        if a == "--" {
+            return &cmd[(i + 1).min(cmd.len())..];
+        }
+        if !a.starts_with('-') {
+            return &cmd[i..];
+        }
+        i += if !a.contains('=') && takes_value(PackageManager::Uv, a) {
+            2
+        } else {
+            1
+        };
+    }
+    &[]
+}
+
+pub fn classify_uv_command(cmd: &[String]) -> UvCommand<'_> {
+    match cmd.first().map(String::as_str) {
+        Some("pip") => {
+            // uv accepts flags between `pip` and its verb
+            // (`uv pip --quiet install x` is valid) — skip them like
+            // `uv_subcommand` does, or the verb lands in Passthrough
+            // ungated.
+            let rest = uv_subcommand(&cmd[1..]);
+            match rest.first().map(String::as_str) {
+                Some("install" | "i") => UvCommand::PipInstall {
+                    install_args: &rest[1..],
+                },
+                Some("sync") => UvCommand::PipSync {
+                    sync_args: &rest[1..],
+                },
+                _ => UvCommand::Passthrough,
+            }
+        }
+        Some("add") => UvCommand::Add {
+            add_args: &cmd[1..],
+        },
+        Some("sync") => UvCommand::Sync,
+        _ => UvCommand::Passthrough,
+    }
+}
+
+/// `uv pip sync` argument list: positionals are requirements files, not
+/// package specs.
+pub fn parse_pip_sync_args(args: &[String]) -> ParsedInstall {
+    let split = extract_node_positionals(PackageManager::Uv, args);
+    let mut requirements_files = split.requirements_files;
+    requirements_files.extend(split.specs.iter().map(PathBuf::from));
+    ParsedInstall {
+        targets: Vec::new(),
+        requirements_files,
+        allow_prerelease: false,
     }
 }
 
@@ -305,7 +401,9 @@ struct PositionalSplit {
 /// The fallback heuristic in [`skip_unknown_flag`] only skips URL/path-like
 /// values, so a bare-word value (`-w my-workspace`) would otherwise parse —
 /// and get verified or blocked — as a package spec. Not exhaustive; the
-/// heuristic still backstops anything unlisted.
+/// heuristic still backstops anything unlisted. The same letter can differ
+/// by manager: npm's `-w <name>` takes a value, while pnpm's `-w`
+/// (workspace-root) and yarn's `-W` are boolean.
 pub(super) fn takes_value(manager: PackageManager, flag: &str) -> bool {
     match manager {
         PackageManager::Npm => matches!(
@@ -329,6 +427,76 @@ pub(super) fn takes_value(manager: PackageManager, flag: &str) -> bool {
                 | "--userconfig"
                 | "--globalconfig"
                 | "--depth"
+        ),
+        PackageManager::Pnpm => matches!(
+            flag,
+            "-C" | "--dir"
+                | "--filter"
+                | "--registry"
+                | "--reporter"
+                | "--loglevel"
+                | "--store-dir"
+                | "--virtual-store-dir"
+                | "--modules-dir"
+                | "--lockfile-dir"
+        ),
+        PackageManager::Yarn => matches!(
+            flag,
+            "--registry"
+                | "--modules-folder"
+                | "--cache-folder"
+                | "--mutex"
+                | "--network-timeout"
+                | "--network-concurrency"
+                | "--global-folder"
+                | "--link-folder"
+                | "--preferred-cache-folder"
+                // yarn-classic's monorepo dir redirect: missing it makes
+                // `yarn --cwd packages/app add x` classify the VALUE as the
+                // verb → ungated passthrough.
+                | "--cwd"
+        ),
+        PackageManager::Uv => matches!(
+            flag,
+            "--group"
+                | "--extra"
+                | "--index"
+                | "--default-index"
+                | "--index-url"
+                | "--extra-index-url"
+                | "-f"
+                | "--find-links"
+                | "--index-strategy"
+                | "--keyring-provider"
+                | "--tag"
+                | "--branch"
+                | "--rev"
+                | "--package"
+                | "-c"
+                | "--constraints"
+                | "--constraint"
+                | "--overrides"
+                | "-p"
+                | "--python"
+                | "--resolution"
+                | "--prerelease"
+                | "--exclude-newer"
+                | "--directory"
+                | "--project"
+                | "--config-setting"
+                | "--link-mode"
+                // uv global options: a valued flag missing here makes its
+                // VALUE classify as the subcommand → ungated passthrough
+                // (`uv --color always add x` must still gate the add).
+                | "--color"
+                | "--config-file"
+                | "--cache-dir"
+                | "--allow-insecure-host"
+                // `uv add` value flags whose bare-word values would
+                // otherwise parse as package specs.
+                | "--optional"
+                | "--bounds"
+                | "--script"
         ),
         PackageManager::Pip => matches!(
             flag,
@@ -371,8 +539,8 @@ pub(super) fn takes_value(manager: PackageManager, flag: &str) -> bool {
     }
 }
 
-/// Strip flags from an npm install argument list, returning only the
-/// positional package specs.
+/// Strip flags from a npm/yarn/pnpm (or `uv add`) install argument list,
+/// returning only the positional package specs.
 ///
 /// We treat anything starting with `-` as a flag. Boolean flags (`-D`,
 /// `--save-dev`, `--no-save`, ...) are dropped on their own. Flags
@@ -393,6 +561,25 @@ fn extract_node_positionals(manager: PackageManager, args: &[String]) -> Positio
             break;
         }
         if a.starts_with('-') {
+            // `uv add -r reqs.txt` adds the file's entries as dependencies —
+            // track the file like pip's `-r` so the gate covers its contents.
+            if manager == PackageManager::Uv {
+                if matches!(a.as_str(), "-r" | "--requirements" | "--requirement") {
+                    if let Some(path) = args.get(i + 1) {
+                        out.requirements_files.push(PathBuf::from(path));
+                    }
+                    i += 2;
+                    continue;
+                }
+                if let Some(rest) = a
+                    .strip_prefix("--requirements=")
+                    .or_else(|| a.strip_prefix("--requirement="))
+                {
+                    out.requirements_files.push(PathBuf::from(rest));
+                    i += 1;
+                    continue;
+                }
+            }
             if !a.contains('=') && takes_value(manager, a) {
                 i += 2;
                 continue;
@@ -778,6 +965,14 @@ fn parse_pypi_spec(raw: &str) -> InstallTarget {
     }
 }
 
+/// Bare PyPI name from a requirement line: stop at extras, operators,
+/// markers, or whitespace. Callers normalize when they need a comparison key.
+pub(super) fn pypi_name_part(spec: &str) -> &str {
+    let stop = |c: char| matches!(c, '[' | '<' | '>' | '=' | '!' | '~' | ';' | ' ');
+    let cut = spec.find(stop).unwrap_or(spec.len());
+    spec[..cut].trim()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,6 +1017,198 @@ mod tests {
         let args = vec!["--workspace=my-workspace".to_string(), "lodash".to_string()];
         let p = extract_node_positionals(PackageManager::Npm, &args);
         assert_eq!(p.specs, vec!["lodash".to_string()]);
+    }
+
+    #[test]
+    fn pnpm_and_yarn_boolean_workspace_flags_keep_the_spec() {
+        // pnpm's `-w` (--workspace-root) and yarn's `-W` are boolean —
+        // the next token is the package being installed.
+        let args = vec!["-w".to_string(), "lodash".to_string()];
+        let p = extract_node_positionals(PackageManager::Pnpm, &args);
+        assert_eq!(p.specs, vec!["lodash".to_string()]);
+
+        let args = vec!["-W".to_string(), "lodash".to_string()];
+        let p = extract_node_positionals(PackageManager::Yarn, &args);
+        assert_eq!(p.specs, vec!["lodash".to_string()]);
+
+        // pnpm's `--filter <selector>` does take a value.
+        let args = vec![
+            "--filter".to_string(),
+            "my-app".to_string(),
+            "lodash".to_string(),
+        ];
+        let p = extract_node_positionals(PackageManager::Pnpm, &args);
+        assert_eq!(p.specs, vec!["lodash".to_string()]);
+    }
+
+    #[test]
+    fn uv_add_group_flag_value_is_not_a_spec() {
+        let args = vec![
+            "--group".to_string(),
+            "dev".to_string(),
+            "requests".to_string(),
+        ];
+        let p = extract_node_positionals(PackageManager::Uv, &args);
+        assert_eq!(p.specs, vec!["requests".to_string()]);
+    }
+
+    #[test]
+    fn classify_uv_command_recognizes_install_shapes() {
+        assert!(matches!(
+            classify_uv_command(&[
+                "pip".to_string(),
+                "install".to_string(),
+                "requests".to_string(),
+            ]),
+            UvCommand::PipInstall { .. }
+        ));
+        assert!(matches!(
+            classify_uv_command(&["pip".to_string(), "i".to_string()]),
+            UvCommand::PipInstall { .. }
+        ));
+        assert!(matches!(
+            classify_uv_command(&["add".to_string(), "django".to_string()]),
+            UvCommand::Add { .. }
+        ));
+        assert_eq!(
+            classify_uv_command(&["sync".to_string(), "--extra".to_string(), "dev".to_string()]),
+            UvCommand::Sync
+        );
+        assert_eq!(
+            classify_uv_command(&["run".to_string(), "pytest".to_string()]),
+            UvCommand::Passthrough
+        );
+        assert_eq!(
+            classify_uv_command(&["lock".to_string()]),
+            UvCommand::Passthrough
+        );
+    }
+
+    #[test]
+    fn uv_valued_global_flags_do_not_swallow_the_subcommand() {
+        // SECURITY: a valued global flag missing from `takes_value` makes
+        // its VALUE classify as the subcommand → silent ungated
+        // passthrough. `uv --color always add x` must still gate the add.
+        for (flag, value) in [
+            ("--color", "always"),
+            ("--config-file", "uv.toml"),
+            ("--cache-dir", "/tmp/cache"),
+            ("--allow-insecure-host", "example.com"),
+        ] {
+            let cmd = vec![
+                flag.to_string(),
+                value.to_string(),
+                "add".to_string(),
+                "requests".to_string(),
+            ];
+            let sub = uv_subcommand(&cmd);
+            assert_eq!(
+                sub.first().map(String::as_str),
+                Some("add"),
+                "{flag} must skip its value, not surface it as the verb"
+            );
+        }
+    }
+
+    #[test]
+    fn uv_pip_flags_between_pip_and_verb_still_classify() {
+        // `uv pip --quiet install x` is a valid uv invocation; the flag
+        // between `pip` and the verb must not push it to Passthrough.
+        assert!(matches!(
+            classify_uv_command(&[
+                "pip".to_string(),
+                "--quiet".to_string(),
+                "install".to_string(),
+                "requests".to_string(),
+            ]),
+            UvCommand::PipInstall { .. }
+        ));
+        assert!(matches!(
+            classify_uv_command(&[
+                "pip".to_string(),
+                "--python".to_string(),
+                "3.12".to_string(),
+                "sync".to_string(),
+                "reqs.txt".to_string(),
+            ]),
+            UvCommand::PipSync { .. }
+        ));
+    }
+
+    #[test]
+    fn uv_add_value_flags_do_not_parse_as_specs() {
+        // `uv add --optional cli rich` adds `rich` to the `cli` extra —
+        // `cli` is a flag value, not a package (it's a real PyPI name, so
+        // misparsing it would false-block or noise the report).
+        let p = extract_node_positionals(
+            PackageManager::Uv,
+            &[
+                "--optional".to_string(),
+                "cli".to_string(),
+                "rich".to_string(),
+            ],
+        );
+        assert_eq!(p.specs, vec!["rich".to_string()]);
+    }
+
+    #[test]
+    fn yarn_cwd_value_does_not_swallow_the_verb() {
+        // SECURITY: yarn-classic's `--cwd <dir>` takes a value; without it
+        // in `takes_value` the DIRECTORY becomes the verb and
+        // `yarn --cwd packages/app add lodash` execs ungated.
+        assert!(takes_value(PackageManager::Yarn, "--cwd"));
+    }
+
+    #[test]
+    fn uv_add_positionals_parse_as_pypi_specs() {
+        let parsed = parse_pypi_positionals_args(&["requests==2.31.0".into()]);
+        assert_eq!(parsed.targets.len(), 1);
+        assert!(
+            matches!(
+                &parsed.targets[0].kind,
+                TargetKind::Pypi(PypiSpec::Exact(v)) if v == "2.31.0"
+            ),
+            "uv add targets must parse as PyPI specs, got {:?}",
+            parsed.targets[0].kind
+        );
+    }
+
+    #[test]
+    fn uv_add_requirements_flag_tracks_the_file() {
+        for args in [
+            vec!["-r".to_string(), "reqs.txt".to_string()],
+            vec!["--requirements".to_string(), "reqs.txt".to_string()],
+            vec!["--requirements=reqs.txt".to_string()],
+        ] {
+            let p = extract_node_positionals(PackageManager::Uv, &args);
+            assert_eq!(
+                p.requirements_files,
+                vec![PathBuf::from("reqs.txt")],
+                "args {args:?}"
+            );
+            assert!(p.specs.is_empty(), "args {args:?}");
+        }
+        // `-c constraints.txt` doesn't add packages — value skipped.
+        let p = extract_node_positionals(
+            PackageManager::Uv,
+            &[
+                "-c".to_string(),
+                "cons.txt".to_string(),
+                "flask".to_string(),
+            ],
+        );
+        assert_eq!(p.specs, vec!["flask".to_string()]);
+        assert!(p.requirements_files.is_empty());
+    }
+
+    #[test]
+    fn pypi_name_part_strips_extras_markers_and_operators() {
+        assert_eq!(pypi_name_part("requests"), "requests");
+        assert_eq!(pypi_name_part("requests[security]==2.31.0"), "requests");
+        assert_eq!(pypi_name_part("Flask_Cors>=4.0"), "Flask_Cors");
+        assert_eq!(pypi_name_part("pkg; python_version >= \"3.7\""), "pkg");
+        assert_eq!(pypi_name_part("pkg ==1.0"), "pkg");
+        assert_eq!(pypi_name_part(""), "");
     }
 
     #[test]

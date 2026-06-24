@@ -47,6 +47,51 @@ fn fixed_match_blocks_and_names_safe_version() {
 }
 
 #[test]
+fn json_remediation_carries_safe_version() {
+    let mut checks = HashMap::new();
+    checks.insert(key("pypi", "oldpkg", "1.0.0"), fixed_body());
+    let mut h = pip_harness(checks, HashMap::new(), 0);
+    let out = h
+        .cmd
+        .args(["pip", "--json", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None);
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert_eq!(
+        parsed["results"][0]["verdict"]["remediation"], "2.0.0",
+        "parsed: {parsed}"
+    );
+}
+
+#[test]
+fn json_remediation_null_when_no_fix() {
+    let mut checks = HashMap::new();
+    checks.insert(key("pypi", "oldpkg", "1.0.0"), no_fix_body());
+    let mut h = pip_harness(checks, HashMap::new(), 0);
+    let out = h
+        .cmd
+        .args(["pip", "--json", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None);
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    let v = &parsed["results"][0]["verdict"];
+    assert!(
+        v.as_object().unwrap().contains_key("remediation"),
+        "verdict must carry the remediation key: {parsed}"
+    );
+    assert!(
+        v["remediation"].is_null(),
+        "remediation must be null when no fix is known: {parsed}"
+    );
+}
+
+#[test]
 fn no_fix_match_reports_no_fixed_version_known() {
     let mut checks = HashMap::new();
     checks.insert(key("pypi", "oldpkg", "1.0.0"), no_fix_body());

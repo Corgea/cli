@@ -9,11 +9,12 @@ pub(super) fn exec_install_with_args(
     manager: PackageManager,
     subcommand: &str,
     rest: &[String],
+    stdout_to_stderr: bool,
 ) -> i32 {
     let mut full = Vec::with_capacity(rest.len() + 1);
     full.push(subcommand.to_string());
     full.extend(rest.iter().cloned());
-    exec_command(manager.binary_name(), &full)
+    exec_command_with_stdio(manager.binary_name(), &full, stdout_to_stderr)
 }
 
 /// Resolve `binary` on PATH. On Windows this finds `.cmd` shims. pip is the
@@ -33,6 +34,20 @@ pub(super) fn resolve_binary(binary: &str) -> Result<std::path::PathBuf, String>
 }
 
 pub(super) fn exec_command(binary: &str, args: &[String]) -> i32 {
+    exec_command_with_stdio(binary, args, false)
+}
+
+/// `stdout_to_stderr` keeps stdout machine-readable under `--json`: the
+/// package manager's own output moves to stderr so stdout carries only the
+/// Corgea report. Every caller that passes `true` here prints its report (the
+/// full report or an empty one via `proceed_ungated`) *before* this exec, so a
+/// missing binary must not print a second JSON document — it stays on stderr
+/// and exits 127, leaving the already-printed report as the one document.
+pub(super) fn exec_command_with_stdio(
+    binary: &str,
+    args: &[String],
+    stdout_to_stderr: bool,
+) -> i32 {
     let resolved = match resolve_binary(binary) {
         Ok(p) => p,
         Err(msg) => {
@@ -45,6 +60,9 @@ pub(super) fn exec_command(binary: &str, args: &[String]) -> i32 {
 
     let mut command = Command::new(&resolved);
     command.args(&os_args);
+    if stdout_to_stderr {
+        command.stdout(std::io::stderr());
+    }
     match command.status() {
         Ok(status) => status.code().unwrap_or_else(|| {
             #[cfg(unix)]
