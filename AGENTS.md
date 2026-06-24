@@ -2,6 +2,8 @@
 
 This subproject is the Corgea developer CLI (Rust → npm + pip via maturin).
 
+Releasing (tags, beta channel, dist-tag mapping): see [RELEASING.md](RELEASING.md).
+
 ## Commands
 
 - After edits: `./harness check` — clippy fix, format, tests, suppression report

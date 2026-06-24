@@ -31,3 +31,31 @@ jobs:
 
       - name: CI gate
         run: ./harness ci
+
+  version-bump-check:
+    name: Version moved past last release
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with tags)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - name: Assert Cargo.toml version is ahead of the last release
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_VER="$(grep -m1 '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          LAST_TAG="$(git tag --sort=-v:refname | grep -E '^v' | head -1 || true)"
+          LAST_VER="${LAST_TAG#v}"
+          if [ -z "$LAST_VER" ]; then
+            echo "No release tag found; skipping version check."
+            exit 0
+          fi
+          echo "Cargo.toml=$CARGO_VER  last release=$LAST_TAG"
+          if [ "$CARGO_VER" = "$LAST_VER" ]; then
+            echo "::error file=Cargo.toml::Cargo.toml version $CARGO_VER matches the last release ($LAST_TAG). Bump [package].version before merging."
+            exit 1
+          fi
+          echo "OK: $CARGO_VER is ahead of the last release ($LAST_TAG)."

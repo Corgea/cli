@@ -11,6 +11,11 @@ on:
         description: "Tag to publish from (for example: v1.7.2)"
         required: true
         type: string
+      dry_run:
+        description: "Run npm publish with --dry-run (no registry write)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -78,14 +83,11 @@ jobs:
       - name: Bundle binaries into vendor/
         run: node scripts/npm/bundle-binaries.js release-assets
 
-      - name: Publish corgea-cli
+      - name: Publish @corgea/cli
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           PACKAGE_VERSION: ${{ needs.prepare.outputs.version }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
         run: |
-          if npm view "corgea-cli@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
-            echo "corgea-cli@${PACKAGE_VERSION} already exists on npm, skipping."
-            exit 0
-          fi
-
-          npm publish --access public
+          chmod +x scripts/npm/publish.sh
+          ./scripts/npm/publish.sh

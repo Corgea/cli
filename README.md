@@ -20,6 +20,14 @@ pip install corgea-cli
 ### Manual Installation
 You can get the latest binaries for your OS from https://github.com/Corgea/cli/releases.
 
+### Beta / pre-release builds
+Opt-in builds that ship ahead of stable. Actively developed — expect breaking changes.
+```
+npm install -g @corgea/cli@beta
+pip install --pre corgea-cli
+```
+Stable installs (`@corgea/cli`, `corgea-cli`) always resolve to the latest non-beta release.
+
 ### Setup
 Once the binary is installed, login with your token from the Corgea app.
 ```

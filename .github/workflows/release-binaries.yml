@@ -75,6 +75,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
           files: "corgea-${{ matrix.target }}.zip"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -85,3 +86,35 @@ jobs:
         with:
           name: binaries-${{ matrix.target }}
           path: "corgea-${{ matrix.target }}.zip"
+
+  finalize-release:
+    name: Finalize GitHub Release Metadata
+    needs: native-binaries
+    if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compose prerelease disclaimer
+        id: body
+        if: contains(inputs.tag || github.ref_name, '-')
+        shell: bash
+        env: { TAG: "${{ inputs.tag || github.ref_name }}" }
+        run: |
+          {
+            echo "body<<__EOF__"
+            echo "> [!WARNING]"
+            echo "> **Beta pre-release (\`$TAG\`)** — actively developed, expect breaking changes."
+            echo ">"
+            echo "> - npm: \`npm install -g @corgea/cli@beta\`"
+            echo "> - pip: \`pip install --pre corgea-cli\`"
+            echo ">"
+            echo "> Changes: see CHANGELOG.md · Issues: https://github.com/Corgea/cli/issues"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+      - name: Set release metadata (once)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
+          generate_release_notes: true
+          body: ${{ steps.body.outputs.body || '' }}
+        env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
