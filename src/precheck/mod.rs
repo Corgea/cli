@@ -5,11 +5,12 @@
 //! the package manager *would* install against the public registry, and
 //! either blocks the install or runs it transparently.
 //!
-//! Two independent blocks:
-//!   * recency — the resolved version was published within `--threshold`
-//!     (default `2d`); `--no-fail` demotes this to a warning;
+//! The gate blocks on a single condition:
 //!   * vuln verdict — the vuln-api knows a resolved version (named or
 //!     transitive) is vulnerable or malicious; only `--force` overrides this.
+//!
+//! Each resolved package's publish time is shown for provenance, but it
+//! never blocks the install.
 //!
 //! Verdict lookups run in one of two modes: public (no token — a vuln-api
 //! outage warns and the install continues, fail-open) or authenticated
@@ -177,18 +178,15 @@ impl VerdictStatus {
 
 #[derive(Debug, Clone)]
 pub struct PrecheckOptions {
-    pub threshold: Duration,
-    /// If true, demote a recent finding from "block" to "warn-and-run".
-    pub no_fail: bool,
-    /// If true, never block: print findings (recent, vulnerable,
-    /// unverifiable) and run the install anyway.
+    /// If true, never block: print findings (vulnerable, unverifiable) and
+    /// run the install anyway.
     pub force: bool,
     /// If true, print the report as one JSON document on stdout; the
     /// package manager's own stdout moves to stderr.
     pub json: bool,
     /// `Some` ⇒ run the vuln-api verdict pass against this endpoint.
-    /// `None` is retained for tests and direct library callers that want
-    /// recency-only behavior.
+    /// `None` is retained for tests and direct library callers that resolve
+    /// and display without a verdict pass.
     pub verdict: Option<VerdictConfig>,
     /// Optional registry overrides, used by tests.
     pub npm_registry: Option<String>,
@@ -219,8 +217,8 @@ pub enum TargetKind {
 /// Outcome of resolving + verifying a single target.
 #[derive(Debug, Clone)]
 pub enum TargetOutcome {
-    /// Resolved cleanly. The blocking recency condition is derived from
-    /// `age` against the report's threshold (`PrecheckReport::is_recent`).
+    /// Resolved cleanly. `age` is the time since publish, shown for
+    /// provenance alongside `resolved.published_at`.
     Resolved {
         target: InstallTarget,
         resolved: crate::verify_deps::registry::ResolvedPackage,
@@ -297,7 +295,6 @@ pub struct PrecheckReport {
     pub subcommand: String,
     pub original_args: Vec<String>,
     pub outcomes: Vec<TargetOutcome>,
-    pub threshold: Duration,
     /// `None` ⇒ no tree pass ran.
     pub tree: Option<TreeReport>,
     /// True when the command named nothing — no CLI targets and no
@@ -312,16 +309,10 @@ impl PrecheckReport {
     fn count(&self, pred: impl Fn(&TargetOutcome) -> bool) -> usize {
         self.outcomes.iter().filter(|o| pred(o)).count()
     }
-    /// True when this age is within the recency threshold (the blocking
-    /// condition). The single definition of "recent".
-    fn is_recent(&self, age: Duration) -> bool {
-        age < self.threshold
-    }
+    /// Named targets that resolved cleanly (regardless of verdict — vulnerable
+    /// ones are tallied separately by `vulnerable_count`).
     pub fn ok_count(&self) -> usize {
-        self.count(|o| matches!(o, TargetOutcome::Resolved { age, .. } if !self.is_recent(*age)))
-    }
-    pub fn recent_count(&self) -> usize {
-        self.count(|o| matches!(o, TargetOutcome::Resolved { age, .. } if self.is_recent(*age)))
+        self.count(|o| matches!(o, TargetOutcome::Resolved { .. }))
     }
     /// Every verdict in the report: named (resolved) outcomes, then
     /// transitive tree findings.
@@ -523,7 +514,6 @@ fn proceed_ungated(
             subcommand: subcommand.to_string(),
             original_args: original_args.to_vec(),
             outcomes: Vec::new(),
-            threshold: opts.threshold,
             tree: None,
             bare_install,
         };
@@ -760,8 +750,7 @@ fn run_parsed_install(
     }
 
     if parsed.targets.is_empty() && !tree_eligible {
-        // Only a truly bare install gets the bare note. A `-r requirements.txt`
-        // install is covered by `requirements_note`.
+        // Only a truly bare install gets the bare note.
         if bare_install {
             render::bare_install_note(manager, subcommand_label);
         }
@@ -779,7 +768,6 @@ fn run_parsed_install(
                 "warning: cannot determine the npm project (current directory is unreadable); proceeding without tree verification."
             );
         }
-        render::requirements_note(&parsed);
         // Nothing to gate (bare yarn/pnpm install, or an unresolvable npm
         // root) — proceed, keeping stdout a single document under --json.
         return proceed_ungated(manager, subcommand_label, rest, bare_install, &opts, exec);
@@ -817,12 +805,6 @@ fn run_parsed_install(
             "warning: transitive dependencies not checked ({reason}); only named packages were verified."
         );
     }
-    // The note is recency-specific, and recency never covers requirements-file
-    // packages: even under a Full tree pass they are verdicted but become
-    // `TreeOutcome`s with no `age` (recency only blocks named CLI targets), so
-    // the caveat applies in every path. `requirements_note` self-guards when
-    // there are no `-r` files.
-    render::requirements_note(&parsed);
     if verdict::public_verdict(&opts).is_some_and(|cfg| cfg.public_login_hint) {
         eprintln!(
             "warning: using public CVE checks; login enables authenticated enforcement and private Corgea intelligence."
@@ -834,7 +816,6 @@ fn run_parsed_install(
         subcommand: subcommand_label.to_string(),
         original_args: rest.to_vec(),
         outcomes,
-        threshold: opts.threshold,
         tree,
         bare_install,
     };
@@ -922,7 +903,6 @@ fn run_locked_install(
         subcommand: subcommand.to_string(),
         original_args,
         outcomes: Vec::new(),
-        threshold: opts.threshold,
         tree: Some(TreeReport::Full {
             resolved_count,
             transitive,
@@ -1131,7 +1111,7 @@ fn requirements_fallback_outcomes(
 }
 
 /// Vuln-api verdict pass over resolved targets, run through the bounded
-/// worker pool. No-op without a `VerdictConfig` (recency-only callers).
+/// worker pool. No-op without a `VerdictConfig` (resolve-and-display callers).
 /// Any client/call failure becomes `Unverifiable` — public mode warns and
 /// fails open; authenticated mode blocks (`VerdictStatus::blocks`).
 fn run_verdict_pass(

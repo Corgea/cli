@@ -3,7 +3,7 @@
 use crate::verify_deps;
 
 use super::{
-    parse, PackageManager, PrecheckOptions, PrecheckReport, TargetOutcome, TreeOrigin, TreeReport,
+    PackageManager, PrecheckOptions, PrecheckReport, TargetOutcome, TreeOrigin, TreeReport,
     VerdictStatus,
 };
 
@@ -49,36 +49,28 @@ pub(super) fn print_refusal(reason: super::verdict::BlockReason, report: &Preche
         BlockReason::Findings => {
             eprintln!("Refusing to run install. Pass --force to proceed despite findings.")
         }
-        BlockReason::RecencyOnly => {
-            eprintln!("Refusing to run install. Pass --no-fail to proceed anyway.")
-        }
     }
-    print_escape_hint(reason, report);
+    print_escape_hint(report);
 }
 
-/// Spell out the concrete escape command, and — when the escape flag was typed
-/// after the install verb — explain that the package manager, not Corgea,
-/// received it. `--force` clears every block; `--no-fail` only the recency one
-/// (so `--force` is accepted there too).
-fn print_escape_hint(reason: super::verdict::BlockReason, report: &PrecheckReport) {
-    use super::verdict::BlockReason;
-    let (canonical, accepted): (&str, &[&str]) = match reason {
-        BlockReason::ExistingTree | BlockReason::Findings => ("--force", &["--force"]),
-        BlockReason::RecencyOnly => ("--no-fail", &["--no-fail", "--force"]),
-    };
-    // An accepted escape sitting in the forwarded args was typed after the
-    // verb — clap handed it to the package manager, not us.
-    let misplaced = accepted
+/// Spell out the concrete `--force` escape command, and — when `--force` was
+/// typed after the install verb — explain that the package manager, not
+/// Corgea, received it.
+fn print_escape_hint(report: &PrecheckReport) {
+    let flag = "--force";
+    // `--force` sitting in the forwarded args was typed after the verb — clap
+    // handed it to the package manager, not us.
+    let misplaced = report
+        .original_args
         .iter()
-        .copied()
-        .find(|f| report.original_args.iter().any(|a| a.as_str() == *f));
-    let flag = misplaced.unwrap_or(canonical);
+        .any(|a| a.as_str() == flag)
+        .then_some(flag);
 
     let manager = report.manager.binary_name();
     if let Some(typed) = misplaced {
         eprintln!("  note: `{typed}` after the verb was passed to {manager}, not corgea.");
     }
-    // Rebuild the command with the escape in the slot Corgea reads — between
+    // Rebuild the command with `--force` in the slot Corgea reads — between
     // the manager and the verb — dropping a misplaced copy from the tail.
     let rest: Vec<&str> = report
         .original_args
@@ -91,29 +83,7 @@ fn print_escape_hint(reason: super::verdict::BlockReason, report: &PrecheckRepor
         corrected.push(' ');
         corrected.push_str(&rest.join(" "));
     }
-    let action = if flag == "--force" {
-        "bypass the gate with"
-    } else {
-        "proceed anyway with"
-    };
-    eprintln!("  {action}: {corrected}");
-}
-
-/// Print the "requirements files are not recency-checked" note when the
-/// install carried any `-r` files. No-op otherwise.
-pub(super) fn requirements_note(parsed: &parse::ParsedInstall) {
-    if parsed.requirements_files.is_empty() {
-        return;
-    }
-    let files: Vec<String> = parsed
-        .requirements_files
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect();
-    eprintln!(
-        "note: requirements files ({}) are not recency-checked by the baseline gate",
-        files.join(", ")
-    );
+    eprintln!("  bypass the gate with: {corrected}");
 }
 
 pub(super) fn warn_public_lookup_failures(report: &PrecheckReport, opts: &PrecheckOptions) {
@@ -281,15 +251,10 @@ pub(super) fn print_text(report: &PrecheckReport) {
             .any(|(prefix, _, _)| *prefix == error_prefix(error))
     };
 
+    println!("Pre-checking `{command}`");
     println!(
-        "Pre-checking `{}` (threshold {})",
-        command,
-        verify_deps::format_duration(report.threshold)
-    );
-    println!(
-        "  {} ok, {} recent, {}, {}, {} skipped, {} errors",
+        "  {} ok, {}, {}, {} skipped, {} errors",
         report.ok_count(),
-        report.recent_count(),
         summary_segment(
             report.vulnerable_count(),
             report.tree_vulnerable_count(),
@@ -401,24 +366,14 @@ pub(super) fn print_text(report: &PrecheckReport) {
                     }
                 }
                 VerdictStatus::Clean | VerdictStatus::NotChecked => {
-                    if report.is_recent(*age) {
-                        println!(
-                            "  ⚠ {} → {}@{}  published {} ago at {} (within threshold)",
-                            target.display,
-                            resolved.name,
-                            resolved.version,
-                            verify_deps::format_duration(*age),
-                            resolved.published_at.format("%Y-%m-%d %H:%M:%S UTC"),
-                        );
-                    } else {
-                        println!(
-                            "  ✓ {} → {}@{}  published {} ago",
-                            target.display,
-                            resolved.name,
-                            resolved.version,
-                            verify_deps::format_duration(*age),
-                        );
-                    }
+                    println!(
+                        "  ✓ {} → {}@{}  published {} ago at {}",
+                        target.display,
+                        resolved.name,
+                        resolved.version,
+                        verify_deps::format_duration(*age),
+                        resolved.published_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                    );
                 }
             },
             TargetOutcome::Skipped { target, reason } => {
@@ -501,7 +456,7 @@ pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
     let verdict_mode = match opts.verdict.as_ref().map(|cfg| &cfg.mode) {
         Some(super::VerdictMode::Public) => "public",
         Some(super::VerdictMode::Authenticated { .. }) => "authenticated",
-        None => "recency-only",
+        None => "none",
     };
     let outcomes: Vec<_> = report
         .outcomes
@@ -515,7 +470,7 @@ pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
             } => {
                 let verdict_json = verdict_json(verdict);
                 json!({
-                    "status": if report.is_recent(*age) { "recent" } else { "ok" },
+                    "status": "ok",
                     "spec": target.display,
                     "name": resolved.name,
                     "resolved_version": resolved.version,
@@ -556,11 +511,9 @@ pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
         "manager": report.manager.binary_name(),
         "subcommand": report.subcommand,
         "args": report.original_args,
-        "threshold_seconds": report.threshold.as_secs(),
         "summary": {
             "named": {
                 "ok": report.ok_count(),
-                "recent": report.recent_count(),
                 "vulnerable": named_counts.vulnerable,
                 "unverifiable": named_counts.unverifiable,
                 "clean": named_counts.clean,
@@ -682,7 +635,7 @@ mod tests {
     #[test]
     fn collapsed_groups_require_more_than_threshold() {
         let unverifiable = |name: &str| {
-            let mut o = resolved_outcome(name, "1.0.0", false);
+            let mut o = resolved_outcome(name, "1.0.0");
             set_verdict(
                 &mut o,
                 VerdictStatus::Unverifiable(format!("vuln-api unavailable (HTTP 503: {name})")),

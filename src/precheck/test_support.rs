@@ -15,8 +15,6 @@ use super::{
 /// Override fields per test via struct update.
 pub(crate) fn stub_opts() -> PrecheckOptions {
     PrecheckOptions {
-        threshold: Duration::from_secs(2 * 86400),
-        no_fail: false,
         force: false,
         json: false,
         verdict: None,
@@ -39,9 +37,8 @@ pub(crate) fn verdict_opts(base_url: &str) -> PrecheckOptions {
     }
 }
 
-pub(crate) fn public_opts(no_fail: bool, force: bool) -> PrecheckOptions {
+pub(crate) fn public_opts(force: bool) -> PrecheckOptions {
     PrecheckOptions {
-        no_fail,
         force,
         verdict: Some(VerdictConfig {
             base_url: "http://127.0.0.1:9".to_string(),
@@ -52,22 +49,16 @@ pub(crate) fn public_opts(no_fail: bool, force: bool) -> PrecheckOptions {
     }
 }
 
-pub(crate) fn authenticated_opts(no_fail: bool, force: bool) -> PrecheckOptions {
+pub(crate) fn authenticated_opts(force: bool) -> PrecheckOptions {
     PrecheckOptions {
-        no_fail,
         force,
         ..verdict_opts("http://127.0.0.1:9")
     }
 }
 
-pub(crate) fn resolved_outcome(name: &str, version: &str, recent: bool) -> TargetOutcome {
-    // Recency derives from age vs `report_with`'s 2-day threshold:
-    // one hour => recent, a year => not.
-    let age = if recent {
-        Duration::from_secs(3600)
-    } else {
-        Duration::from_secs(365 * 86400)
-    };
+pub(crate) fn resolved_outcome(name: &str, version: &str) -> TargetOutcome {
+    // Age only drives the published-date display now; fix it for determinism.
+    let age = Duration::from_secs(3600);
     TargetOutcome::Resolved {
         target: InstallTarget {
             name: name.to_string(),
@@ -92,7 +83,6 @@ pub(crate) fn report_with(outcomes: Vec<TargetOutcome>) -> PrecheckReport {
         subcommand: "install".to_string(),
         original_args: vec![],
         outcomes,
-        threshold: Duration::from_secs(2 * 86400),
         tree: None,
         // Most tests model an install that named something; bare-install
         // cases set this explicitly.

@@ -152,7 +152,7 @@ fn force_after_the_verb_is_forwarded_not_consumed_and_block_explains_placement()
 }
 
 #[test]
-fn no_fail_does_not_waive_vulnerable_block() {
+fn vulnerable_named_pin_blocks_install() {
     let mut checks = HashMap::new();
     checks.insert(
         key("pypi", "oldpkg", "1.0.0"),
@@ -161,13 +161,13 @@ fn no_fail_does_not_waive_vulnerable_block() {
     let mut h = pip_harness(checks, HashMap::new(), None, 0);
     let out = h
         .cmd
-        .args(["pip", "--no-fail", "install", "oldpkg==1.0.0"])
+        .args(["pip", "install", "oldpkg==1.0.0"])
         .output()
         .expect("run corgea");
     assert_eq!(
         out.status.code(),
         Some(1),
-        "--no-fail demotes recency only, never a vulnerable verdict"
+        "a vulnerable verdict blocks the install"
     );
     assert_eq!(h.recorded_argv(), None);
 }

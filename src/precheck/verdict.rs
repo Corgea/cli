@@ -174,7 +174,7 @@ pub(super) fn apply_verdicts(
             // must show what installs) and verdict it there. `age` /
             // `resolved.published_at` still reflect the CLI-resolved version —
             // a one-minor-version drift, left as-is rather than re-fetching on
-            // the gate's critical path; recency stays driven by that age.
+            // the gate's critical path; the published-date display keeps that age.
             for &i in indices {
                 if let TargetOutcome::Resolved {
                     resolved,
@@ -215,8 +215,6 @@ pub(super) enum BlockReason {
     ExistingTree,
     /// Vulnerable findings. `--force` is the escape.
     Findings,
-    /// Only the recency threshold fired. `--no-fail` is the escape.
-    RecencyOnly,
 }
 
 pub(super) fn block_reason(report: &PrecheckReport, opts: &PrecheckOptions) -> Option<BlockReason> {
@@ -247,9 +245,6 @@ pub(super) fn block_reason(report: &PrecheckReport, opts: &PrecheckOptions) -> O
         } else {
             BlockReason::Findings
         });
-    }
-    if !opts.no_fail && report.recent_count() > 0 {
-        return Some(BlockReason::RecencyOnly);
     }
     None
 }
@@ -324,7 +319,7 @@ fn verify_one(
 
     match resolved {
         Ok(resolved) => {
-            // Future publish dates clamp to zero — maximally recent.
+            // Future publish dates clamp to zero.
             let age = now
                 .signed_duration_since(resolved.published_at)
                 .to_std()
@@ -357,23 +352,22 @@ mod tests {
     }
 
     /// Predicate matrix: force ⇒ never block; vulnerable blocks in every
-    /// verdict mode; unverifiable/error findings block only in authenticated
-    /// mode; recency keeps its --no-fail demotion.
+    /// verdict mode; unverifiable/error/skipped findings block only in
+    /// authenticated mode.
     #[test]
     fn block_predicate_matrix() {
         let clean = {
-            let mut o = resolved_outcome("pkg", "1.0.0", false);
+            let mut o = resolved_outcome("pkg", "1.0.0");
             set_verdict(&mut o, VerdictStatus::Clean);
             report_with(vec![o])
         };
-        let recent = report_with(vec![resolved_outcome("pkg", "1.0.0", true)]);
         let vulnerable = {
-            let mut o = resolved_outcome("pkg", "1.0.0", false);
+            let mut o = resolved_outcome("pkg", "1.0.0");
             set_verdict(&mut o, VerdictStatus::Vulnerable(vec![]));
             report_with(vec![o])
         };
         let unverifiable = {
-            let mut o = resolved_outcome("pkg", "1.0.0", false);
+            let mut o = resolved_outcome("pkg", "1.0.0");
             set_verdict(&mut o, VerdictStatus::Unverifiable("503".to_string()));
             report_with(vec![o])
         };
@@ -401,57 +395,44 @@ mod tests {
             reason: "git/URL/path reference".to_string(),
         }]);
 
-        assert!(!should_block_install(&clean, &public_opts(false, false)));
-        assert!(should_block_install(&recent, &public_opts(false, false)));
-        assert!(!should_block_install(&recent, &public_opts(true, false)));
-        assert!(should_block_install(
-            &vulnerable,
-            &public_opts(false, false)
-        ));
+        assert!(!should_block_install(&clean, &public_opts(false)));
+        assert!(should_block_install(&vulnerable, &public_opts(false)));
         assert!(
-            should_block_install(&vulnerable, &public_opts(true, false)),
-            "--no-fail must not waive a vulnerable block"
-        );
-        assert!(
-            !should_block_install(&unverifiable, &public_opts(false, false)),
+            !should_block_install(&unverifiable, &public_opts(false)),
             "public mode must fail open on lookup errors"
         );
         assert!(
-            should_block_install(&unverifiable, &authenticated_opts(true, false)),
+            should_block_install(&unverifiable, &authenticated_opts(false)),
             "authenticated mode must fail closed on lookup errors"
         );
         assert!(
-            !should_block_install(&resolution_error, &public_opts(false, false)),
+            !should_block_install(&resolution_error, &public_opts(false)),
             "public mode must fail open when no verdict can be obtained"
         );
         assert!(
-            should_block_install(&resolution_error, &authenticated_opts(false, false)),
+            should_block_install(&resolution_error, &authenticated_opts(false)),
             "authenticated mode must fail closed when no verdict can be obtained"
         );
         assert!(
-            !should_block_install(&skipped, &public_opts(false, false)),
+            !should_block_install(&skipped, &public_opts(false)),
             "public mode must let a skipped direct reference through"
         );
         assert!(
-            should_block_install(&skipped, &authenticated_opts(false, false)),
+            should_block_install(&skipped, &authenticated_opts(false)),
             "authenticated mode must fail closed on an unverifiable direct reference"
         );
         for report in [
             &clean,
-            &recent,
             &vulnerable,
             &unverifiable,
             &resolution_error,
             &skipped,
         ] {
             assert!(
-                !should_block_install(report, &public_opts(false, true)),
+                !should_block_install(report, &public_opts(true)),
                 "--force must never block"
             );
-            assert!(!should_block_install(
-                report,
-                &authenticated_opts(true, true)
-            ));
+            assert!(!should_block_install(report, &authenticated_opts(true)));
         }
     }
 
@@ -460,7 +441,7 @@ mod tests {
     /// `should_block_install` true without `--force`, false with it.
     #[test]
     fn tree_findings_extend_block_counts() {
-        let mut named = resolved_outcome("pkg", "1.0.0", false);
+        let mut named = resolved_outcome("pkg", "1.0.0");
         set_verdict(&mut named, VerdictStatus::Clean);
         let mut report = report_with(vec![named]);
         report.tree = Some(TreeReport::Full {
@@ -512,7 +493,7 @@ mod tests {
         ];
         for (origin, with_named, bare_install, blames_tree) in cases {
             let outcomes = if with_named {
-                vec![resolved_outcome("cleanpkg", "1.0.0", false)]
+                vec![resolved_outcome("cleanpkg", "1.0.0")]
             } else {
                 vec![]
             };
@@ -523,7 +504,7 @@ mod tests {
                 transitive: vec![tree_vulnerable(origin)],
             });
             assert_eq!(
-                blames_existing_tree(&report, &authenticated_opts(false, false)),
+                blames_existing_tree(&report, &authenticated_opts(false)),
                 blames_tree,
                 "origin {origin:?}, with_named {with_named}, bare {bare_install}"
             );
@@ -534,7 +515,7 @@ mod tests {
     /// when a pre-existing tree finding is also vulnerable.
     #[test]
     fn refusal_blame_requires_clean_named_targets() {
-        let mut named = resolved_outcome("badpkg", "1.0.0", false);
+        let mut named = resolved_outcome("badpkg", "1.0.0");
         set_verdict(&mut named, VerdictStatus::Vulnerable(vec![vm("A-1", None)]));
         let mut report = report_with(vec![named]);
         report.tree = Some(TreeReport::Full {
@@ -546,7 +527,7 @@ mod tests {
                 origin: TreeOrigin::PreExisting,
             }],
         });
-        assert!(!blames_existing_tree(&report, &public_opts(false, false)));
+        assert!(!blames_existing_tree(&report, &public_opts(false)));
     }
 
     /// Verdict pass against an in-process stub: vulnerable body → Vulnerable
@@ -570,9 +551,9 @@ mod tests {
         let opts = verdict_opts(&stub.base_url);
 
         let mut outcomes = vec![
-            resolved_outcome("evil", "1.0.0", false),
-            resolved_outcome("flaky", "1.0.0", false),
-            resolved_outcome("goodpkg", "1.0.0", false), // unknown → stub default clean
+            resolved_outcome("evil", "1.0.0"),
+            resolved_outcome("flaky", "1.0.0"),
+            resolved_outcome("goodpkg", "1.0.0"), // unknown → stub default clean
         ];
         run_verdict_pass(PackageManager::Pip, &mut outcomes, &opts);
 
@@ -590,7 +571,7 @@ mod tests {
         assert!(matches!(&verdicts[2], VerdictStatus::Clean));
 
         // Without a VerdictConfig the pass is a no-op.
-        let mut untouched = vec![resolved_outcome("evil", "1.0.0", false)];
+        let mut untouched = vec![resolved_outcome("evil", "1.0.0")];
         let no_verdict = stub_opts();
         run_verdict_pass(PackageManager::Pip, &mut untouched, &no_verdict);
         assert!(matches!(
@@ -728,7 +709,7 @@ mod tests {
     /// installs), with NO duplicate `(from requirements)` finding.
     #[test]
     fn apply_verdicts_collapses_pip_backtracked_named_target() {
-        let mut outcomes = vec![resolved_outcome("flask", "3.0.3", false)];
+        let mut outcomes = vec![resolved_outcome("flask", "3.0.3")];
         let results = vec![(
             pkg("flask", "3.0.2", true),
             VerdictStatus::Vulnerable(vec![vm("CVE-1", None)]),
@@ -768,7 +749,7 @@ mod tests {
     /// outcome unchanged — the version is untouched and the verdict lands.
     #[test]
     fn apply_verdicts_exact_named_match_unchanged() {
-        let mut outcomes = vec![resolved_outcome("flask", "3.0.3", false)];
+        let mut outcomes = vec![resolved_outcome("flask", "3.0.3")];
         let results = vec![(
             pkg("flask", "3.0.3", true),
             VerdictStatus::Vulnerable(vec![vm("CVE-1", None)]),
@@ -794,7 +775,7 @@ mod tests {
         // A named outcome shares the name to prove name-only matching is NOT
         // used for npm: the by-name index exists, but the requested guard
         // keeps both copies out of it.
-        let mut outcomes = vec![resolved_outcome("lodash", "4.17.21", false)];
+        let mut outcomes = vec![resolved_outcome("lodash", "4.17.21")];
         let results = vec![
             (pkg("lodash", "4.17.20", false), VerdictStatus::Clean),
             (pkg("lodash", "3.10.1", false), VerdictStatus::Clean),

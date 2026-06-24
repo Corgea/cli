@@ -228,22 +228,7 @@ enum Commands {
 struct InstallWrapArgs {
     #[arg(
         long,
-        short = 't',
-        default_value = "2d",
-        value_parser = corgea::verify_deps::parse_threshold,
-        help = "Recency threshold. Resolved versions younger than this are blocked. e.g. '2d', '12h'."
-    )]
-    threshold: std::time::Duration,
-
-    #[arg(
-        long,
-        help = "Demote a recency block to a printed warning. The install still runs."
-    )]
-    no_fail: bool,
-
-    #[arg(
-        long,
-        help = "Proceed with the install despite vulnerable or recent findings. Findings are still printed."
+        help = "Proceed with the install despite vulnerable findings. Findings are still printed."
     )]
     force: bool,
 
@@ -271,8 +256,6 @@ fn install_wrap_options(
             .is_some_and(|v| v.trim() == "1");
     let mode = select_verdict_mode(token, custom_vuln_api_url, send_token_to_custom);
     corgea::precheck::PrecheckOptions {
-        threshold: args.threshold,
-        no_fail: args.no_fail,
         force: args.force,
         json: args.json,
         verdict: Some(corgea::precheck::VerdictConfig {
