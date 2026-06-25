@@ -50,6 +50,36 @@ corgea deps policy init --exist-ok     # write starter policy, or keep existing 
 
 See [Dependency Scanning (CLI)](https://docs.corgea.app/cli/deps) for the full flag and exit-code reference.
 
+## Install Gate
+
+Prefix a package-manager install with `corgea` to vet every package it would
+install — named **and transitive** — against Corgea's vulnerability API *before*
+anything lands on disk. Known-vulnerable or malicious versions block the install;
+a clean set runs the underlying command untouched. Works with `pip`, `npm`,
+`yarn`, `pnpm`, and `uv`.
+
+No token required — baseline public CVE checks run out of the box. Try it:
+
+```bash
+corgea npm install lodash@4.17.20      # blocks: known-vulnerable (CVE-2025-13465), exits 1
+corgea pip install requests            # resolves, checks the verdict, then runs pip
+corgea npm install axios@^1.0.0        # ranges resolve to a concrete version first
+corgea pip --force install <pkg>       # print findings but install anyway
+corgea pip list                        # non-install subcommands pass straight through
+```
+
+`corgea pip install` and `corgea npm install` resolve the **full would-install
+set** (named + transitive) via a safe dry-run, so a vulnerable *transitive*
+dependency blocks too. Blocked findings steer to the fix: each advisory shows
+`fixed in <version>`, and the gate prints the safe version to install instead.
+
+Logging in (`corgea login`) upgrades the gate to authenticated enforcement —
+unverifiable packages, resolution errors, and lookup failures then fail closed
+(public mode warns and continues). Wrapper flags (`--force`, `--json`) go between
+the manager and its command: `corgea npm --force install <pkg>`.
+
+See [the CLI docs](https://docs.corgea.app/cli) for the full flag and exit-code reference.
+
 ## Development Setup
 
 ### Prerequisites
