@@ -148,8 +148,9 @@ fn externally_managed_pip_force_proceeds() {
 
 #[test]
 fn pip_fresh_pin_installs_and_shows_publish_date() {
-    // Recency no longer blocks: a freshly-published pin installs, and its
-    // publish time is shown for provenance.
+    // Recency is pinned off in the harness (CORGEA_RECENCY_GATE=0), so a
+    // freshly-published pin installs and its publish time is shown for
+    // provenance. The recency-on behavior is covered below.
     let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
     let out = h
         .cmd
@@ -159,7 +160,7 @@ fn pip_fresh_pin_installs_and_shows_publish_date() {
     assert_eq!(
         out.status.code(),
         Some(0),
-        "fresh pins no longer block; stderr: {}",
+        "fresh pins install with the gate off; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(
@@ -168,6 +169,87 @@ fn pip_fresh_pin_installs_and_shows_publish_date() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("published"), "stdout: {stdout}");
+}
+
+#[test]
+fn pip_fresh_pin_blocks_when_recency_gate_on() {
+    // With the recency gate enabled, a pin published an hour ago is refused
+    // before pip runs, and the refusal points at the config toggle.
+    let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
+    let out = h
+        .cmd
+        .env("CORGEA_RECENCY_GATE", "1")
+        .args(["pip", "install", "freshpkg==9.9.9"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        h.recorded_argv(),
+        None,
+        "pip must not run on a recency block"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("recency window"), "stderr: {stderr}");
+    assert!(stderr.contains("freshpkg@9.9.9"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("recency_gate = false"),
+        "refusal must name the config toggle; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn pip_recency_block_bypassed_by_force() {
+    // `--force` overrides the recency block like every other block.
+    let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
+    let out = h
+        .cmd
+        .env("CORGEA_RECENCY_GATE", "1")
+        .args(["pip", "--force", "install", "freshpkg==9.9.9"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("install freshpkg==9.9.9")
+    );
+}
+
+#[test]
+fn pip_recency_threshold_zero_allows_fresh_pin() {
+    // A zero-day window can never be tripped — proves the threshold plumbs
+    // through from the env override.
+    let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
+    let out = h
+        .cmd
+        .env("CORGEA_RECENCY_GATE", "1")
+        .env("CORGEA_RECENCY_THRESHOLD_DAYS", "0")
+        .args(["pip", "install", "freshpkg==9.9.9"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("install freshpkg==9.9.9")
+    );
+}
+
+#[test]
+fn pip_old_pin_not_blocked_by_recency() {
+    // Even with the gate on, a 2020-published pin is well outside the window.
+    let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
+    let out = h
+        .cmd
+        .env("CORGEA_RECENCY_GATE", "1")
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg==1.0.0"));
 }
 
 #[test]

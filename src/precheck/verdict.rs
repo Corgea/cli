@@ -219,6 +219,10 @@ pub(super) enum BlockReason {
     ExistingTree,
     /// Vulnerable findings. `--force` is the escape.
     Findings,
+    /// A named target was published within the configured recency window.
+    /// Carries the window so the refusal can name it. Escapes: disable the
+    /// gate in config, or `--force` for this install.
+    Recency { threshold_days: u32 },
 }
 
 pub(super) fn block_reason(report: &PrecheckReport, opts: &PrecheckOptions) -> Option<BlockReason> {
@@ -250,7 +254,33 @@ pub(super) fn block_reason(report: &PrecheckReport, opts: &PrecheckOptions) -> O
             BlockReason::Findings
         });
     }
+    // Recency is the softer, second gate: a clean-but-fresh named target
+    // blocks only when no vulnerable/unverifiable finding already did.
+    if let Some(recency) = &opts.recency {
+        if !fresh_named_targets(report, recency.threshold_days).is_empty() {
+            return Some(BlockReason::Recency {
+                threshold_days: recency.threshold_days,
+            });
+        }
+    }
     None
+}
+
+/// Named install targets whose resolved version was published within
+/// `threshold_days`. Unknown age (`None`, pip backtracking to a version we
+/// never resolved) never qualifies — recency is best-effort and must not
+/// reintroduce stale-provenance blocks. Shared by `block_reason` (the
+/// decision) and `render::print_refusal` (which names the offenders).
+pub(super) fn fresh_named_targets(
+    report: &PrecheckReport,
+    threshold_days: u32,
+) -> Vec<&TargetOutcome> {
+    let window = Duration::from_secs(u64::from(threshold_days) * 86_400);
+    report
+        .outcomes
+        .iter()
+        .filter(|o| matches!(o, TargetOutcome::Resolved { age: Some(age), .. } if *age < window))
+        .collect()
 }
 
 /// True when the block is entirely the existing tree's doing: vulnerable

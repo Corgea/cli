@@ -20,6 +20,7 @@ pub(crate) fn stub_opts() -> PrecheckOptions {
         verdict: None,
         npm_registry: None,
         pypi_registry: Some("http://127.0.0.1:9".to_string()),
+        recency: None,
     }
 }
 

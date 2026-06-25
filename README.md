@@ -73,6 +73,12 @@ set** (named + transitive) via a safe dry-run, so a vulnerable *transitive*
 dependency blocks too. Blocked findings steer to the fix: each advisory shows
 `fixed in <version>`, and the gate prints the safe version to install instead.
 
+The gate also blocks **freshly published** packages — anything published within
+the recency window (default 14 days) — to catch just-shipped typosquats and
+hijacks before advisory feeds catch up. It is on by default; turn it off with
+`recency_gate = false` in `~/.corgea/config.toml`, retune the window with
+`recency_threshold_days`, or pass `--force` for a one-off install.
+
 Logging in (`corgea login`) upgrades the gate to authenticated enforcement —
 unverifiable packages, resolution errors, and lookup failures then fail closed
 (public mode warns and continues). Wrapper flags (`--force`, `--json`) go between

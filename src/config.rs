@@ -11,6 +11,22 @@ pub struct Config {
     pub(crate) token: String,
     #[serde(default)]
     pub(crate) default_agent: Option<String>,
+    /// Install-gate recency check: block installs of packages published within
+    /// `recency_threshold_days`. On by default; toggle off to stop those
+    /// failures. Defaulted (not `Option`) so an upgraded config without the
+    /// field inherits the gate rather than silently disabling it.
+    #[serde(default = "default_recency_gate")]
+    pub(crate) recency_gate: bool,
+    #[serde(default = "default_recency_threshold_days")]
+    pub(crate) recency_threshold_days: u32,
+}
+
+fn default_recency_gate() -> bool {
+    true
+}
+
+fn default_recency_threshold_days() -> u32 {
+    14
 }
 
 impl Config {
@@ -39,6 +55,8 @@ impl Config {
                 debug: 0,
                 token: "".to_string(),
                 default_agent: None,
+                recency_gate: default_recency_gate(),
+                recency_threshold_days: default_recency_threshold_days(),
             };
 
             let toml = toml::to_string(&config).expect("Failed to serialize config");
@@ -120,6 +138,32 @@ impl Config {
 
         self.default_agent.clone()
     }
+
+    /// Whether the install-gate recency check is enabled. `CORGEA_RECENCY_GATE`
+    /// (`1`/`true` | `0`/`false`) overrides the config file.
+    pub fn get_recency_gate(&self) -> bool {
+        if let Ok(v) = env::var("CORGEA_RECENCY_GATE") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" => return true,
+                "0" | "false" => return false,
+                _ => {}
+            }
+        }
+
+        self.recency_gate
+    }
+
+    /// Recency window in days. `CORGEA_RECENCY_THRESHOLD_DAYS` overrides the
+    /// config file.
+    pub fn get_recency_threshold_days(&self) -> u32 {
+        if let Ok(v) = env::var("CORGEA_RECENCY_THRESHOLD_DAYS") {
+            if let Ok(days) = v.trim().parse::<u32>() {
+                return days;
+            }
+        }
+
+        self.recency_threshold_days
+    }
 }
 
 /// Base URL for the vuln-api service: `CORGEA_VULN_API_URL` env var,
@@ -143,6 +187,20 @@ fn resolve_vuln_api_url(override_url: Option<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recency_gate_defaults_on_for_configs_missing_the_field() {
+        // A config written before the recency fields existed must inherit the
+        // gate (opt-out), not silently disable it.
+        let legacy = r#"
+            url = "https://www.corgea.app"
+            debug = 0
+            token = ""
+        "#;
+        let config: Config = toml::from_str(legacy).expect("deserialize legacy config");
+        assert!(config.recency_gate, "missing recency_gate defaults to on");
+        assert_eq!(config.recency_threshold_days, 14);
+    }
 
     #[test]
     fn vuln_api_url_resolution_order() {

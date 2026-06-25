@@ -49,6 +49,29 @@ pub(super) fn print_refusal(reason: super::verdict::BlockReason, report: &Preche
         BlockReason::Findings => {
             eprintln!("Refusing to run install. Pass --force to proceed despite findings.")
         }
+        BlockReason::Recency { threshold_days } => {
+            eprintln!(
+                "Refusing to run install: package(s) published within the {threshold_days}-day recency window."
+            );
+            for o in super::verdict::fresh_named_targets(report, threshold_days) {
+                if let TargetOutcome::Resolved {
+                    resolved,
+                    age: Some(age),
+                    ..
+                } = o
+                {
+                    eprintln!(
+                        "  ✗ {}@{} published {} ago",
+                        resolved.name,
+                        resolved.version,
+                        verify_deps::format_duration(*age),
+                    );
+                }
+            }
+            eprintln!(
+                "  turn off the recency gate with `recency_gate = false` in ~/.corgea/config.toml"
+            );
+        }
     }
     print_escape_hint(report);
 }
@@ -547,6 +570,9 @@ pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
             },
         },
         "verdict_mode": verdict_mode,
+        // `null` when the recency gate is off; consumers pair it with each
+        // result's `age_seconds` to see which named targets tripped it.
+        "recency_threshold_days": opts.recency.as_ref().map(|r| r.threshold_days),
         "results": outcomes,
         "tree": report.tree.as_ref().map(|t| match t {
             TreeReport::Full { resolved_count, transitive } => json!({

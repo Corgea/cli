@@ -18,12 +18,19 @@ use tempfile::TempDir;
 /// A `corgea` invocation isolated from the host environment: temp
 /// HOME/USERPROFILE, no Corgea config/registry env vars, and no
 /// agent-detection env vars leaking in.
+///
+/// The recency gate is pinned **off** (`CORGEA_RECENCY_GATE=0`) so that — as
+/// with the registry stubs — every block in a gate test is the vuln verdict's
+/// doing, not an incidental publish-date. Recency-specific tests opt back in
+/// with `h.cmd.env("CORGEA_RECENCY_GATE", "1")`.
 #[allow(dead_code)]
 pub fn corgea_isolated() -> (Command, TempDir) {
     let home = TempDir::new().expect("temp HOME");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_corgea"));
     cmd.env("HOME", home.path())
         .env("USERPROFILE", home.path())
+        .env("CORGEA_RECENCY_GATE", "0")
+        .env_remove("CORGEA_RECENCY_THRESHOLD_DAYS")
         .env_remove("CORGEA_TOKEN")
         .env_remove("CORGEA_URL")
         .env_remove("CORGEA_NPM_REGISTRY")

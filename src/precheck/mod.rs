@@ -191,6 +191,18 @@ pub struct PrecheckOptions {
     /// Optional registry overrides, used by tests.
     pub npm_registry: Option<String>,
     pub pypi_registry: Option<String>,
+    /// `Some` ⇒ recency gate enabled (config `recency_gate = true`). Blocks
+    /// named install targets published within the window. `None` disables it.
+    pub recency: Option<RecencyConfig>,
+}
+
+/// Install-gate recency policy. Present only when the gate is enabled.
+#[derive(Debug, Clone)]
+pub struct RecencyConfig {
+    /// Block named targets published within this many days. Unknown publish
+    /// dates (pip backtracking) never block — recency is best-effort; the
+    /// vuln-api verdict stays the hard gate.
+    pub threshold_days: u32,
 }
 
 /// Each item the user (or a `-r` requirements file) asked us to install.

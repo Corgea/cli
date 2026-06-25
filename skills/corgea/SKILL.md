@@ -184,6 +184,17 @@ Blocked findings steer to the fix: each advisory line shows
 package has a fix, the gate prints `→ safe version: <name>@<version>` — the
 highest fix covering every advisory. Install that version instead.
 
+The gate also blocks **freshly published** named targets: a package whose
+resolved version was published within the recency window (default 14 days)
+is refused, naming each package and its publish age. This catches just-shipped
+typosquat/hijack releases before the advisory feeds catch up. It is **on by
+default**; turn it off with `recency_gate = false` in `~/.corgea/config.toml`
+(or `CORGEA_RECENCY_GATE=0`), tune the window with `recency_threshold_days`
+(or `CORGEA_RECENCY_THRESHOLD_DAYS`), or pass `--force` for a single install.
+Packages whose publish date is unknown (pip backtracking to an unresolved
+version) never trip it, and a vulnerable/malicious verdict takes precedence —
+such a package blocks as vulnerable, not as fresh.
+
 ```bash
 corgea pip install requests==2.31.0   # resolves, checks the vuln verdict, then runs pip
 corgea npm install axios@^1.0.0       # same gate for npm ranges
@@ -204,14 +215,18 @@ and a `tree` object: `null` when no tree pass ran; otherwise `mode` is
 `resolved_count` and a `transitive[]` array of `{name, version, origin,
 verdict}` for packages beyond the named targets. Vulnerable `verdict`
 objects carry a `remediation` field: the safe version covering every
-advisory, or `null` when any advisory has no known fix.
+advisory, or `null` when any advisory has no known fix. A top-level
+`recency_threshold_days` reports the active recency window (or `null` when
+the recency gate is off); pair it with each result's `age_seconds`.
 
 Baseline CVE checks need no token. The default vuln-api
 uses `CORGEA_TOKEN` (or the `corgea login` token) when present. A custom
 `CORGEA_VULN_API_URL` is public by default, even when a token exists; set
 `CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` to send the token to that
-custom URL and make lookup failures fail closed. Overrides for testing:
-`CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`, `CORGEA_VULN_API_URL`.
+custom URL and make lookup failures fail closed. Recency gate:
+`recency_gate` / `recency_threshold_days` in `~/.corgea/config.toml`, overridden
+by `CORGEA_RECENCY_GATE` and `CORGEA_RECENCY_THRESHOLD_DAYS`. Overrides for
+testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`, `CORGEA_VULN_API_URL`.
 
 #### Limitations
 

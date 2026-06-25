@@ -265,6 +265,11 @@ fn install_wrap_options(
         }),
         npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
         pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
+        recency: config
+            .get_recency_gate()
+            .then(|| corgea::precheck::RecencyConfig {
+                threshold_days: config.get_recency_threshold_days(),
+            }),
     }
 }
 
