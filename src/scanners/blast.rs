@@ -264,7 +264,7 @@ pub fn run(
         );
     });
 
-    let classifications = match report_scan_status(&config.get_url(), &project_name) {
+    let classifications = match report_scan_status(&config.get_url(), &project_name, &scan_id) {
         Ok(issues_classes) => {
             *stop_signal.lock().unwrap() = true;
             let _ = results_thread.join();
@@ -507,8 +507,9 @@ pub fn check_scan_status(scan_id: &str, url: &str) -> Result<bool, Box<dyn Error
 pub fn fetch_and_group_scan_issues(
     url: &str,
     project: &str,
+    scan_id: &str,
 ) -> Result<HashMap<String, usize>, Box<dyn std::error::Error>> {
-    let issues = match utils::api::get_all_issues(url, project, None) {
+    let issues = match utils::api::get_all_issues(url, project, Some(scan_id.to_string())) {
         Ok(issues) => issues,
         Err(err) => {
             return Err(format!("Failed to fetch scan issues: {}", err).into());
@@ -528,8 +529,9 @@ pub fn fetch_and_group_scan_issues(
 pub fn report_scan_status(
     url: &str,
     project: &str,
+    scan_id: &str,
 ) -> Result<HashMap<String, usize>, Box<dyn std::error::Error>> {
-    let classification_counts = match fetch_and_group_scan_issues(url, project) {
+    let classification_counts = match fetch_and_group_scan_issues(url, project, scan_id) {
         Ok(counts) => counts,
         Err(e) => {
             return Err(e);
