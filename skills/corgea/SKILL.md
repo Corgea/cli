@@ -1,6 +1,6 @@
 ---
 name: corgea
-description: Scans code for security vulnerabilities using Corgea's AI-powered BLAST scanner and third-party tools, gates `pip` and `npm` package installs against vulnerable and suspiciously-recent dependencies (including transitive), manages findings, and displays AI-generated fixes. Use when the user needs to install pip/npm packages safely, scan for security issues, upload scan reports, list or inspect vulnerabilities, view fixes, or integrate security scanning into CI/CD.
+description: Scans code for security vulnerabilities using Corgea's AI-powered BLAST scanner and third-party tools, gates `pip` and `npm` package installs against vulnerable and malicious dependencies (including transitive), manages findings, and displays AI-generated fixes. Use when the user needs to install pip/npm packages safely, scan for security issues, upload scan reports, list or inspect vulnerabilities, view fixes, or integrate security scanning into CI/CD.
 allowed-tools: Shell, Read, Grep, Glob, StrReplace
 ---
 
@@ -134,9 +134,10 @@ Notes: `deps scan --out-format table|json|sarif` is the report/export selector; 
 ### Install Wrappers — `corgea pip|npm|yarn|pnpm|uv <args...>`
 
 Run a package manager through Corgea's install gate. Install commands with
-named targets are resolved against the public registry first, then gated
-twice: a version published within `--threshold` (default `2d`) blocks
-(exit 1), and each resolved version is checked against Corgea's vuln-api.
+named targets are resolved against the public registry first, then each
+resolved version is checked against Corgea's vuln-api. Every resolved
+package's publish time is shown for provenance (`published <age> ago at
+<UTC timestamp>`), but it never blocks.
 Baseline public CVE checks need no token: known-vulnerable or malicious
 versions block, but vuln-api lookup outages warn and continue because public
 mode is fail-open. A Corgea token on the default vuln-api enables
@@ -174,19 +175,29 @@ verified in that fallback. Verdict requests run in a bounded pool
 project, pip in a uv project, …) is refused with a
 `Did you mean `corgea …`?` suggestion; `--force` bypasses that guard too.
 
-Wrapper flags (`--force`, `--no-fail`, `--json`, `-t`) are read between the
-manager name and the install verb (`corgea npm --force install x`); flags
-after the verb belong to the package manager and are forwarded untouched.
+Wrapper flags (`--force`, `--json`) are read between the manager name and the
+install verb (`corgea npm --force install x`); flags after the verb belong to
+the package manager and are forwarded untouched.
 
 Blocked findings steer to the fix: each advisory line shows
 `fixed in <version>` (or `no fixed version known`). When every advisory on a
 package has a fix, the gate prints `→ safe version: <name>@<version>` — the
 highest fix covering every advisory. Install that version instead.
 
+The gate also blocks **freshly published** named targets: a package whose
+resolved version was published within the recency window (default 14 days)
+is refused, naming each package and its publish age. This catches just-shipped
+typosquat/hijack releases before the advisory feeds catch up. It is **on by
+default**; turn it off with `recency_gate = false` in `~/.corgea/config.toml`
+(or `CORGEA_RECENCY_GATE=0`), tune the window with `recency_threshold_days`
+(or `CORGEA_RECENCY_THRESHOLD_DAYS`), or pass `--force` for a single install.
+Packages whose publish date is unknown (pip backtracking to an unresolved
+version) never trip it, and a vulnerable/malicious verdict takes precedence —
+such a package blocks as vulnerable, not as fresh.
+
 ```bash
-corgea pip install requests==2.31.0   # resolves, checks recency + vuln verdict, then runs pip
+corgea pip install requests==2.31.0   # resolves, checks the vuln verdict, then runs pip
 corgea npm install axios@^1.0.0       # same gate for npm ranges
-corgea pip --no-fail install newpkg   # demote a recency block to a warning (vuln blocks still apply)
 corgea pip --force install badpkg     # print findings but install anyway (overrides every block)
 corgea pip --json install newpkg      # machine-readable per-target report incl. verdicts
 corgea pip list                       # non-install subcommands pass straight through
@@ -194,26 +205,28 @@ corgea pip list                       # non-install subcommands pass straight th
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--threshold` | `-t` | Recency threshold (`2d`, `12h`). Younger resolved versions block. |
-| `--no-fail` | | Demote a recency block to a warning. Does NOT bypass vulnerable blocks or authenticated unverifiable blocks. |
-| `--force` | | Proceed despite all findings (vulnerable, unverifiable, recent). Findings still print. Also bypasses the wrong-package-manager and PEP 668 refusals, and unparsable-lockfile refusals on `uv sync`/`npm ci`. |
+| `--force` | | Proceed despite all findings (vulnerable, unverifiable). Findings still print. Also bypasses the wrong-package-manager and PEP 668 refusals, and unparsable-lockfile refusals on `uv sync`/`npm ci`. |
 | `--json` | | JSON report instead of text. Per-result `verdict` object + `verdict_mode` + `tree`. Stdout carries only the report; the package manager's output moves to stderr. |
 
 `--json` adds `verdict_mode` (`"public"` or `"authenticated"` from the CLI;
-`"recency-only"` can only appear for library callers that disable verdicts)
+`"none"` can only appear for library callers that disable verdicts)
 and a `tree` object: `null` when no tree pass ran; otherwise `mode` is
 `"full"` (transitive checked) or `"named-only"` (with a `reason`), plus
 `resolved_count` and a `transitive[]` array of `{name, version, origin,
 verdict}` for packages beyond the named targets. Vulnerable `verdict`
 objects carry a `remediation` field: the safe version covering every
-advisory, or `null` when any advisory has no known fix.
+advisory, or `null` when any advisory has no known fix. A top-level
+`recency_threshold_days` reports the active recency window (or `null` when
+the recency gate is off); pair it with each result's `age_seconds`.
 
-Recency gating and baseline CVE checks need no token. The default vuln-api
+Baseline CVE checks need no token. The default vuln-api
 uses `CORGEA_TOKEN` (or the `corgea login` token) when present. A custom
 `CORGEA_VULN_API_URL` is public by default, even when a token exists; set
 `CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` to send the token to that
-custom URL and make lookup failures fail closed. Overrides for testing:
-`CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`, `CORGEA_VULN_API_URL`.
+custom URL and make lookup failures fail closed. Recency gate:
+`recency_gate` / `recency_threshold_days` in `~/.corgea/config.toml`, overridden
+by `CORGEA_RECENCY_GATE` and `CORGEA_RECENCY_THRESHOLD_DAYS`. Overrides for
+testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`, `CORGEA_VULN_API_URL`.
 
 #### Limitations
 

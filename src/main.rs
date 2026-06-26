@@ -211,15 +211,15 @@ enum Commands {
         #[command(subcommand)]
         command: corgea::deps::run::DepsSubcommand,
     },
-    /// Wrap `npm` commands: gate install targets on recency + vuln verdicts, then run npm.
+    /// Wrap `npm` commands: gate install targets on Corgea's vuln verdicts, then run npm.
     Npm(InstallWrapArgs),
-    /// Wrap `yarn` commands: gate install targets on recency + vuln verdicts, then run yarn.
+    /// Wrap `yarn` commands: gate install targets on Corgea's vuln verdicts, then run yarn.
     Yarn(InstallWrapArgs),
-    /// Wrap `pnpm` commands: gate install targets on recency + vuln verdicts, then run pnpm.
+    /// Wrap `pnpm` commands: gate install targets on Corgea's vuln verdicts, then run pnpm.
     Pnpm(InstallWrapArgs),
-    /// Wrap `pip` commands: gate install targets on recency + vuln verdicts, then run pip.
+    /// Wrap `pip` commands: gate install targets on Corgea's vuln verdicts, then run pip.
     Pip(InstallWrapArgs),
-    /// Wrap `uv` commands: gate install targets on recency + vuln verdicts, then run uv.
+    /// Wrap `uv` commands: gate install targets on Corgea's vuln verdicts, then run uv.
     Uv(InstallWrapArgs),
 }
 
@@ -228,22 +228,7 @@ enum Commands {
 struct InstallWrapArgs {
     #[arg(
         long,
-        short = 't',
-        default_value = "2d",
-        value_parser = corgea::verify_deps::parse_threshold,
-        help = "Recency threshold. Resolved versions younger than this are blocked. e.g. '2d', '12h'."
-    )]
-    threshold: std::time::Duration,
-
-    #[arg(
-        long,
-        help = "Demote a recency block to a printed warning. The install still runs."
-    )]
-    no_fail: bool,
-
-    #[arg(
-        long,
-        help = "Proceed with the install despite vulnerable or recent findings. Findings are still printed."
+        help = "Proceed with the install despite vulnerable findings. Findings are still printed."
     )]
     force: bool,
 
@@ -271,8 +256,6 @@ fn install_wrap_options(
             .is_some_and(|v| v.trim() == "1");
     let mode = select_verdict_mode(token, custom_vuln_api_url, send_token_to_custom);
     corgea::precheck::PrecheckOptions {
-        threshold: args.threshold,
-        no_fail: args.no_fail,
         force: args.force,
         json: args.json,
         verdict: Some(corgea::precheck::VerdictConfig {
@@ -282,6 +265,11 @@ fn install_wrap_options(
         }),
         npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
         pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
+        recency: config
+            .get_recency_gate()
+            .then(|| corgea::precheck::RecencyConfig {
+                threshold_days: config.get_recency_threshold_days(),
+            }),
     }
 }
 

@@ -147,22 +147,109 @@ fn externally_managed_pip_force_proceeds() {
 }
 
 #[test]
-fn pip_fresh_pin_blocks_without_running_install() {
+fn pip_fresh_pin_installs_and_shows_publish_date() {
+    // Recency is pinned off in the harness (CORGEA_RECENCY_GATE=0), so a
+    // freshly-published pin installs and its publish time is shown for
+    // provenance. The recency-on behavior is covered below.
     let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
     let out = h
         .cmd
         .args(["pip", "install", "freshpkg==9.9.9"])
         .output()
         .expect("failed to run corgea");
-    assert_eq!(out.status.code(), Some(1));
-    assert_eq!(h.recorded_argv(), None, "pip must not run when blocked");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "fresh pins install with the gate off; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("install freshpkg==9.9.9")
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("within threshold"), "stdout: {stdout}");
+    assert!(stdout.contains("published"), "stdout: {stdout}");
+}
+
+#[test]
+fn pip_fresh_pin_blocks_when_recency_gate_on() {
+    // With the recency gate enabled, a pin published an hour ago is refused
+    // before pip runs, and the refusal points at the config toggle.
+    let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
+    let out = h
+        .cmd
+        .env("CORGEA_RECENCY_GATE", "1")
+        .args(["pip", "install", "freshpkg==9.9.9"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        h.recorded_argv(),
+        None,
+        "pip must not run on a recency block"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("recency window"), "stderr: {stderr}");
+    assert!(stderr.contains("freshpkg@9.9.9"), "stderr: {stderr}");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("Refusing to run install"),
+        stderr.contains("recency_gate = false"),
+        "refusal must name the config toggle; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn pip_recency_block_bypassed_by_force() {
+    // `--force` overrides the recency block like every other block.
+    let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
+    let out = h
+        .cmd
+        .env("CORGEA_RECENCY_GATE", "1")
+        .args(["pip", "--force", "install", "freshpkg==9.9.9"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("install freshpkg==9.9.9")
+    );
+}
+
+#[test]
+fn pip_recency_threshold_zero_allows_fresh_pin() {
+    // A zero-day window can never be tripped — proves the threshold plumbs
+    // through from the env override.
+    let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
+    let out = h
+        .cmd
+        .env("CORGEA_RECENCY_GATE", "1")
+        .env("CORGEA_RECENCY_THRESHOLD_DAYS", "0")
+        .args(["pip", "install", "freshpkg==9.9.9"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("install freshpkg==9.9.9")
+    );
+}
+
+#[test]
+fn pip_old_pin_not_blocked_by_recency() {
+    // Even with the gate on, a 2020-published pin is well outside the window.
+    let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
+    let out = h
+        .cmd
+        .env("CORGEA_RECENCY_GATE", "1")
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("failed to run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg==1.0.0"));
 }
 
 #[test]
@@ -183,29 +270,6 @@ fn pip_old_pin_runs_install_with_forwarded_args() {
     assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg==1.0.0"));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("published"), "stdout: {stdout}");
-}
-
-#[test]
-fn pip_no_fail_demotes_block_and_installs() {
-    let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
-    let out = h
-        .cmd
-        .args(["pip", "--no-fail", "install", "freshpkg==9.9.9"])
-        .output()
-        .expect("failed to run corgea");
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        h.recorded_argv().as_deref(),
-        Some("install freshpkg==9.9.9"),
-        "--no-fail must still run the install"
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("within threshold"), "stdout: {stdout}");
 }
 
 #[test]
@@ -285,20 +349,26 @@ fn pip_resolution_error_prints_error_but_install_proceeds() {
 }
 
 #[test]
-fn pip_json_reports_fresh_pin_as_recent() {
+fn pip_json_reports_publish_date() {
     let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
     let out = h
         .cmd
         .args(["pip", "--json", "install", "freshpkg==9.9.9"])
         .output()
         .expect("failed to run corgea");
-    assert_eq!(out.status.code(), Some(1));
-    assert_eq!(h.recorded_argv(), None);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("install freshpkg==9.9.9")
+    );
     let parsed: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
-    assert_eq!(parsed["results"][0]["status"], "recent");
+    assert_eq!(parsed["results"][0]["status"], "ok");
     assert_eq!(parsed["results"][0]["name"], "freshpkg");
-    assert_eq!(parsed["summary"]["named"]["recent"], 1);
+    assert!(
+        parsed["results"][0]["published_at"].is_string(),
+        "published_at must be reported: {parsed}"
+    );
 }
 
 #[test]
@@ -402,39 +472,38 @@ fn npm_json_after_verb_belongs_to_the_manager() {
 }
 
 #[test]
-fn pip_mixed_fresh_and_old_pins_block_without_running_install() {
+fn pip_mixed_fresh_and_old_pins_both_install() {
     let mut h = wrapper("pip", "CORGEA_PYPI_REGISTRY", 0);
     let out = h
         .cmd
         .args(["pip", "install", "freshpkg==9.9.9", "oldpkg==1.0.0"])
         .output()
         .expect("failed to run corgea");
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(0));
     assert_eq!(
-        h.recorded_argv(),
-        None,
-        "one recent target must block the whole install"
+        h.recorded_argv().as_deref(),
+        Some("install freshpkg==9.9.9 oldpkg==1.0.0"),
+        "both pins install regardless of publish date"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("within threshold"), "stdout: {stdout}");
-    assert!(stdout.contains("1 ok, 1 recent"), "stdout: {stdout}");
+    assert!(stdout.contains("2 ok"), "stdout: {stdout}");
 }
 
 #[test]
-fn npm_fresh_pin_blocks_without_running_install() {
+fn npm_fresh_pin_installs() {
     let mut h = wrapper("npm", "CORGEA_NPM_REGISTRY", 0);
     let out = h
         .cmd
         .args(["npm", "install", "freshpkg@9.9.9"])
         .output()
         .expect("failed to run corgea");
-    assert_eq!(out.status.code(), Some(1));
-    assert_eq!(h.recorded_argv(), None, "npm must not run when blocked");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("Refusing to run install"),
-        "stderr: {}",
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "fresh pins no longer block; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert_eq!(h.recorded_argv().as_deref(), Some("install freshpkg@9.9.9"));
 }
 
 #[test]
@@ -693,45 +762,43 @@ fn uv_add_in_requirements_project_blocks_with_pip_install_suggestion() {
 fn npm_install_verb_behind_global_flags_is_still_gated() {
     // SKILL.md promises `npm --loglevel silent install x` is still gated:
     // the verb is found behind global flags, and the flag's value is not
-    // mistaken for the verb.
+    // mistaken for the verb. The gated path prints the "Pre-checking" header;
+    // an ungated passthrough would emit no gate output at all.
     let mut h = wrapper("npm", "CORGEA_NPM_REGISTRY", 0);
     let out = h
         .cmd
         .args(["npm", "--loglevel", "silent", "install", "freshpkg@9.9.9"])
         .output()
         .expect("failed to run corgea");
-    assert_eq!(out.status.code(), Some(1), "gate must fire behind flags");
-    assert_eq!(h.recorded_argv(), None, "npm must not run when blocked");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Pre-checking"),
+        "gate must fire behind flags; stdout: {stdout}"
+    );
 }
 
 #[test]
 fn npm_install_aliases_are_gated_not_passed_through() {
     // npm accepts many install aliases (and tolerates the typo `isntall`).
-    // Each must route through the GATE, not the ungated passthrough: a
-    // fresh-pinned package blocks (exit 1, npm never runs). If the alias
-    // slipped past the gate, npm would run the fresh package instead.
+    // Each must route through the GATE, not the ungated passthrough: the gate
+    // resolves the package and prints its "Pre-checking" header. An alias that
+    // slipped past the gate would reach npm with no gate output.
     for alias in ["isntall", "in", "ins"] {
-        let mut h = wrapper("npm", "CORGEA_NPM_REGISTRY", 0);
+        let (mut h, registry_hits) = wrapper_with_hits("npm", "CORGEA_NPM_REGISTRY", 0);
         let out = h
             .cmd
             .args(["npm", alias, "freshpkg@9.9.9"])
             .output()
             .expect("failed to run corgea");
-        assert_eq!(
-            out.status.code(),
-            Some(1),
-            "alias `{alias}` must be gated; stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert_eq!(
-            h.recorded_argv(),
-            None,
-            "alias `{alias}`: npm must not run when blocked"
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("Pre-checking"),
+            "alias `{alias}` must be gated; stdout: {stdout}"
         );
         assert!(
-            String::from_utf8_lossy(&out.stderr).contains("Refusing to run install"),
-            "alias `{alias}` stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
+            registry_hits.load(Ordering::SeqCst) > 0,
+            "alias `{alias}`: the gate must resolve the package"
         );
     }
 }

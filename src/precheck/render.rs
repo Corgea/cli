@@ -3,7 +3,7 @@
 use crate::verify_deps;
 
 use super::{
-    parse, PackageManager, PrecheckOptions, PrecheckReport, TargetOutcome, TreeOrigin, TreeReport,
+    PackageManager, PrecheckOptions, PrecheckReport, TargetOutcome, TreeOrigin, TreeReport,
     VerdictStatus,
 };
 
@@ -34,7 +34,13 @@ pub(super) fn bare_install_note(manager: PackageManager, subcommand_label: &str)
 
 /// The refusal line on stderr. Messaging only; the block decision and the
 /// choice of escape hatch live in `verdict::block_reason`.
-pub(super) fn print_refusal(reason: super::verdict::BlockReason) {
+///
+/// Each block also prints the concrete escape invocation (`corgea npm --force
+/// install …`). Wrapper flags are read *between* the manager and the verb, so a
+/// `--force` typed after the verb is swallowed by clap's trailing-var-arg and
+/// forwarded to the package manager — the gate never sees it. When that
+/// misplacement is detected, a `note:` line spells out why the flag had no effect.
+pub(super) fn print_refusal(reason: super::verdict::BlockReason, report: &PrecheckReport) {
     use super::verdict::BlockReason;
     match reason {
         BlockReason::ExistingTree => eprintln!(
@@ -43,27 +49,64 @@ pub(super) fn print_refusal(reason: super::verdict::BlockReason) {
         BlockReason::Findings => {
             eprintln!("Refusing to run install. Pass --force to proceed despite findings.")
         }
-        BlockReason::RecencyOnly => {
-            eprintln!("Refusing to run install. Pass --no-fail to proceed anyway.")
+        BlockReason::Recency { threshold_days } => {
+            eprintln!(
+                "Refusing to run install: package(s) published within the {threshold_days}-day recency window."
+            );
+            for o in super::verdict::fresh_named_targets(report, threshold_days) {
+                if let TargetOutcome::Resolved {
+                    resolved,
+                    age: Some(age),
+                    ..
+                } = o
+                {
+                    eprintln!(
+                        "  ✗ {}@{} published {} ago",
+                        resolved.name,
+                        resolved.version,
+                        verify_deps::format_duration(*age),
+                    );
+                }
+            }
+            eprintln!(
+                "  turn off the recency gate with `recency_gate = false` in ~/.corgea/config.toml"
+            );
         }
     }
+    print_escape_hint(report);
 }
 
-/// Print the "requirements files are not recency-checked" note when the
-/// install carried any `-r` files. No-op otherwise.
-pub(super) fn requirements_note(parsed: &parse::ParsedInstall) {
-    if parsed.requirements_files.is_empty() {
-        return;
-    }
-    let files: Vec<String> = parsed
-        .requirements_files
+/// Spell out the concrete `--force` escape command, and — when `--force` was
+/// typed after the install verb — explain that the package manager, not
+/// Corgea, received it.
+fn print_escape_hint(report: &PrecheckReport) {
+    let flag = "--force";
+    // `--force` sitting in the forwarded args was typed after the verb — clap
+    // handed it to the package manager, not us.
+    let misplaced = report
+        .original_args
         .iter()
-        .map(|p| p.display().to_string())
+        .any(|a| a.as_str() == flag)
+        .then_some(flag);
+
+    let manager = report.manager.binary_name();
+    if let Some(typed) = misplaced {
+        eprintln!("  note: `{typed}` after the verb was passed to {manager}, not corgea.");
+    }
+    // Rebuild the command with `--force` in the slot Corgea reads — between
+    // the manager and the verb — dropping a misplaced copy from the tail.
+    let rest: Vec<&str> = report
+        .original_args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| *a != flag)
         .collect();
-    eprintln!(
-        "note: requirements files ({}) are not recency-checked by the baseline gate",
-        files.join(", ")
-    );
+    let mut corrected = format!("corgea {manager} {flag} {}", report.subcommand);
+    if !rest.is_empty() {
+        corrected.push(' ');
+        corrected.push_str(&rest.join(" "));
+    }
+    eprintln!("  bypass the gate with: {corrected}");
 }
 
 pub(super) fn warn_public_lookup_failures(report: &PrecheckReport, opts: &PrecheckOptions) {
@@ -231,15 +274,10 @@ pub(super) fn print_text(report: &PrecheckReport) {
             .any(|(prefix, _, _)| *prefix == error_prefix(error))
     };
 
+    println!("Pre-checking `{command}`");
     println!(
-        "Pre-checking `{}` (threshold {})",
-        command,
-        verify_deps::format_duration(report.threshold)
-    );
-    println!(
-        "  {} ok, {} recent, {}, {}, {} skipped, {} errors",
+        "  {} ok, {}, {}, {} skipped, {} errors",
         report.ok_count(),
-        report.recent_count(),
         summary_segment(
             report.vulnerable_count(),
             report.tree_vulnerable_count(),
@@ -350,26 +388,23 @@ pub(super) fn print_text(report: &PrecheckReport) {
                         );
                     }
                 }
-                VerdictStatus::Clean | VerdictStatus::NotChecked => {
-                    if report.is_recent(*age) {
-                        println!(
-                            "  ⚠ {} → {}@{}  published {} ago at {} (within threshold)",
-                            target.display,
-                            resolved.name,
-                            resolved.version,
-                            verify_deps::format_duration(*age),
-                            resolved.published_at.format("%Y-%m-%d %H:%M:%S UTC"),
-                        );
-                    } else {
-                        println!(
-                            "  ✓ {} → {}@{}  published {} ago",
-                            target.display,
-                            resolved.name,
-                            resolved.version,
-                            verify_deps::format_duration(*age),
-                        );
-                    }
-                }
+                // `age` is `None` when pip backtracked the named target to a
+                // version we never resolved — its publish date is unknown, so
+                // show the version without a (wrong) provenance line.
+                VerdictStatus::Clean | VerdictStatus::NotChecked => match age {
+                    Some(age) => println!(
+                        "  ✓ {} → {}@{}  published {} ago at {}",
+                        target.display,
+                        resolved.name,
+                        resolved.version,
+                        verify_deps::format_duration(*age),
+                        resolved.published_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                    ),
+                    None => println!(
+                        "  ✓ {} → {}@{}  publish date unavailable",
+                        target.display, resolved.name, resolved.version,
+                    ),
+                },
             },
             TargetOutcome::Skipped { target, reason } => {
                 println!("  ? {}: {}", target.display, reason);
@@ -451,7 +486,7 @@ pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
     let verdict_mode = match opts.verdict.as_ref().map(|cfg| &cfg.mode) {
         Some(super::VerdictMode::Public) => "public",
         Some(super::VerdictMode::Authenticated { .. }) => "authenticated",
-        None => "recency-only",
+        None => "none",
     };
     let outcomes: Vec<_> = report
         .outcomes
@@ -464,13 +499,23 @@ pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
                 verdict,
             } => {
                 let verdict_json = verdict_json(verdict);
+                // `null` when pip backtracked to a version we never resolved:
+                // the publish date belonged to the CLI-resolved version, not
+                // what installs, so we drop it rather than report a wrong one.
+                let (published_at, age_seconds) = match age {
+                    Some(age) => (
+                        json!(resolved.published_at.to_rfc3339()),
+                        json!(age.as_secs()),
+                    ),
+                    None => (serde_json::Value::Null, serde_json::Value::Null),
+                };
                 json!({
-                    "status": if report.is_recent(*age) { "recent" } else { "ok" },
+                    "status": "ok",
                     "spec": target.display,
                     "name": resolved.name,
                     "resolved_version": resolved.version,
-                    "published_at": resolved.published_at.to_rfc3339(),
-                    "age_seconds": age.as_secs(),
+                    "published_at": published_at,
+                    "age_seconds": age_seconds,
                     "verdict": verdict_json,
                 })
             }
@@ -506,11 +551,9 @@ pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
         "manager": report.manager.binary_name(),
         "subcommand": report.subcommand,
         "args": report.original_args,
-        "threshold_seconds": report.threshold.as_secs(),
         "summary": {
             "named": {
                 "ok": report.ok_count(),
-                "recent": report.recent_count(),
                 "vulnerable": named_counts.vulnerable,
                 "unverifiable": named_counts.unverifiable,
                 "clean": named_counts.clean,
@@ -527,6 +570,9 @@ pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
             },
         },
         "verdict_mode": verdict_mode,
+        // `null` when the recency gate is off; consumers pair it with each
+        // result's `age_seconds` to see which named targets tripped it.
+        "recency_threshold_days": opts.recency.as_ref().map(|r| r.threshold_days),
         "results": outcomes,
         "tree": report.tree.as_ref().map(|t| match t {
             TreeReport::Full { resolved_count, transitive } => json!({
@@ -632,7 +678,7 @@ mod tests {
     #[test]
     fn collapsed_groups_require_more_than_threshold() {
         let unverifiable = |name: &str| {
-            let mut o = resolved_outcome(name, "1.0.0", false);
+            let mut o = resolved_outcome(name, "1.0.0");
             set_verdict(
                 &mut o,
                 VerdictStatus::Unverifiable(format!("vuln-api unavailable (HTTP 503: {name})")),

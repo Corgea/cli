@@ -1,4 +1,4 @@
-[tool.poetry]
+[project]
 name = "python-poetry-multi"
 version = "0.1.0"
 
