@@ -260,6 +260,48 @@ fn extract_repo_name_from_url(url: &str) -> Option<String> {
     None
 }
 
+/// Extract the `org/repo` slug from a git remote URL. Returns the last two
+/// meaningful path segments so it is a substring of essentially every stored
+/// (normalized) `repo_url` form. Distinct from `extract_repo_name_from_url`,
+/// which returns only the final segment (`repo`).
+///
+/// Handles:
+///   https://github.com/org/repo(.git)            -> org/repo
+///   git@github.com:org/repo(.git)                -> org/repo
+///   ssh://git@github.com/org/repo                -> org/repo
+///   https://dev.azure.com/org/project/_git/repo  -> project/_git/repo
+///
+/// Azure `_git` is kept (and the preceding project segment included) because
+/// doghouse `normalize_repo_url` stores Azure as `.../project/_git/repo`
+/// (`heeler/models.py:208-212`) — `project/_git/repo` is a substring of that,
+/// `project/repo` is NOT. Azure SSH remotes (`ssh.dev.azure.com/v3/...`, which
+/// carry no `_git` segment) are a known limitation; users pass --project-name.
+///
+/// Returns None when fewer than two path segments follow the host (a bare host
+/// or garbage input).
+pub fn extract_repo_slug(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    // Drop scheme (`https://`, `ssh://`, …) if present.
+    let url = url.rsplit("://").next().unwrap_or(url);
+    // Split host from path: URL forms use '/', scp-like `git@host:org/repo`
+    // uses ':'. After filtering empties, segments[0] is the host.
+    let segments: Vec<&str> = url.split(['/', ':']).filter(|s| !s.is_empty()).collect();
+    if segments.len() < 3 {
+        return None; // need host + at least org + repo
+    }
+    let last = segments[segments.len() - 1];
+    let prev = segments[segments.len() - 2];
+    if prev == "_git" && segments.len() >= 4 {
+        // Azure DevOps: keep the project so the slug stays a substring of the
+        // normalized stored URL (.../project/_git/repo).
+        let project = segments[segments.len() - 3];
+        Some(format!("{}/_git/{}", project, last))
+    } else {
+        Some(format!("{}/{}", prev, last))
+    }
+}
+
 pub fn get_env_var_if_exists(var_name: &str) -> Option<String> {
     match env::var(var_name) {
         Ok(value) if !value.trim().is_empty() => Some(value),
@@ -369,5 +411,56 @@ mod tests {
             "node_modules file should be excluded: {:?}",
             added
         );
+    }
+
+    #[test]
+    fn extract_repo_slug_handles_common_remote_forms() {
+        assert_eq!(
+            extract_repo_slug("https://github.com/org/repo.git").as_deref(),
+            Some("org/repo")
+        );
+        assert_eq!(
+            extract_repo_slug("https://github.com/org/repo").as_deref(),
+            Some("org/repo")
+        );
+        assert_eq!(
+            extract_repo_slug("git@github.com:org/repo.git").as_deref(),
+            Some("org/repo")
+        );
+        assert_eq!(
+            extract_repo_slug("git@github.com:org/repo").as_deref(),
+            Some("org/repo")
+        );
+        assert_eq!(
+            extract_repo_slug("ssh://git@github.com/org/repo").as_deref(),
+            Some("org/repo")
+        );
+        assert_eq!(
+            extract_repo_slug("https://github.com/org/repo/").as_deref(),
+            Some("org/repo")
+        );
+        // host:port should not leak the port into the slug
+        assert_eq!(
+            extract_repo_slug("https://git.example.com:8443/org/repo").as_deref(),
+            Some("org/repo")
+        );
+        // Bank of Hope case
+        assert_eq!(
+            extract_repo_slug("git@github.com:bohappdev/dotnet-azure-web-tsb.git").as_deref(),
+            Some("bohappdev/dotnet-azure-web-tsb")
+        );
+        // Azure DevOps `_git` HTTPS -> keeps project + _git so it stays a substring
+        // of the normalized stored URL.
+        assert_eq!(
+            extract_repo_slug("https://dev.azure.com/org/project/_git/repo").as_deref(),
+            Some("project/_git/repo")
+        );
+    }
+
+    #[test]
+    fn extract_repo_slug_returns_none_for_unsplittable_input() {
+        assert_eq!(extract_repo_slug("not a url"), None);
+        assert_eq!(extract_repo_slug(""), None);
+        assert_eq!(extract_repo_slug("github.com"), None); // host only
     }
 }

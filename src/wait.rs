@@ -2,14 +2,18 @@ use crate::config::Config;
 use crate::scanners::blast;
 use crate::utils;
 
-pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>) {
-    let project_name = match utils::generic::get_current_working_directory() {
-        Some(name) => name,
-        None => {
-            log::error!("Unable to retrieve the current working directory. Please check your permissions and try again.");
-            std::process::exit(1);
-        }
-    };
+pub fn run(
+    config: &Config,
+    scan_id: Option<String>,
+    project_name_override: Option<String>,
+    repo_override: Option<String>,
+) {
+    let resolved = utils::api::resolve_project(
+        &config.get_url(),
+        project_name_override.as_deref(),
+        repo_override.as_deref(),
+    );
+    let project_name = resolved.query_name.clone();
 
     let scans_result =
         utils::api::query_scan_list(&config.get_url(), Some(&project_name), Some(1), None);
@@ -45,13 +49,23 @@ pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>)
         None => match scans.first() {
             Some(scan) => (scan.id.clone(), scan.status == "Complete"),
             None => {
-                log::error!("Error querying scan list");
+                if resolved.confirmed {
+                    log::error!(
+                        "Project '{}' has no scans yet. Run 'corgea scan' to start one.",
+                        project_name
+                    );
+                } else {
+                    log::error!(
+                        "No scan to wait for: no Corgea project found for {}. Run 'corgea scan', or pass --scan-id / --project-name.",
+                        resolved.tried_label
+                    );
+                }
                 std::process::exit(1);
             }
         },
     };
 
-    let scan_url = match &project_id {
+    let scan_url = match &resolved.project_id {
         Some(pid) => format!("{}/project/{}/?scan_id={}", config.get_url(), pid, scan_id),
         None => format!(
             "{}/project/{}?scan_id={}",

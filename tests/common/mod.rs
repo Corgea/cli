@@ -433,3 +433,62 @@ pub fn tree_harness(
         .vuln_statuses(statuses)
         .build()
 }
+
+// --- project-resolution e2e fixtures (shared by list_resolution.rs and
+// wait_resolution.rs) -------------------------------------------------------
+
+/// Canonical project name for the Bank-of-Hope resolution case: the dir
+/// basename (`dotnet-azure-web-tsb`) differs from the stored project name.
+#[allow(dead_code)]
+pub const CANON: &str = "bohappdev/dotnet-azure-web-tsb";
+/// Git remote whose slug resolves to `CANON`.
+#[allow(dead_code)]
+pub const REMOTE: &str = "https://github.com/bohappdev/dotnet-azure-web-tsb.git";
+
+/// `/projects` hit returning the canonical project whose `repo_url` contains
+/// the slug (id 7) — the new-backend confirmed path.
+#[allow(dead_code)]
+pub fn projects_match() -> String {
+    r#"{"status":"ok","projects":[{"id":7,"name":"bohappdev/dotnet-azure-web-tsb","repo_url":"https://github.com/bohappdev/dotnet-azure-web-tsb"}]}"#.to_string()
+}
+
+/// `/projects` miss (repo not onboarded / pre-COR-1426 backend filtered out).
+#[allow(dead_code)]
+pub fn projects_empty() -> String {
+    r#"{"status":"ok","projects":[]}"#.to_string()
+}
+
+/// `/scans` returning one `Complete` scan under `project`.
+#[allow(dead_code)]
+pub fn scans_one(project: &str) -> String {
+    format!(
+        r#"{{"status":"ok","page":1,"total_pages":1,"scans":[{{"id":"scan-123","project":"{project}","repo":"https://github.com/bohappdev/dotnet-azure-web-tsb","branch":"main","status":"Complete","engine":"blast","created_at":"2026-01-01T00:00:00Z"}}]}}"#
+    )
+}
+
+/// `/scans` returning an empty page.
+#[allow(dead_code)]
+pub fn scans_empty() -> String {
+    r#"{"status":"ok","page":1,"total_pages":1,"scans":[]}"#.to_string()
+}
+
+/// Temp git repo at `<tmp>/<dirname>` with `origin` set to `remote`. The dir
+/// basename is the caller's to choose so it can differ from the stored name.
+#[allow(dead_code)]
+pub fn temp_git_repo(dirname: &str, remote: &str) -> (TempDir, std::path::PathBuf) {
+    let tmp = TempDir::new().expect("temp dir");
+    let repo_dir = tmp.path().join(dirname);
+    std::fs::create_dir(&repo_dir).expect("create repo dir");
+    let repo = git2::Repository::init(&repo_dir).expect("git init");
+    repo.remote("origin", remote).expect("set origin");
+    (tmp, repo_dir)
+}
+
+/// Temp NON-git dir at `<tmp>/<dirname>` (no remote).
+#[allow(dead_code)]
+pub fn temp_plain_dir(dirname: &str) -> (TempDir, std::path::PathBuf) {
+    let tmp = TempDir::new().expect("temp dir");
+    let dir = tmp.path().join(dirname);
+    std::fs::create_dir(&dir).expect("create dir");
+    (tmp, dir)
+}
