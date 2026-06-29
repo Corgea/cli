@@ -8,10 +8,6 @@ use super::{
     TargetOutcome, TreeOrigin, TreeOutcome, TreeReport, VerdictConfig, VerdictStatus,
 };
 
-/// Above this many verdict jobs, print a stderr progress line so a big tree
-/// pass doesn't look hung.
-const VERDICT_PROGRESS_THRESHOLD: usize = 8;
-
 /// Max parallel vuln-api / registry requests.
 const VERDICT_CONCURRENCY: usize = 8;
 
@@ -34,8 +30,10 @@ pub(super) fn verdict_pool(
         }
     };
 
-    if jobs.len() > VERDICT_PROGRESS_THRESHOLD {
-        eprintln!("checking {} packages against Corgea vuln-api…", jobs.len());
+    if !jobs.is_empty() {
+        let n = jobs.len();
+        let noun = if n == 1 { "package" } else { "packages" };
+        eprintln!("checking {n} {noun} against Corgea vuln-api…");
     }
 
     let ecosystem = manager.ecosystem();

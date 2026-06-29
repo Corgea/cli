@@ -225,6 +225,9 @@ enum Commands {
 
 /// Shared flags for the install-wrapper subcommands (`corgea npm|pip`).
 #[derive(clap::Args, Debug, Clone)]
+// Free `-V/--version` into `cmd` so the wrappers forward it to the package
+// manager (`corgea --version` still prints the CLI version at the top level).
+#[command(disable_version_flag = true)]
 struct InstallWrapArgs {
     #[arg(
         long,
