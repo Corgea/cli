@@ -8,11 +8,24 @@ pub fn run(
     project_name_override: Option<String>,
     repo_override: Option<String>,
 ) {
-    let resolved = utils::api::resolve_project(
+    let resolved = match utils::api::resolve_project(
         &config.get_url(),
         project_name_override.as_deref(),
         repo_override.as_deref(),
-    );
+    ) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            log::error!(
+                "Unable to resolve the Corgea project. Please check your connection and ensure that:\n\
+                - The server URL is reachable.\n\
+                - Your authentication token is valid.\n\n\
+                Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli\n\n\
+                Error details: {}",
+                e
+            );
+            std::process::exit(1);
+        }
+    };
     let project_name = resolved.query_name.clone();
 
     let scans_result =

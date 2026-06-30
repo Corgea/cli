@@ -242,6 +242,93 @@ fn list_json_miss_is_valid_empty_envelope() {
 }
 
 #[test]
+fn list_issues_with_scan_id_skips_project_resolution() {
+    use std::sync::{Arc, Mutex};
+    let hits = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hits_c = hits.clone();
+    // The scan-id issue route ignores the project, so no /projects call should
+    // be made even from a real git repo where a remote IS present. (COR-1577)
+    let url = common::spawn_http_stub(move |path| {
+        hits_c.lock().unwrap().push(path.to_string());
+        if path.starts_with("/api/v1/verify") {
+            ("200 OK", r#"{"status":"ok"}"#.to_string())
+        } else if path.contains("/check_blocking_rules") {
+            (
+                "200 OK",
+                r#"{"block":false,"blocking_issues":[],"total_pages":1}"#.to_string(),
+            )
+        } else if path.starts_with("/api/v1/scan/") && path.contains("/issues") {
+            (
+                "200 OK",
+                r#"{"status":"ok","page":1,"total_pages":1,"total_issues":0,"issues":[]}"#
+                    .to_string(),
+            )
+        } else {
+            ("404 Not Found", r#"{"message":"not found"}"#.to_string())
+        }
+    });
+    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    let out = run_list(&["--issues", "--scan-id", "scan-xyz"], &url, &repo);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        !hits.iter().any(|h| h.starts_with("/api/v1/projects")),
+        "no /projects resolution for --issues --scan-id; hits: {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|h| h.contains("/scan/scan-xyz/issues")),
+        "expected the scan-id issue route; hits: {hits:?}"
+    );
+}
+
+#[test]
+fn list_resolves_from_subdirectory() {
+    use std::sync::{Arc, Mutex};
+    let hits = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hits_c = hits.clone();
+    let url = common::spawn_http_stub(move |path| {
+        hits_c.lock().unwrap().push(path.to_string());
+        if path.starts_with("/api/v1/verify") {
+            ("200 OK", r#"{"status":"ok"}"#.to_string())
+        } else if path.starts_with("/api/v1/projects?repo_url=") {
+            ("200 OK", projects_match())
+        } else if path.starts_with("/api/v1/scans?") {
+            ("200 OK", scans_one(CANON))
+        } else {
+            ("404 Not Found", r#"{"message":"not found"}"#.to_string())
+        }
+    });
+    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    let subdir = repo.join("src");
+    std::fs::create_dir(&subdir).expect("create subdir");
+    let out = run_list(&[], &url, &subdir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Discovery walks up from src/ to the repo root, so the remote slug — not
+    // the `src` basename — drives resolution: a /projects hit proves it.
+    let hits = hits.lock().unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h.starts_with("/api/v1/projects?repo_url=bohappdev%2Fdotnet-azure-web-tsb")),
+        "expected /projects resolution from the subdir; hits: {hits:?}"
+    );
+    assert!(
+        stdout.contains("bohappdev/dotnet-azure-web-tsb"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
 fn list_issues_json_miss_keeps_stdout_clean() {
     let url = spawn_stub(projects_empty(), scans_empty(), issues_miss());
     let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);

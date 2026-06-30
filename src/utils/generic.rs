@@ -343,6 +343,19 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
     }))
 }
 
+/// Find the enclosing repository's `origin` remote URL, searching upward from
+/// the current directory so `corgea list`/`wait` resolve correctly when run
+/// from a subdirectory, not only the repo root. `get_repo_info` uses
+/// `Repository::open`, which succeeds only at the root; this uses
+/// `Repository::discover`. Returns None outside a git repo or when `origin`
+/// carries no URL.
+pub fn discover_repo_url() -> Option<String> {
+    let repo = Repository::discover(Path::new(".")).ok()?;
+    repo.find_remote("origin")
+        .ok()
+        .and_then(|remote| remote.url().map(|url| url.to_string()))
+}
+
 pub fn get_status(status: &str) -> &str {
     match status.to_lowercase().as_str() {
         "fix available" | "fix_available" => "Fix Available",
