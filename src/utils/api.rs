@@ -729,6 +729,199 @@ pub fn query_scan_list(
     }
 }
 
+#[derive(Deserialize, Debug)]
+pub struct ProjectSummary {
+    // Project.id is an integer in the envelope; model it tolerantly so an
+    // unexpected string id (or a missing field) never fails deserialization.
+    #[serde(default)]
+    pub id: serde_json::Value,
+    pub name: String,
+    #[serde(default)]
+    pub repo_url: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ProjectsResponse {
+    // Models the `@paginated` envelope status; deserialized for completeness but
+    // not consumed (the slug guard + non-2xx/parse handling already gate misses).
+    #[allow(dead_code)]
+    pub status: String,
+    #[serde(default)]
+    pub projects: Option<Vec<ProjectSummary>>,
+}
+
+/// Stringify a scalar JSON id (number -> "123", string -> as-is) for the wait
+/// scan URL. Returns None for null/array/object/missing so a bogus id never
+/// becomes part of a URL like `/project/null/`.
+fn id_to_string(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// True when a stored `repo_url` refers to exactly `slug` (an `org/repo`-style
+/// value, already lowercased). Matches on a path-segment boundary so a sibling
+/// or prefix repo is never mistaken for the target: the backend's
+/// `repo_url__icontains` filter returns `org/repo-v2` for slug `org/repo`, and a
+/// plain substring check would wrongly accept it. Strips `.git`/trailing slash
+/// first so `…/org/repo.git` and `…/org/repo/` both match `org/repo`.
+fn repo_url_matches_slug(repo_url: &str, slug_lc: &str) -> bool {
+    let r = repo_url.trim().trim_end_matches('/');
+    let r = r.strip_suffix(".git").unwrap_or(r).to_lowercase();
+    r == slug_lc || r.ends_with(&format!("/{}", slug_lc))
+}
+
+/// Resolve the canonical project for a repo slug via GET /api/v1/projects?repo_url=…
+///
+/// Old-backend safety guard: a pre-COR-1426 backend ignores the unknown
+/// `repo_url` param and returns ALL company projects. Keep only candidates
+/// whose returned `repo_url` matches the slug on a path-segment boundary; on an
+/// old backend none match -> Ok(None) -> caller falls back to the CWD-name path.
+///
+/// Hard failures (network, auth, 5xx) return `Err` so the caller can surface the
+/// backend problem instead of silently resolving to the local-directory project;
+/// only a clean "no match" (or a 404 from a backend without the endpoint) is a
+/// soft `Ok(None)`.
+pub fn resolve_project_by_repo(
+    url: &str,
+    slug: &str,
+) -> Result<Option<ProjectSummary>, Box<dyn std::error::Error>> {
+    let request_url = format!("{}{}/projects", url, API_BASE);
+    let client = http_client();
+    debug(&format!(
+        "Resolving project via {} (repo_url={})",
+        request_url, slug
+    ));
+    let response = client
+        .get(&request_url)
+        .query(&[("repo_url", slug)])
+        .send()?;
+    check_for_warnings(response.headers(), response.status());
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        // /projects absent on a very old backend -> soft miss; the caller falls
+        // back to the name-based path, so this stays a no-regression case.
+        return Ok(None);
+    }
+    if !status.is_success() {
+        // Auth (401/403) or server (5xx) failure: surface it rather than
+        // silently resolving to the local-directory project.
+        return Err(format!("/projects request failed: HTTP {}", status).into());
+    }
+    let text = response.text()?;
+    let parsed: ProjectsResponse = match serde_json::from_str(&text) {
+        Ok(p) => p,
+        Err(e) => {
+            debug(&format!(
+                "Failed to parse /projects response: {} | body: {}",
+                e, text
+            ));
+            return Ok(None);
+        }
+    };
+    let slug_lc = slug.to_lowercase();
+    let matched = parsed.projects.unwrap_or_default().into_iter().find(|p| {
+        p.repo_url
+            .as_deref()
+            .map(|r| repo_url_matches_slug(r, &slug_lc))
+            .unwrap_or(false)
+    });
+    Ok(matched)
+}
+
+/// What `list`/`wait` need to drive the existing name-based queries.
+#[derive(Debug)]
+pub struct ResolvedProject {
+    /// Sent as `?project=` to the listing endpoints.
+    pub query_name: String,
+    /// True only when a backend project was confirmed via /projects. Drives
+    /// confirmed-but-empty vs unresolved-miss messaging.
+    pub confirmed: bool,
+    /// Numeric id (stringified) when confirmed and the id is a scalar — used
+    /// for the wait scan URL. None otherwise (falls back to query_name).
+    pub project_id: Option<String>,
+    /// What we looked for ("project 'x'" / "repo 'org/repo'" / "directory
+    /// 'dir'"), pre-formatted for the miss message.
+    pub tried_label: String,
+}
+
+/// Resolve which project `list`/`wait` should query.
+/// 1) --project-name -> use verbatim, skip resolution.
+/// 2) else slug from --repo or the discovered git remote -> resolve_project_by_repo:
+///    confirmed -> canonical {name,id}.
+/// 3) unconfirmed: explicit --repo -> query the slug as a name (never the CWD);
+///    auto-detected remote -> CWD basename (no-regression fallback).
+/// 4) no remote -> CWD basename (today's behavior).
+///
+/// Returns `Err` only for a hard resolver failure (network/auth/5xx from
+/// /projects); a clean "no match" resolves to the fallback name above.
+pub fn resolve_project(
+    url: &str,
+    project_name_override: Option<&str>,
+    repo_override: Option<&str>,
+) -> Result<ResolvedProject, Box<dyn std::error::Error>> {
+    if let Some(name) = project_name_override {
+        return Ok(ResolvedProject {
+            query_name: name.to_string(),
+            confirmed: false,
+            project_id: None,
+            tried_label: format!("project '{}'", name),
+        });
+    }
+
+    // Explicit --repo vs auto-detected remote changes the unconfirmed fallback.
+    let repo_was_explicit = repo_override.is_some();
+    // --repo may already be a bare `org/repo` slug (extract_repo_slug needs a
+    // host segment, so it returns None for a 2-segment value) -> use raw value.
+    // No --repo: discover the enclosing repo's remote (works from a subdir).
+    let slug = match repo_override {
+        Some(r) => utils::generic::extract_repo_slug(r).or_else(|| Some(r.to_string())),
+        None => {
+            utils::generic::discover_repo_url().and_then(|u| utils::generic::extract_repo_slug(&u))
+        }
+    };
+
+    // CWD basename, resolved lazily — only the fallback paths below read it.
+    let cwd =
+        || utils::generic::get_current_working_directory().unwrap_or_else(|| "unknown".to_string());
+
+    if let Some(slug) = slug {
+        // `?` propagates hard resolver failures (network/auth/5xx); only a clean
+        // Ok(None) "no match" falls through to the name-based fallback below.
+        if let Some(project) = resolve_project_by_repo(url, &slug)? {
+            return Ok(ResolvedProject {
+                query_name: project.name,
+                confirmed: true,
+                project_id: id_to_string(&project.id),
+                tried_label: format!("repo '{}'", slug),
+            });
+        }
+        // Unconfirmed: explicit --repo queries the slug as a name (clean miss,
+        // never wrong CWD results); auto-detected remote keeps the CWD fallback.
+        let query_name = if repo_was_explicit {
+            slug.clone()
+        } else {
+            cwd()
+        };
+        return Ok(ResolvedProject {
+            query_name,
+            confirmed: false,
+            project_id: None,
+            tried_label: format!("repo '{}'", slug),
+        });
+    }
+
+    let cwd = cwd();
+    Ok(ResolvedProject {
+        tried_label: format!("directory '{}'", cwd),
+        query_name: cwd,
+        confirmed: false,
+        project_id: None,
+    })
+}
+
 pub fn exchange_code_for_token(
     base_url: &str,
     code: &str,
@@ -1301,5 +1494,128 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(attempts.get(), RETRY_BACKOFF_SECS.len() + 1);
+    }
+
+    // Single-response-per-connection JSON stub on an ephemeral port; returns base URL.
+    fn spawn_projects_stub(body: &'static str) -> String {
+        spawn_projects_stub_status("200 OK", body)
+    }
+
+    // As `spawn_projects_stub` but with a caller-chosen status line, for the
+    // resolver error-path tests (404 soft-miss vs 5xx hard error).
+    fn spawn_projects_stub_status(status_line: &'static str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                // Drain the request headers before responding. Closing the
+                // socket with an unread request still in the kernel buffer
+                // triggers a TCP RST that surfaces on the client as hyper
+                // `UnexpectedMessage` (flaky, timing-dependent).
+                let mut chunk = [0u8; 1024];
+                let mut buf = Vec::new();
+                while let Ok(n) = stream.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn resolve_project_by_repo_keeps_only_repo_url_matches() {
+        // New backend: filter applied, one matching project returned.
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","projects":[{"id":7,"name":"bohappdev/dotnet-azure-web-tsb","repo_url":"https://github.com/bohappdev/dotnet-azure-web-tsb"}]}"#,
+        );
+        let got = resolve_project_by_repo(&base, "bohappdev/dotnet-azure-web-tsb").unwrap();
+        assert_eq!(
+            got.map(|p| p.name).as_deref(),
+            Some("bohappdev/dotnet-azure-web-tsb")
+        );
+    }
+
+    #[test]
+    fn resolve_project_by_repo_guards_against_old_backend_returning_all() {
+        // Old backend ignores ?repo_url and returns unrelated projects -> guard -> None.
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","projects":[{"id":1,"name":"other/repo","repo_url":"https://github.com/other/repo"},{"id":2,"name":"misc/thing","repo_url":"https://github.com/misc/thing"}]}"#,
+        );
+        let got = resolve_project_by_repo(&base, "bohappdev/dotnet-azure-web-tsb").unwrap();
+        assert!(got.is_none(), "non-matching projects must be discarded");
+    }
+
+    #[test]
+    fn resolve_project_by_repo_empty_projects_is_none() {
+        let base = spawn_projects_stub(r#"{"status":"ok","projects":[]}"#);
+        assert!(resolve_project_by_repo(&base, "org/repo")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn repo_url_matches_slug_enforces_path_boundary() {
+        // Exact repo (with/without scheme, .git, trailing slash) matches; a
+        // sibling/prefix repo or a different org must not (COR-1577 review).
+        assert!(repo_url_matches_slug(
+            "https://github.com/acme/api",
+            "acme/api"
+        ));
+        assert!(repo_url_matches_slug(
+            "https://github.com/acme/api.git",
+            "acme/api"
+        ));
+        assert!(repo_url_matches_slug("acme/api", "acme/api"));
+        assert!(!repo_url_matches_slug(
+            "https://github.com/acme/api-v2",
+            "acme/api"
+        ));
+        assert!(!repo_url_matches_slug(
+            "https://github.com/notacme/api",
+            "acme/api"
+        ));
+    }
+
+    #[test]
+    fn resolve_project_by_repo_rejects_sibling_prefix_repo() {
+        // Backend `repo_url__icontains` returns the sibling `acme/api-v2` for
+        // slug `acme/api`; the boundary guard must reject it rather than
+        // confirming the wrong project (COR-1577 review).
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","projects":[{"id":9,"name":"acme/api-v2","repo_url":"https://github.com/acme/api-v2"}]}"#,
+        );
+        let got = resolve_project_by_repo(&base, "acme/api").unwrap();
+        assert!(got.is_none(), "a prefix sibling repo must not be confirmed");
+    }
+
+    #[test]
+    fn resolve_project_by_repo_404_is_soft_none() {
+        // /projects absent on a very old backend -> soft miss (Ok(None)).
+        let base = spawn_projects_stub_status("404 Not Found", r#"{"message":"not found"}"#);
+        assert!(resolve_project_by_repo(&base, "org/repo")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn resolve_project_by_repo_server_error_is_hard_err() {
+        // 5xx must surface, not silently fall back to the local-dir project.
+        let base = spawn_projects_stub_status("500 Internal Server Error", r#"{"error":"boom"}"#);
+        assert!(resolve_project_by_repo(&base, "org/repo").is_err());
     }
 }
