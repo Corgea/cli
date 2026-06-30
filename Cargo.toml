@@ -60,3 +60,7 @@ serde_yaml_ng = "0.10"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
+
+[profile.release]
+strip = true
+lto = "thin"
