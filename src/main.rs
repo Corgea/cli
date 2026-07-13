@@ -83,9 +83,16 @@ enum Commands {
 
         #[arg(
             long,
-            help = "Skip the scan if this commit already has a completed scan for the same project and branch within the last 24h. Only for a default blast scan (not with --fail, --fail-on, --only-uncommitted, --target, --exclude, --scan-type, --policy, or --out-file/--out-format)."
+            help = "Skip the scan if this commit already has a completed scan for the same project and branch within the last 24h. Only for a default blast scan (not with --fail, --fail-on, --only-uncommitted, --target, --exclude, --scan-type, --policy, --metadata, or --out-file/--out-format)."
         )]
         skip_if_scanned: bool,
+
+        #[arg(
+            long = "metadata",
+            value_name = "KEY=VALUE",
+            help = "Attach scan-level metadata (repeatable), e.g. --metadata pipeline_url=... --metadata artifact_version=1.2.3"
+        )]
+        metadata: Vec<String>,
 
         #[arg(
             short,
@@ -493,6 +500,7 @@ fn main() {
             fail,
             only_uncommitted,
             skip_if_scanned,
+            metadata,
             scan_type,
             policy,
             out_format,
@@ -530,6 +538,19 @@ fn main() {
                 std::process::exit(1);
             }
 
+            if !metadata.is_empty() && *scanner != Scanner::Blast {
+                ::log::error!("--metadata is only supported with the blast scanner.");
+                std::process::exit(1);
+            }
+
+            let metadata_json = match scanners::blast::metadata_json_from_pairs(metadata) {
+                Ok(json) => json,
+                Err(e) => {
+                    ::log::error!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+
             if *skip_if_scanned
                 && (*fail
                     || fail_on.is_some()
@@ -538,11 +559,12 @@ fn main() {
                     || exclude.is_some()
                     || scan_type.is_some()
                     || policy.is_some()
+                    || metadata_json.is_some()
                     || out_file.is_some()
                     || out_format.is_some())
             {
                 ::log::error!(
-                    "--skip-if-scanned only applies to a default blast scan. It cannot be combined with --fail, --fail-on, --only-uncommitted, --target, --exclude, --scan-type, --policy, or --out-file/--out-format."
+                    "--skip-if-scanned only applies to a default blast scan. It cannot be combined with --fail, --fail-on, --only-uncommitted, --target, --exclude, --scan-type, --policy, --metadata, or --out-file/--out-format."
                 );
                 std::process::exit(1);
             }
@@ -620,6 +642,7 @@ fn main() {
                     fail,
                     only_uncommitted,
                     skip_if_scanned,
+                    metadata_json,
                     scan_type.clone(),
                     policy.clone(),
                     out_format.clone(),

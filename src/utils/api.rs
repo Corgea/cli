@@ -226,6 +226,7 @@ pub fn upload_zip(
     repo_info: Option<utils::generic::RepoInfo>,
     scan_type: Option<String>,
     policy: Option<String>,
+    metadata: Option<String>,
 ) -> Result<UploadZipResult, Box<dyn std::error::Error>> {
     let client = http_client();
     let file_size = std::fs::metadata(file_path)?.len();
@@ -346,6 +347,9 @@ pub fn upload_zip(
         }
         if let Some(policy) = policy.clone() {
             form = form.part("target_policies", multipart::Part::text(policy.to_string()));
+        }
+        if let Some(meta) = &metadata {
+            form = form.part("metadata", multipart::Part::text(meta.clone()));
         }
 
         let response = match client
@@ -950,6 +954,8 @@ pub struct ScanResponse {
     pub created_at: String,
     #[serde(default)]
     pub git_sha: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
