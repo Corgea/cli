@@ -954,7 +954,7 @@ pub struct ScanResponse {
     pub created_at: String,
     #[serde(default)]
     pub git_sha: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
 
