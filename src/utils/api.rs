@@ -692,6 +692,8 @@ pub fn query_scan_list(
     project: Option<&str>,
     page: Option<u16>,
     page_size: Option<u16>,
+    branch: Option<&str>,
+    sha: Option<&str>,
 ) -> Result<ScansResponse, Box<dyn Error>> {
     let url = format!("{}{}/scans", url, API_BASE);
     let page = page.unwrap_or(1);
@@ -703,6 +705,12 @@ pub fn query_scan_list(
     }
     if let Some(project) = project {
         query_params.push(("project", project.to_string()));
+    }
+    if let Some(branch) = branch {
+        query_params.push(("branch", branch.to_string()));
+    }
+    if let Some(sha) = sha {
+        query_params.push(("sha", sha.to_string()));
     }
 
     let client = http_client();
@@ -940,6 +948,8 @@ pub struct ScanResponse {
     pub status: String,
     pub engine: String,
     pub created_at: String,
+    #[serde(default)]
+    pub git_sha: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

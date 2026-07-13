@@ -1,6 +1,8 @@
 use crate::config::Config;
 use crate::targets;
 use crate::utils;
+use crate::utils::api::ScanResponse;
+use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
@@ -15,6 +17,7 @@ pub fn run(
     fail_on: Option<String>,
     fail: &bool,
     only_uncommitted: &bool,
+    skip_if_scanned: &bool,
     scan_type: Option<String>,
     policy: Option<String>,
     out_format: Option<String>,
@@ -44,6 +47,41 @@ pub fn run(
             }
         }
     }
+
+    let project_name = utils::generic::determine_project_name(project_name.as_deref());
+    let repo_info = utils::generic::get_repo_info("./").unwrap_or_default();
+
+    if *skip_if_scanned {
+        if let Some(ref info) = repo_info {
+            // Require both SHA and branch so detached-HEAD / unknown-branch
+            // never matches a null-branch scan by accident.
+            if let (Some(sha), Some(branch)) = (info.sha.as_deref(), info.branch.as_deref()) {
+                if let Ok(resp) = utils::api::query_scan_list(
+                    &config.get_url(),
+                    Some(&project_name),
+                    Some(1),
+                    None,
+                    Some(branch),
+                    Some(sha),
+                ) {
+                    let scans = resp.scans.unwrap_or_default();
+                    let now = Utc::now();
+                    if let Some(scan) = find_recent_matching_scan(&scans, sha, Some(branch), now) {
+                        let age = parse_created_at(&scan.created_at)
+                            .map(|created| format_scan_age(created, now))
+                            .unwrap_or_else(|| "recently".to_string());
+                        let short_sha: String = sha.chars().take(8).collect();
+                        println!(
+                            "Skipping scan: commit {} on {} was already scanned {} (scan {}).",
+                            short_sha, branch, age, scan.id
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     println!("\nScanning with BLAST 🚀🚀🚀");
 
     if let Some(scan_type) = &scan_type {
@@ -58,9 +96,8 @@ pub fn run(
     println!("\n\n");
     let temp_dir = env::temp_dir().join(format!("corgea/tmp/{}", Uuid::new_v4()));
     fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
-    let project_name = utils::generic::determine_project_name(project_name.as_deref());
     let zip_path = format!("{}/{}.zip", temp_dir.display(), project_name);
-    let repo_info = utils::generic::get_repo_info("./").unwrap_or_default();
+
     match utils::generic::create_path_if_not_exists(&temp_dir) {
         Ok(_) => (),
         Err(e) => {
@@ -556,4 +593,145 @@ pub fn report_scan_status(
     println!("{:-<20} | ", "");
     println!("{:<20} | {}", "Total", total_issues);
     Ok(classification_counts)
+}
+
+fn find_recent_matching_scan<'a>(
+    scans: &'a [ScanResponse],
+    local_sha: &str,
+    local_branch: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<&'a ScanResponse> {
+    scans.iter().find(|scan| {
+        if scan.status != "complete" {
+            return false;
+        }
+        if scan.git_sha.as_deref() != Some(local_sha) {
+            return false;
+        }
+        if scan.branch.as_deref() != local_branch {
+            return false;
+        }
+        match parse_created_at(&scan.created_at) {
+            // Reject future timestamps (clock skew) and anything >= 24h old.
+            Some(created) => created <= now && now - created < Duration::hours(24),
+            None => false,
+        }
+    })
+}
+
+fn parse_created_at(raw: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S") {
+        return Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
+    }
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
+    }
+    None
+}
+
+fn format_scan_age(created: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let minutes = (now - created).num_minutes().max(0);
+    if minutes < 60 {
+        format!("{minutes}m ago")
+    } else {
+        format!("{}h ago", minutes / 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan(
+        id: &str,
+        sha: Option<&str>,
+        branch: Option<&str>,
+        status: &str,
+        created_at: &str,
+    ) -> ScanResponse {
+        ScanResponse {
+            id: id.to_string(),
+            project: "proj".to_string(),
+            repo: None,
+            branch: branch.map(str::to_string),
+            status: status.to_string(),
+            engine: "blast".to_string(),
+            created_at: created_at.to_string(),
+            git_sha: sha.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn skips_matching_complete_scan_within_24h() {
+        let now = Utc::now();
+        let created = (now - Duration::hours(3)).to_rfc3339();
+        let scans = vec![scan(
+            "s1",
+            Some("abc123"),
+            Some("main"),
+            "complete",
+            &created,
+        )];
+        let matched = find_recent_matching_scan(&scans, "abc123", Some("main"), now);
+        assert_eq!(matched.map(|s| s.id.as_str()), Some("s1"));
+    }
+
+    #[test]
+    fn does_not_skip_stale_or_exact_24h_scan() {
+        let now = Utc::now();
+        let stale = (now - Duration::hours(25)).to_rfc3339();
+        let exact = (now - Duration::hours(24)).to_rfc3339();
+        let scans = vec![
+            scan("s1", Some("abc123"), Some("main"), "complete", &stale),
+            scan("s2", Some("abc123"), Some("main"), "complete", &exact),
+        ];
+        assert!(find_recent_matching_scan(&scans, "abc123", Some("main"), now).is_none());
+    }
+
+    #[test]
+    fn does_not_skip_future_created_at() {
+        let now = Utc::now();
+        let created = (now + Duration::hours(1)).to_rfc3339();
+        let scans = vec![scan(
+            "s1",
+            Some("abc123"),
+            Some("main"),
+            "complete",
+            &created,
+        )];
+        assert!(find_recent_matching_scan(&scans, "abc123", Some("main"), now).is_none());
+    }
+
+    #[test]
+    fn does_not_skip_different_branch_or_sha() {
+        let now = Utc::now();
+        let created = (now - Duration::hours(1)).to_rfc3339();
+        let scans = vec![
+            scan("s1", Some("abc123"), Some("other"), "complete", &created),
+            scan("s2", Some("ffff"), Some("main"), "complete", &created),
+        ];
+        assert!(find_recent_matching_scan(&scans, "abc123", Some("main"), now).is_none());
+    }
+
+    #[test]
+    fn does_not_skip_missing_sha_or_incomplete() {
+        let now = Utc::now();
+        let created = (now - Duration::hours(1)).to_rfc3339();
+        let scans = vec![
+            scan("s1", None, Some("main"), "complete", &created),
+            scan("s2", Some("abc123"), Some("main"), "scanning", &created),
+        ];
+        assert!(find_recent_matching_scan(&scans, "abc123", Some("main"), now).is_none());
+    }
+
+    #[test]
+    fn format_scan_age_uses_minutes_under_one_hour() {
+        let now = Utc::now();
+        let created = now - Duration::minutes(12);
+        assert_eq!(format_scan_age(created, now), "12m ago");
+        assert_eq!(format_scan_age(now - Duration::hours(3), now), "3h ago");
+    }
 }

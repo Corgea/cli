@@ -263,6 +263,8 @@ pub fn run(
             Some(&project_name),
             *page,
             *page_size,
+            None,
+            None,
         ) {
             Ok(scans) => {
                 let page = scans.page;
@@ -304,6 +306,7 @@ pub fn run(
             "Status".to_string(),
             "Repo".to_string(),
             "Branch".to_string(),
+            "SHA".to_string(),
         ]];
 
         for scan in &scans {
@@ -319,6 +322,11 @@ pub fn run(
             } else {
                 formatted_repo
             };
+            let short_sha = scan
+                .git_sha
+                .as_deref()
+                .map(|s| s.chars().take(8).collect::<String>())
+                .unwrap_or_else(|| "N/A".to_string());
 
             table.push(vec![
                 scan.id.clone(),
@@ -326,6 +334,7 @@ pub fn run(
                 scan.status.clone(),
                 formatted_repo,
                 scan.branch.clone().unwrap_or("N/A".to_string()),
+                short_sha,
             ]);
         }
 

@@ -82,6 +82,12 @@ enum Commands {
         only_uncommitted: bool,
 
         #[arg(
+            long,
+            help = "Skip the scan if this commit already has a completed scan for the same project and branch within the last 24h. Cannot be combined with --fail or --fail-on."
+        )]
+        skip_if_scanned: bool,
+
+        #[arg(
             short,
             long,
             help = "Fail on (exits with error code 1) based on blocking rules defined in the web app."
@@ -486,6 +492,7 @@ fn main() {
             fail_on,
             fail,
             only_uncommitted,
+            skip_if_scanned,
             scan_type,
             policy,
             out_format,
@@ -515,6 +522,18 @@ fn main() {
 
             if *only_uncommitted && *scanner != Scanner::Blast {
                 ::log::error!("only_uncommitted is only supported with blast scanner.");
+                std::process::exit(1);
+            }
+
+            if *skip_if_scanned && *scanner != Scanner::Blast {
+                ::log::error!("--skip-if-scanned is only supported with the blast scanner.");
+                std::process::exit(1);
+            }
+
+            if *skip_if_scanned && (*fail || fail_on.is_some()) {
+                ::log::error!(
+                    "--skip-if-scanned cannot be used with --fail or --fail-on (skipping would bypass those checks)."
+                );
                 std::process::exit(1);
             }
 
@@ -590,6 +609,7 @@ fn main() {
                     fail_on.clone(),
                     fail,
                     only_uncommitted,
+                    skip_if_scanned,
                     scan_type.clone(),
                     policy.clone(),
                     out_format.clone(),
