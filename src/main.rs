@@ -83,7 +83,7 @@ enum Commands {
 
         #[arg(
             long,
-            help = "Skip the scan if this commit already has a completed scan for the same project and branch within the last 24h. Cannot be combined with --fail or --fail-on."
+            help = "Skip the scan if this commit already has a completed scan for the same project and branch within the last 24h. Only for a default blast scan (not with --fail, --fail-on, --only-uncommitted, --target, --exclude, --scan-type, --policy, or --out-file/--out-format)."
         )]
         skip_if_scanned: bool,
 
@@ -530,9 +530,19 @@ fn main() {
                 std::process::exit(1);
             }
 
-            if *skip_if_scanned && (*fail || fail_on.is_some()) {
+            if *skip_if_scanned
+                && (*fail
+                    || fail_on.is_some()
+                    || *only_uncommitted
+                    || target.is_some()
+                    || exclude.is_some()
+                    || scan_type.is_some()
+                    || policy.is_some()
+                    || out_file.is_some()
+                    || out_format.is_some())
+            {
                 ::log::error!(
-                    "--skip-if-scanned cannot be used with --fail or --fail-on (skipping would bypass those checks)."
+                    "--skip-if-scanned only applies to a default blast scan. It cannot be combined with --fail, --fail-on, --only-uncommitted, --target, --exclude, --scan-type, --policy, or --out-file/--out-format."
                 );
                 std::process::exit(1);
             }

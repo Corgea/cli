@@ -602,7 +602,7 @@ fn find_recent_matching_scan<'a>(
     now: DateTime<Utc>,
 ) -> Option<&'a ScanResponse> {
     scans.iter().find(|scan| {
-        if scan.status != "complete" {
+        if !scan.status.eq_ignore_ascii_case("complete") {
             return false;
         }
         if scan.git_sha.as_deref() != Some(local_sha) {
@@ -677,6 +677,23 @@ mod tests {
         )];
         let matched = find_recent_matching_scan(&scans, "abc123", Some("main"), now);
         assert_eq!(matched.map(|s| s.id.as_str()), Some("s1"));
+    }
+
+    #[test]
+    fn skips_title_case_complete_status() {
+        let now = Utc::now();
+        let created = (now - Duration::hours(1)).to_rfc3339();
+        let scans = vec![scan(
+            "s1",
+            Some("abc123"),
+            Some("main"),
+            "Complete",
+            &created,
+        )];
+        assert_eq!(
+            find_recent_matching_scan(&scans, "abc123", Some("main"), now).map(|s| s.id.as_str()),
+            Some("s1")
+        );
     }
 
     #[test]
