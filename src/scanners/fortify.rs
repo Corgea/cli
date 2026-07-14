@@ -2,6 +2,7 @@ use crate::scan::upload_scan;
 use crate::Config;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
+use quick_xml::XmlVersion;
 use std::fs::File;
 use std::io;
 use std::io::{BufReader, Read};
@@ -92,7 +93,9 @@ fn extract_file_path(scan_file: PathBuf) -> (String, Vec<String>) {
                             Ok(attr) => {
                                 let attr_key = attr.key.as_ref();
                                 if attr_key == b"path" {
-                                    if let Ok(value) = attr.unescape_value() {
+                                    if let Ok(value) =
+                                        attr.normalized_value(XmlVersion::Implicit1_0)
+                                    {
                                         let path_str = value.to_string();
                                         if !paths.contains(&path_str) {
                                             paths.push(path_str);
@@ -115,7 +118,9 @@ fn extract_file_path(scan_file: PathBuf) -> (String, Vec<String>) {
                             Ok(attr) => {
                                 let attr_key = attr.key.as_ref();
                                 if attr_key == b"path" {
-                                    if let Ok(value) = attr.unescape_value() {
+                                    if let Ok(value) =
+                                        attr.normalized_value(XmlVersion::Implicit1_0)
+                                    {
                                         let path_str = value.to_string();
                                         if !paths.contains(&path_str) {
                                             paths.push(path_str);
