@@ -345,8 +345,14 @@ pub(super) fn print_text(report: &PrecheckReport) {
                         // When `safe_version` is `Some` it equals
                         // `advertised_fix` and clears every advisory; otherwise
                         // some advisory has no fix, so the "(advertised fix)"
-                        // hedge marks the bump as partial.
-                        if t.origin == TreeOrigin::PreExisting {
+                        // hedge marks the bump as partial. Malware is the
+                        // exception: it is removed, not upgraded, so never steer
+                        // toward "install another version" of a malicious dep —
+                        // a mixed CVE+MAL payload could otherwise surface the
+                        // CVE's advertised fix here.
+                        if t.origin == TreeOrigin::PreExisting
+                            && !matches!(t.verdict, VerdictStatus::Malicious(_))
+                        {
                             if let Some(fix) = advertised_fix(matches) {
                                 let hedge = if safe_version(matches).is_some() {
                                     ""
@@ -477,10 +483,13 @@ fn verdict_json(verdict: &VerdictStatus) -> serde_json::Value {
             })
         }
         VerdictStatus::Malicious(matches) => {
+            // Malware is removed, not upgraded: never advertise a safe-version
+            // remediation for a malicious verdict, even when a co-reported CVE
+            // carries an advertised fix.
             json!({
                 "status": "malicious",
                 "matches": matches,
-                "remediation": safe_version(matches),
+                "remediation": serde_json::Value::Null,
             })
         }
         VerdictStatus::Unverifiable(error) => {
@@ -769,5 +778,22 @@ mod tests {
             advertised_fix(&[vm("A-1", Some("1.2.0")), vm("A-2", Some("1.10.0"))]),
             Some("1.10.0".to_string())
         );
+    }
+
+    #[test]
+    fn malicious_verdict_json_never_advertises_remediation() {
+        // Malware is removed, not upgraded: even a co-reported, fixable CVE
+        // must not surface a remediation version on a malicious verdict.
+        let malicious = VerdictStatus::Malicious(vec![
+            vm("CVE-2024-7777", Some("1.0.0")),
+            vm("MAL-2024-8888", None),
+        ]);
+        assert_eq!(
+            verdict_json(&malicious)["remediation"],
+            serde_json::Value::Null
+        );
+        // Contrast: the same fixable match on a Vulnerable verdict still does.
+        let vulnerable = VerdictStatus::Vulnerable(vec![vm("CVE-2024-7777", Some("1.0.0"))]);
+        assert_eq!(verdict_json(&vulnerable)["remediation"], "1.0.0");
     }
 }

@@ -463,3 +463,67 @@ fn bare_npm_install_malicious_lockdep_json_tree_counts() {
     assert_eq!(evil["verdict"]["status"], "malicious");
     assert_eq!(evil["verdict"]["matches"][0]["malware"], true);
 }
+
+/// A pre-existing malicious dep whose payload also carries a *fixable* CVE must
+/// NOT print the `fix with:` upgrade hint (text) or a JSON `remediation`:
+/// malware is removed, not upgraded, and steering to the CVE's advertised
+/// version would leave the malicious package installed. Guards the shared
+/// `Vulnerable | Malicious` fix-hint path at render.rs:334.
+#[test]
+fn bare_npm_install_malicious_lockdep_never_suggests_a_fix_upgrade() {
+    let mixed_body = r#"{"ecosystem":"npm","package_name":"evildep","version":"0.4.2","is_vulnerable":true,
+        "matches":[{"advisory_id":"CVE-2024-7777","severity_level":"high","tier":2,
+                    "vulnerable_version_range":"< 1.0.0","fixed_version":"1.0.0","malware":false},
+                   {"advisory_id":"MAL-2024-8888","severity_level":"critical","tier":1,
+                    "vulnerable_version_range":null,"fixed_version":null,"malware":true}]}"#;
+    let mut checks = HashMap::new();
+    checks.insert(key("npm", "evildep", "0.4.2"), mixed_body.to_string());
+    let mut h = GateHarness::new()
+        .fake_tree_pm("npm", NPM_LOCK, 0)
+        .oldpkg_registry()
+        .vuln_checks(checks)
+        .with_project_file("package.json", PACKAGE_JSON)
+        .build();
+
+    // Text: malicious label present, but no upgrade hint.
+    let out = h.cmd.args(["npm", "install"]).output().expect("run corgea");
+    assert_eq!(out.status.code(), Some(1), "malicious lockdep must block");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("known malicious:"),
+        "malicious label: {stdout}"
+    );
+    assert!(
+        !stdout.contains("fix with:"),
+        "malware must not advertise an upgrade path: {stdout}"
+    );
+
+    // JSON: the malicious tree entry carries a null remediation.
+    let mut checks2 = HashMap::new();
+    checks2.insert(key("npm", "evildep", "0.4.2"), mixed_body.to_string());
+    let mut hj = GateHarness::new()
+        .fake_tree_pm("npm", NPM_LOCK, 0)
+        .oldpkg_registry()
+        .vuln_checks(checks2)
+        .with_project_file("package.json", PACKAGE_JSON)
+        .build();
+    let out_json = hj
+        .cmd
+        .args(["npm", "--json", "install"])
+        .output()
+        .expect("run corgea");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out_json.stdout).expect("stdout must be valid JSON");
+    let evil = parsed["tree"]["transitive"]
+        .as_array()
+        .expect("transitive array")
+        .iter()
+        .find(|t| t["name"] == "evildep")
+        .expect("evildep entry");
+    assert_eq!(evil["verdict"]["status"], "malicious");
+    assert_eq!(
+        evil["verdict"]["remediation"],
+        serde_json::Value::Null,
+        "malicious verdict must not advertise a remediation version"
+    );
+}
