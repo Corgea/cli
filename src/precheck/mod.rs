@@ -153,8 +153,13 @@ pub struct VerdictConfig {
 pub enum VerdictStatus {
     /// vuln-api answered: no known advisories for this exact version.
     Clean,
-    /// vuln-api answered: known vulnerable or malicious — blocks.
+    /// vuln-api answered: known vulnerable — blocks.
     Vulnerable(Vec<crate::vuln_api::VulnMatch>),
+    /// vuln-api answered: known malicious (wire malware flag or `MAL-`
+    /// advisory id — `VulnMatch::is_malicious`) — blocks. Carries ALL
+    /// matches, malware and ordinary CVEs together, so a package that is
+    /// both drops nothing; the stronger claim names the verdict.
+    Malicious(Vec<crate::vuln_api::VulnMatch>),
     /// The verdict could not be obtained (network/5xx/auth/integrity).
     /// Blocks only in authenticated mode.
     Unverifiable(String),
@@ -169,7 +174,7 @@ impl VerdictStatus {
     /// `verdict::block_reason` and the refusal-blame predicate.
     fn blocks(&self, fail_closed: bool) -> bool {
         match self {
-            VerdictStatus::Vulnerable(_) => true,
+            VerdictStatus::Vulnerable(_) | VerdictStatus::Malicious(_) => true,
             VerdictStatus::Unverifiable(_) => fail_closed,
             VerdictStatus::Clean | VerdictStatus::NotChecked => false,
         }
@@ -352,6 +357,18 @@ impl PrecheckReport {
     pub fn vulnerable_count(&self) -> usize {
         self.verdicts()
             .filter(|v| matches!(v, VerdictStatus::Vulnerable(_)))
+            .count()
+    }
+    /// Malicious findings across named targets and the resolved tree.
+    pub fn malicious_count(&self) -> usize {
+        self.verdicts()
+            .filter(|v| matches!(v, VerdictStatus::Malicious(_)))
+            .count()
+    }
+    /// Malicious findings beyond the named targets (the resolved tree).
+    pub fn tree_malicious_count(&self) -> usize {
+        self.tree_verdicts()
+            .filter(|v| matches!(v, VerdictStatus::Malicious(_)))
             .count()
     }
     pub fn unverifiable_count(&self) -> usize {

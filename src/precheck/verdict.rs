@@ -51,7 +51,16 @@ pub(super) fn verdict_pool(
                 &job.name,
                 &job.version,
             ) {
-                Ok(resp) if resp.is_vulnerable => VerdictStatus::Vulnerable(resp.matches),
+                Ok(resp) if resp.is_vulnerable => {
+                    // Any malicious match makes the whole verdict Malicious:
+                    // the stronger claim wins for mixed advisory sets, and
+                    // the payload keeps ALL matches so nothing is dropped.
+                    if resp.matches.iter().any(|m| m.is_malicious()) {
+                        VerdictStatus::Malicious(resp.matches)
+                    } else {
+                        VerdictStatus::Vulnerable(resp.matches)
+                    }
+                }
                 Ok(_) => VerdictStatus::Clean,
                 Err(e) => VerdictStatus::Unverifiable(e.to_string()),
             },
@@ -214,6 +223,11 @@ pub(super) fn apply_verdicts(
 /// `render::print_refusal` only maps variants to text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BlockReason {
+    /// A known-malicious package (wire malware flag or MAL- advisory) is in
+    /// the would-install set. Top precedence: an already-installed malicious
+    /// package is MORE urgent, so the softer existing-tree framing must not
+    /// win. `--force` is the escape.
+    Malware,
     /// Every blocking finding predates this command (existing tree only).
     /// `--force` is the escape.
     ExistingTree,
@@ -248,6 +262,10 @@ pub(super) fn block_reason(report: &PrecheckReport, opts: &PrecheckOptions) -> O
         || (fail_closed
             && (report.error_count() > 0 || report.skipped_count() > 0 || tree_degraded_unchecked))
     {
+        // Malware outranks the existing-tree/Findings split below.
+        if report.malicious_count() > 0 {
+            return Some(BlockReason::Malware);
+        }
         return Some(if blames_existing_tree(report, opts) {
             BlockReason::ExistingTree
         } else {
@@ -400,6 +418,11 @@ mod tests {
             set_verdict(&mut o, VerdictStatus::Vulnerable(vec![]));
             report_with(vec![o])
         };
+        let malicious = {
+            let mut o = resolved_outcome("pkg", "1.0.0");
+            set_verdict(&mut o, VerdictStatus::Malicious(vec![]));
+            report_with(vec![o])
+        };
         let unverifiable = {
             let mut o = resolved_outcome("pkg", "1.0.0");
             set_verdict(&mut o, VerdictStatus::Unverifiable("503".to_string()));
@@ -432,6 +455,14 @@ mod tests {
         assert!(!should_block_install(&clean, &public_opts(false)));
         assert!(should_block_install(&vulnerable, &public_opts(false)));
         assert!(
+            should_block_install(&malicious, &public_opts(false)),
+            "malicious blocks in public mode"
+        );
+        assert!(
+            should_block_install(&malicious, &authenticated_opts(false)),
+            "malicious blocks in authenticated mode"
+        );
+        assert!(
             !should_block_install(&unverifiable, &public_opts(false)),
             "public mode must fail open on lookup errors"
         );
@@ -458,6 +489,7 @@ mod tests {
         for report in [
             &clean,
             &vulnerable,
+            &malicious,
             &unverifiable,
             &resolution_error,
             &skipped,
@@ -545,6 +577,40 @@ mod tests {
         }
     }
 
+    /// Malware wins the refusal even when every blocking finding predates
+    /// the command (bare install, pre-existing tree): the softer
+    /// existing-tree framing must not bury a malicious package. The same
+    /// shape with a merely-vulnerable verdict keeps the existing-tree blame.
+    #[test]
+    fn malware_refusal_beats_existing_tree_blame() {
+        let tree_finding = |verdict: VerdictStatus| {
+            let mut report = report_with(vec![]);
+            report.bare_install = true;
+            report.tree = Some(TreeReport::Full {
+                resolved_count: 1,
+                transitive: vec![TreeOutcome {
+                    name: "evildep".to_string(),
+                    version: "0.4.2".to_string(),
+                    origin: TreeOrigin::PreExisting,
+                    verdict,
+                }],
+            });
+            report
+        };
+        let malicious = tree_finding(VerdictStatus::Malicious(vec![vm("MAL-2024-0002", None)]));
+        assert_eq!(
+            block_reason(&malicious, &public_opts(false)),
+            Some(BlockReason::Malware),
+            "pre-existing malicious must refuse as Malware, not ExistingTree"
+        );
+        let vulnerable = tree_finding(VerdictStatus::Vulnerable(vec![vm("CVE-2024-0002", None)]));
+        assert_eq!(
+            block_reason(&vulnerable, &public_opts(false)),
+            Some(BlockReason::ExistingTree),
+            "the merely-vulnerable twin keeps the existing-tree refusal"
+        );
+    }
+
     /// A vulnerable NAMED target must never blame the existing tree, even
     /// when a pre-existing tree finding is also vulnerable.
     #[test]
@@ -564,9 +630,9 @@ mod tests {
         assert!(!blames_existing_tree(&report, &public_opts(false)));
     }
 
-    /// Verdict pass against an in-process stub: vulnerable body → Vulnerable
-    /// with matches; 503 override → Unverifiable; no VerdictConfig → outcomes
-    /// keep NotChecked.
+    /// Verdict pass against an in-process stub: a vulnerable body with a MAL-
+    /// id → Malicious with matches; 503 override → Unverifiable; no
+    /// VerdictConfig → outcomes keep NotChecked.
     #[test]
     fn verdict_pass_maps_stub_responses() {
         use std::collections::HashMap;
@@ -599,7 +665,8 @@ mod tests {
             })
             .collect();
         assert!(
-            matches!(&verdicts[0], VerdictStatus::Vulnerable(m) if m[0].advisory_id == "MAL-2024-0001")
+            matches!(&verdicts[0], VerdictStatus::Malicious(m) if m[0].advisory_id == "MAL-2024-0001"),
+            "a MAL- advisory id classifies malicious even without the wire flag (deploy-skew cover)"
         );
         assert!(matches!(&verdicts[1], VerdictStatus::Unverifiable(_)));
         assert!(matches!(&verdicts[2], VerdictStatus::Clean));
@@ -617,8 +684,82 @@ mod tests {
         ));
     }
 
+    /// The wire malware flag alone (non-MAL id) classifies Malicious; a
+    /// plain CVE with malware:false stays Vulnerable (the never-mislabel
+    /// guard, from the safe direction); a mixed CVE+MAL advisory set is
+    /// Malicious carrying ALL matches.
+    #[test]
+    fn verdict_pass_classifies_malicious_by_flag_prefix_and_mixed_sets() {
+        use std::collections::HashMap;
+
+        let key = |name: &str| crate::vuln_api_stub::key("pypi", name, "1.0.0");
+        let mut checks = HashMap::new();
+        // Flag alone, CVE-style id (non-MAL malicious origin).
+        checks.insert(
+            key("flagged"),
+            crate::vuln_api_stub::malicious_body(
+                "pypi",
+                "flagged",
+                "1.0.0",
+                "GHSA-aaaa-bbbb-cccc",
+                None,
+            ),
+        );
+        // Neither flag nor prefix: must stay Vulnerable.
+        checks.insert(
+            key("plaincve"),
+            crate::vuln_api_stub::vulnerable_body(
+                "pypi",
+                "plaincve",
+                "1.0.0",
+                "CVE-2024-1111",
+                Some("2.0.0"),
+            ),
+        );
+        // Mixed set: one ordinary CVE + one MAL advisory.
+        checks.insert(
+            key("mixed"),
+            r#"{"ecosystem":"pypi","package_name":"mixed","version":"1.0.0","is_vulnerable":true,
+            "matches":[{"advisory_id":"CVE-2024-2222","severity_level":"high","tier":1,
+                        "vulnerable_version_range":null,"fixed_version":"2.0.0","malware":false},
+                       {"advisory_id":"MAL-2024-0009","severity_level":"critical","tier":1,
+                        "vulnerable_version_range":null,"fixed_version":null,"malware":true}]}"#
+                .to_string(),
+        );
+        let stub = crate::vuln_api_stub::spawn_with_statuses(checks, HashMap::new());
+        let opts = verdict_opts(&stub.base_url);
+
+        let mut outcomes = vec![
+            resolved_outcome("flagged", "1.0.0"),
+            resolved_outcome("plaincve", "1.0.0"),
+            resolved_outcome("mixed", "1.0.0"),
+        ];
+        run_verdict_pass(PackageManager::Pip, &mut outcomes, &opts);
+
+        let verdicts: Vec<_> = outcomes
+            .iter()
+            .map(|o| match o {
+                TargetOutcome::Resolved { verdict, .. } => verdict.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert!(
+            matches!(&verdicts[0], VerdictStatus::Malicious(m) if m[0].malware),
+            "wire flag alone must classify Malicious"
+        );
+        assert!(
+            matches!(&verdicts[1], VerdictStatus::Vulnerable(_)),
+            "neither flag nor MAL- prefix must stay Vulnerable (never mislabel)"
+        );
+        assert!(
+            matches!(&verdicts[2], VerdictStatus::Malicious(m) if m.len() == 2),
+            "mixed sets classify Malicious and carry ALL matches"
+        );
+    }
+
     /// The pool must verdict every job exactly once and return the flagged
-    /// job `Vulnerable` with the rest `Clean`.
+    /// job `Malicious` (its `MAL-` id classifies malicious) with the rest
+    /// `Clean`.
     #[test]
     fn verdict_pool_returns_all_results() {
         use std::collections::HashMap;
@@ -651,7 +792,7 @@ mod tests {
         assert_eq!(results.len(), 6, "all jobs verdicted");
         let flagged = results
             .iter()
-            .filter(|(_, v)| matches!(v, VerdictStatus::Vulnerable(_)))
+            .filter(|(_, v)| matches!(v, VerdictStatus::Malicious(_)))
             .count();
         let clean = results
             .iter()
@@ -664,7 +805,7 @@ mod tests {
             .find(|(p, _)| p.name == "evil")
             .expect("evil present");
         assert!(
-            matches!(&evil.1, VerdictStatus::Vulnerable(m) if m[0].advisory_id == "MAL-2024-0001")
+            matches!(&evil.1, VerdictStatus::Malicious(m) if m[0].advisory_id == "MAL-2024-0001")
         );
     }
 

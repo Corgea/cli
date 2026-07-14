@@ -34,7 +34,7 @@ fn vulnerable_evildep_checks() -> HashMap<PackageKey, String> {
     let mut checks = HashMap::new();
     checks.insert(
         key("pypi", "evildep", "0.4.2"),
-        vulnerable_body("pypi", "evildep", "0.4.2", "MAL-2024-0002", None),
+        vulnerable_body("pypi", "evildep", "0.4.2", "CVE-2024-0002", None),
     );
     checks
 }
@@ -74,7 +74,7 @@ fn uv_sync_vulnerable_lockfile_blocks() {
         "uv must not run on a vulnerable verdict"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for needle in ["evildep", "MAL-2024-0002", "(locked)"] {
+    for needle in ["evildep", "CVE-2024-0002", "(locked)"] {
         assert!(stdout.contains(needle), "stdout: {stdout}");
     }
     // Nothing was named by this command — the refusal blames the lock, not

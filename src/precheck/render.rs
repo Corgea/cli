@@ -43,6 +43,9 @@ pub(super) fn bare_install_note(manager: PackageManager, subcommand_label: &str)
 pub(super) fn print_refusal(reason: super::verdict::BlockReason, report: &PrecheckReport) {
     use super::verdict::BlockReason;
     match reason {
+        BlockReason::Malware => eprintln!(
+            "Refusing to run install: known MALICIOUS package(s) detected. Pass --force only if you are certain."
+        ),
         BlockReason::ExistingTree => eprintln!(
             "Refusing to run install: your existing dependency tree has known-vulnerable packages (none were added by this command). Fix them or pass --force."
         ),
@@ -204,6 +207,14 @@ fn summary_segment(total: usize, from_tree: usize, label: &str) -> String {
     }
 }
 
+/// Render label for a blocking verdict: the stronger claim names it.
+fn known_label(verdict: &VerdictStatus) -> &'static str {
+    match verdict {
+        VerdictStatus::Malicious(_) => "known malicious",
+        _ => "known vulnerable",
+    }
+}
+
 /// More than this many unverifiable findings with the same error-prefix
 /// render as one collapsed line instead of one line per package.
 const UNVERIFIABLE_COLLAPSE_THRESHOLD: usize = 3;
@@ -275,8 +286,23 @@ pub(super) fn print_text(report: &PrecheckReport) {
     };
 
     println!("Pre-checking `{command}`");
+    // The malicious segment prints only when present: "malicious" appearing
+    // anywhere in the output is itself the signal, and the never-mislabel
+    // guard asserts its absence for merely-vulnerable reports.
+    let malicious_segment = if report.malicious_count() > 0 {
+        format!(
+            "{}, ",
+            summary_segment(
+                report.malicious_count(),
+                report.tree_malicious_count(),
+                "malicious"
+            )
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "  {} ok, {}, {}, {} skipped, {} errors",
+        "  {} ok, {malicious_segment}{}, {}, {} skipped, {} errors",
         report.ok_count(),
         summary_segment(
             report.vulnerable_count(),
@@ -305,9 +331,10 @@ pub(super) fn print_text(report: &PrecheckReport) {
             );
             for t in transitive {
                 match &t.verdict {
-                    VerdictStatus::Vulnerable(matches) => {
+                    VerdictStatus::Vulnerable(matches) | VerdictStatus::Malicious(matches) => {
+                        let label = known_label(&t.verdict);
                         println!(
-                            "  ✗ {}@{} {}  known vulnerable:",
+                            "  ✗ {}@{} {}  {label}:",
                             t.name,
                             t.version,
                             t.origin.label()
@@ -373,9 +400,10 @@ pub(super) fn print_text(report: &PrecheckReport) {
                 age,
                 verdict,
             } => match verdict {
-                VerdictStatus::Vulnerable(matches) => {
+                VerdictStatus::Vulnerable(matches) | VerdictStatus::Malicious(matches) => {
+                    let label = known_label(verdict);
                     println!(
-                        "  ✗ {} → {}@{}  known vulnerable:",
+                        "  ✗ {} → {}@{}  {label}:",
                         target.display, resolved.name, resolved.version,
                     );
                     print_vulnerable_matches(&resolved.name, matches);
@@ -448,6 +476,13 @@ fn verdict_json(verdict: &VerdictStatus) -> serde_json::Value {
                 "remediation": safe_version(matches),
             })
         }
+        VerdictStatus::Malicious(matches) => {
+            json!({
+                "status": "malicious",
+                "matches": matches,
+                "remediation": safe_version(matches),
+            })
+        }
         VerdictStatus::Unverifiable(error) => {
             json!({ "status": "unverifiable", "error": error })
         }
@@ -463,6 +498,7 @@ fn verdict_json(verdict: &VerdictStatus) -> serde_json::Value {
 #[derive(Default)]
 struct VerdictCounts {
     clean: usize,
+    malicious: usize,
     vulnerable: usize,
     unverifiable: usize,
     not_checked: usize,
@@ -473,6 +509,7 @@ fn verdict_counts<'a>(verdicts: impl Iterator<Item = &'a VerdictStatus>) -> Verd
     for v in verdicts {
         match v {
             VerdictStatus::Clean => c.clean += 1,
+            VerdictStatus::Malicious(_) => c.malicious += 1,
             VerdictStatus::Vulnerable(_) => c.vulnerable += 1,
             VerdictStatus::Unverifiable(_) => c.unverifiable += 1,
             VerdictStatus::NotChecked => c.not_checked += 1,
@@ -554,6 +591,7 @@ pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
         "summary": {
             "named": {
                 "ok": report.ok_count(),
+                "malicious": named_counts.malicious,
                 "vulnerable": named_counts.vulnerable,
                 "unverifiable": named_counts.unverifiable,
                 "clean": named_counts.clean,
@@ -563,6 +601,7 @@ pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
             },
             "tree": {
                 "resolved_count": tree_resolved,
+                "malicious": tree_counts.malicious,
                 "vulnerable": tree_counts.vulnerable,
                 "unverifiable": tree_counts.unverifiable,
                 "clean": tree_counts.clean,

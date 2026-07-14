@@ -88,6 +88,21 @@ pub struct VulnMatch {
     pub tier: Option<u8>,
     pub vulnerable_version_range: Option<String>,
     pub fixed_version: Option<String>,
+    /// Absent on pre-COR-1646 servers → false.
+    #[serde(default)]
+    pub malware: bool,
+}
+
+impl VulnMatch {
+    /// The one CLI-side definition of "malicious": the server's malware
+    /// flag OR a `MAL-` advisory-id prefix. The prefix half covers deploy
+    /// skew (a new CLI against a pre-COR-1646 server that doesn't emit the
+    /// flag yet); the flag half covers malicious origins whose ids are not
+    /// `MAL-` (`database_specific.malicious-packages-origins`). Duplicated
+    /// with the server's `advisory_is_malware` by design (resolved Q1).
+    pub fn is_malicious(&self) -> bool {
+        self.malware || self.advisory_id.starts_with("MAL-")
+    }
 }
 
 /// `corgea-cli/<version> (<label>)` user-agent string.
@@ -835,6 +850,7 @@ mod tests {
         assert_eq!(m.tier, Some(1));
         assert_eq!(m.vulnerable_version_range.as_deref(), Some(">=3.2,<3.2.5"));
         assert_eq!(m.fixed_version.as_deref(), Some("3.2.5"));
+        assert!(!m.malware);
     }
 
     #[test]
@@ -849,5 +865,44 @@ mod tests {
         assert!(m.advisory_id.starts_with("MAL-"));
         assert!(m.vulnerable_version_range.is_none());
         assert!(m.fixed_version.is_none());
+        assert!(m.malware, "the malware fixture carries the wire flag");
+    }
+
+    #[test]
+    fn vuln_match_malware_defaults_false_when_absent() {
+        // Pre-COR-1646 server shape: no malware key. Absence must mean
+        // false, not an error and not a third state.
+        let m: VulnMatch = serde_json::from_str(
+            r#"{"advisory_id":"CVE-2024-0001","severity_level":"high","tier":1,
+                "vulnerable_version_range":null,"fixed_version":null}"#,
+        )
+        .unwrap();
+        assert!(!m.malware);
+        assert!(!m.is_malicious());
+    }
+
+    #[test]
+    fn is_malicious_covers_flag_and_prefix() {
+        let m = |advisory: &str, malware: bool| VulnMatch {
+            advisory_id: advisory.to_string(),
+            severity_level: "critical".to_string(),
+            tier: Some(1),
+            vulnerable_version_range: None,
+            fixed_version: None,
+            malware,
+        };
+        assert!(m("MAL-2024-0001", true).is_malicious());
+        assert!(
+            m("MAL-2024-0001", false).is_malicious(),
+            "MAL- prefix alone must classify (old server, deploy skew)"
+        );
+        assert!(
+            m("GHSA-aaaa-bbbb-cccc", true).is_malicious(),
+            "wire flag alone must classify (non-MAL malicious origin)"
+        );
+        assert!(
+            !m("CVE-2024-0001", false).is_malicious(),
+            "neither flag nor prefix must never classify malicious"
+        );
     }
 }
