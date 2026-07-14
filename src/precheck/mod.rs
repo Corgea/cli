@@ -155,10 +155,10 @@ pub enum VerdictStatus {
     Clean,
     /// vuln-api answered: known vulnerable — blocks.
     Vulnerable(Vec<crate::vuln_api::VulnMatch>),
-    /// vuln-api answered: known malicious (wire malware flag or `MAL-`
-    /// advisory id — `VulnMatch::is_malicious`) — blocks. Carries ALL
-    /// matches, malware and ordinary CVEs together, so a package that is
-    /// both drops nothing; the stronger claim names the verdict.
+    /// vuln-api answered: known malicious (server `malware` flag —
+    /// `VulnMatch::is_malicious`) — blocks. Carries ALL matches, malware
+    /// and ordinary CVEs together, so a package that is both drops nothing;
+    /// the stronger claim names the verdict.
     Malicious(Vec<crate::vuln_api::VulnMatch>),
     /// The verdict could not be obtained (network/5xx/auth/integrity).
     /// Blocks only in authenticated mode.

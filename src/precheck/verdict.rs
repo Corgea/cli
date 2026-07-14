@@ -223,8 +223,8 @@ pub(super) fn apply_verdicts(
 /// `render::print_refusal` only maps variants to text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BlockReason {
-    /// A known-malicious package (wire malware flag or MAL- advisory) is in
-    /// the would-install set. Top precedence: an already-installed malicious
+    /// A known-malicious package (server `malware` flag) is in the
+    /// would-install set. Top precedence: an already-installed malicious
     /// package is MORE urgent, so the softer existing-tree framing must not
     /// win. `--force` is the escape.
     Malware,
@@ -630,8 +630,8 @@ mod tests {
         assert!(!blames_existing_tree(&report, &public_opts(false)));
     }
 
-    /// Verdict pass against an in-process stub: a vulnerable body with a MAL-
-    /// id → Malicious with matches; 503 override → Unverifiable; no
+    /// Verdict pass against an in-process stub: a malware-flagged body →
+    /// Malicious with matches; 503 override → Unverifiable; no
     /// VerdictConfig → outcomes keep NotChecked.
     #[test]
     fn verdict_pass_maps_stub_responses() {
@@ -641,7 +641,13 @@ mod tests {
         let mut checks = HashMap::new();
         checks.insert(
             key("evil"),
-            crate::vuln_api_stub::vulnerable_body("pypi", "evil", "1.0.0", "MAL-2024-0001", None),
+            crate::vuln_api_stub::malicious_body(
+                "pypi",
+                "evil",
+                "1.0.0",
+                "GHSA-58j3-rgh4-9rjc",
+                None,
+            ),
         );
         checks.insert(key("flaky"), "{}".to_string());
         let mut statuses = HashMap::new();
@@ -665,8 +671,8 @@ mod tests {
             })
             .collect();
         assert!(
-            matches!(&verdicts[0], VerdictStatus::Malicious(m) if m[0].advisory_id == "MAL-2024-0001"),
-            "a MAL- advisory id classifies malicious even without the wire flag (deploy-skew cover)"
+            matches!(&verdicts[0], VerdictStatus::Malicious(m) if m[0].advisory_id == "GHSA-58j3-rgh4-9rjc" && m[0].malware),
+            "the wire malware flag classifies malicious (the /check id is the GHSA alias, not a MAL- id)"
         );
         assert!(matches!(&verdicts[1], VerdictStatus::Unverifiable(_)));
         assert!(matches!(&verdicts[2], VerdictStatus::Clean));
@@ -684,12 +690,12 @@ mod tests {
         ));
     }
 
-    /// The wire malware flag alone (non-MAL id) classifies Malicious; a
-    /// plain CVE with malware:false stays Vulnerable (the never-mislabel
-    /// guard, from the safe direction); a mixed CVE+MAL advisory set is
-    /// Malicious carrying ALL matches.
+    /// The wire malware flag classifies Malicious (here on a GHSA-aliased
+    /// id, as real `/check` reports it); a plain CVE with malware:false
+    /// stays Vulnerable (the never-mislabel guard, from the safe direction);
+    /// a mixed set with one flagged match is Malicious carrying ALL matches.
     #[test]
-    fn verdict_pass_classifies_malicious_by_flag_prefix_and_mixed_sets() {
+    fn verdict_pass_classifies_malicious_by_flag_and_mixed_sets() {
         use std::collections::HashMap;
 
         let key = |name: &str| crate::vuln_api_stub::key("pypi", name, "1.0.0");
@@ -705,7 +711,7 @@ mod tests {
                 None,
             ),
         );
-        // Neither flag nor prefix: must stay Vulnerable.
+        // No malware flag: must stay Vulnerable.
         checks.insert(
             key("plaincve"),
             crate::vuln_api_stub::vulnerable_body(
@@ -716,7 +722,7 @@ mod tests {
                 Some("2.0.0"),
             ),
         );
-        // Mixed set: one ordinary CVE + one MAL advisory.
+        // Mixed set: one ordinary CVE + one malware-flagged advisory.
         checks.insert(
             key("mixed"),
             r#"{"ecosystem":"pypi","package_name":"mixed","version":"1.0.0","is_vulnerable":true,
@@ -749,7 +755,7 @@ mod tests {
         );
         assert!(
             matches!(&verdicts[1], VerdictStatus::Vulnerable(_)),
-            "neither flag nor MAL- prefix must stay Vulnerable (never mislabel)"
+            "no malware flag must stay Vulnerable (never mislabel)"
         );
         assert!(
             matches!(&verdicts[2], VerdictStatus::Malicious(m) if m.len() == 2),
@@ -758,8 +764,8 @@ mod tests {
     }
 
     /// The pool must verdict every job exactly once and return the flagged
-    /// job `Malicious` (its `MAL-` id classifies malicious) with the rest
-    /// `Clean`.
+    /// job `Malicious` (its `malware` wire flag classifies malicious) with
+    /// the rest `Clean`.
     #[test]
     fn verdict_pool_returns_all_results() {
         use std::collections::HashMap;
@@ -767,7 +773,13 @@ mod tests {
         let mut checks = HashMap::new();
         checks.insert(
             crate::vuln_api_stub::key("pypi", "evil", "1.0.0"),
-            crate::vuln_api_stub::vulnerable_body("pypi", "evil", "1.0.0", "MAL-2024-0001", None),
+            crate::vuln_api_stub::malicious_body(
+                "pypi",
+                "evil",
+                "1.0.0",
+                "GHSA-58j3-rgh4-9rjc",
+                None,
+            ),
         );
         let stub = crate::vuln_api_stub::spawn_with_statuses(checks, HashMap::new());
 
@@ -805,7 +817,7 @@ mod tests {
             .find(|(p, _)| p.name == "evil")
             .expect("evil present");
         assert!(
-            matches!(&evil.1, VerdictStatus::Malicious(m) if m[0].advisory_id == "MAL-2024-0001")
+            matches!(&evil.1, VerdictStatus::Malicious(m) if m[0].advisory_id == "GHSA-58j3-rgh4-9rjc" && m[0].malware)
         );
     }
 

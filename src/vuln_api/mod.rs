@@ -94,14 +94,17 @@ pub struct VulnMatch {
 }
 
 impl VulnMatch {
-    /// The one CLI-side definition of "malicious": the server's malware
-    /// flag OR a `MAL-` advisory-id prefix. The prefix half covers deploy
-    /// skew (a new CLI against a pre-COR-1646 server that doesn't emit the
-    /// flag yet); the flag half covers malicious origins whose ids are not
-    /// `MAL-` (`database_specific.malicious-packages-origins`). Duplicated
-    /// with the server's `advisory_is_malware` by design (resolved Q1).
+    /// The one CLI-side definition of "malicious": the server's `malware`
+    /// flag, set by the vuln-api `/check` route via `advisory_is_malware`
+    /// (COR-1646). It is the single authoritative signal — an id-prefix
+    /// heuristic can't stand in, because `/check` reports the canonical
+    /// alias (e.g. `GHSA-…`) as `advisory_id`, not the `MAL-` id, so
+    /// GHSA-aliased malware would slip past a prefix test. Requires the
+    /// worker deployed with/before this CLI; against a pre-COR-1646 server
+    /// the flag is absent → the package still blocks as `Vulnerable`
+    /// (fail-safe), only without the malicious label (resolved Q1).
     pub fn is_malicious(&self) -> bool {
-        self.malware || self.advisory_id.starts_with("MAL-")
+        self.malware
     }
 }
 
@@ -882,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn is_malicious_covers_flag_and_prefix() {
+    fn is_malicious_reads_wire_flag_only() {
         let m = |advisory: &str, malware: bool| VulnMatch {
             advisory_id: advisory.to_string(),
             severity_level: "critical".to_string(),
@@ -891,18 +894,17 @@ mod tests {
             fixed_version: None,
             malware,
         };
+        // The wire flag is the sole signal, regardless of the id shape.
+        assert!(m("GHSA-58j3-rgh4-9rjc", true).is_malicious());
         assert!(m("MAL-2024-0001", true).is_malicious());
         assert!(
-            m("MAL-2024-0001", false).is_malicious(),
-            "MAL- prefix alone must classify (old server, deploy skew)"
-        );
-        assert!(
-            m("GHSA-aaaa-bbbb-cccc", true).is_malicious(),
-            "wire flag alone must classify (non-MAL malicious origin)"
+            !m("MAL-2024-0001", false).is_malicious(),
+            "a MAL- id without the flag is NOT malicious: /check reports the \
+             canonical alias, so the prefix is not a reliable signal"
         );
         assert!(
             !m("CVE-2024-0001", false).is_malicious(),
-            "neither flag nor prefix must never classify malicious"
+            "an ordinary CVE without the flag is not malicious"
         );
     }
 }
