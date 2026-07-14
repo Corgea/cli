@@ -532,11 +532,10 @@ fn split_pep440_prerelease(v: &str) -> Option<(&str, Option<String>)> {
         (1, "a", r)
     } else if let Some(r) = suffix.strip_prefix('b') {
         (2, "b", r)
-    } else if let Some(r) = suffix.strip_prefix('c') {
+    } else {
+        let r = suffix.strip_prefix('c')?;
         // PEP 440 spells release-candidate `c` and `rc` interchangeably.
         (3, "rc", r)
-    } else {
-        return None;
     };
     let num_str = rest.trim_start_matches(['.', '-', '_']);
     // Reject anything we didn't fully consume (combined `a1.dev2`, local
