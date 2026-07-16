@@ -790,6 +790,15 @@ fn run_parsed_install(
     // The named-target registry lookups and the tree dry-run are independent
     // network/subprocess work — overlap them; verdicts need both.
     let now = Utc::now();
+    // Name each resolve phase on stderr so small/short runs don't look hung.
+    // Both lines are stderr (like every gate note), so stdout stays JSON-clean
+    // under --json. Conditional: a non-tree-eligible run prints only its line.
+    if !parsed.targets.is_empty() {
+        eprintln!("resolving named package targets…");
+    }
+    if tree_eligible {
+        eprintln!("resolving the would-install dependency tree…");
+    }
     let (mut outcomes, tree_resolution) = std::thread::scope(|s| {
         let tree = tree_eligible.then(|| s.spawn(|| tree::resolve_tree(manager, rest, &parsed)));
         let outcomes = verdict::verify_all(&parsed.targets, &opts, &now, parsed.allow_prerelease);
