@@ -13,7 +13,7 @@ const NO_VERDICT_REASON: &str = "vulnerability verdict not checked";
 /// Version stamped on every `--json` document Corgea owns on stdout — the
 /// report body and every blocking `{"error"}` / `{"warning"}` document — so
 /// machine consumers can branch on the shape across install-gate phases.
-pub(super) const SCHEMA_VERSION: u32 = 1;
+pub(super) const SCHEMA_VERSION: u32 = 2;
 
 /// One honest stderr line when a zero-spec install can't be gated:
 /// yarn/pnpm/uv have no safe dry-run, so a bare install pulls its whole

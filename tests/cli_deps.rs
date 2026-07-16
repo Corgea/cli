@@ -297,6 +297,33 @@ fn cli_deps_help_includes_copy_paste_examples() {
 }
 
 #[test]
+fn cli_deps_nested_help_forms_both_work() {
+    // Both `corgea help deps scan` and `corgea deps help scan` must exit 0 and
+    // print the `deps scan` help. This regressed on ≤1.8.7; the guard keeps the
+    // two forms from silently diverging again.
+    let run = |args: &[&str]| -> String {
+        let (mut cmd, _home) = corgea_isolated();
+        let out = cmd.args(args).output().expect("failed to run corgea");
+        assert!(
+            out.status.success(),
+            "args: {args:?}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            stdout.contains("Usage: corgea deps scan"),
+            "args: {args:?}\nstdout: {stdout}"
+        );
+        stdout
+    };
+    assert_eq!(
+        run(&["help", "deps", "scan"]),
+        run(&["deps", "help", "scan"]),
+        "both nested-help forms must print identical help"
+    );
+}
+
+#[test]
 fn cli_deps_rejects_invalid_render_format() {
     let (mut cmd, _home) = corgea_isolated();
     let out = cmd

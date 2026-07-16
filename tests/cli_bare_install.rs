@@ -448,7 +448,7 @@ fn bare_npm_install_malicious_lockdep_json_tree_counts() {
     assert_eq!(out.status.code(), Some(1));
     let parsed: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
-    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(parsed["schema_version"], 2);
     assert_eq!(parsed["summary"]["tree"]["malicious"], 1);
     assert_eq!(
         parsed["summary"]["tree"]["vulnerable"], 0,

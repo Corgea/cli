@@ -173,7 +173,7 @@ fn uv_sync_without_lockfile_json_emits_single_empty_report() {
     );
     let parsed: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout must be one JSON document");
-    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(parsed["schema_version"], 2);
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("'uv sync' is not gated"),
         "the ungated note still goes to stderr: {}",

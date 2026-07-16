@@ -110,7 +110,7 @@ fn npm_ci_no_project_json_emits_single_empty_report() {
     assert_eq!(h.recorded_argv().as_deref(), Some("ci"), "npm still runs");
     let parsed: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout must be one JSON document");
-    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(parsed["schema_version"], 2);
     assert_eq!(parsed["summary"]["tree"]["resolved_count"], 0);
 }
 
@@ -132,7 +132,7 @@ fn npm_ci_no_lockfile_json_emits_single_empty_report() {
     assert_eq!(h.recorded_argv().as_deref(), Some("ci"), "npm still runs");
     let parsed: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout must be one JSON document");
-    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(parsed["schema_version"], 2);
 }
 
 #[test]
@@ -153,7 +153,7 @@ fn npm_ci_json_missing_binary_after_report_is_single_doc() {
     assert_eq!(out.status.code(), Some(127), "missing npm exits 127");
     let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
         .expect("stdout must be exactly one JSON document, not two concatenated");
-    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(parsed["schema_version"], 2);
     // The report (not an error doc) is what's on stdout; the binary-missing
     // message goes to stderr.
     assert_eq!(parsed["summary"]["tree"]["clean"], 2);
