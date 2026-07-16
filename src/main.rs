@@ -74,7 +74,7 @@ enum Commands {
 
         #[arg(
             long,
-            help = "Fail on (exits with error code 1) a specific severity level . Valid options are CR, HI, ME, LO."
+            help = "Fail (exit code 1) on the listed conditions. Comma-separated list of severity thresholds ('CR', 'HI', 'ME', 'LO' — trips at or above the level) and/or 'malicious' (trips when any dependency in the scan is classified malicious). Examples: 'HI', 'malicious', 'HI,malicious'."
         )]
         fail_on: Option<String>,
 
@@ -231,6 +231,9 @@ enum Commands {
 
 /// Shared flags for the install-wrapper subcommands (`corgea npm|pip`).
 #[derive(clap::Args, Debug, Clone)]
+// Free `-V/--version` into `cmd` so the wrappers forward it to the package
+// manager (`corgea --version` still prints the CLI version at the top level).
+#[command(disable_version_flag = true)]
 struct InstallWrapArgs {
     #[arg(
         long,
@@ -507,10 +510,8 @@ fn main() {
                     ::log::error!("fail_on is only supported with blast scanner.");
                     std::process::exit(1);
                 }
-                if !["CR", "HI", "LO", "ME"].contains(&level.as_str()) {
-                    ::log::error!(
-                        "Invalid fail_on option. Expected one of 'CR', 'HI', 'ME', 'LO'."
-                    );
+                if let Err(msg) = scanners::blast::parse_fail_on_tokens(level) {
+                    ::log::error!("{}", msg);
                     std::process::exit(1);
                 }
             }

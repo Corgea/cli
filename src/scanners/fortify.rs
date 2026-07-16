@@ -150,3 +150,52 @@ fn extract_file_path(scan_file: PathBuf) -> (String, Vec<String>) {
 
     (contents, paths)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Exercises the FVDL path extraction end to end on a representative
+    /// report: both the `Start` and `Empty` `SourceLocation` arms, XML entity
+    /// unescaping, in-`Vulnerability` scoping, and de-duplication. `fortify.rs`
+    /// had no coverage; this pins the behavior across the quick-xml 0.36 -> 0.41
+    /// bump (the migration replaced the deprecated `unescape_value` with
+    /// `normalized_value(XmlVersion::Implicit1_0)`, which must still resolve
+    /// `&amp;` -> `&` for source paths).
+    #[test]
+    fn extract_file_path_pulls_scoped_source_locations() {
+        let fvdl = r#"<?xml version="1.0" encoding="UTF-8"?>
+<FVDL>
+  <Vulnerabilities>
+    <Vulnerability>
+      <SourceLocation path="src/start/a&amp;b.java"></SourceLocation>
+      <SourceLocation path="src/empty/App.java" line="42"/>
+    </Vulnerability>
+    <Vulnerability>
+      <SourceLocation path="src/empty/App.java" line="99"/>
+    </Vulnerability>
+  </Vulnerabilities>
+  <SourceLocation path="outside/ignored.java" line="1"/>
+</FVDL>"#;
+
+        let mut tmp = tempfile::NamedTempFile::new().expect("create temp fvdl");
+        tmp.write_all(fvdl.as_bytes()).expect("write fvdl");
+        tmp.flush().expect("flush fvdl");
+
+        let (contents, paths) = extract_file_path(tmp.path().to_path_buf());
+
+        assert_eq!(contents, fvdl, "returns the raw scan contents unchanged");
+        assert_eq!(
+            paths,
+            vec![
+                // Start arm, with `&amp;` unescaped by normalized_value.
+                "src/start/a&b.java".to_string(),
+                // Empty arm, de-duplicated across the two Vulnerability blocks.
+                "src/empty/App.java".to_string(),
+            ],
+            "extracts in-Vulnerability SourceLocation paths, unescapes entities, \
+             ignores the out-of-scope SourceLocation, and de-duplicates"
+        );
+    }
+}

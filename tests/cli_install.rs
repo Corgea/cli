@@ -897,3 +897,34 @@ fn npm_github_shorthand_skips_verification_and_execs() {
         "stdout: {stdout}"
     );
 }
+
+#[test]
+fn wrapper_version_flag_forwards_to_manager() {
+    // `corgea npm --version` must reach the package manager, matching how
+    // every other wrapper token already delegates. On `main` clap intercepts
+    // `-V/--version` and prints `corgea-npm 1.9.1`; the PM never runs.
+    for (bin, flag) in [("npm", "--version"), ("npm", "-V"), ("pip", "--version")] {
+        let mut h = GateHarness::new().fake_recorder(bin, 0).build();
+        let out = h
+            .cmd
+            .args([bin, flag])
+            .output()
+            .expect("failed to run corgea");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{bin} {flag}: stderr {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            h.recorded_argv().as_deref(),
+            Some(flag),
+            "{bin} {flag}: the version flag must reach the package manager"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("corgea-"),
+            "{bin} {flag}: clap must not intercept the version flag; stdout: {stdout}"
+        );
+    }
+}

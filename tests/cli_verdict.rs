@@ -370,3 +370,64 @@ fn vuln_api_outage_warns_but_installs() {
         "stderr: {stderr}"
     );
 }
+
+#[test]
+fn small_set_emits_resolve_and_verdict_progress_on_stderr() {
+    // A 2-package set (≤ the old `>8` gate) must still narrate its phases on
+    // stderr — the reported "looks like a hang" symptom. Empty `checks` ⇒ the
+    // vuln-api stub answers clean, so the install proceeds and pip runs.
+    let mut h = pip_harness(HashMap::new(), HashMap::new(), None, 0);
+    let out = h
+        .cmd
+        .args(["pip", "install", "pkga==1.0.0", "pkgb==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "two clean pins proceed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        h.recorded_argv().as_deref(),
+        Some("install pkga==1.0.0 pkgb==1.0.0")
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("resolving named package targets"),
+        "stderr must narrate named resolution: {stderr}"
+    );
+    assert!(
+        stderr.contains("resolving the would-install dependency tree"),
+        "stderr must narrate tree resolution: {stderr}"
+    );
+    assert!(
+        stderr.contains("checking 2 packages against Corgea vuln-api"),
+        "stderr must narrate the verdict pass for a small set: {stderr}"
+    );
+}
+
+#[test]
+fn small_set_progress_keeps_json_stdout_clean() {
+    // Under --json the same stderr trail must appear while stdout stays exactly
+    // one parseable Corgea document.
+    let mut h = pip_harness(HashMap::new(), HashMap::new(), None, 0);
+    let out = h
+        .cmd
+        .args(["pip", "--json", "install", "pkga==1.0.0", "pkgb==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("resolving named package targets"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("checking 2 packages against Corgea vuln-api"),
+        "stderr: {stderr}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be exactly one JSON document");
+    assert_eq!(parsed["schema_version"], 1);
+}
