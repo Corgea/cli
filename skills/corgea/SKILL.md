@@ -219,7 +219,8 @@ advisory, or `null` when any advisory has no known fix. Known-malicious
 packages report a distinct verdict `status` of `malicious` (matches carry a
 `malware` boolean; each summary object carries a separate `malicious` count)
 and refuse with a distinct `known MALICIOUS package(s) detected` message;
-`remediation` applies to vulnerable and malicious verdicts alike. A top-level
+their `remediation` field is always `null` because malware must be removed,
+not upgraded. A top-level
 `recency_threshold_days` reports the active recency window (or `null` when
 the recency gate is off); pair it with each result's `age_seconds`.
 
