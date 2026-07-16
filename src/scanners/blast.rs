@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::targets;
 use crate::utils;
+use crate::utils::api::SCAIssue;
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
@@ -417,30 +418,122 @@ pub fn run(
     print!("\n\nThank you for using Corgea! 🐕\n\n");
 
     if let Some(fail_on) = fail_on {
-        match fail_on.as_str() {
-            "LO" if classifications.values().any(|&count| count > 0) => {
+        let tokens = match parse_fail_on_tokens(&fail_on) {
+            Ok(tokens) => tokens,
+            Err(msg) => {
+                log::error!("{}", msg);
                 std::process::exit(1);
             }
-            "ME" if (classifications.get("ME").is_some_and(|&count| count > 0)
-                || classifications.get("HI").is_some_and(|&count| count > 0)) =>
-            {
-                std::process::exit(1);
-            }
-            "HI" if (classifications.get("CR").is_some_and(|&count| count > 0)
-                || classifications.get("HI").is_some_and(|&count| count > 0)) =>
-            {
-                std::process::exit(1);
-            }
-            "CR" => {
-                if let Some(cr_count) = classifications.get("CR") {
-                    if *cr_count > 0 {
-                        std::process::exit(1);
-                    }
+        };
+
+        let severity_already_tripped = tokens
+            .iter()
+            .filter(|t| t.as_str() != "malicious")
+            .any(|t| severity_gate_trips(t, &classifications));
+        let needs_sca_fetch = !severity_already_tripped && tokens.iter().any(|t| t == "malicious");
+
+        let sca_issues = if needs_sca_fetch {
+            match utils::api::get_all_sca_issues(
+                &config.get_url(),
+                &project_name,
+                Some(scan_id.clone()),
+            ) {
+                Ok(issues) => issues,
+                Err(e) => {
+                    log::error!(
+                        "\n\nFailed to fetch SCA issues for --fail-on malicious: {}\n\n",
+                        e
+                    );
+                    std::process::exit(1);
                 }
             }
-            _ => (),
+        } else {
+            Vec::new()
+        };
+
+        if fail_on_gate_trips(&tokens, &classifications, &sca_issues) {
+            println!(
+                "\nExiting with error code 1: scan results matched --fail-on {}.",
+                fail_on
+            );
+            std::process::exit(1);
         }
     }
+}
+
+pub const VALID_FAIL_ON_TOKENS: [&str; 5] = ["CR", "HI", "ME", "LO", "malicious"];
+
+/// Parse and validate a comma-separated --fail-on value.
+/// "HI,malicious", "malicious", "CR" are all valid.
+pub fn parse_fail_on_tokens(fail_on: &str) -> Result<Vec<String>, String> {
+    let tokens: Vec<String> = fail_on
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let valid_options = || {
+        VALID_FAIL_ON_TOKENS
+            .iter()
+            .map(|t| format!("'{}'", t))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if tokens.is_empty() {
+        return Err(format!(
+            "Invalid fail_on option. Expected a comma-separated list of {}.",
+            valid_options()
+        ));
+    }
+    for token in &tokens {
+        if !VALID_FAIL_ON_TOKENS.contains(&token.as_str()) {
+            return Err(format!(
+                "Invalid fail_on option '{}'. Expected a comma-separated list of {}.",
+                token,
+                valid_options()
+            ));
+        }
+    }
+    Ok(tokens)
+}
+
+fn severity_rank(severity: &str) -> Option<u8> {
+    match severity {
+        "LO" => Some(0),
+        "ME" => Some(1),
+        "HI" => Some(2),
+        "CR" => Some(3),
+        _ => None,
+    }
+}
+
+/// At-or-above semantics: --fail-on ME trips on ME, HI, and CR.
+pub fn severity_gate_trips(threshold: &str, counts: &HashMap<String, usize>) -> bool {
+    let Some(threshold_rank) = severity_rank(threshold) else {
+        return false;
+    };
+    counts.iter().any(|(severity, &count)| {
+        count > 0 && severity_rank(severity).is_some_and(|rank| rank >= threshold_rank)
+    })
+}
+
+/// Any scan-scoped SCA issue classified malicious trips the gate.
+/// Merely-vulnerable issues (classification None or other) do not.
+pub fn malicious_gate_trips(sca_issues: &[SCAIssue]) -> bool {
+    sca_issues
+        .iter()
+        .any(|issue| issue.classification.as_deref() == Some("malicious"))
+}
+
+/// Comma-list OR semantics: ANY listed condition tripping fails the scan.
+pub fn fail_on_gate_trips(
+    tokens: &[String],
+    counts: &HashMap<String, usize>,
+    sca_issues: &[SCAIssue],
+) -> bool {
+    tokens.iter().any(|token| match token.as_str() {
+        "malicious" => malicious_gate_trips(sca_issues),
+        threshold => severity_gate_trips(threshold, counts),
+    })
 }
 
 pub fn wait_for_scan(config: &Config, scan_id: &str) {
@@ -556,4 +649,128 @@ pub fn report_scan_status(
     println!("{:-<20} | ", "");
     println!("{:<20} | {}", "Total", total_issues);
     Ok(classification_counts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::api::{SCAIssue, SCALocation, SCAPackage};
+
+    fn counts(pairs: &[(&str, usize)]) -> HashMap<String, usize> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    fn sca_issue(classification: Option<&str>) -> SCAIssue {
+        SCAIssue {
+            id: "issue-1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            description: None,
+            details: None,
+            severity: Some("CRITICAL".to_string()),
+            classification: classification.map(|c| c.to_string()),
+            cve: None,
+            package: SCAPackage {
+                name: "pkg".to_string(),
+                version: "1.0.0".to_string(),
+                ecosystem: "npm".to_string(),
+                fix_version: None,
+            },
+            location: SCALocation {
+                path: "package-lock.json".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn parse_accepts_single_severity_and_malicious_and_mixed_list() {
+        assert_eq!(parse_fail_on_tokens("CR").unwrap(), vec!["CR"]);
+        assert_eq!(
+            parse_fail_on_tokens("malicious").unwrap(),
+            vec!["malicious"]
+        );
+        assert_eq!(
+            parse_fail_on_tokens("HI, malicious").unwrap(),
+            vec!["HI", "malicious"]
+        );
+    }
+
+    #[test]
+    fn parse_rejects_invalid_and_empty_tokens() {
+        assert!(parse_fail_on_tokens("BAD").is_err());
+        assert!(parse_fail_on_tokens("HI,BAD").is_err());
+        assert!(parse_fail_on_tokens("").is_err());
+        assert!(parse_fail_on_tokens(",").is_err());
+    }
+
+    #[test]
+    fn severity_gate_me_trips_on_cr_only_scan() {
+        // Deliberate behavior fix: at-or-above (previously the ME arm omitted CR).
+        assert!(severity_gate_trips("ME", &counts(&[("CR", 1)])));
+    }
+
+    #[test]
+    fn severity_gate_at_or_above_matrix() {
+        assert!(severity_gate_trips("LO", &counts(&[("LO", 1)])));
+        assert!(severity_gate_trips("LO", &counts(&[("CR", 1)])));
+        assert!(severity_gate_trips("ME", &counts(&[("ME", 2)])));
+        assert!(severity_gate_trips("HI", &counts(&[("CR", 1)])));
+        assert!(severity_gate_trips("CR", &counts(&[("CR", 1)])));
+        assert!(!severity_gate_trips("CR", &counts(&[("HI", 5)])));
+        assert!(!severity_gate_trips("HI", &counts(&[("ME", 5), ("LO", 5)])));
+        assert!(!severity_gate_trips("ME", &counts(&[("LO", 5)])));
+        assert!(!severity_gate_trips("LO", &counts(&[])));
+        // zero-count buckets never trip
+        assert!(!severity_gate_trips("LO", &counts(&[("CR", 0)])));
+        // unknown severity strings never trip
+        assert!(!severity_gate_trips("LO", &counts(&[("NA", 3)])));
+    }
+
+    #[test]
+    fn malicious_gate_trips_only_on_malicious_classification() {
+        assert!(malicious_gate_trips(&[sca_issue(Some("malicious"))]));
+        assert!(malicious_gate_trips(&[
+            sca_issue(None),
+            sca_issue(Some("malicious"))
+        ]));
+        // merely-vulnerable (classification None) does NOT trip
+        assert!(!malicious_gate_trips(&[sca_issue(None)]));
+        assert!(!malicious_gate_trips(&[sca_issue(Some("other"))]));
+        assert!(!malicious_gate_trips(&[]));
+    }
+
+    #[test]
+    fn fail_on_gate_composes_comma_list_with_or_semantics() {
+        let tokens = |s: &str| parse_fail_on_tokens(s).unwrap();
+
+        // HI,malicious: severity side alone trips (CR is at-or-above HI)
+        assert!(fail_on_gate_trips(
+            &tokens("HI,malicious"),
+            &counts(&[("CR", 1)]),
+            &[]
+        ));
+        // HI,malicious: malicious side alone trips
+        assert!(fail_on_gate_trips(
+            &tokens("HI,malicious"),
+            &counts(&[("LO", 1)]),
+            &[sca_issue(Some("malicious"))]
+        ));
+        // HI,malicious: neither side trips
+        assert!(!fail_on_gate_trips(
+            &tokens("HI,malicious"),
+            &counts(&[("LO", 1)]),
+            &[sca_issue(None)]
+        ));
+        // malicious alone: severity findings never trip it, merely-vulnerable passes
+        assert!(!fail_on_gate_trips(
+            &tokens("malicious"),
+            &counts(&[("CR", 9)]),
+            &[sca_issue(None)]
+        ));
+        // severity alone: SCA issues never trip it
+        assert!(!fail_on_gate_trips(
+            &tokens("CR"),
+            &counts(&[("LO", 1)]),
+            &[sca_issue(Some("malicious"))]
+        ));
+    }
 }
