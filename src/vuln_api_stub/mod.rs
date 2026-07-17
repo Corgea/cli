@@ -5,6 +5,21 @@ use std::thread;
 
 pub type PackageKey = (String, String, String);
 
+pub type ProfileKey = (String, String);
+
+/// `(ecosystem, name)` key for the profile route table — same
+/// lowercase+trim rule as `key()`.
+pub fn profile_key(eco: &str, name: &str) -> ProfileKey {
+    (eco.to_string(), name.trim().to_lowercase())
+}
+
+/// Profile body helper for tests: a package block plus `advisories`.
+pub fn profile_body(ecosystem: &str, name: &str, advisories_json: &str) -> String {
+    format!(
+        r#"{{"package":{{"ecosystem":"{ecosystem}","name":"{name}"}},"advisories":{advisories_json}}}"#
+    )
+}
+
 /// `(ecosystem, name, version)` key for the stub's route tables. Applies the
 /// REAL server's normalization (worker.js `normalizePackageName`: lowercase
 /// and trim, NOT PEP 503) on both the fixture and lookup sides. The stub
@@ -61,6 +76,30 @@ pub fn spawn_with_retry_once(
         status_overrides,
         retry_once,
         HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        None,
+    )
+}
+
+/// Like [`spawn_with_statuses`], plus a profile route table for
+/// `/v1/packages/{eco}/{name}`. Unknown profile keys answer 404
+/// ("Package not found"), matching the real handler — unlike /check's
+/// synthesized clean. `profile_statuses` overrides the status for a
+/// scripted key (e.g. 500), like `status_overrides` does for /check.
+pub fn spawn_with_profiles(
+    package_checks: HashMap<PackageKey, String>,
+    status_overrides: HashMap<PackageKey, u16>,
+    package_profiles: HashMap<ProfileKey, String>,
+    profile_statuses: HashMap<ProfileKey, u16>,
+) -> VulnApiStub {
+    spawn(
+        package_checks,
+        status_overrides,
+        HashSet::new(),
+        HashMap::new(),
+        package_profiles,
+        profile_statuses,
         None,
     )
 }
@@ -81,6 +120,8 @@ pub fn spawn_with_drops(
         status_overrides,
         HashSet::new(),
         drops,
+        HashMap::new(),
+        HashMap::new(),
         None,
     )
 }
@@ -95,6 +136,8 @@ pub fn spawn_capturing_vuln_api_stub() -> (String, std::sync::Arc<std::sync::Mut
         HashMap::new(),
         HashSet::new(),
         HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
         Some(std::sync::Arc::clone(&requests)),
     );
     // Dropping the stub's join handle detaches the listener thread; the
@@ -102,11 +145,14 @@ pub fn spawn_capturing_vuln_api_stub() -> (String, std::sync::Arc<std::sync::Mut
     (stub.base_url, requests)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn(
     package_checks: HashMap<PackageKey, String>,
     status_overrides: HashMap<PackageKey, u16>,
     retry_once: HashSet<PackageKey>,
     drops: HashMap<PackageKey, usize>,
+    package_profiles: HashMap<ProfileKey, String>,
+    profile_statuses: HashMap<ProfileKey, u16>,
     capture: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 ) -> VulnApiStub {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
@@ -126,6 +172,8 @@ fn spawn(
                 &status_overrides,
                 &mut pending_retries,
                 &mut pending_drops,
+                &package_profiles,
+                &profile_statuses,
                 capture.as_deref(),
             );
         }
@@ -178,12 +226,15 @@ pub fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
     buf
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_connection(
     stream: &mut std::net::TcpStream,
     package_checks: &HashMap<PackageKey, String>,
     status_overrides: &HashMap<PackageKey, u16>,
     pending_retries: &mut HashSet<PackageKey>,
     pending_drops: &mut HashMap<PackageKey, usize>,
+    package_profiles: &HashMap<ProfileKey, String>,
+    profile_statuses: &HashMap<ProfileKey, u16>,
     capture: Option<&std::sync::Mutex<Vec<String>>>,
 ) {
     let buf = read_http_request(stream);
@@ -227,6 +278,29 @@ fn handle_connection(
                         .unwrap_or_else(|| default_clean_response(&key.0, &key.1, &key.2));
                     let status = status_overrides.get(&key).copied().unwrap_or(200);
                     (status, body, false)
+                }
+            } else if parts.len() >= 4
+                && parts[0] == "v1"
+                && parts[1] == "packages"
+                && !(parts.len() >= 6 && parts[parts.len() - 2] == "versions")
+            {
+                // Version-route shape excluded by position, not by segment
+                // value, so a package literally named "versions" still
+                // resolves as a profile (matching the worker's catch-all).
+                let name = urlencoding::decode(&parts[3..].join("/"))
+                    .unwrap_or_default()
+                    .into_owned();
+                let key = profile_key(parts[2], &name);
+                match package_profiles.get(&key) {
+                    Some(body) => {
+                        let status = profile_statuses.get(&key).copied().unwrap_or(200);
+                        (status, body.clone(), false)
+                    }
+                    None => match profile_statuses.get(&key) {
+                        // Status-only script (e.g. 500 with a canned error body).
+                        Some(&status) => (status, r#"{"error":"scripted"}"#.to_string(), false),
+                        None => (404, r#"{"error":"Package not found"}"#.to_string(), false),
+                    },
                 }
             } else {
                 (404, NOT_FOUND_BODY.to_string(), false)
@@ -348,5 +422,34 @@ mod tests {
             "/v1/packages/pypi/flask-cors/versions/4.0.0/check",
         );
         assert!(resp.contains(r#""is_vulnerable":false"#), "resp: {resp}");
+    }
+
+    #[test]
+    fn scripted_profile_and_status_override() {
+        let profiles = HashMap::from([(
+            profile_key("npm", "axios"),
+            profile_body("npm", "axios", r#"[{"id":"GHSA-test"}]"#),
+        )]);
+        let profile_statuses = HashMap::from([(profile_key("npm", "flaky"), 500u16)]);
+        let stub = spawn_with_profiles(HashMap::new(), HashMap::new(), profiles, profile_statuses);
+
+        // Scripted body → 200.
+        let resp = get(&stub.base_url, "/v1/packages/npm/axios");
+        assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
+        assert!(resp.contains("GHSA-test"), "resp: {resp}");
+
+        // Unknown key → 404 "Package not found" (not default-clean).
+        let resp = get(&stub.base_url, "/v1/packages/npm/unknown");
+        assert!(resp.starts_with("HTTP/1.1 404"), "resp: {resp}");
+        assert!(resp.contains("Package not found"), "resp: {resp}");
+
+        // Status-only override → 500.
+        let resp = get(&stub.base_url, "/v1/packages/npm/flaky");
+        assert!(resp.starts_with("HTTP/1.1 500"), "resp: {resp}");
+
+        // A package literally named "versions" is a profile, not a version route.
+        let resp = get(&stub.base_url, "/v1/packages/npm/versions");
+        assert!(resp.starts_with("HTTP/1.1 404"), "resp: {resp}");
+        assert!(resp.contains("Package not found"), "resp: {resp}");
     }
 }

@@ -1,6 +1,7 @@
 //! Report rendering: text output, refusal line, fix/steer helpers.
 
 use crate::verify_deps;
+use crate::vuln_api::{highest_fix, safe_version};
 
 use super::{
     PackageManager, PrecheckOptions, PrecheckReport, TargetOutcome, TreeOrigin, TreeReport,
@@ -121,45 +122,6 @@ fn fix_note(m: &crate::vuln_api::VulnMatch) -> String {
         Some(v) => format!(" — fixed in {v}"),
         None => " — no fixed version known".to_string(),
     }
-}
-
-/// Highest of `fixes` after sort/dedup: a single distinct value is returned
-/// as-is (no parsing — preserves odd-but-unambiguous forms); several distinct
-/// values compare by lenient semver. With `all_must_parse`, one unparsable
-/// candidate among several poisons the answer (`None`); otherwise unparsable
-/// candidates are skipped.
-fn highest_fix(mut fixes: Vec<&str>, all_must_parse: bool) -> Option<String> {
-    fixes.sort_unstable();
-    fixes.dedup();
-    match fixes.as_slice() {
-        [] => None,
-        [only] => Some((*only).to_string()),
-        many => {
-            let mut parsed = Vec::with_capacity(many.len());
-            for raw in many {
-                match semver::Version::parse(&verify_deps::registry::normalize_for_semver(raw)) {
-                    Ok(v) => parsed.push((v, *raw)),
-                    Err(_) if all_must_parse => return None,
-                    Err(_) => {}
-                }
-            }
-            parsed
-                .into_iter()
-                .max_by(|(a, _), (b, _)| a.cmp(b))
-                .map(|(_, raw)| raw.to_string())
-        }
-    }
-}
-
-/// The one version certified to clear every match. Requires every match to
-/// carry a `fixed_version`; any match without one — or an unparsable
-/// candidate among several — means no version can be certified, so `None`.
-fn safe_version(matches: &[crate::vuln_api::VulnMatch]) -> Option<String> {
-    let fixes: Vec<&str> = matches
-        .iter()
-        .map(|m| m.fixed_version.as_deref())
-        .collect::<Option<_>>()?;
-    highest_fix(fixes, true)
 }
 
 /// Highest `fixed_version` the advisories advertise, by lenient semver.
@@ -603,61 +565,6 @@ mod tests {
     use super::super::test_support::*;
     use super::super::TreeOutcome;
     use super::*;
-
-    #[test]
-    fn safe_version_single_fix() {
-        assert_eq!(
-            safe_version(&[vm("A-1", Some("2.0.0"))]),
-            Some("2.0.0".to_string())
-        );
-    }
-
-    #[test]
-    fn safe_version_duplicate_fixes_collapse_without_parsing() {
-        // "1.0rc1" is unparsable, but a single distinct value needs no parse.
-        assert_eq!(
-            safe_version(&[vm("A-1", Some("1.0rc1")), vm("A-2", Some("1.0rc1"))]),
-            Some("1.0rc1".to_string())
-        );
-    }
-
-    #[test]
-    fn safe_version_picks_highest_of_distinct_fixes() {
-        // Semver order, not lexical ("1.2.0" > "1.10.0" lexically).
-        assert_eq!(
-            safe_version(&[vm("A-1", Some("1.2.0")), vm("A-2", Some("1.10.0"))]),
-            Some("1.10.0".to_string())
-        );
-    }
-
-    #[test]
-    fn safe_version_two_component_versions_normalize() {
-        assert_eq!(
-            safe_version(&[vm("A-1", Some("4.0")), vm("A-2", Some("3.2.5"))]),
-            Some("4.0".to_string())
-        );
-    }
-
-    #[test]
-    fn safe_version_mixed_fix_and_none_is_none() {
-        assert_eq!(
-            safe_version(&[vm("A-1", Some("2.0.0")), vm("A-2", None)]),
-            None
-        );
-    }
-
-    #[test]
-    fn safe_version_unparsable_among_distinct_is_none() {
-        assert_eq!(
-            safe_version(&[vm("A-1", Some("2!1.0")), vm("A-2", Some("1.0.0"))]),
-            None
-        );
-    }
-
-    #[test]
-    fn safe_version_empty_matches_is_none() {
-        assert_eq!(safe_version(&[]), None);
-    }
 
     #[test]
     fn error_prefix_strips_parenthesized_detail() {

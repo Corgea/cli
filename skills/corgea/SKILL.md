@@ -131,6 +131,51 @@ Agent environments default to compact TSV; force output with `--format human|age
 Notes: `deps scan --out-format table|json|sarif` is the report/export selector; do not combine it with `deps scan --format`.
 <!-- END GENERATED CORGEA DEPS SKILL -->
 
+### Advisories — `corgea advisories check`
+
+Query Corgea's vulnerability database for a package **before** choosing or
+installing it. Read-only: it reports, never blocks. Network access to the
+vuln-api is required. The package-level form needs no token; the versioned
+form uses the same auth story as the install gate (a Corgea token is
+attached automatically when logged in on the default vuln-api, and the
+production version-check route may require one — a tokenless 401 exits 2
+with a clear message).
+
+**Before adding or choosing a dependency version, run
+`corgea advisories check <ecosystem> <package>` to see its advisory history,
+then `corgea advisories check <ecosystem> <package>@<version>` once you have
+a candidate version. Pick the safe version the output steers to. The install
+gate (`corgea npm|pip|...`) remains the backstop.**
+
+```bash
+corgea advisories check npm axios            # axios's advisory history (up to 100 most recent)
+corgea advisories check npm axios@1.0.0      # verdict for one exact version
+corgea advisories check pypi requests@2.31.0 # pypi (pip is accepted as an alias)
+corgea advisories check npm axios@1.0.0 --json  # stable machine-readable document
+```
+
+| Exit code | Meaning |
+|-----------|---------|
+| 0 | Clean: no advisories for the version, no advisories for the package, or package unknown to the database |
+| 1 | Advisories found (versioned: vulnerable; unversioned: at least one advisory linked) |
+| 2 | Error: network, auth, parse, or bad arguments |
+
+Versions must be exact (`1.2.3`, not `^1.2`). The versioned form gives the
+same verdict the install gate enforces — advisory IDs, severities,
+`fixed in <version>` notes, and a `→ safe version:` steer when every
+advisory has a fix. The unversioned form lists the package's advisory
+history (id, severity, cvss, tier, kev/malware markers) so you can pick a
+version with a clean record; it has no fix data, so follow up with the
+versioned form. `--json` emits one `schema_version: 1` document on stdout
+(`verdict` object for the versioned form — same vocabulary as the install
+gate's `--json`; `found` + `advisories[]` + `possibly_truncated` for the
+unversioned form — the listing caps at 100 advisories and
+`possibly_truncated: true` means more may exist). Errors after arguments
+parse (network, auth, unknown package spec, bad version) emit
+`{"schema_version":1,"error":...}` on stdout and exit 2; malformed
+command-line usage (missing arguments, unknown flags) gets the CLI's
+standard usage text on stderr instead, also exit 2.
+
 ### Install Wrappers — `corgea pip|npm|yarn|pnpm|uv <args...>`
 
 Run a package manager through Corgea's install gate. Install commands with

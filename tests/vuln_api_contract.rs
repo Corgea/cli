@@ -16,8 +16,13 @@
 
 mod common;
 
-use corgea::vuln_api::{check_package_version, http_client, Ecosystem, VulnCheckResponse};
-use corgea::vuln_api_stub::{key, spawn_with_statuses, vulnerable_body};
+use corgea::vuln_api::{
+    check_package_version, fetch_package_profile, http_client, Ecosystem, PackageProfile,
+    VulnCheckResponse,
+};
+use corgea::vuln_api_stub::{
+    key, profile_key, spawn_with_profiles, spawn_with_statuses, vulnerable_body,
+};
 use std::collections::HashMap;
 
 const STAGING_URL: &str = "https://cve-worker-staging.corgea.workers.dev";
@@ -124,6 +129,41 @@ fn stub_server_error_surfaces_as_unavailable() {
     assert!(err.to_string().contains("unavailable (HTTP 503)"));
 }
 
+#[test]
+fn fixture_package_profile_deserializes() {
+    // The committed profile fixture (full server serialization) must
+    // deserialize into the CLI's tolerant subset — ignored fields and all.
+    let parsed: PackageProfile =
+        serde_json::from_str(&fixture_body("package_profile.json")).expect("parse profile fixture");
+    assert_eq!(parsed.package.ecosystem, "npm");
+    assert_eq!(parsed.package.name, "axios");
+    assert_eq!(parsed.advisories.len(), 2);
+    assert!(parsed.advisories.iter().any(|a| a.malware == Some(true)));
+}
+
+#[test]
+fn stub_profile_roundtrip_and_not_found() {
+    let stub = spawn_with_profiles(
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::from([(
+            profile_key("npm", "axios"),
+            fixture_body("package_profile.json"),
+        )]),
+        HashMap::new(),
+    );
+    let client = http_client().expect("client");
+    let profile = fetch_package_profile(&client, &stub.base_url, None, Ecosystem::Npm, "axios")
+        .unwrap()
+        .expect("known package should be Some");
+    assert_eq!(profile.advisories.len(), 2);
+
+    let missing =
+        fetch_package_profile(&client, &stub.base_url, None, Ecosystem::Npm, "no-such-pkg")
+            .unwrap();
+    assert!(missing.is_none(), "unknown package profile is Ok(None)");
+}
+
 // ---- staging (network, deterministic targets) ----
 
 fn assert_staging_vulnerable(ecosystem: Ecosystem, name: &str, version: &str) {
@@ -175,4 +215,32 @@ fn staging_unknown_package_is_clean() {
     .unwrap();
     assert!(!verdict.is_vulnerable);
     assert!(verdict.matches.is_empty());
+}
+
+#[test]
+#[ignore = "network: hits the staging vuln-api"]
+fn staging_axios_profile_lists_advisories() {
+    let client = http_client().expect("client");
+    let profile = fetch_package_profile(&client, STAGING_URL, None, Ecosystem::Npm, "axios")
+        .unwrap()
+        .expect("axios should have a profile row");
+    assert!(
+        !profile.advisories.is_empty(),
+        "axios profile should list advisories"
+    );
+}
+
+#[test]
+#[ignore = "network: hits the staging vuln-api"]
+fn staging_unknown_package_profile_is_none() {
+    let client = http_client().expect("client");
+    let profile = fetch_package_profile(
+        &client,
+        STAGING_URL,
+        None,
+        Ecosystem::Npm,
+        "corgea-contract-test-nonexistent",
+    )
+    .unwrap();
+    assert!(profile.is_none(), "unknown package profile is Ok(None)");
 }
