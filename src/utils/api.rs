@@ -1095,6 +1095,7 @@ pub struct SCAIssue {
     pub description: Option<String>,
     pub details: Option<String>,
     pub severity: Option<String>,
+    pub classification: Option<String>,
     pub cve: Option<String>,
     pub package: SCAPackage,
     pub location: SCALocation,

@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::targets;
 use crate::utils;
-use crate::utils::api::ScanResponse;
+use crate::utils::api::{SCAIssue, ScanResponse};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
 use std::env;
@@ -50,36 +50,69 @@ pub fn run(
     }
 
     let project_name = utils::generic::determine_project_name(project_name.as_deref());
-    let repo_info = utils::generic::get_repo_info("./").unwrap_or_default();
+    let mut repo_info = utils::generic::get_repo_info("./").unwrap_or_default();
+    // Detached HEAD (common in CI): fill branch from CI metadata so skip and
+    // upload agree on the same branch name.
+    if let Some(ref mut info) = repo_info {
+        if info
+            .branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .is_none()
+        {
+            info.branch = resolve_skip_branch(None);
+        }
+    }
 
     if *skip_if_scanned {
-        if let Some(ref info) = repo_info {
-            // Require both SHA and branch so detached-HEAD / unknown-branch
-            // never matches a null-branch scan by accident.
-            if let (Some(sha), Some(branch)) = (info.sha.as_deref(), info.branch.as_deref()) {
-                if let Ok(resp) = utils::api::query_scan_list(
-                    &config.get_url(),
-                    Some(&project_name),
-                    Some(1),
-                    None,
-                    Some(branch),
-                    Some(sha),
-                ) {
-                    let scans = resp.scans.unwrap_or_default();
-                    let now = Utc::now();
-                    if let Some(scan) = find_recent_matching_scan(&scans, sha, Some(branch), now) {
-                        let age = parse_created_at(&scan.created_at)
-                            .map(|created| format_scan_age(created, now))
-                            .unwrap_or_else(|| "recently".to_string());
-                        let short_sha: String = sha.chars().take(8).collect();
-                        println!(
-                            "Skipping scan: commit {} on {} was already scanned {} (scan {}).",
-                            short_sha, branch, age, scan.id
-                        );
-                        return;
+        match &repo_info {
+            None => {
+                println!("--skip-if-scanned: not a git repository; scanning normally.");
+            }
+            Some(_) if utils::generic::is_working_tree_dirty("./") => {
+                println!(
+                    "--skip-if-scanned: working tree has uncommitted changes; scanning normally."
+                );
+            }
+            Some(info) => match (info.sha.as_deref(), info.branch.as_deref()) {
+                (Some(sha), Some(branch)) => {
+                    if let Ok(resp) = utils::api::query_scan_list(
+                        &config.get_url(),
+                        Some(&project_name),
+                        Some(1),
+                        None,
+                        Some(branch),
+                        Some(sha),
+                    ) {
+                        let scans = resp.scans.unwrap_or_default();
+                        let now = Utc::now();
+                        if let Some(scan) =
+                            find_recent_matching_scan(&scans, sha, Some(branch), now)
+                        {
+                            let age = parse_created_at(&scan.created_at)
+                                .map(|created| format_scan_age(created, now))
+                                .unwrap_or_else(|| "recently".to_string());
+                            let short_sha: String = sha.chars().take(8).collect();
+                            println!(
+                                "Skipping scan: commit {} on {} was already scanned {} (scan {}).",
+                                short_sha, branch, age, scan.id
+                            );
+                            return;
+                        }
                     }
                 }
-            }
+                (None, _) => {
+                    println!(
+                        "--skip-if-scanned: could not determine commit SHA; scanning normally."
+                    );
+                }
+                (_, None) => {
+                    println!(
+                        "--skip-if-scanned: could not determine branch (detached HEAD without CI metadata); scanning normally."
+                    );
+                }
+            },
         }
     }
 
@@ -456,30 +489,122 @@ pub fn run(
     print!("\n\nThank you for using Corgea! 🐕\n\n");
 
     if let Some(fail_on) = fail_on {
-        match fail_on.as_str() {
-            "LO" if classifications.values().any(|&count| count > 0) => {
+        let tokens = match parse_fail_on_tokens(&fail_on) {
+            Ok(tokens) => tokens,
+            Err(msg) => {
+                log::error!("{}", msg);
                 std::process::exit(1);
             }
-            "ME" if (classifications.get("ME").is_some_and(|&count| count > 0)
-                || classifications.get("HI").is_some_and(|&count| count > 0)) =>
-            {
-                std::process::exit(1);
-            }
-            "HI" if (classifications.get("CR").is_some_and(|&count| count > 0)
-                || classifications.get("HI").is_some_and(|&count| count > 0)) =>
-            {
-                std::process::exit(1);
-            }
-            "CR" => {
-                if let Some(cr_count) = classifications.get("CR") {
-                    if *cr_count > 0 {
-                        std::process::exit(1);
-                    }
+        };
+
+        let severity_already_tripped = tokens
+            .iter()
+            .filter(|t| t.as_str() != "malicious")
+            .any(|t| severity_gate_trips(t, &classifications));
+        let needs_sca_fetch = !severity_already_tripped && tokens.iter().any(|t| t == "malicious");
+
+        let sca_issues = if needs_sca_fetch {
+            match utils::api::get_all_sca_issues(
+                &config.get_url(),
+                &project_name,
+                Some(scan_id.clone()),
+            ) {
+                Ok(issues) => issues,
+                Err(e) => {
+                    log::error!(
+                        "\n\nFailed to fetch SCA issues for --fail-on malicious: {}\n\n",
+                        e
+                    );
+                    std::process::exit(1);
                 }
             }
-            _ => (),
+        } else {
+            Vec::new()
+        };
+
+        if fail_on_gate_trips(&tokens, &classifications, &sca_issues) {
+            println!(
+                "\nExiting with error code 1: scan results matched --fail-on {}.",
+                fail_on
+            );
+            std::process::exit(1);
         }
     }
+}
+
+pub const VALID_FAIL_ON_TOKENS: [&str; 5] = ["CR", "HI", "ME", "LO", "malicious"];
+
+/// Parse and validate a comma-separated --fail-on value.
+/// "HI,malicious", "malicious", "CR" are all valid.
+pub fn parse_fail_on_tokens(fail_on: &str) -> Result<Vec<String>, String> {
+    let tokens: Vec<String> = fail_on
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let valid_options = || {
+        VALID_FAIL_ON_TOKENS
+            .iter()
+            .map(|t| format!("'{}'", t))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if tokens.is_empty() {
+        return Err(format!(
+            "Invalid fail_on option. Expected a comma-separated list of {}.",
+            valid_options()
+        ));
+    }
+    for token in &tokens {
+        if !VALID_FAIL_ON_TOKENS.contains(&token.as_str()) {
+            return Err(format!(
+                "Invalid fail_on option '{}'. Expected a comma-separated list of {}.",
+                token,
+                valid_options()
+            ));
+        }
+    }
+    Ok(tokens)
+}
+
+fn severity_rank(severity: &str) -> Option<u8> {
+    match severity {
+        "LO" => Some(0),
+        "ME" => Some(1),
+        "HI" => Some(2),
+        "CR" => Some(3),
+        _ => None,
+    }
+}
+
+/// At-or-above semantics: --fail-on ME trips on ME, HI, and CR.
+pub fn severity_gate_trips(threshold: &str, counts: &HashMap<String, usize>) -> bool {
+    let Some(threshold_rank) = severity_rank(threshold) else {
+        return false;
+    };
+    counts.iter().any(|(severity, &count)| {
+        count > 0 && severity_rank(severity).is_some_and(|rank| rank >= threshold_rank)
+    })
+}
+
+/// Any scan-scoped SCA issue classified malicious trips the gate.
+/// Merely-vulnerable issues (classification None or other) do not.
+pub fn malicious_gate_trips(sca_issues: &[SCAIssue]) -> bool {
+    sca_issues
+        .iter()
+        .any(|issue| issue.classification.as_deref() == Some("malicious"))
+}
+
+/// Comma-list OR semantics: ANY listed condition tripping fails the scan.
+pub fn fail_on_gate_trips(
+    tokens: &[String],
+    counts: &HashMap<String, usize>,
+    sca_issues: &[SCAIssue],
+) -> bool {
+    tokens.iter().any(|token| match token.as_str() {
+        "malicious" => malicious_gate_trips(sca_issues),
+        threshold => severity_gate_trips(threshold, counts),
+    })
 }
 
 pub fn wait_for_scan(config: &Config, scan_id: &str) {
@@ -623,6 +748,30 @@ pub fn metadata_json_from_pairs(pairs: &[String]) -> Result<Option<String>, Stri
     }
 }
 
+/// Branch for skip matching: local git branch, else common CI metadata
+/// (`GITHUB_HEAD_REF` / `GITHUB_REF_NAME` / `CI_COMMIT_BRANCH` / `CI_COMMIT_REF_NAME`)
+/// so detached-HEAD checkouts in CI can still skip.
+fn resolve_skip_branch(repo_branch: Option<&str>) -> Option<String> {
+    if let Some(branch) = repo_branch.map(str::trim).filter(|b| !b.is_empty()) {
+        return Some(branch.to_string());
+    }
+    for key in [
+        "GITHUB_HEAD_REF",
+        "GITHUB_REF_NAME",
+        "CI_COMMIT_BRANCH",
+        "CI_COMMIT_REF_NAME",
+    ] {
+        if let Some(branch) = env::var(key)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            return Some(branch);
+        }
+    }
+    None
+}
+
 fn find_recent_matching_scan<'a>(
     scans: &'a [ScanResponse],
     local_sha: &str,
@@ -631,6 +780,10 @@ fn find_recent_matching_scan<'a>(
 ) -> Option<&'a ScanResponse> {
     scans.iter().find(|scan| {
         if !scan.status.eq_ignore_ascii_case("complete") {
+            return false;
+        }
+        // BLAST uploads store engine as "corgea-blast"; never skip on Semgrep/Snyk/etc.
+        if !scan.engine.eq_ignore_ascii_case("corgea-blast") {
             return false;
         }
         if scan.git_sha.as_deref() != Some(local_sha) {
@@ -672,6 +825,127 @@ fn format_scan_age(created: DateTime<Utc>, now: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::api::{SCAIssue, SCALocation, SCAPackage};
+
+    fn counts(pairs: &[(&str, usize)]) -> HashMap<String, usize> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    fn sca_issue(classification: Option<&str>) -> SCAIssue {
+        SCAIssue {
+            id: "issue-1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            description: None,
+            details: None,
+            severity: Some("CRITICAL".to_string()),
+            classification: classification.map(|c| c.to_string()),
+            cve: None,
+            package: SCAPackage {
+                name: "pkg".to_string(),
+                version: "1.0.0".to_string(),
+                ecosystem: "npm".to_string(),
+                fix_version: None,
+            },
+            location: SCALocation {
+                path: "package-lock.json".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn parse_accepts_single_severity_and_malicious_and_mixed_list() {
+        assert_eq!(parse_fail_on_tokens("CR").unwrap(), vec!["CR"]);
+        assert_eq!(
+            parse_fail_on_tokens("malicious").unwrap(),
+            vec!["malicious"]
+        );
+        assert_eq!(
+            parse_fail_on_tokens("HI, malicious").unwrap(),
+            vec!["HI", "malicious"]
+        );
+    }
+
+    #[test]
+    fn parse_rejects_invalid_and_empty_tokens() {
+        assert!(parse_fail_on_tokens("BAD").is_err());
+        assert!(parse_fail_on_tokens("HI,BAD").is_err());
+        assert!(parse_fail_on_tokens("").is_err());
+        assert!(parse_fail_on_tokens(",").is_err());
+    }
+
+    #[test]
+    fn severity_gate_me_trips_on_cr_only_scan() {
+        // Deliberate behavior fix: at-or-above (previously the ME arm omitted CR).
+        assert!(severity_gate_trips("ME", &counts(&[("CR", 1)])));
+    }
+
+    #[test]
+    fn severity_gate_at_or_above_matrix() {
+        assert!(severity_gate_trips("LO", &counts(&[("LO", 1)])));
+        assert!(severity_gate_trips("LO", &counts(&[("CR", 1)])));
+        assert!(severity_gate_trips("ME", &counts(&[("ME", 2)])));
+        assert!(severity_gate_trips("HI", &counts(&[("CR", 1)])));
+        assert!(severity_gate_trips("CR", &counts(&[("CR", 1)])));
+        assert!(!severity_gate_trips("CR", &counts(&[("HI", 5)])));
+        assert!(!severity_gate_trips("HI", &counts(&[("ME", 5), ("LO", 5)])));
+        assert!(!severity_gate_trips("ME", &counts(&[("LO", 5)])));
+        assert!(!severity_gate_trips("LO", &counts(&[])));
+        // zero-count buckets never trip
+        assert!(!severity_gate_trips("LO", &counts(&[("CR", 0)])));
+        // unknown severity strings never trip
+        assert!(!severity_gate_trips("LO", &counts(&[("NA", 3)])));
+    }
+
+    #[test]
+    fn malicious_gate_trips_only_on_malicious_classification() {
+        assert!(malicious_gate_trips(&[sca_issue(Some("malicious"))]));
+        assert!(malicious_gate_trips(&[
+            sca_issue(None),
+            sca_issue(Some("malicious"))
+        ]));
+        // merely-vulnerable (classification None) does NOT trip
+        assert!(!malicious_gate_trips(&[sca_issue(None)]));
+        assert!(!malicious_gate_trips(&[sca_issue(Some("other"))]));
+        assert!(!malicious_gate_trips(&[]));
+    }
+
+    #[test]
+    fn fail_on_gate_composes_comma_list_with_or_semantics() {
+        let tokens = |s: &str| parse_fail_on_tokens(s).unwrap();
+
+        // HI,malicious: severity side alone trips (CR is at-or-above HI)
+        assert!(fail_on_gate_trips(
+            &tokens("HI,malicious"),
+            &counts(&[("CR", 1)]),
+            &[]
+        ));
+        // HI,malicious: malicious side alone trips
+        assert!(fail_on_gate_trips(
+            &tokens("HI,malicious"),
+            &counts(&[("LO", 1)]),
+            &[sca_issue(Some("malicious"))]
+        ));
+        // HI,malicious: neither side trips
+        assert!(!fail_on_gate_trips(
+            &tokens("HI,malicious"),
+            &counts(&[("LO", 1)]),
+            &[sca_issue(None)]
+        ));
+        // malicious alone: severity findings never trip it, merely-vulnerable passes
+        assert!(!fail_on_gate_trips(
+            &tokens("malicious"),
+            &counts(&[("CR", 9)]),
+            &[sca_issue(None)]
+        ));
+        // severity alone: SCA issues never trip it
+        assert!(!fail_on_gate_trips(
+            &tokens("CR"),
+            &counts(&[("LO", 1)]),
+            &[sca_issue(Some("malicious"))]
+        ));
+    }
+
+    // --skip-if-scanned helpers
 
     fn scan(
         id: &str,
@@ -680,13 +954,24 @@ mod tests {
         status: &str,
         created_at: &str,
     ) -> ScanResponse {
+        scan_with_engine(id, sha, branch, status, "corgea-blast", created_at)
+    }
+
+    fn scan_with_engine(
+        id: &str,
+        sha: Option<&str>,
+        branch: Option<&str>,
+        status: &str,
+        engine: &str,
+        created_at: &str,
+    ) -> ScanResponse {
         ScanResponse {
             id: id.to_string(),
             project: "proj".to_string(),
             repo: None,
             branch: branch.map(str::to_string),
             status: status.to_string(),
-            engine: "blast".to_string(),
+            engine: engine.to_string(),
             created_at: created_at.to_string(),
             git_sha: sha.map(str::to_string),
             metadata: None,
@@ -817,6 +1102,39 @@ mod tests {
             scan("s2", Some("abc123"), Some("main"), "scanning", &created),
         ];
         assert!(find_recent_matching_scan(&scans, "abc123", Some("main"), now).is_none());
+    }
+
+    #[test]
+    fn does_not_skip_non_blast_engine() {
+        let now = Utc::now();
+        let created = (now - Duration::hours(1)).to_rfc3339();
+        let scans = vec![
+            scan_with_engine(
+                "s1",
+                Some("abc123"),
+                Some("main"),
+                "complete",
+                "semgrep",
+                &created,
+            ),
+            scan_with_engine(
+                "s2",
+                Some("abc123"),
+                Some("main"),
+                "complete",
+                "snyk",
+                &created,
+            ),
+        ];
+        assert!(find_recent_matching_scan(&scans, "abc123", Some("main"), now).is_none());
+    }
+
+    #[test]
+    fn resolve_skip_branch_prefers_repo_branch() {
+        assert_eq!(
+            resolve_skip_branch(Some("feature/x")).as_deref(),
+            Some("feature/x")
+        );
     }
 
     #[test]

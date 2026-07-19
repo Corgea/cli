@@ -62,6 +62,7 @@ pub fn run(
             "Version".to_string(),
             "Fix Version".to_string(),
             "Severity".to_string(),
+            "Classification".to_string(),
             "CVE".to_string(),
             "Ecosystem".to_string(),
             "File Path".to_string(),
@@ -95,6 +96,7 @@ pub fn run(
                     .clone()
                     .unwrap_or("N/A".to_string()),
                 issue.severity.clone().unwrap_or("N/A".to_string()),
+                issue.classification.clone().unwrap_or("N/A".to_string()),
                 issue.cve.clone().unwrap_or("N/A".to_string()),
                 issue.package.ecosystem.clone(),
                 shortened_path,
