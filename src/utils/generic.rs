@@ -1,5 +1,5 @@
 use crate::utils::terminal::{set_text_color, TerminalColor};
-use git2::Repository;
+use git2::{Repository, StatusOptions};
 use globset::{Glob, GlobSetBuilder};
 use ignore::WalkBuilder;
 use std::env;
@@ -299,6 +299,23 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
         repo_url,
         sha,
     }))
+}
+
+/// True when the worktree or index differs from HEAD (including untracked files).
+/// Returns true on error so callers that skip work fail closed.
+pub fn is_working_tree_dirty(dir: &str) -> bool {
+    let Ok(repo) = Repository::open(Path::new(dir)) else {
+        return true;
+    };
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true);
+    opts.exclude_submodules(true);
+    opts.include_ignored(false);
+    let dirty = match repo.statuses(Some(&mut opts)) {
+        Ok(statuses) => !statuses.is_empty(),
+        Err(_) => true,
+    };
+    dirty
 }
 
 pub fn get_status(status: &str) -> &str {

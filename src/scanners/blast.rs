@@ -49,36 +49,69 @@ pub fn run(
     }
 
     let project_name = utils::generic::determine_project_name(project_name.as_deref());
-    let repo_info = utils::generic::get_repo_info("./").unwrap_or_default();
+    let mut repo_info = utils::generic::get_repo_info("./").unwrap_or_default();
+    // Detached HEAD (common in CI): fill branch from CI metadata so skip and
+    // upload agree on the same branch name.
+    if let Some(ref mut info) = repo_info {
+        if info
+            .branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .is_none()
+        {
+            info.branch = resolve_skip_branch(None);
+        }
+    }
 
     if *skip_if_scanned {
-        if let Some(ref info) = repo_info {
-            // Require both SHA and branch so detached-HEAD / unknown-branch
-            // never matches a null-branch scan by accident.
-            if let (Some(sha), Some(branch)) = (info.sha.as_deref(), info.branch.as_deref()) {
-                if let Ok(resp) = utils::api::query_scan_list(
-                    &config.get_url(),
-                    Some(&project_name),
-                    Some(1),
-                    None,
-                    Some(branch),
-                    Some(sha),
-                ) {
-                    let scans = resp.scans.unwrap_or_default();
-                    let now = Utc::now();
-                    if let Some(scan) = find_recent_matching_scan(&scans, sha, Some(branch), now) {
-                        let age = parse_created_at(&scan.created_at)
-                            .map(|created| format_scan_age(created, now))
-                            .unwrap_or_else(|| "recently".to_string());
-                        let short_sha: String = sha.chars().take(8).collect();
-                        println!(
-                            "Skipping scan: commit {} on {} was already scanned {} (scan {}).",
-                            short_sha, branch, age, scan.id
-                        );
-                        return;
+        match &repo_info {
+            None => {
+                println!("--skip-if-scanned: not a git repository; scanning normally.");
+            }
+            Some(_) if utils::generic::is_working_tree_dirty("./") => {
+                println!(
+                    "--skip-if-scanned: working tree has uncommitted changes; scanning normally."
+                );
+            }
+            Some(info) => match (info.sha.as_deref(), info.branch.as_deref()) {
+                (Some(sha), Some(branch)) => {
+                    if let Ok(resp) = utils::api::query_scan_list(
+                        &config.get_url(),
+                        Some(&project_name),
+                        Some(1),
+                        None,
+                        Some(branch),
+                        Some(sha),
+                    ) {
+                        let scans = resp.scans.unwrap_or_default();
+                        let now = Utc::now();
+                        if let Some(scan) =
+                            find_recent_matching_scan(&scans, sha, Some(branch), now)
+                        {
+                            let age = parse_created_at(&scan.created_at)
+                                .map(|created| format_scan_age(created, now))
+                                .unwrap_or_else(|| "recently".to_string());
+                            let short_sha: String = sha.chars().take(8).collect();
+                            println!(
+                                "Skipping scan: commit {} on {} was already scanned {} (scan {}).",
+                                short_sha, branch, age, scan.id
+                            );
+                            return;
+                        }
                     }
                 }
-            }
+                (None, _) => {
+                    println!(
+                        "--skip-if-scanned: could not determine commit SHA; scanning normally."
+                    );
+                }
+                (_, None) => {
+                    println!(
+                        "--skip-if-scanned: could not determine branch (detached HEAD without CI metadata); scanning normally."
+                    );
+                }
+            },
         }
     }
 
@@ -687,6 +720,30 @@ pub fn report_scan_status(
     Ok(classification_counts)
 }
 
+/// Branch for skip matching: local git branch, else common CI metadata
+/// (`GITHUB_HEAD_REF` / `GITHUB_REF_NAME` / `CI_COMMIT_BRANCH` / `CI_COMMIT_REF_NAME`)
+/// so detached-HEAD checkouts in CI can still skip.
+fn resolve_skip_branch(repo_branch: Option<&str>) -> Option<String> {
+    if let Some(branch) = repo_branch.map(str::trim).filter(|b| !b.is_empty()) {
+        return Some(branch.to_string());
+    }
+    for key in [
+        "GITHUB_HEAD_REF",
+        "GITHUB_REF_NAME",
+        "CI_COMMIT_BRANCH",
+        "CI_COMMIT_REF_NAME",
+    ] {
+        if let Some(branch) = env::var(key)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            return Some(branch);
+        }
+    }
+    None
+}
+
 fn find_recent_matching_scan<'a>(
     scans: &'a [ScanResponse],
     local_sha: &str,
@@ -695,6 +752,10 @@ fn find_recent_matching_scan<'a>(
 ) -> Option<&'a ScanResponse> {
     scans.iter().find(|scan| {
         if !scan.status.eq_ignore_ascii_case("complete") {
+            return false;
+        }
+        // BLAST uploads store engine as "corgea-blast"; never skip on Semgrep/Snyk/etc.
+        if !scan.engine.eq_ignore_ascii_case("corgea-blast") {
             return false;
         }
         if scan.git_sha.as_deref() != Some(local_sha) {
@@ -865,13 +926,24 @@ mod tests {
         status: &str,
         created_at: &str,
     ) -> ScanResponse {
+        scan_with_engine(id, sha, branch, status, "corgea-blast", created_at)
+    }
+
+    fn scan_with_engine(
+        id: &str,
+        sha: Option<&str>,
+        branch: Option<&str>,
+        status: &str,
+        engine: &str,
+        created_at: &str,
+    ) -> ScanResponse {
         ScanResponse {
             id: id.to_string(),
             project: "proj".to_string(),
             repo: None,
             branch: branch.map(str::to_string),
             status: status.to_string(),
-            engine: "blast".to_string(),
+            engine: engine.to_string(),
             created_at: created_at.to_string(),
             git_sha: sha.map(str::to_string),
         }
@@ -955,6 +1027,39 @@ mod tests {
             scan("s2", Some("abc123"), Some("main"), "scanning", &created),
         ];
         assert!(find_recent_matching_scan(&scans, "abc123", Some("main"), now).is_none());
+    }
+
+    #[test]
+    fn does_not_skip_non_blast_engine() {
+        let now = Utc::now();
+        let created = (now - Duration::hours(1)).to_rfc3339();
+        let scans = vec![
+            scan_with_engine(
+                "s1",
+                Some("abc123"),
+                Some("main"),
+                "complete",
+                "semgrep",
+                &created,
+            ),
+            scan_with_engine(
+                "s2",
+                Some("abc123"),
+                Some("main"),
+                "complete",
+                "snyk",
+                &created,
+            ),
+        ];
+        assert!(find_recent_matching_scan(&scans, "abc123", Some("main"), now).is_none());
+    }
+
+    #[test]
+    fn resolve_skip_branch_prefers_repo_branch() {
+        assert_eq!(
+            resolve_skip_branch(Some("feature/x")).as_deref(),
+            Some("feature/x")
+        );
     }
 
     #[test]
