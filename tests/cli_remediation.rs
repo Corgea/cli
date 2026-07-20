@@ -15,11 +15,11 @@ use common::{key, pip_harness, vulnerable_body};
 use std::collections::HashMap;
 
 fn fixed_body() -> String {
-    vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0"))
+    vulnerable_body("pypi", "oldpkg", "1.0.0", "CVE-2024-0001", Some("2.0.0"))
 }
 
 fn no_fix_body() -> String {
-    vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0002", None)
+    vulnerable_body("pypi", "oldpkg", "1.0.0", "CVE-2024-0002", None)
 }
 
 #[test]

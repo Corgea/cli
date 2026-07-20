@@ -14,8 +14,26 @@ pub fn key(eco: &str, name: &str, ver: &str) -> PackageKey {
     (eco.to_string(), name.trim().to_lowercase(), ver.to_string())
 }
 
-/// Single-match vulnerable verdict body; `fixed: None` renders
-/// `"fixed_version":null`. Shared by the in-crate unit tests and the
+/// Single-match verdict body with the per-match `malware` wire flag;
+/// `fixed: None` renders `"fixed_version":null`.
+fn check_body(
+    ecosystem: &str,
+    name: &str,
+    version: &str,
+    advisory: &str,
+    fixed: Option<&str>,
+    malware: bool,
+) -> String {
+    let fixed = fixed.map_or("null".to_string(), |f| format!(r#""{f}""#));
+    format!(
+        r#"{{"ecosystem":"{ecosystem}","package_name":"{name}","version":"{version}","is_vulnerable":true,
+        "matches":[{{"advisory_id":"{advisory}","severity_level":"critical","tier":1,
+                    "vulnerable_version_range":null,"fixed_version":{fixed},"malware":{malware}}}]}}"#
+    )
+}
+
+/// Single-match vulnerable verdict body (`malware:false`); `fixed: None`
+/// renders `"fixed_version":null`. Shared by the in-crate unit tests and the
 /// integration tests (via `tests/common`).
 pub fn vulnerable_body(
     ecosystem: &str,
@@ -24,12 +42,19 @@ pub fn vulnerable_body(
     advisory: &str,
     fixed: Option<&str>,
 ) -> String {
-    let fixed = fixed.map_or("null".to_string(), |f| format!(r#""{f}""#));
-    format!(
-        r#"{{"ecosystem":"{ecosystem}","package_name":"{name}","version":"{version}","is_vulnerable":true,
-        "matches":[{{"advisory_id":"{advisory}","severity_level":"critical","tier":1,
-                    "vulnerable_version_range":null,"fixed_version":{fixed}}}]}}"#
-    )
+    check_body(ecosystem, name, version, advisory, fixed, false)
+}
+
+/// Single-match malicious verdict body: same shape as [`vulnerable_body`]
+/// with the wire `malware` flag set.
+pub fn malicious_body(
+    ecosystem: &str,
+    name: &str,
+    version: &str,
+    advisory: &str,
+    fixed: Option<&str>,
+) -> String {
+    check_body(ecosystem, name, version, advisory, fixed, true)
 }
 
 const NOT_FOUND_BODY: &str = r#"{"error":"not found"}"#;

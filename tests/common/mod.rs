@@ -7,7 +7,7 @@ use corgea::vuln_api_stub::PackageKey;
 /// `(ecosystem, name, version)` stub key and the single-match vulnerable
 /// verdict body, shared with the in-crate unit tests.
 #[allow(unused_imports)]
-pub use corgea::vuln_api_stub::{key, vulnerable_body};
+pub use corgea::vuln_api_stub::{key, malicious_body, vulnerable_body};
 #[cfg(unix)]
 use std::collections::HashMap;
 #[cfg(unix)]
