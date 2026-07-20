@@ -70,7 +70,7 @@ fn pip_requirements_format_control_refuses_dry_run() {
     let mut checks = HashMap::new();
     checks.insert(
         key("pypi", "oldpkg", "1.0.0"),
-        vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0004", None),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "CVE-2024-0004", None),
     );
     // The fake pip records argv ONLY on its dry-run branch: a recorded
     // marker would mean the dry-run executed against the hostile file.
@@ -107,11 +107,11 @@ fn pip_requirements_format_control_refuses_dry_run() {
         "stderr must name the refusing directive: {stderr}"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("MAL-2024-0004"), "stdout: {stdout}");
+    assert!(stdout.contains("CVE-2024-0004"), "stdout: {stdout}");
 }
 
 fn vulnerable_evildep_body(ecosystem: &str) -> String {
-    vulnerable_body(ecosystem, "evildep", "0.4.2", "MAL-2024-0002", None)
+    vulnerable_body(ecosystem, "evildep", "0.4.2", "CVE-2024-0002", None)
 }
 
 #[test]
@@ -153,7 +153,7 @@ fn transitive_vulnerable_blocks_install() {
             "{binary} must not run on a transitive vulnerable verdict"
         );
         let stdout = String::from_utf8_lossy(&out.stdout);
-        for needle in ["evildep", "MAL-2024-0002", "(transitive)"] {
+        for needle in ["evildep", "CVE-2024-0002", "(transitive)"] {
             assert!(stdout.contains(needle), "{binary} stdout: {stdout}");
         }
     }
@@ -182,7 +182,7 @@ fn uv_requirements_file_install_is_tree_gated() {
     assert_eq!(out.status.code(), Some(1), "transitive vuln must block");
     assert_eq!(h.recorded_argv(), None, "uv must not run when blocked");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for needle in ["evildep", "MAL-2024-0002", "(transitive)"] {
+    for needle in ["evildep", "CVE-2024-0002", "(transitive)"] {
         assert!(stdout.contains(needle), "stdout: {stdout}");
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -342,7 +342,7 @@ fn pip_requirements_fallback_checks_file_entries_when_tree_fails() {
     let mut checks = HashMap::new();
     checks.insert(
         key("pypi", "oldpkg", "1.0.0"),
-        vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0003", None),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "CVE-2024-0003", None),
     );
     let mut h = tree_harness("pip", checks, HashMap::new(), RESOLUTION_FAILS);
     let out = h
@@ -361,7 +361,7 @@ fn pip_requirements_fallback_checks_file_entries_when_tree_fails() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     for needle in [
         "oldpkg==1.0.0",
-        "MAL-2024-0003",
+        "CVE-2024-0003",
         "idna @ git+https://github.com/jazzband/idna.git@main",
         "PEP 508 direct reference",
     ] {

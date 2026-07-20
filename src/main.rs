@@ -231,7 +231,7 @@ enum Commands {
 struct InstallWrapArgs {
     #[arg(
         long,
-        help = "Proceed with the install despite vulnerable findings. Findings are still printed."
+        help = "Proceed with the install despite vulnerable or malicious findings. Findings are still printed."
     )]
     force: bool,
 
