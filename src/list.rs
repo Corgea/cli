@@ -15,8 +15,12 @@ pub fn run(
     page_size: &Option<u16>,
     scan_id: &Option<String>,
 ) {
-    let project_name =
-        utils::generic::get_current_working_directory().unwrap_or("unknown".to_string());
+    // Resolve the project name the same way `corgea scan` does (prefer the Git
+    // remote repository name, then fall back to the directory name) so lookups
+    // match the project key scans are stored under. Using the bare directory
+    // basename here caused "Project not found" whenever the checkout directory
+    // differed from the repository name (e.g. Git worktrees).
+    let project_name = utils::generic::determine_project_name(None);
     println!();
     if *sca_issues {
         let sca_issues_response = match utils::api::get_sca_issues(
