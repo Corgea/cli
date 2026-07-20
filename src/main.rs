@@ -167,6 +167,12 @@ enum Commands {
 
         #[arg(long, value_parser = clap::value_parser!(u16), help = "Number of items per page")]
         page_size: Option<u16>,
+
+        #[arg(
+            long,
+            help = "The name of the Corgea project. Defaults to git repository name if found, otherwise to the current directory name."
+        )]
+        project_name: Option<String>,
     },
     /// Inspect something, by default it will inspect a scan
     Inspect {
@@ -621,6 +627,7 @@ fn main() {
             scan_id,
             sca_issues,
             code_quality,
+            project_name,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             if [*issues, *sca_issues, *code_quality]
@@ -647,6 +654,7 @@ fn main() {
                 page,
                 page_size,
                 scan_id,
+                project_name,
             );
         }
         Some(Commands::Inspect {

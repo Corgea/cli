@@ -14,13 +14,15 @@ pub fn run(
     page: &Option<u16>,
     page_size: &Option<u16>,
     scan_id: &Option<String>,
+    project_name: &Option<String>,
 ) {
-    // Resolve the project name the same way `corgea scan` does (prefer the Git
-    // remote repository name, then fall back to the directory name) so lookups
-    // match the project key scans are stored under. Using the bare directory
-    // basename here caused "Project not found" whenever the checkout directory
-    // differed from the repository name (e.g. Git worktrees).
-    let project_name = utils::generic::determine_project_name(None);
+    // Resolve the project name the same way `corgea scan` does: honor an explicit
+    // --project-name, otherwise prefer the Git remote repository name and fall
+    // back to the directory name. This matches the project key scans are stored
+    // under; using the bare directory basename caused "Project not found"
+    // whenever the checkout directory differed from the repository name (e.g.
+    // Git worktrees).
+    let project_name = utils::generic::determine_project_name(project_name.as_deref());
     println!();
     if *sca_issues {
         let sca_issues_response = match utils::api::get_sca_issues(
@@ -163,7 +165,10 @@ pub fn run(
         let mut blocking_rules: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
 
-        if scan_id.is_some() {
+        // Blocking rules are a security-listing concern. Skip the enrichment for
+        // code quality so a blocking-rules API failure can't take down the CQ
+        // listing and so Blocking columns aren't driven by non-CQ findings.
+        if scan_id.is_some() && !*code_quality {
             let mut page: u32 = 1;
             loop {
                 match utils::api::check_blocking_rules(
