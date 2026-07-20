@@ -323,6 +323,25 @@ fn unknown_package_exits_0_with_note() {
 }
 
 #[test]
+fn profile_generic_404_exits_2() {
+    // A 404 without the worker's package-miss sentinel (wrong host, older
+    // deployment, proxy/CDN) is an error, not a clean "no advisories" answer.
+    let stub = vuln_api_stub::spawn_with_profiles(
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::from([(vuln_api_stub::profile_key("npm", "axios"), 404u16)]),
+    );
+    let out = advisories_check(&stub.base_url, &["npm", "axios"]);
+    assert_eq!(out.status.code(), Some(2), "stdout: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("CORGEA_VULN_API_URL"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn profile_identity_mismatch_exits_2() {
     let body = vuln_api_stub::profile_body("npm", "left-pad", "[]");
     let stub = vuln_api_stub::spawn_with_profiles(

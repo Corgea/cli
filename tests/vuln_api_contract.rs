@@ -205,6 +205,24 @@ fn staging_mezzanine_6_0_0_is_vulnerable() {
 
 #[test]
 #[ignore = "network: hits the staging vuln-api"]
+fn staging_unknown_package_profile_is_not_found() {
+    // Pins the worker's package-miss sentinel body: fetch_package_profile
+    // maps a 404 to Ok(None) only when it carries {"error":"Package not
+    // found"}, so this fails if the worker ever changes that body.
+    let client = http_client().expect("client");
+    let missing = fetch_package_profile(
+        &client,
+        STAGING_URL,
+        None,
+        Ecosystem::Npm,
+        "corgea-contract-test-nonexistent",
+    )
+    .unwrap();
+    assert!(missing.is_none(), "sentinel 404 should map to Ok(None)");
+}
+
+#[test]
+#[ignore = "network: hits the staging vuln-api"]
 fn staging_unknown_package_is_clean() {
     let verdict = check(
         STAGING_URL,

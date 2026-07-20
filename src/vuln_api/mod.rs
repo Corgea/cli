@@ -512,9 +512,21 @@ pub struct AdvisorySummary {
     pub modified_at: Option<String>,
 }
 
+/// The worker's package-miss sentinel (worker.js `packageProfileHandler`:
+/// `{"error":"Package not found"}`). Matched on the parsed `error` field,
+/// not the raw string, so field order/whitespace can't break it. Pinned
+/// against staging by the vuln_api_contract tests.
+fn is_package_not_found_body(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+        .is_some_and(|e| e == "Package not found")
+}
+
 /// GET /v1/packages/:eco/:name. `Ok(None)` = the package has no row in the
-/// advisory database (the route's 404) — a legitimate data answer, unlike
-/// /check where 404 can only mean a misconfigured URL.
+/// advisory database (the route's sentinel 404) — a legitimate data answer,
+/// unlike /check where 404 can only mean a misconfigured URL. A 404 without
+/// the sentinel body is an error.
 pub fn fetch_package_profile(
     client: &reqwest::blocking::Client,
     base_url: &str,
@@ -534,10 +546,20 @@ pub fn fetch_package_profile(
     debug(&format!("Sending vuln-api request to URL: {}", url));
 
     let response = send_package_check_with_retry(client, &url, token)?;
-    // Unlike /check, a 404 here is a legitimate data answer: the package has
-    // no row in the advisory database.
+    // Unlike /check, a 404 here CAN be a legitimate data answer — but only
+    // when it carries the route's own package-miss sentinel body. Any other
+    // 404 (wrong host, older deployment without the route, proxy/CDN) must
+    // surface as an error, not read as a clean package.
     if response.status().as_u16() == 404 {
-        return Ok(None);
+        let body = response.text().unwrap_or_default();
+        if is_package_not_found_body(&body) {
+            return Ok(None);
+        }
+        return Err(format!(
+            "vuln-api route not found (HTTP 404) — check CORGEA_VULN_API_URL. Body: {}",
+            body_snippet(&body, ERROR_BODY_SNIPPET_LEN)
+        )
+        .into());
     }
     let response = shared_status_error(response, token)?;
 
@@ -1168,6 +1190,38 @@ mod tests {
         let err =
             fetch_profile_with_stub(&stub, Ecosystem::Npm, "axios").expect_err("500 should fail");
         assert!(err.to_string().contains("unavailable"));
+    }
+
+    #[test]
+    fn fetch_package_profile_generic_404_is_an_error() {
+        // A 404 without the worker's package-miss sentinel body (wrong host,
+        // older deployment, proxy/CDN) must not read as a clean package.
+        // Status-only script: the stub answers 404 with a non-sentinel body.
+        let profile_statuses =
+            HashMap::from([(vuln_api_stub::profile_key("npm", "axios"), 404u16)]);
+        let stub = vuln_api_stub::spawn_with_profiles(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            profile_statuses,
+        );
+        let err = fetch_profile_with_stub(&stub, Ecosystem::Npm, "axios")
+            .expect_err("non-sentinel 404 should fail");
+        assert!(err.to_string().contains("CORGEA_VULN_API_URL"));
+    }
+
+    #[test]
+    fn package_not_found_body_matches_sentinel_only() {
+        assert!(is_package_not_found_body(
+            r#"{"error":"Package not found"}"#
+        ));
+        // Field order/extra fields don't matter; other errors and non-JSON do.
+        assert!(is_package_not_found_body(
+            r#"{ "status": 404, "error": "Package not found" }"#
+        ));
+        assert!(!is_package_not_found_body(r#"{"error":"Invalid url"}"#));
+        assert!(!is_package_not_found_body("<html>404</html>"));
+        assert!(!is_package_not_found_body(""));
     }
 
     #[test]
