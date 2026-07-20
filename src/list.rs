@@ -4,6 +4,7 @@ use crate::utils;
 use serde_json::json;
 use std::path::Path;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     config: &Config,
     issues: &bool,
