@@ -49,6 +49,43 @@ pub fn run_command(base_cmd: &String, mut command: Command) -> String {
 pub struct ScanUploadResult {
     pub scan_id: String,
     pub project_id: Option<String>,
+    pub project_name: String,
+}
+
+/// Build the URL to the Corgea scan page so users can track results.
+pub fn build_scan_url(config: &Config, result: &ScanUploadResult) -> String {
+    match &result.project_id {
+        Some(pid) => format!(
+            "{}/project/{}/?scan_id={}",
+            config.get_url(),
+            pid,
+            result.scan_id
+        ),
+        None => format!(
+            "{}/project/{}?scan_id={}",
+            config.get_url(),
+            result.project_name,
+            result.scan_id
+        ),
+    }
+}
+
+/// Print the scan page URL so the user can track the scan results without
+/// waiting for it to complete.
+pub fn print_scan_tracking_url(config: &Config, result: &ScanUploadResult) {
+    let scan_url = build_scan_url(config, result);
+    print!(
+        "\n\nScan has started with ID: {}.\n\nYou can view it populate at the link:\n{}\n\n",
+        result.scan_id,
+        utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
+    );
+    print!(
+        "{}",
+        utils::terminal::set_text_color(
+            "Your scan will continue securely in the Corgea cloud.\n",
+            utils::terminal::TerminalColor::Blue
+        )
+    );
 }
 
 pub fn run_semgrep(config: &Config, project_name: Option<String>) {
@@ -85,14 +122,21 @@ pub fn run_snyk(config: &Config, project_name: Option<String>) {
     }
 }
 
-pub fn read_stdin_report(config: &Config, project_name: Option<String>) {
+pub fn read_stdin_report(
+    config: &Config,
+    project_name: Option<String>,
+) -> Option<ScanUploadResult> {
     let mut input = String::new();
     let _ = io::stdin().read_to_string(&mut input);
 
-    let _ = parse_scan(config, input, false, project_name);
+    parse_scan(config, input, false, project_name)
 }
 
-pub fn read_file_report(config: &Config, file_path: &str, project_name: Option<String>) {
+pub fn read_file_report(
+    config: &Config,
+    file_path: &str,
+    project_name: Option<String>,
+) -> Option<ScanUploadResult> {
     let input = match std::fs::read_to_string(file_path) {
         Ok(input) => input,
         Err(e) => {
@@ -101,7 +145,7 @@ pub fn read_file_report(config: &Config, file_path: &str, project_name: Option<S
         }
     };
 
-    let _ = parse_scan(config, input, false, project_name);
+    parse_scan(config, input, false, project_name)
 }
 
 pub fn parse_scan(
@@ -517,5 +561,6 @@ pub fn upload_scan(
     sast_scan_id.map(|scan_id| ScanUploadResult {
         scan_id,
         project_id,
+        project_name: project.clone(),
     })
 }
