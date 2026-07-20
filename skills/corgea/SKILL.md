@@ -193,7 +193,7 @@ default**; turn it off with `recency_gate = false` in `~/.corgea/config.toml`
 (or `CORGEA_RECENCY_THRESHOLD_DAYS`), or pass `--force` for a single install.
 Packages whose publish date is unknown (pip backtracking to an unresolved
 version) never trip it, and a vulnerable/malicious verdict takes precedence —
-such a package blocks as vulnerable, not as fresh.
+such a package blocks on that verdict, not as fresh.
 
 ```bash
 corgea pip install requests==2.31.0   # resolves, checks the vuln verdict, then runs pip
@@ -205,7 +205,7 @@ corgea pip list                       # non-install subcommands pass straight th
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--force` | | Proceed despite all findings (vulnerable, unverifiable). Findings still print. Also bypasses the wrong-package-manager and PEP 668 refusals, and unparsable-lockfile refusals on `uv sync`/`npm ci`. |
+| `--force` | | Proceed despite all findings (vulnerable, malicious, unverifiable). Findings still print. Also bypasses the wrong-package-manager and PEP 668 refusals, and unparsable-lockfile refusals on `uv sync`/`npm ci`. |
 | `--json` | | JSON report instead of text. Per-result `verdict` object + `verdict_mode` + `tree`. Stdout carries only the report; the package manager's output moves to stderr. |
 
 `--json` adds `verdict_mode` (`"public"` or `"authenticated"` from the CLI;
@@ -215,7 +215,12 @@ and a `tree` object: `null` when no tree pass ran; otherwise `mode` is
 `resolved_count` and a `transitive[]` array of `{name, version, origin,
 verdict}` for packages beyond the named targets. Vulnerable `verdict`
 objects carry a `remediation` field: the safe version covering every
-advisory, or `null` when any advisory has no known fix. A top-level
+advisory, or `null` when any advisory has no known fix. Known-malicious
+packages report a distinct verdict `status` of `malicious` (matches carry a
+`malware` boolean; each summary object carries a separate `malicious` count)
+and refuse with a distinct `known MALICIOUS package(s) detected` message;
+their `remediation` field is always `null` because malware must be removed,
+not upgraded. A top-level
 `recency_threshold_days` reports the active recency window (or `null` when
 the recency gate is off); pair it with each result's `age_seconds`.
 

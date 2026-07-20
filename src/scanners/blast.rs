@@ -68,12 +68,14 @@ pub fn run(
     if *skip_if_scanned {
         match &repo_info {
             None => {
-                println!("--skip-if-scanned: not a git repository; scanning normally.");
+                log::error!("--skip-if-scanned can only be used in a git repository.");
+                std::process::exit(1);
             }
             Some(_) if utils::generic::is_working_tree_dirty("./") => {
-                println!(
-                    "--skip-if-scanned: working tree has uncommitted changes; scanning normally."
+                log::error!(
+                    "--skip-if-scanned requires a clean working tree (no uncommitted or staged changes)."
                 );
+                std::process::exit(1);
             }
             Some(info) => match (info.sha.as_deref(), info.branch.as_deref()) {
                 (Some(sha), Some(branch)) => {
@@ -103,14 +105,14 @@ pub fn run(
                     }
                 }
                 (None, _) => {
-                    println!(
-                        "--skip-if-scanned: could not determine commit SHA; scanning normally."
-                    );
+                    log::error!("--skip-if-scanned could not determine the commit SHA.");
+                    std::process::exit(1);
                 }
                 (_, None) => {
-                    println!(
-                        "--skip-if-scanned: could not determine branch (detached HEAD without CI metadata); scanning normally."
+                    log::error!(
+                        "--skip-if-scanned could not determine the branch (detached HEAD without CI metadata)."
                     );
+                    std::process::exit(1);
                 }
             },
         }

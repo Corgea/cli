@@ -83,7 +83,7 @@ enum Commands {
 
         #[arg(
             long,
-            help = "Skip the scan if this commit already has a completed scan for the same project and branch within the last 24h. Only for a default blast scan (not with --fail, --fail-on, --only-uncommitted, --target, --exclude, --scan-type, --policy, --metadata, or --out-file/--out-format)."
+            help = "Skip the scan if this commit already has a completed BLAST scan for the same project and branch within the last 24h. Requires a clean git checkout. Only for a default blast scan (not with --fail, --fail-on, --only-uncommitted, --target, --exclude, --scan-type, --policy, --metadata, or --out-file/--out-format)."
         )]
         skip_if_scanned: bool,
 
@@ -244,7 +244,7 @@ enum Commands {
 struct InstallWrapArgs {
     #[arg(
         long,
-        help = "Proceed with the install despite vulnerable findings. Findings are still printed."
+        help = "Proceed with the install despite vulnerable or malicious findings. Findings are still printed."
     )]
     force: bool,
 
