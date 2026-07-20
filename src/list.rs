@@ -202,7 +202,6 @@ pub fn run(
                     .map(|issue| {
                         serde_json::json!(utils::api::IssueWithBlockingRules {
                             id: issue.id.clone(),
-                            issue_type: issue.issue_type.clone(),
                             scan_id: issue.scan_id.clone(),
                             status: issue.status.clone(),
                             urgency: issue.urgency.clone(),

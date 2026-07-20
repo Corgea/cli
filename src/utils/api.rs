@@ -1024,8 +1024,6 @@ pub struct FullIssueResponse {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Issue {
     pub id: String,
-    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
-    pub issue_type: Option<String>,
     pub scan_id: Option<String>,
     pub status: String,
     pub urgency: String,
@@ -1040,8 +1038,6 @@ pub struct Issue {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct IssueWithBlockingRules {
     pub id: String,
-    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
-    pub issue_type: Option<String>,
     pub scan_id: Option<String>,
     pub status: String,
     pub urgency: String,
@@ -1199,8 +1195,7 @@ mod tests {
     #[test]
     fn deserializes_code_quality_issue_response() {
         // Code quality issues carry a free-form classification label (no CWE) and
-        // a `type` discriminator, and must deserialize into the same Issue struct
-        // used for security issues.
+        // must deserialize into the same Issue struct used for security issues.
         let body = r#"{
             "status": "ok",
             "page": 1,
@@ -1209,7 +1204,6 @@ mod tests {
             "issues": [
                 {
                     "id": "11111111-1111-1111-1111-111111111111",
-                    "type": "code_quality",
                     "urgency": "ME",
                     "created_at": "2026-01-01T00:00:00Z",
                     "status": "open",
@@ -1235,7 +1229,6 @@ mod tests {
         let issues = parsed.issues.expect("issues present");
         assert_eq!(issues.len(), 1);
         let issue = &issues[0];
-        assert_eq!(issue.issue_type.as_deref(), Some("code_quality"));
         assert_eq!(issue.classification.id, "Maintainability");
         assert_eq!(issue.classification.name, "Maintainability");
         assert!(issue.classification.description.is_none());
