@@ -8,6 +8,7 @@ pub fn run(
     config: &Config,
     issues: &bool,
     sca_issues: &bool,
+    code_quality: &bool,
     json: &bool,
     page: &Option<u16>,
     page_size: &Option<u16>,
@@ -108,14 +109,30 @@ pub fn run(
             Some(sca_issues_response.page),
             Some(sca_issues_response.total_pages),
         );
-    } else if *issues {
-        let issues_response = match utils::api::get_scan_issues(
-            &config.get_url(),
-            &project_name,
-            Some((*page).unwrap_or(1)),
-            *page_size,
-            scan_id.clone(),
-        ) {
+    } else if *issues || *code_quality {
+        let fetch_result = if *code_quality {
+            utils::api::get_quality_issues(
+                &config.get_url(),
+                &project_name,
+                Some((*page).unwrap_or(1)),
+                *page_size,
+                scan_id.clone(),
+            )
+        } else {
+            utils::api::get_scan_issues(
+                &config.get_url(),
+                &project_name,
+                Some((*page).unwrap_or(1)),
+                *page_size,
+                scan_id.clone(),
+            )
+        };
+        let issue_kind = if *code_quality {
+            "code quality issues"
+        } else {
+            "scan issues"
+        };
+        let issues_response = match fetch_result {
             Ok(response) => response,
             Err(e) => {
                 debug(&format!("Error Sending Request: {}", e));
@@ -127,7 +144,7 @@ pub fn run(
                     }
                 } else {
                     log::error!(
-                        "Unable to fetch scan issues. Please check your connection and ensure that:\n\
+                        "Unable to fetch {issue_kind}. Please check your connection and ensure that:\n\
                         - The server URL is reachable.\n\
                         - Your authentication token is valid.\n\n\
                         Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli {}",
@@ -185,6 +202,7 @@ pub fn run(
                     .map(|issue| {
                         serde_json::json!(utils::api::IssueWithBlockingRules {
                             id: issue.id.clone(),
+                            issue_type: issue.issue_type.clone(),
                             scan_id: issue.scan_id.clone(),
                             status: issue.status.clone(),
                             urgency: issue.urgency.clone(),

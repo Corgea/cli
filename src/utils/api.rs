@@ -513,6 +513,62 @@ pub fn get_scan_issues(
     }
 }
 
+pub fn get_quality_issues(
+    url: &str,
+    project: &str,
+    page: Option<u16>,
+    page_size: Option<u16>,
+    scan_id: Option<String>,
+) -> Result<ProjectIssuesResponse, Box<dyn std::error::Error>> {
+    let mut seperator = "?";
+    let mut url = match scan_id {
+        Some(scan_id) => format!("{}{}/scan/{}/issues/quality", url, API_BASE, scan_id),
+        None => {
+            seperator = "&";
+            format!(
+                "{}{}/issues/code-quality?project={}",
+                url, API_BASE, project
+            )
+        }
+    };
+    if let Some(p) = page {
+        url.push_str(&format!("{}page={}", seperator, p));
+    }
+    if let Some(p_size) = page_size {
+        url.push_str(&format!("&page_size={}", p_size));
+    } else {
+        url.push_str("&page_size=30");
+    }
+    let client = http_client();
+
+    debug(&format!("Sending request to URL: {}", url));
+
+    let response = match client.get(&url).send() {
+        Ok(res) => {
+            check_for_warnings(res.headers(), res.status());
+            res
+        }
+        Err(e) => return Err(format!("Failed to send request: {}", e).into()),
+    };
+    let response_text = response.text()?;
+    let project_issues_response: ProjectIssuesResponse = serde_json::from_str(&response_text)
+        .map_err(|e| {
+            debug(&format!(
+                "Failed to parse response: {}. Response body: {}",
+                e, response_text
+            ));
+            format!("Failed to parse response: {}", e)
+        })?;
+
+    if project_issues_response.status == "ok" {
+        Ok(project_issues_response)
+    } else if project_issues_response.status == "no_project_found" {
+        Err("Project not found 404".into())
+    } else {
+        Err("Server error 500".into())
+    }
+}
+
 pub fn get_scan(url: &str, scan_id: &str) -> Result<ScanResponse, Box<dyn std::error::Error>> {
     let url = format!("{}{}/scan/{}", url, API_BASE, scan_id);
 
@@ -968,6 +1024,8 @@ pub struct FullIssueResponse {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Issue {
     pub id: String,
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub issue_type: Option<String>,
     pub scan_id: Option<String>,
     pub status: String,
     pub urgency: String,
@@ -982,6 +1040,8 @@ pub struct Issue {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct IssueWithBlockingRules {
     pub id: String,
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub issue_type: Option<String>,
     pub scan_id: Option<String>,
     pub status: String,
     pub urgency: String,
@@ -1134,6 +1194,51 @@ mod tests {
         );
         assert!(headers.get("Authorization").is_none());
         assert!(headers.get("CORGEA-SOURCE").is_some());
+    }
+
+    #[test]
+    fn deserializes_code_quality_issue_response() {
+        // Code quality issues carry a free-form classification label (no CWE) and
+        // a `type` discriminator, and must deserialize into the same Issue struct
+        // used for security issues.
+        let body = r#"{
+            "status": "ok",
+            "page": 1,
+            "total_pages": 1,
+            "total_issues": 1,
+            "issues": [
+                {
+                    "id": "11111111-1111-1111-1111-111111111111",
+                    "type": "code_quality",
+                    "urgency": "ME",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "status": "open",
+                    "classification": {
+                        "id": "Maintainability",
+                        "name": "Maintainability",
+                        "description": null
+                    },
+                    "location": {
+                        "file": {"name": "app.py", "language": "python", "path": "app/app.py"},
+                        "project": {"name": "proj", "branch": "main", "git_sha": "abc"},
+                        "line_number": 20
+                    },
+                    "auto_triage": {"false_positive_detection": {"status": "valid"}},
+                    "auto_fix_suggestion": {"status": "no_fix"}
+                }
+            ]
+        }"#;
+
+        let parsed: ProjectIssuesResponse =
+            serde_json::from_str(body).expect("should parse code quality response");
+        assert_eq!(parsed.status, "ok");
+        let issues = parsed.issues.expect("issues present");
+        assert_eq!(issues.len(), 1);
+        let issue = &issues[0];
+        assert_eq!(issue.issue_type.as_deref(), Some("code_quality"));
+        assert_eq!(issue.classification.id, "Maintainability");
+        assert_eq!(issue.classification.name, "Maintainability");
+        assert!(issue.classification.description.is_none());
     }
 
     #[test]
