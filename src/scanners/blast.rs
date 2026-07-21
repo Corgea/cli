@@ -49,25 +49,18 @@ pub fn run(
     }
 
     let project_name = utils::generic::determine_project_name(project_name.as_deref());
-    let mut repo_info = utils::generic::get_repo_info("./").unwrap_or_default();
-    // Detached HEAD (common in CI): fill branch from CI metadata so skip and
-    // upload agree on the same branch name.
-    if let Some(ref mut info) = repo_info {
-        if info
-            .branch
-            .as_deref()
-            .map(str::trim)
-            .filter(|b| !b.is_empty())
-            .is_none()
-        {
-            info.branch = resolve_skip_branch(None);
-        }
-    }
+    let repo_info = utils::generic::get_repo_info("./").unwrap_or_default();
 
     if *skip_if_scanned {
         match &repo_info {
             None => {
                 log::error!("--skip-if-scanned can only be used in a git repository.");
+                std::process::exit(1);
+            }
+            // Packaging uses cwd; only skip when cwd is the repo root so a
+            // packages/a scan cannot suppress a later root scan (or vice versa).
+            Some(_) if !utils::generic::is_at_repo_root("./") => {
+                log::error!("--skip-if-scanned must be run from the repository root.");
                 std::process::exit(1);
             }
             Some(_) if utils::generic::is_working_tree_dirty("./") => {
@@ -76,20 +69,43 @@ pub fn run(
                 );
                 std::process::exit(1);
             }
-            Some(info) => match (info.sha.as_deref(), info.branch.as_deref()) {
-                (Some(sha), Some(branch)) => {
-                    if let Ok(resp) = utils::api::query_scan_list(
-                        &config.get_url(),
-                        Some(&project_name),
-                        Some(1),
-                        None,
-                        Some(branch),
-                        Some(sha),
-                    ) {
+            Some(info) => {
+                let Some(sha) = info.sha.as_deref() else {
+                    log::error!("--skip-if-scanned could not determine the commit SHA.");
+                    std::process::exit(1);
+                };
+                // CI branch is skip-lookup only; upload keeps raw git branch metadata.
+                let Some(branch) = resolve_skip_branch(info.branch.as_deref()) else {
+                    log::error!(
+                        "--skip-if-scanned could not determine the branch (detached HEAD without CI metadata)."
+                    );
+                    std::process::exit(1);
+                };
+                let git_had_branch = info
+                    .branch
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .is_some();
+                // Detached uploads store null branch; don't filter those out.
+                let query_branch = if git_had_branch {
+                    Some(branch.as_str())
+                } else {
+                    None
+                };
+                match utils::api::query_scan_list(
+                    &config.get_url(),
+                    Some(&project_name),
+                    Some(1),
+                    None,
+                    query_branch,
+                    Some(sha),
+                ) {
+                    Ok(resp) => {
                         let scans = resp.scans.unwrap_or_default();
                         let now = Utc::now();
                         if let Some(scan) =
-                            find_recent_matching_scan(&scans, sha, Some(branch), now)
+                            find_recent_matching_scan(&scans, sha, &branch, !git_had_branch, now)
                         {
                             let age = parse_created_at(&scan.created_at)
                                 .map(|created| format_scan_age(created, now))
@@ -102,18 +118,13 @@ pub fn run(
                             return;
                         }
                     }
+                    Err(e) => {
+                        log::warn!(
+                            "--skip-if-scanned: failed to query recent scans ({e}); scanning normally."
+                        );
+                    }
                 }
-                (None, _) => {
-                    log::error!("--skip-if-scanned could not determine the commit SHA.");
-                    std::process::exit(1);
-                }
-                (_, None) => {
-                    log::error!(
-                        "--skip-if-scanned could not determine the branch (detached HEAD without CI metadata)."
-                    );
-                    std::process::exit(1);
-                }
-            },
+            }
         }
     }
 
@@ -749,7 +760,8 @@ fn resolve_skip_branch(repo_branch: Option<&str>) -> Option<String> {
 fn find_recent_matching_scan<'a>(
     scans: &'a [ScanResponse],
     local_sha: &str,
-    local_branch: Option<&str>,
+    local_branch: &str,
+    allow_null_scan_branch: bool,
     now: DateTime<Utc>,
 ) -> Option<&'a ScanResponse> {
     scans.iter().find(|scan| {
@@ -763,7 +775,9 @@ fn find_recent_matching_scan<'a>(
         if scan.git_sha.as_deref() != Some(local_sha) {
             return false;
         }
-        if scan.branch.as_deref() != local_branch {
+        let branch_ok = scan.branch.as_deref() == Some(local_branch)
+            || (allow_null_scan_branch && scan.branch.is_none());
+        if !branch_ok {
             return false;
         }
         match parse_created_at(&scan.created_at) {
@@ -962,7 +976,7 @@ mod tests {
             "complete",
             &created,
         )];
-        let matched = find_recent_matching_scan(&scans, "abc123", Some("main"), now);
+        let matched = find_recent_matching_scan(&scans, "abc123", "main", false, now);
         assert_eq!(matched.map(|s| s.id.as_str()), Some("s1"));
     }
 
@@ -978,7 +992,7 @@ mod tests {
             &created,
         )];
         assert_eq!(
-            find_recent_matching_scan(&scans, "abc123", Some("main"), now).map(|s| s.id.as_str()),
+            find_recent_matching_scan(&scans, "abc123", "main", false, now).map(|s| s.id.as_str()),
             Some("s1")
         );
     }
@@ -992,7 +1006,7 @@ mod tests {
             scan("s1", Some("abc123"), Some("main"), "complete", &stale),
             scan("s2", Some("abc123"), Some("main"), "complete", &exact),
         ];
-        assert!(find_recent_matching_scan(&scans, "abc123", Some("main"), now).is_none());
+        assert!(find_recent_matching_scan(&scans, "abc123", "main", false, now).is_none());
     }
 
     #[test]
@@ -1006,7 +1020,7 @@ mod tests {
             "complete",
             &created,
         )];
-        assert!(find_recent_matching_scan(&scans, "abc123", Some("main"), now).is_none());
+        assert!(find_recent_matching_scan(&scans, "abc123", "main", false, now).is_none());
     }
 
     #[test]
@@ -1017,7 +1031,7 @@ mod tests {
             scan("s1", Some("abc123"), Some("other"), "complete", &created),
             scan("s2", Some("ffff"), Some("main"), "complete", &created),
         ];
-        assert!(find_recent_matching_scan(&scans, "abc123", Some("main"), now).is_none());
+        assert!(find_recent_matching_scan(&scans, "abc123", "main", false, now).is_none());
     }
 
     #[test]
@@ -1028,7 +1042,19 @@ mod tests {
             scan("s1", None, Some("main"), "complete", &created),
             scan("s2", Some("abc123"), Some("main"), "scanning", &created),
         ];
-        assert!(find_recent_matching_scan(&scans, "abc123", Some("main"), now).is_none());
+        assert!(find_recent_matching_scan(&scans, "abc123", "main", false, now).is_none());
+    }
+
+    #[test]
+    fn skips_null_branch_scan_when_detached_ci_fallback_allowed() {
+        let now = Utc::now();
+        let created = (now - Duration::hours(1)).to_rfc3339();
+        let scans = vec![scan("s1", Some("abc123"), None, "complete", &created)];
+        assert_eq!(
+            find_recent_matching_scan(&scans, "abc123", "main", true, now).map(|s| s.id.as_str()),
+            Some("s1")
+        );
+        assert!(find_recent_matching_scan(&scans, "abc123", "main", false, now).is_none());
     }
 
     #[test]
@@ -1053,7 +1079,7 @@ mod tests {
                 &created,
             ),
         ];
-        assert!(find_recent_matching_scan(&scans, "abc123", Some("main"), now).is_none());
+        assert!(find_recent_matching_scan(&scans, "abc123", "main", false, now).is_none());
     }
 
     #[test]

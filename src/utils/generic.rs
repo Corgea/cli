@@ -303,6 +303,23 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
     }))
 }
 
+/// True when `dir` is the repository worktree root (not a subdirectory).
+pub fn is_at_repo_root(dir: &str) -> bool {
+    let Ok(repo) = Repository::discover(Path::new(dir)) else {
+        return false;
+    };
+    let Some(workdir) = repo.workdir() else {
+        return false;
+    };
+    let Ok(workdir) = workdir.canonicalize() else {
+        return false;
+    };
+    let Ok(cwd) = Path::new(dir).canonicalize() else {
+        return false;
+    };
+    workdir == cwd
+}
+
 /// True when the worktree or index differs from HEAD (including untracked files
 /// and submodule changes). Returns true on error so callers that skip work fail closed.
 pub fn is_working_tree_dirty(dir: &str) -> bool {
@@ -388,11 +405,15 @@ mod tests {
 
         let nested = root.join("pkg").join("inner");
         fs::create_dir_all(&nested).unwrap();
-        let info = get_repo_info(nested.to_str().unwrap())
+        let nested_s = nested.to_str().unwrap();
+        let root_s = root.to_str().unwrap();
+        let info = get_repo_info(nested_s)
             .unwrap()
             .expect("should find repo from subdirectory");
         assert!(info.sha.is_some());
-        assert!(!is_working_tree_dirty(nested.to_str().unwrap()));
+        assert!(!is_working_tree_dirty(nested_s));
+        assert!(is_at_repo_root(root_s));
+        assert!(!is_at_repo_root(nested_s));
     }
 
     #[test]
