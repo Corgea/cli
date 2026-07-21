@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::{key, vulnerable_body, GateHarness, NPM_LOCK, RESOLUTION_FAILS};
+use common::{key, malicious_body, vulnerable_body, GateHarness, NPM_LOCK, RESOLUTION_FAILS};
 use std::collections::HashMap;
 
 const PACKAGE_JSON: &str = r#"{"name":"proj","version":"1.0.0","dependencies":{"oldpkg":"1.0.0"}}"#;
@@ -25,7 +25,7 @@ fn bare_npm_install_vulnerable_lockfile_blocks() {
     let mut checks = HashMap::new();
     checks.insert(
         key("npm", "evildep", "0.4.2"),
-        vulnerable_body("npm", "evildep", "0.4.2", "MAL-2024-0002", None),
+        vulnerable_body("npm", "evildep", "0.4.2", "CVE-2024-0002", None),
     );
     let mut h = GateHarness::new()
         .fake_tree_pm("npm", NPM_LOCK, 0)
@@ -42,7 +42,7 @@ fn bare_npm_install_vulnerable_lockfile_blocks() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("evildep"), "stdout: {stdout}");
-    assert!(stdout.contains("MAL-2024-0002"), "stdout: {stdout}");
+    assert!(stdout.contains("CVE-2024-0002"), "stdout: {stdout}");
     assert!(stdout.contains("(transitive)"), "stdout: {stdout}");
     // A bare install names no targets, so everything resolved is the
     // existing tree's — the refusal must say so.
@@ -76,7 +76,7 @@ fn bare_npm_install_force_overrides_block() {
     let mut checks = HashMap::new();
     checks.insert(
         key("npm", "evildep", "0.4.2"),
-        vulnerable_body("npm", "evildep", "0.4.2", "MAL-2024-0002", None),
+        vulnerable_body("npm", "evildep", "0.4.2", "CVE-2024-0002", None),
     );
     let mut h = GateHarness::new()
         .fake_tree_pm("npm", NPM_LOCK, 0)
@@ -102,7 +102,7 @@ fn bare_npm_install_json_carries_tree_object() {
     let mut checks = HashMap::new();
     checks.insert(
         key("npm", "evildep", "0.4.2"),
-        vulnerable_body("npm", "evildep", "0.4.2", "MAL-2024-0002", None),
+        vulnerable_body("npm", "evildep", "0.4.2", "CVE-2024-0002", None),
     );
     let mut h = GateHarness::new()
         .fake_tree_pm("npm", NPM_LOCK, 0)
@@ -301,7 +301,7 @@ fn yarn_cwd_value_does_not_bypass_the_gate() {
     let mut checks = HashMap::new();
     checks.insert(
         key("npm", "oldpkg", "1.0.0"),
-        vulnerable_body("npm", "oldpkg", "1.0.0", "MAL-2024-0007", None),
+        vulnerable_body("npm", "oldpkg", "1.0.0", "CVE-2024-0007", None),
     );
     let mut h = GateHarness::new()
         .fake_recorder("yarn", 0)
@@ -358,7 +358,7 @@ fn bare_npm_install_from_subdirectory_is_gated() {
     let mut checks = HashMap::new();
     checks.insert(
         key("npm", "evildep", "0.4.2"),
-        vulnerable_body("npm", "evildep", "0.4.2", "MAL-2024-0002", None),
+        vulnerable_body("npm", "evildep", "0.4.2", "CVE-2024-0002", None),
     );
     let mut h = GateHarness::new()
         .fake_tree_pm("npm", NPM_LOCK, 0)
@@ -380,4 +380,150 @@ fn bare_npm_install_from_subdirectory_is_gated() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("evildep"), "stdout: {stdout}");
+}
+
+/// A malicious package already in the lockfile (bare install, pre-existing
+/// tree) must render the tree-arm malicious label and refuse with the
+/// Malware copy — NOT the softer existing-tree blame (Q2 top precedence,
+/// tree path, end to end).
+#[test]
+fn bare_npm_install_malicious_lockdep_refuses_as_malware_not_existing_tree() {
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("npm", "evildep", "0.4.2"),
+        malicious_body("npm", "evildep", "0.4.2", "MAL-2024-8888", None),
+    );
+    let mut h = GateHarness::new()
+        .fake_tree_pm("npm", NPM_LOCK, 0)
+        .oldpkg_registry()
+        .vuln_checks(checks)
+        .with_project_file("package.json", PACKAGE_JSON)
+        .build();
+    let out = h.cmd.args(["npm", "install"]).output().expect("run corgea");
+    assert_eq!(out.status.code(), Some(1), "malicious lockdep must block");
+    assert_eq!(h.recorded_argv(), None, "npm must not run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("known malicious:"),
+        "tree-arm label: {stdout}"
+    );
+    assert!(
+        stdout.contains("1 malicious (1 from resolved tree)"),
+        "tree summary segment: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "Refusing to run install: known MALICIOUS package(s) detected. Pass --force only if you are certain."
+        ),
+        "Malware must beat the existing-tree blame: {stderr}"
+    );
+    assert!(
+        !stderr.contains("your existing dependency tree"),
+        "the softer existing-tree copy must not appear: {stderr}"
+    );
+}
+
+/// Same malicious lockdep under `--json`: the tree summary carries the
+/// malicious count, the transitive entry carries the malicious status and
+/// wire flag, and vulnerable stays zero.
+#[test]
+fn bare_npm_install_malicious_lockdep_json_tree_counts() {
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("npm", "evildep", "0.4.2"),
+        malicious_body("npm", "evildep", "0.4.2", "MAL-2024-8888", None),
+    );
+    let mut h = GateHarness::new()
+        .fake_tree_pm("npm", NPM_LOCK, 0)
+        .oldpkg_registry()
+        .vuln_checks(checks)
+        .with_project_file("package.json", PACKAGE_JSON)
+        .build();
+    let out = h
+        .cmd
+        .args(["npm", "--json", "install"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["schema_version"], 2);
+    assert_eq!(parsed["summary"]["tree"]["malicious"], 1);
+    assert_eq!(
+        parsed["summary"]["tree"]["vulnerable"], 0,
+        "not double-counted as vulnerable"
+    );
+    let evil = parsed["tree"]["transitive"]
+        .as_array()
+        .expect("transitive array")
+        .iter()
+        .find(|t| t["name"] == "evildep")
+        .expect("evildep entry");
+    assert_eq!(evil["verdict"]["status"], "malicious");
+    assert_eq!(evil["verdict"]["matches"][0]["malware"], true);
+}
+
+/// A pre-existing malicious dep whose payload also carries a *fixable* CVE must
+/// NOT print the `fix with:` upgrade hint (text) or a JSON `remediation`:
+/// malware is removed, not upgraded, and steering to the CVE's advertised
+/// version would leave the malicious package installed. Guards the shared
+/// `Vulnerable | Malicious` fix-hint path at render.rs:334.
+#[test]
+fn bare_npm_install_malicious_lockdep_never_suggests_a_fix_upgrade() {
+    let mixed_body = r#"{"ecosystem":"npm","package_name":"evildep","version":"0.4.2","is_vulnerable":true,
+        "matches":[{"advisory_id":"CVE-2024-7777","severity_level":"high","tier":2,
+                    "vulnerable_version_range":"< 1.0.0","fixed_version":"1.0.0","malware":false},
+                   {"advisory_id":"MAL-2024-8888","severity_level":"critical","tier":1,
+                    "vulnerable_version_range":null,"fixed_version":null,"malware":true}]}"#;
+    let mut checks = HashMap::new();
+    checks.insert(key("npm", "evildep", "0.4.2"), mixed_body.to_string());
+    let mut h = GateHarness::new()
+        .fake_tree_pm("npm", NPM_LOCK, 0)
+        .oldpkg_registry()
+        .vuln_checks(checks)
+        .with_project_file("package.json", PACKAGE_JSON)
+        .build();
+
+    // Text: malicious label present, but no upgrade hint.
+    let out = h.cmd.args(["npm", "install"]).output().expect("run corgea");
+    assert_eq!(out.status.code(), Some(1), "malicious lockdep must block");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("known malicious:"),
+        "malicious label: {stdout}"
+    );
+    assert!(
+        !stdout.contains("fix with:"),
+        "malware must not advertise an upgrade path: {stdout}"
+    );
+
+    // JSON: the malicious tree entry carries a null remediation.
+    let mut checks2 = HashMap::new();
+    checks2.insert(key("npm", "evildep", "0.4.2"), mixed_body.to_string());
+    let mut hj = GateHarness::new()
+        .fake_tree_pm("npm", NPM_LOCK, 0)
+        .oldpkg_registry()
+        .vuln_checks(checks2)
+        .with_project_file("package.json", PACKAGE_JSON)
+        .build();
+    let out_json = hj
+        .cmd
+        .args(["npm", "--json", "install"])
+        .output()
+        .expect("run corgea");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out_json.stdout).expect("stdout must be valid JSON");
+    let evil = parsed["tree"]["transitive"]
+        .as_array()
+        .expect("transitive array")
+        .iter()
+        .find(|t| t["name"] == "evildep")
+        .expect("evildep entry");
+    assert_eq!(evil["verdict"]["status"], "malicious");
+    assert_eq!(
+        evil["verdict"]["remediation"],
+        serde_json::Value::Null,
+        "malicious verdict must not advertise a remediation version"
+    );
 }

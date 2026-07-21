@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{key, pip_harness, vulnerable_body};
+use common::{key, malicious_body, pip_harness, vulnerable_body};
 use corgea::vuln_api_stub::{header_value, spawn_capturing_vuln_api_stub};
 use std::collections::HashMap;
 
@@ -21,7 +21,7 @@ fn vulnerable_pin_blocks_without_running_install() {
     let mut checks = HashMap::new();
     checks.insert(
         key("pypi", "oldpkg", "1.0.0"),
-        vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0")),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "CVE-2024-0001", Some("2.0.0")),
     );
     let mut h = pip_harness(checks, HashMap::new(), None, 0);
     let out = h
@@ -36,7 +36,7 @@ fn vulnerable_pin_blocks_without_running_install() {
         "pip must not run on a vulnerable verdict"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("MAL-2024-0001"), "stdout: {stdout}");
+    assert!(stdout.contains("CVE-2024-0001"), "stdout: {stdout}");
     assert!(stdout.contains("critical"), "stdout: {stdout}");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("--force"),
@@ -93,7 +93,7 @@ fn force_overrides_vulnerable_block_and_propagates_exit_code() {
     let mut checks = HashMap::new();
     checks.insert(
         key("pypi", "oldpkg", "1.0.0"),
-        vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0")),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "CVE-2024-0001", Some("2.0.0")),
     );
     let mut h = pip_harness(checks, HashMap::new(), None, 7);
     let out = h
@@ -109,7 +109,7 @@ fn force_overrides_vulnerable_block_and_propagates_exit_code() {
     assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg==1.0.0"));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("MAL-2024-0001"),
+        stdout.contains("CVE-2024-0001"),
         "findings must still print under --force: {stdout}"
     );
 }
@@ -122,7 +122,7 @@ fn force_after_the_verb_is_forwarded_not_consumed_and_block_explains_placement()
     let mut checks = HashMap::new();
     checks.insert(
         key("pypi", "oldpkg", "1.0.0"),
-        vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0")),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "CVE-2024-0001", Some("2.0.0")),
     );
     let mut h = pip_harness(checks, HashMap::new(), None, 0);
     let out = h
@@ -156,7 +156,7 @@ fn vulnerable_named_pin_blocks_install() {
     let mut checks = HashMap::new();
     checks.insert(
         key("pypi", "oldpkg", "1.0.0"),
-        vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0")),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "CVE-2024-0001", Some("2.0.0")),
     );
     let mut h = pip_harness(checks, HashMap::new(), None, 0);
     let out = h
@@ -254,7 +254,7 @@ fn tokenless_public_check_discloses_mode() {
     let mut checks = HashMap::new();
     checks.insert(
         key("pypi", "oldpkg", "1.0.0"),
-        vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0")),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "CVE-2024-0001", Some("2.0.0")),
     );
     let mut h = pip_harness(checks, HashMap::new(), None, 0);
     let out = h
@@ -323,7 +323,7 @@ fn json_carries_verdict_object_and_mode() {
     let mut checks = HashMap::new();
     checks.insert(
         key("pypi", "oldpkg", "1.0.0"),
-        vulnerable_body("pypi", "oldpkg", "1.0.0", "MAL-2024-0001", Some("2.0.0")),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "CVE-2024-0001", Some("2.0.0")),
     );
     let mut h = pip_harness(checks, HashMap::new(), None, 0);
     let out = h
@@ -339,7 +339,7 @@ fn json_carries_verdict_object_and_mode() {
     assert_eq!(parsed["results"][0]["verdict"]["status"], "vulnerable");
     assert_eq!(
         parsed["results"][0]["verdict"]["matches"][0]["advisory_id"],
-        "MAL-2024-0001"
+        "CVE-2024-0001"
     );
     assert_eq!(
         parsed["results"][0]["verdict"]["matches"][0]["fixed_version"],
@@ -368,6 +368,160 @@ fn vuln_api_outage_warns_but_installs() {
     assert!(
         stderr.contains("CVE check unavailable; continuing because public mode is fail-open"),
         "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn malicious_pin_blocks_with_distinct_message() {
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("pypi", "evilpkg", "1.0.0"),
+        malicious_body("pypi", "evilpkg", "1.0.0", "MAL-2024-9999", None),
+    );
+    let mut h = pip_harness(checks, HashMap::new(), None, 0);
+    let out = h
+        .cmd
+        .args(["pip", "install", "evilpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        h.recorded_argv(),
+        None,
+        "pip must not run on a malicious verdict"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("known malicious:"), "stdout: {stdout}");
+    assert!(stdout.contains("1 malicious"), "summary segment: {stdout}");
+    assert!(stdout.contains("MAL-2024-9999"), "stdout: {stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "Refusing to run install: known MALICIOUS package(s) detected. Pass --force only if you are certain."
+        ),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("corgea pip --force install"),
+        "escape hint must still spell the bypass: {stderr}"
+    );
+}
+
+#[test]
+fn force_overrides_malicious_block_and_propagates_exit_code() {
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("pypi", "evilpkg", "1.0.0"),
+        malicious_body("pypi", "evilpkg", "1.0.0", "MAL-2024-9999", None),
+    );
+    let mut h = pip_harness(checks, HashMap::new(), None, 7);
+    let out = h
+        .cmd
+        .args(["pip", "--force", "install", "evilpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "manager exit code must propagate under --force"
+    );
+    assert_eq!(h.recorded_argv().as_deref(), Some("install evilpkg==1.0.0"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("known malicious:"),
+        "findings must still print under --force: {stdout}"
+    );
+}
+
+#[test]
+fn merely_vulnerable_output_never_says_malicious() {
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("pypi", "oldpkg", "1.0.0"),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "CVE-2024-4242", Some("2.0.0")),
+    );
+    let mut h = pip_harness(checks, HashMap::new(), None, 0);
+    let out = h
+        .cmd
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1), "still blocks as vulnerable");
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !all.to_lowercase().contains("malicious"),
+        "a merely-vulnerable package must never be labeled malicious: {all}"
+    );
+}
+
+#[test]
+fn json_malicious_status_flag_and_counts_under_schema_v2() {
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("pypi", "evilpkg", "1.0.0"),
+        malicious_body("pypi", "evilpkg", "1.0.0", "MAL-2024-9999", None),
+    );
+    let mut h = pip_harness(checks, HashMap::new(), None, 0);
+    let out = h
+        .cmd
+        .args(["pip", "--json", "install", "evilpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None);
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["schema_version"], 2);
+    assert_eq!(parsed["results"][0]["verdict"]["status"], "malicious");
+    assert_eq!(
+        parsed["results"][0]["verdict"]["matches"][0]["malware"],
+        true
+    );
+    assert_eq!(parsed["summary"]["named"]["malicious"], 1);
+    assert_eq!(
+        parsed["summary"]["named"]["vulnerable"], 0,
+        "malicious is tallied separately, not double-counted as vulnerable"
+    );
+}
+
+/// Mixed report — one malicious target and one merely-vulnerable target:
+/// both labels render, tallies stay separate (no double-count), and the
+/// Malware refusal wins over the generic Findings copy (resolved Q2 top
+/// precedence at the E2E level).
+#[test]
+fn mixed_targets_tally_separately_and_malicious_refusal_wins() {
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("pypi", "evilpkg", "1.0.0"),
+        malicious_body("pypi", "evilpkg", "1.0.0", "MAL-2024-9999", None),
+    );
+    checks.insert(
+        key("pypi", "oldpkg", "1.0.0"),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "CVE-2024-4242", Some("2.0.0")),
+    );
+    let mut h = pip_harness(checks, HashMap::new(), None, 0);
+    let out = h
+        .cmd
+        .args(["pip", "install", "evilpkg==1.0.0", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.recorded_argv(), None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("known malicious:"), "stdout: {stdout}");
+    assert!(stdout.contains("known vulnerable:"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("1 malicious, 1 vulnerable"),
+        "separate summary tallies, no double-count: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("known MALICIOUS package(s) detected"),
+        "Malware refusal must beat the generic Findings copy: {stderr}"
     );
 }
 
@@ -429,5 +583,5 @@ fn small_set_progress_keeps_json_stdout_clean() {
     );
     let parsed: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout must be exactly one JSON document");
-    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(parsed["schema_version"], 2);
 }

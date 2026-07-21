@@ -9,7 +9,7 @@ Committed JSON bodies matching the authoritative server serialization
 |---|---|
 | `check_clean.json` | known package, no advisories |
 | `check_vulnerable.json` | one advisory with `fixed_version` remediation |
-| `check_malware.json` | `MAL-*` advisory, no version range, no fix |
+| `check_malware.json` | `MAL-*` advisory, no version range, no fix, `malware: true` wire flag |
 | `check_unknown.json` | unknown package — `/check` answers 200 clean, not 404 |
 | `package_profile.json` | `/v1/packages/:eco/:name` profile — full server serialization (all 14 `formatAdvisorySummary` fields + full `package` block), two advisories (GHSA + `MAL-*`) |
 | `package_profile_not_found.json` | profile route 404 body — `{"error":"Package not found"}` |
