@@ -108,9 +108,13 @@ fn parse_ecosystem(raw: &str) -> Result<crate::vuln_api::Ecosystem, String> {
 
 /// Split `<package>[@<version>]` on the LAST `@` at index > 0, so scoped
 /// npm names survive: `@scope/pkg@1.2.3` → ("@scope/pkg", Some("1.2.3")),
-/// `@scope/pkg` → ("@scope/pkg", None). Bare `@`, trailing `@`, and empty
-/// specs are usage errors. Versions must be exact — range syntax, tags,
-/// and (npm) partial versions are rejected.
+/// `@scope/pkg` → ("@scope/pkg", None). For pypi the pip-native spelling is
+/// also accepted: `requests==2.31.0` splits at the leftmost `==` (`===`,
+/// PEP 440 arbitrary equality, reads as exact too) and extras are stripped
+/// (`requests[security]` → `requests`) — they select install features, not
+/// the registry name. Bare `@`, trailing separators, and empty specs are
+/// usage errors. Versions must be exact — range syntax, tags, and (npm)
+/// partial versions are rejected.
 fn parse_package_spec(
     ecosystem: crate::vuln_api::Ecosystem,
     spec: &str,
@@ -119,17 +123,29 @@ fn parse_package_spec(
     if spec.is_empty() {
         return Err("package spec is empty".to_string());
     }
-    let (name, version) = match spec.rfind('@') {
-        Some(0) | None => (spec, None),
-        Some(pos) => (&spec[..pos], Some(&spec[pos + 1..])),
+    let is_pypi = ecosystem == crate::vuln_api::Ecosystem::Pypi;
+    let (name, version, sep) = match spec.split_once("==") {
+        Some((n, v)) if is_pypi => (n, Some(v.strip_prefix('=').unwrap_or(v)), "=="),
+        _ => match spec.rfind('@') {
+            Some(0) | None => (spec, None, "@"),
+            Some(pos) => (&spec[..pos], Some(&spec[pos + 1..]), "@"),
+        },
     };
+    let name = if is_pypi {
+        name.split_once('[').map_or(name, |(n, _)| n)
+    } else {
+        name
+    };
+    // PEP 508 allows spaces around the operator (`requests == 2.31.0`), so
+    // trim each half after splitting.
+    let name = name.trim();
     if name.is_empty() || name == "@" {
         return Err(format!("invalid package spec '{spec}'"));
     }
-    match version {
+    match version.map(str::trim) {
         None => Ok((name.to_string(), None)),
         Some("") => Err(format!(
-            "invalid package spec '{spec}': trailing '@' (write <package> or <package>@<version>)"
+            "invalid package spec '{spec}': trailing '{sep}' (write <package> or <package>{sep}<version>)"
         )),
         Some(v) => {
             require_exact_version(ecosystem, v)?;
@@ -395,6 +411,46 @@ mod tests {
             parse_package_spec(Ecosystem::Npm, "@scope/pkg@1.2.3"),
             Ok(("@scope/pkg".to_string(), Some("1.2.3".to_string())))
         );
+    }
+
+    #[test]
+    fn parse_spec_pypi_accepts_pip_style_separators() {
+        for spec in [
+            "requests==2.31.0",
+            "requests===2.31.0",
+            "requests == 2.31.0",
+        ] {
+            assert_eq!(
+                parse_package_spec(Ecosystem::Pypi, spec),
+                Ok(("requests".to_string(), Some("2.31.0".to_string()))),
+                "spec: {spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_spec_pypi_strips_extras() {
+        assert_eq!(
+            parse_package_spec(Ecosystem::Pypi, "requests[security]"),
+            Ok(("requests".to_string(), None))
+        );
+        assert_eq!(
+            parse_package_spec(Ecosystem::Pypi, "requests[security]==2.31.0"),
+            Ok(("requests".to_string(), Some("2.31.0".to_string())))
+        );
+        assert_eq!(
+            parse_package_spec(Ecosystem::Pypi, "requests[security]@2.31.0"),
+            Ok(("requests".to_string(), Some("2.31.0".to_string())))
+        );
+    }
+
+    #[test]
+    fn parse_spec_pypi_rejects_bad_pip_forms() {
+        let err =
+            parse_package_spec(Ecosystem::Pypi, "requests==").expect_err("trailing == is an error");
+        assert!(err.contains("trailing"), "err: {err}");
+        assert!(parse_package_spec(Ecosystem::Pypi, "[security]==1.0").is_err());
+        assert!(parse_package_spec(Ecosystem::Pypi, "requests==2.31.*").is_err());
     }
 
     #[test]

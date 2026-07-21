@@ -151,6 +151,7 @@ gate (`corgea npm|pip|...`) remains the backstop.**
 corgea advisories check npm axios            # axios's advisory history (up to 100 most recent)
 corgea advisories check npm axios@1.0.0      # verdict for one exact version
 corgea advisories check pypi requests@2.31.0 # pypi (pip is accepted as an alias)
+corgea advisories check pypi requests==2.31.0  # pip-style separator also accepted; extras ([security]) are ignored
 corgea advisories check npm axios@1.0.0 --json  # stable machine-readable document
 ```
 
