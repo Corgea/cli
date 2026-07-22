@@ -62,7 +62,6 @@ pub fn run(
     let project_name = utils::generic::determine_project_name(project_name.as_deref());
     let zip_path = format!("{}/{}.zip", temp_dir.display(), project_name);
     let repo_info = utils::generic::get_repo_info("./").unwrap_or_default();
-
     match utils::generic::create_path_if_not_exists(&temp_dir) {
         Ok(_) => (),
         Err(e) => {
