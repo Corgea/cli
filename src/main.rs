@@ -82,6 +82,13 @@ enum Commands {
         only_uncommitted: bool,
 
         #[arg(
+            long = "metadata",
+            value_name = "KEY=VALUE",
+            help = "Attach scan-level metadata (repeatable), e.g. --metadata pipeline_url=... --metadata artifact_version=1.2.3"
+        )]
+        metadata: Vec<String>,
+
+        #[arg(
             short,
             long,
             help = "Fail on (exits with error code 1) based on blocking rules defined in the web app."
@@ -529,6 +536,7 @@ fn main() {
             fail_on,
             fail,
             only_uncommitted,
+            metadata,
             scan_type,
             policy,
             out_format,
@@ -558,6 +566,19 @@ fn main() {
                 ::log::error!("only_uncommitted is only supported with blast scanner.");
                 std::process::exit(1);
             }
+
+            if !metadata.is_empty() && *scanner != Scanner::Blast {
+                ::log::error!("--metadata is only supported with the blast scanner.");
+                std::process::exit(1);
+            }
+
+            let metadata_json = match scanners::blast::metadata_json_from_pairs(metadata) {
+                Ok(json) => json,
+                Err(e) => {
+                    ::log::error!("{}", e);
+                    std::process::exit(1);
+                }
+            };
 
             if out_file.is_some() && *scanner != Scanner::Blast {
                 ::log::error!("out_file is only supported with blast scanner.");
@@ -631,6 +652,7 @@ fn main() {
                     fail_on.clone(),
                     fail,
                     only_uncommitted,
+                    metadata_json,
                     scan_type.clone(),
                     policy.clone(),
                     out_format.clone(),
