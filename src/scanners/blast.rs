@@ -1,8 +1,7 @@
 use crate::config::Config;
 use crate::targets;
 use crate::utils;
-use crate::utils::api::{SCAIssue, ScanResponse};
-use chrono::{DateTime, Duration, Utc};
+use crate::utils::api::SCAIssue;
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
@@ -17,7 +16,6 @@ pub fn run(
     fail_on: Option<String>,
     fail: &bool,
     only_uncommitted: &bool,
-    skip_if_scanned: &bool,
     scan_type: Option<String>,
     policy: Option<String>,
     out_format: Option<String>,
@@ -47,87 +45,6 @@ pub fn run(
             }
         }
     }
-
-    let project_name = utils::generic::determine_project_name(project_name.as_deref());
-    let repo_info = utils::generic::get_repo_info("./").unwrap_or_default();
-
-    if *skip_if_scanned {
-        match &repo_info {
-            None => {
-                log::error!("--skip-if-scanned can only be used in a git repository.");
-                std::process::exit(1);
-            }
-            // Packaging uses cwd; only skip when cwd is the repo root so a
-            // packages/a scan cannot suppress a later root scan (or vice versa).
-            Some(_) if !utils::generic::is_at_repo_root("./") => {
-                log::error!("--skip-if-scanned must be run from the repository root.");
-                std::process::exit(1);
-            }
-            Some(_) if utils::generic::is_working_tree_dirty("./") => {
-                log::error!(
-                    "--skip-if-scanned requires a clean working tree (no uncommitted or staged changes)."
-                );
-                std::process::exit(1);
-            }
-            Some(info) => {
-                let Some(sha) = info.sha.as_deref() else {
-                    log::error!("--skip-if-scanned could not determine the commit SHA.");
-                    std::process::exit(1);
-                };
-                // CI branch is skip-lookup only; upload keeps raw git branch metadata.
-                let Some(branch) = resolve_skip_branch(info.branch.as_deref()) else {
-                    log::error!(
-                        "--skip-if-scanned could not determine the branch (detached HEAD without CI metadata)."
-                    );
-                    std::process::exit(1);
-                };
-                let git_had_branch = info
-                    .branch
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|b| !b.is_empty())
-                    .is_some();
-                // Detached uploads store null branch; don't filter those out.
-                let query_branch = if git_had_branch {
-                    Some(branch.as_str())
-                } else {
-                    None
-                };
-                match utils::api::query_scan_list(
-                    &config.get_url(),
-                    Some(&project_name),
-                    Some(1),
-                    None,
-                    query_branch,
-                    Some(sha),
-                ) {
-                    Ok(resp) => {
-                        let scans = resp.scans.unwrap_or_default();
-                        let now = Utc::now();
-                        if let Some(scan) =
-                            find_recent_matching_scan(&scans, sha, &branch, !git_had_branch, now)
-                        {
-                            let age = parse_created_at(&scan.created_at)
-                                .map(|created| format_scan_age(created, now))
-                                .unwrap_or_else(|| "recently".to_string());
-                            let short_sha: String = sha.chars().take(8).collect();
-                            println!(
-                                "Skipping scan: commit {} on {} was already scanned {} (scan {}).",
-                                short_sha, branch, age, scan.id
-                            );
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "--skip-if-scanned: failed to query recent scans ({e}); scanning normally."
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     println!("\nScanning with BLAST 🚀🚀🚀");
 
     if let Some(scan_type) = &scan_type {
@@ -142,7 +59,9 @@ pub fn run(
     println!("\n\n");
     let temp_dir = env::temp_dir().join(format!("corgea/tmp/{}", Uuid::new_v4()));
     fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+    let project_name = utils::generic::determine_project_name(project_name.as_deref());
     let zip_path = format!("{}/{}.zip", temp_dir.display(), project_name);
+    let repo_info = utils::generic::get_repo_info("./").unwrap_or_default();
 
     match utils::generic::create_path_if_not_exists(&temp_dir) {
         Ok(_) => (),
@@ -733,83 +652,6 @@ pub fn report_scan_status(
     Ok(classification_counts)
 }
 
-/// Branch for skip matching: local git branch, else common CI metadata
-/// (`GITHUB_HEAD_REF` / `GITHUB_REF_NAME` / `CI_COMMIT_BRANCH` / `CI_COMMIT_REF_NAME`)
-/// so detached-HEAD checkouts in CI can still skip.
-fn resolve_skip_branch(repo_branch: Option<&str>) -> Option<String> {
-    if let Some(branch) = repo_branch.map(str::trim).filter(|b| !b.is_empty()) {
-        return Some(branch.to_string());
-    }
-    for key in [
-        "GITHUB_HEAD_REF",
-        "GITHUB_REF_NAME",
-        "CI_COMMIT_BRANCH",
-        "CI_COMMIT_REF_NAME",
-    ] {
-        if let Some(branch) = env::var(key)
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-        {
-            return Some(branch);
-        }
-    }
-    None
-}
-
-fn find_recent_matching_scan<'a>(
-    scans: &'a [ScanResponse],
-    local_sha: &str,
-    local_branch: &str,
-    allow_null_scan_branch: bool,
-    now: DateTime<Utc>,
-) -> Option<&'a ScanResponse> {
-    scans.iter().find(|scan| {
-        if !scan.status.eq_ignore_ascii_case("complete") {
-            return false;
-        }
-        // BLAST uploads store engine as "corgea-blast"; never skip on Semgrep/Snyk/etc.
-        if !scan.engine.eq_ignore_ascii_case("corgea-blast") {
-            return false;
-        }
-        if scan.git_sha.as_deref() != Some(local_sha) {
-            return false;
-        }
-        let branch_ok = scan.branch.as_deref() == Some(local_branch)
-            || (allow_null_scan_branch && scan.branch.is_none());
-        if !branch_ok {
-            return false;
-        }
-        match parse_created_at(&scan.created_at) {
-            // Reject future timestamps (clock skew) and anything >= 24h old.
-            Some(created) => created <= now && now - created < Duration::hours(24),
-            None => false,
-        }
-    })
-}
-
-fn parse_created_at(raw: &str) -> Option<DateTime<Utc>> {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
-        return Some(dt.with_timezone(&Utc));
-    }
-    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S") {
-        return Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
-    }
-    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f") {
-        return Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
-    }
-    None
-}
-
-fn format_scan_age(created: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    let minutes = (now - created).num_minutes().max(0);
-    if minutes < 60 {
-        format!("{minutes}m ago")
-    } else {
-        format!("{}h ago", minutes / 60)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -931,170 +773,5 @@ mod tests {
             &counts(&[("LO", 1)]),
             &[sca_issue(Some("malicious"))]
         ));
-    }
-
-    // --skip-if-scanned helpers
-
-    fn scan(
-        id: &str,
-        sha: Option<&str>,
-        branch: Option<&str>,
-        status: &str,
-        created_at: &str,
-    ) -> ScanResponse {
-        scan_with_engine(id, sha, branch, status, "corgea-blast", created_at)
-    }
-
-    fn scan_with_engine(
-        id: &str,
-        sha: Option<&str>,
-        branch: Option<&str>,
-        status: &str,
-        engine: &str,
-        created_at: &str,
-    ) -> ScanResponse {
-        ScanResponse {
-            id: id.to_string(),
-            project: "proj".to_string(),
-            repo: None,
-            branch: branch.map(str::to_string),
-            status: status.to_string(),
-            engine: engine.to_string(),
-            created_at: created_at.to_string(),
-            git_sha: sha.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn skips_matching_complete_scan_within_24h() {
-        let now = Utc::now();
-        let created = (now - Duration::hours(3)).to_rfc3339();
-        let scans = vec![scan(
-            "s1",
-            Some("abc123"),
-            Some("main"),
-            "complete",
-            &created,
-        )];
-        let matched = find_recent_matching_scan(&scans, "abc123", "main", false, now);
-        assert_eq!(matched.map(|s| s.id.as_str()), Some("s1"));
-    }
-
-    #[test]
-    fn skips_title_case_complete_status() {
-        let now = Utc::now();
-        let created = (now - Duration::hours(1)).to_rfc3339();
-        let scans = vec![scan(
-            "s1",
-            Some("abc123"),
-            Some("main"),
-            "Complete",
-            &created,
-        )];
-        assert_eq!(
-            find_recent_matching_scan(&scans, "abc123", "main", false, now).map(|s| s.id.as_str()),
-            Some("s1")
-        );
-    }
-
-    #[test]
-    fn does_not_skip_stale_or_exact_24h_scan() {
-        let now = Utc::now();
-        let stale = (now - Duration::hours(25)).to_rfc3339();
-        let exact = (now - Duration::hours(24)).to_rfc3339();
-        let scans = vec![
-            scan("s1", Some("abc123"), Some("main"), "complete", &stale),
-            scan("s2", Some("abc123"), Some("main"), "complete", &exact),
-        ];
-        assert!(find_recent_matching_scan(&scans, "abc123", "main", false, now).is_none());
-    }
-
-    #[test]
-    fn does_not_skip_future_created_at() {
-        let now = Utc::now();
-        let created = (now + Duration::hours(1)).to_rfc3339();
-        let scans = vec![scan(
-            "s1",
-            Some("abc123"),
-            Some("main"),
-            "complete",
-            &created,
-        )];
-        assert!(find_recent_matching_scan(&scans, "abc123", "main", false, now).is_none());
-    }
-
-    #[test]
-    fn does_not_skip_different_branch_or_sha() {
-        let now = Utc::now();
-        let created = (now - Duration::hours(1)).to_rfc3339();
-        let scans = vec![
-            scan("s1", Some("abc123"), Some("other"), "complete", &created),
-            scan("s2", Some("ffff"), Some("main"), "complete", &created),
-        ];
-        assert!(find_recent_matching_scan(&scans, "abc123", "main", false, now).is_none());
-    }
-
-    #[test]
-    fn does_not_skip_missing_sha_or_incomplete() {
-        let now = Utc::now();
-        let created = (now - Duration::hours(1)).to_rfc3339();
-        let scans = vec![
-            scan("s1", None, Some("main"), "complete", &created),
-            scan("s2", Some("abc123"), Some("main"), "scanning", &created),
-        ];
-        assert!(find_recent_matching_scan(&scans, "abc123", "main", false, now).is_none());
-    }
-
-    #[test]
-    fn skips_null_branch_scan_when_detached_ci_fallback_allowed() {
-        let now = Utc::now();
-        let created = (now - Duration::hours(1)).to_rfc3339();
-        let scans = vec![scan("s1", Some("abc123"), None, "complete", &created)];
-        assert_eq!(
-            find_recent_matching_scan(&scans, "abc123", "main", true, now).map(|s| s.id.as_str()),
-            Some("s1")
-        );
-        assert!(find_recent_matching_scan(&scans, "abc123", "main", false, now).is_none());
-    }
-
-    #[test]
-    fn does_not_skip_non_blast_engine() {
-        let now = Utc::now();
-        let created = (now - Duration::hours(1)).to_rfc3339();
-        let scans = vec![
-            scan_with_engine(
-                "s1",
-                Some("abc123"),
-                Some("main"),
-                "complete",
-                "semgrep",
-                &created,
-            ),
-            scan_with_engine(
-                "s2",
-                Some("abc123"),
-                Some("main"),
-                "complete",
-                "snyk",
-                &created,
-            ),
-        ];
-        assert!(find_recent_matching_scan(&scans, "abc123", "main", false, now).is_none());
-    }
-
-    #[test]
-    fn resolve_skip_branch_prefers_repo_branch() {
-        assert_eq!(
-            resolve_skip_branch(Some("feature/x")).as_deref(),
-            Some("feature/x")
-        );
-    }
-
-    #[test]
-    fn format_scan_age_uses_minutes_under_one_hour() {
-        let now = Utc::now();
-        let created = now - Duration::minutes(12);
-        assert_eq!(format_scan_age(created, now), "12m ago");
-        assert_eq!(format_scan_age(now - Duration::hours(3), now), "3h ago");
     }
 }

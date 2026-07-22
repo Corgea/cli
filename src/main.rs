@@ -82,12 +82,6 @@ enum Commands {
         only_uncommitted: bool,
 
         #[arg(
-            long,
-            help = "Skip the scan if this commit already has a completed BLAST scan for the same project and branch within the last 24h. Requires a clean git checkout. Only for a default blast scan (not with --fail, --fail-on, --only-uncommitted, --target, --exclude, --scan-type, --policy, or --out-file/--out-format)."
-        )]
-        skip_if_scanned: bool,
-
-        #[arg(
             short,
             long,
             help = "Fail on (exits with error code 1) based on blocking rules defined in the web app."
@@ -495,7 +489,6 @@ fn main() {
             fail_on,
             fail,
             only_uncommitted,
-            skip_if_scanned,
             scan_type,
             policy,
             out_format,
@@ -523,28 +516,6 @@ fn main() {
 
             if *only_uncommitted && *scanner != Scanner::Blast {
                 ::log::error!("only_uncommitted is only supported with blast scanner.");
-                std::process::exit(1);
-            }
-
-            if *skip_if_scanned && *scanner != Scanner::Blast {
-                ::log::error!("--skip-if-scanned is only supported with the blast scanner.");
-                std::process::exit(1);
-            }
-
-            if *skip_if_scanned
-                && (*fail
-                    || fail_on.is_some()
-                    || *only_uncommitted
-                    || target.is_some()
-                    || exclude.is_some()
-                    || scan_type.is_some()
-                    || policy.is_some()
-                    || out_file.is_some()
-                    || out_format.is_some())
-            {
-                ::log::error!(
-                    "--skip-if-scanned only applies to a default blast scan. It cannot be combined with --fail, --fail-on, --only-uncommitted, --target, --exclude, --scan-type, --policy, or --out-file/--out-format."
-                );
                 std::process::exit(1);
             }
 
@@ -620,7 +591,6 @@ fn main() {
                     fail_on.clone(),
                     fail,
                     only_uncommitted,
-                    skip_if_scanned,
                     scan_type.clone(),
                     policy.clone(),
                     out_format.clone(),

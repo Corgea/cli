@@ -265,8 +265,6 @@ pub fn run(
             Some(&project_name),
             *page,
             *page_size,
-            None,
-            None,
         ) {
             Ok(scans) => {
                 let page = scans.page;

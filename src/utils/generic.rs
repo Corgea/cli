@@ -1,5 +1,5 @@
 use crate::utils::terminal::{set_text_color, TerminalColor};
-use git2::{Repository, StatusOptions};
+use git2::Repository;
 use globset::{Glob, GlobSetBuilder};
 use ignore::WalkBuilder;
 use std::env;
@@ -268,7 +268,7 @@ pub fn get_env_var_if_exists(var_name: &str) -> Option<String> {
 }
 
 pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
-    // discover (not open) so callers in a repo subdirectory still resolve HEAD.
+    // Use discover so subdirectory CWDs still resolve the repo HEAD/SHA.
     let repo = match Repository::discover(Path::new(dir)) {
         Ok(repo) => repo,
         Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
@@ -301,42 +301,6 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
         repo_url,
         sha,
     }))
-}
-
-/// True when `dir` is the repository worktree root (not a subdirectory).
-pub fn is_at_repo_root(dir: &str) -> bool {
-    let Ok(repo) = Repository::discover(Path::new(dir)) else {
-        return false;
-    };
-    let Some(workdir) = repo.workdir() else {
-        return false;
-    };
-    let Ok(workdir) = workdir.canonicalize() else {
-        return false;
-    };
-    let Ok(cwd) = Path::new(dir).canonicalize() else {
-        return false;
-    };
-    workdir == cwd
-}
-
-/// True when the worktree or index differs from HEAD (including untracked files
-/// and submodule changes). Returns true on error so callers that skip work fail closed.
-pub fn is_working_tree_dirty(dir: &str) -> bool {
-    let Ok(repo) = Repository::discover(Path::new(dir)) else {
-        return true;
-    };
-    let mut opts = StatusOptions::new();
-    opts.include_untracked(true);
-    // Include submodule status so a changed gitlink or dirty submodule
-    // cannot be skipped as if HEAD content were unchanged.
-    opts.exclude_submodules(false);
-    opts.include_ignored(false);
-    let dirty = match repo.statuses(Some(&mut opts)) {
-        Ok(statuses) => !statuses.is_empty(),
-        Err(_) => true,
-    };
-    dirty
 }
 
 pub fn get_status(status: &str) -> &str {
@@ -405,15 +369,10 @@ mod tests {
 
         let nested = root.join("pkg").join("inner");
         fs::create_dir_all(&nested).unwrap();
-        let nested_s = nested.to_str().unwrap();
-        let root_s = root.to_str().unwrap();
-        let info = get_repo_info(nested_s)
+        let info = get_repo_info(nested.to_str().unwrap())
             .unwrap()
             .expect("should find repo from subdirectory");
         assert!(info.sha.is_some());
-        assert!(!is_working_tree_dirty(nested_s));
-        assert!(is_at_repo_root(root_s));
-        assert!(!is_at_repo_root(nested_s));
     }
 
     #[test]
