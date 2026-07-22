@@ -13,8 +13,7 @@ pub fn run(
     page_size: &Option<u16>,
     scan_id: &Option<String>,
 ) {
-    let project_name =
-        utils::generic::get_current_working_directory().unwrap_or("unknown".to_string());
+    let project_name = utils::generic::determine_project_name(None);
     println!();
     if *sca_issues {
         let sca_issues_response = match utils::api::get_sca_issues(
@@ -322,22 +321,43 @@ pub fn run(
             } else {
                 formatted_repo
             };
-            let short_sha = scan
-                .git_sha
-                .as_deref()
-                .map(|s| s.chars().take(8).collect::<String>())
-                .unwrap_or_else(|| "N/A".to_string());
-
             table.push(vec![
                 scan.id.clone(),
                 scan.project.clone(),
                 scan.status.clone(),
                 formatted_repo,
                 scan.branch.clone().unwrap_or("N/A".to_string()),
-                short_sha,
+                format_short_sha(scan.git_sha.as_deref()),
             ]);
         }
 
         utils::terminal::print_table(table, page, total_pages);
+    }
+}
+
+/// Format a git SHA for the list table. Missing/blank → "N/A"; otherwise first 8 chars.
+fn format_short_sha(git_sha: Option<&str>) -> String {
+    git_sha
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(8).collect::<String>())
+        .unwrap_or_else(|| "N/A".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_short_sha_missing_or_blank_is_na() {
+        assert_eq!(format_short_sha(None), "N/A");
+        assert_eq!(format_short_sha(Some("")), "N/A");
+        assert_eq!(format_short_sha(Some("   ")), "N/A");
+    }
+
+    #[test]
+    fn format_short_sha_truncates_to_eight_chars() {
+        assert_eq!(format_short_sha(Some("abcdef0123456789")), "abcdef01");
+        assert_eq!(format_short_sha(Some("abc")), "abc");
     }
 }
