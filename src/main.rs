@@ -82,12 +82,6 @@ enum Commands {
         only_uncommitted: bool,
 
         #[arg(
-            long,
-            help = "Skip the scan if this commit already has a completed BLAST scan for the same project and branch within the last 24h. Requires a clean git checkout. Only for a default blast scan (not with --fail, --fail-on, --only-uncommitted, --target, --exclude, --scan-type, --policy, --metadata, or --out-file/--out-format)."
-        )]
-        skip_if_scanned: bool,
-
-        #[arg(
             long = "metadata",
             value_name = "KEY=VALUE",
             help = "Attach scan-level metadata (repeatable), e.g. --metadata pipeline_url=... --metadata artifact_version=1.2.3"
@@ -224,6 +218,11 @@ enum Commands {
         #[command(subcommand)]
         command: corgea::deps::run::DepsSubcommand,
     },
+    /// Look up a package's known advisories before choosing or installing it
+    Advisories {
+        #[command(subcommand)]
+        command: corgea::advisories::AdvisoriesSubcommand,
+    },
     /// Wrap `npm` commands: gate install targets on Corgea's vuln verdicts, then run npm.
     Npm(InstallWrapArgs),
     /// Wrap `yarn` commands: gate install targets on Corgea's vuln verdicts, then run yarn.
@@ -259,10 +258,20 @@ struct InstallWrapArgs {
     cmd: Vec<String>,
 }
 
-fn install_wrap_options(
-    args: &InstallWrapArgs,
-    config: &Config,
-) -> corgea::precheck::PrecheckOptions {
+/// The vuln-api access policy shared by the install gate and `advisories`:
+/// which base URL to hit and whether the Corgea token travels with the
+/// request. `has_token` reports whether the user is logged in, independent
+/// of the isolation decision that may keep the token off a custom URL.
+struct VulnApiAccess {
+    base_url: String,
+    mode: corgea::precheck::VerdictMode,
+    has_token: bool,
+}
+
+/// Resolve the shared vuln-api access policy once so both surfaces apply the
+/// same base-URL/token-isolation rule (never send a token to a custom URL
+/// without explicit opt-in).
+fn resolve_vuln_api_access(config: &Config) -> VulnApiAccess {
     let token = config.get_token();
     let token = token.trim();
     let base_url = config::vuln_api_url();
@@ -270,14 +279,25 @@ fn install_wrap_options(
     let send_token_to_custom =
         utils::generic::get_env_var_if_exists("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL")
             .is_some_and(|v| v.trim() == "1");
-    let mode = select_verdict_mode(token, custom_vuln_api_url, send_token_to_custom);
+    VulnApiAccess {
+        mode: select_verdict_mode(token, custom_vuln_api_url, send_token_to_custom),
+        base_url,
+        has_token: !token.is_empty(),
+    }
+}
+
+fn install_wrap_options(
+    args: &InstallWrapArgs,
+    config: &Config,
+) -> corgea::precheck::PrecheckOptions {
+    let access = resolve_vuln_api_access(config);
     corgea::precheck::PrecheckOptions {
         force: args.force,
         json: args.json,
         verdict: Some(corgea::precheck::VerdictConfig {
-            base_url,
-            mode,
-            public_login_hint: token.is_empty(),
+            base_url: access.base_url,
+            mode: access.mode,
+            public_login_hint: !access.has_token,
         }),
         npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
         pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
@@ -286,6 +306,20 @@ fn install_wrap_options(
             .then(|| corgea::precheck::RecencyConfig {
                 threshold_days: config.get_recency_threshold_days(),
             }),
+    }
+}
+
+/// Advisories connection options. No token gate — tokenless (public) mode
+/// must work — but the same isolation policy as the install wrap.
+fn advisories_options(config: &Config) -> corgea::advisories::AdvisoriesOptions {
+    let access = resolve_vuln_api_access(config);
+    let token = match access.mode {
+        corgea::precheck::VerdictMode::Authenticated { token } => Some(token),
+        corgea::precheck::VerdictMode::Public => None,
+    };
+    corgea::advisories::AdvisoriesOptions {
+        base_url: access.base_url,
+        token,
     }
 }
 
@@ -502,7 +536,6 @@ fn main() {
             fail_on,
             fail,
             only_uncommitted,
-            skip_if_scanned,
             metadata,
             scan_type,
             policy,
@@ -534,11 +567,6 @@ fn main() {
                 std::process::exit(1);
             }
 
-            if *skip_if_scanned && *scanner != Scanner::Blast {
-                ::log::error!("--skip-if-scanned is only supported with the blast scanner.");
-                std::process::exit(1);
-            }
-
             if !metadata.is_empty() && *scanner != Scanner::Blast {
                 ::log::error!("--metadata is only supported with the blast scanner.");
                 std::process::exit(1);
@@ -551,24 +579,6 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-
-            if *skip_if_scanned
-                && (*fail
-                    || fail_on.is_some()
-                    || *only_uncommitted
-                    || target.is_some()
-                    || exclude.is_some()
-                    || scan_type.is_some()
-                    || policy.is_some()
-                    || metadata_json.is_some()
-                    || out_file.is_some()
-                    || out_format.is_some())
-            {
-                ::log::error!(
-                    "--skip-if-scanned only applies to a default blast scan. It cannot be combined with --fail, --fail-on, --only-uncommitted, --target, --exclude, --scan-type, --policy, --metadata, or --out-file/--out-format."
-                );
-                std::process::exit(1);
-            }
 
             if out_file.is_some() && *scanner != Scanner::Blast {
                 ::log::error!("out_file is only supported with blast scanner.");
@@ -642,7 +652,6 @@ fn main() {
                     fail_on.clone(),
                     fail,
                     only_uncommitted,
-                    skip_if_scanned,
                     metadata_json,
                     scan_type.clone(),
                     policy.clone(),
@@ -724,6 +733,12 @@ fn main() {
         Some(Commands::Deps { command }) => {
             // Offline: no token / network. Exit code propagates fail-on policy.
             std::process::exit(i32::from(corgea::deps::run::run(command.clone())));
+        }
+        Some(Commands::Advisories { command }) => {
+            std::process::exit(corgea::advisories::run(
+                command.clone(),
+                advisories_options(&corgea_config),
+            ));
         }
         // Install wrappers: no auth gate. Public CVE checks run without a
         // token and fail open on lookup outages.

@@ -696,8 +696,6 @@ pub fn query_scan_list(
     project: Option<&str>,
     page: Option<u16>,
     page_size: Option<u16>,
-    branch: Option<&str>,
-    sha: Option<&str>,
 ) -> Result<ScansResponse, Box<dyn Error>> {
     let url = format!("{}{}/scans", url, API_BASE);
     let page = page.unwrap_or(1);
@@ -709,12 +707,6 @@ pub fn query_scan_list(
     }
     if let Some(project) = project {
         query_params.push(("project", project.to_string()));
-    }
-    if let Some(branch) = branch {
-        query_params.push(("branch", branch.to_string()));
-    }
-    if let Some(sha) = sha {
-        query_params.push(("sha", sha.to_string()));
     }
 
     let client = http_client();
@@ -1127,6 +1119,34 @@ pub struct SCAIssuesResponse {
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn scan_response_deserializes_git_sha_and_defaults_when_missing() {
+        let with_sha = r#"{
+            "id": "s1",
+            "project": "p",
+            "repo": null,
+            "branch": "main",
+            "status": "complete",
+            "engine": "corgea-blast",
+            "created_at": "2026-01-01T00:00:00Z",
+            "git_sha": "abcdef0123456789"
+        }"#;
+        let parsed: ScanResponse = serde_json::from_str(with_sha).unwrap();
+        assert_eq!(parsed.git_sha.as_deref(), Some("abcdef0123456789"));
+
+        let without_sha = r#"{
+            "id": "s1",
+            "project": "p",
+            "repo": null,
+            "branch": "main",
+            "status": "complete",
+            "engine": "corgea-blast",
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let parsed: ScanResponse = serde_json::from_str(without_sha).unwrap();
+        assert_eq!(parsed.git_sha, None);
+    }
 
     #[test]
     fn auth_headers_uses_bearer_for_jwt_tokens() {

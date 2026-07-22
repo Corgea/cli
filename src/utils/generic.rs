@@ -1,5 +1,5 @@
 use crate::utils::terminal::{set_text_color, TerminalColor};
-use git2::{Repository, StatusOptions};
+use git2::Repository;
 use globset::{Glob, GlobSetBuilder};
 use ignore::WalkBuilder;
 use std::env;
@@ -268,9 +268,11 @@ pub fn get_env_var_if_exists(var_name: &str) -> Option<String> {
 }
 
 pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
-    let repo = match Repository::open(Path::new(dir)) {
+    // Use discover so subdirectory CWDs still resolve the repo HEAD/SHA.
+    let repo = match Repository::discover(Path::new(dir)) {
         Ok(repo) => repo,
-        Err(_) => return Ok(None),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+        Err(e) => return Err(e),
     };
 
     let branch = repo.head().ok().and_then(|head| {
@@ -301,23 +303,6 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
     }))
 }
 
-/// True when the worktree or index differs from HEAD (including untracked files).
-/// Returns true on error so callers that skip work fail closed.
-pub fn is_working_tree_dirty(dir: &str) -> bool {
-    let Ok(repo) = Repository::open(Path::new(dir)) else {
-        return true;
-    };
-    let mut opts = StatusOptions::new();
-    opts.include_untracked(true);
-    opts.exclude_submodules(true);
-    opts.include_ignored(false);
-    let dirty = match repo.statuses(Some(&mut opts)) {
-        Ok(statuses) => !statuses.is_empty(),
-        Err(_) => true,
-    };
-    dirty
-}
-
 pub fn get_status(status: &str) -> &str {
     match status.to_lowercase().as_str() {
         "fix available" | "fix_available" => "Fix Available",
@@ -344,6 +329,51 @@ pub struct RepoInfo {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
+
+    #[test]
+    fn get_repo_info_discovers_from_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join("README"), "hi").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "README"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+
+        let nested = root.join("pkg").join("inner");
+        fs::create_dir_all(&nested).unwrap();
+        let info = get_repo_info(nested.to_str().unwrap())
+            .unwrap()
+            .expect("should find repo from subdirectory");
+        assert!(info.sha.is_some());
+    }
 
     #[test]
     fn create_zip_from_target_excludes_default_globs() {
