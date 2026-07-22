@@ -108,6 +108,47 @@ impl VulnMatch {
     }
 }
 
+/// Highest of `fixes` after sort/dedup: a single distinct value is returned
+/// as-is (no parsing — preserves odd-but-unambiguous forms); several distinct
+/// values compare by lenient semver. With `all_must_parse`, one unparsable
+/// candidate among several poisons the answer (`None`); otherwise unparsable
+/// candidates are skipped.
+pub(crate) fn highest_fix(mut fixes: Vec<&str>, all_must_parse: bool) -> Option<String> {
+    fixes.sort_unstable();
+    fixes.dedup();
+    match fixes.as_slice() {
+        [] => None,
+        [only] => Some((*only).to_string()),
+        many => {
+            let mut parsed = Vec::with_capacity(many.len());
+            for raw in many {
+                match semver::Version::parse(&crate::verify_deps::registry::normalize_for_semver(
+                    raw,
+                )) {
+                    Ok(v) => parsed.push((v, *raw)),
+                    Err(_) if all_must_parse => return None,
+                    Err(_) => {}
+                }
+            }
+            parsed
+                .into_iter()
+                .max_by(|(a, _), (b, _)| a.cmp(b))
+                .map(|(_, raw)| raw.to_string())
+        }
+    }
+}
+
+/// The one version certified to clear every match. Requires every match to
+/// carry a `fixed_version`; any match without one — or an unparsable
+/// candidate among several — means no version can be certified, so `None`.
+pub fn safe_version(matches: &[VulnMatch]) -> Option<String> {
+    let fixes: Vec<&str> = matches
+        .iter()
+        .map(|m| m.fixed_version.as_deref())
+        .collect::<Option<_>>()?;
+    highest_fix(fixes, true)
+}
+
 /// `corgea-cli/<version> (<label>)` user-agent string.
 pub(crate) fn user_agent(label: &str) -> String {
     format!("corgea-cli/{} ({label})", env!("CARGO_PKG_VERSION"))
@@ -300,6 +341,73 @@ fn send_package_check_with_retry(
     }
 }
 
+/// Map the HTTP statuses shared by every vuln-api route to a stable error
+/// message, returning the response unchanged on success so the caller can
+/// read its body. Tests assert these strings — keep them stable. 404 is
+/// NOT handled here: each route assigns it its own meaning (/check treats it
+/// as a misconfigured URL, the profile route as "package not found"), so
+/// callers handle 404 before calling this.
+fn shared_status_error(
+    response: reqwest::blocking::Response,
+    token: Option<&str>,
+) -> Result<reqwest::blocking::Response, Box<dyn std::error::Error>> {
+    let status = response.status();
+    match status.as_u16() {
+        401 if token.is_some() => {
+            Err("vuln-api rejected the Corgea token (run `corgea login` to refresh)".into())
+        }
+        401 => Err("vuln-api requires authentication".into()),
+        403 => Err("vuln-api access denied (check your Corgea plan/permissions)".into()),
+        429 => Err("vuln-api rate-limited this request (retry later)".into()),
+        code @ 500..=599 => Err(format!("vuln-api unavailable (HTTP {})", code).into()),
+        code if !status.is_success() => {
+            let suffix = error_body_suffix(response);
+            Err(format!("vuln-api returned unexpected HTTP {}{}", code, suffix).into())
+        }
+        _ => Ok(response),
+    }
+}
+
+/// Confused-deputy guard shared by the check and profile routes: refuse to
+/// attribute a response to a different `(ecosystem, name)` than requested.
+/// The current server echoes the request path verbatim, so this can only
+/// fire on a tampering or misbehaving intermediary — defense in depth, not a
+/// live server contract. Empty echoes are skipped. Comparisons are
+/// case-insensitive, and the name comparison applies the ecosystem's
+/// canonical rule (PEP 503) to BOTH sides so a response echoing the stored
+/// spelling (`flask_cors` for a `flask-cors` request) is not a false
+/// mismatch — that would fail closed for valid pypi packages with `_`/`.`
+/// in their names. Callers apply any route-specific guards (version,
+/// is_vulnerable contradiction) separately.
+fn verify_response_identity(
+    ecosystem: Ecosystem,
+    resp_ecosystem: &str,
+    resp_name: &str,
+    requested_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !resp_ecosystem.is_empty() && !resp_ecosystem.eq_ignore_ascii_case(ecosystem.path_segment())
+    {
+        return Err(format!(
+            "vuln-api response ecosystem '{}' does not match request '{}'",
+            resp_ecosystem,
+            ecosystem.path_segment()
+        )
+        .into());
+    }
+    if !resp_name.is_empty()
+        && !ecosystem
+            .normalize_name(resp_name)
+            .eq_ignore_ascii_case(&ecosystem.normalize_name(requested_name))
+    {
+        return Err(format!(
+            "vuln-api response package '{}' does not match request '{}'",
+            resp_name, requested_name
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// One HTTP request per `(name, version)`. A 1000-package lockfile makes
 /// 1000 requests (through the verdict pool's bounded concurrency); the
 /// future optimization is a server-side batch endpoint, not client tricks.
@@ -334,31 +442,13 @@ pub fn check_package_version(
 
     let response = send_package_check_with_retry(client, &url, token)?;
 
-    let status = response.status();
-    // Fixed messages for recognized statuses — tests assert these strings,
-    // keep them stable. The /check route answers 200 (empty matches) for
-    // unknown packages; a 404 can only mean a wrong base URL or route, and
-    // treating it as "clean" would silently disable the gate on a
-    // misconfigured endpoint.
-    match status.as_u16() {
-        401 if token.is_some() => {
-            return Err(
-                "vuln-api rejected the Corgea token (run `corgea login` to refresh)".into(),
-            );
-        }
-        401 => return Err("vuln-api requires authentication".into()),
-        403 => return Err("vuln-api access denied (check your Corgea plan/permissions)".into()),
-        429 => return Err("vuln-api rate-limited this request (retry later)".into()),
-        code @ 500..=599 => return Err(format!("vuln-api unavailable (HTTP {})", code).into()),
-        404 => {
-            return Err("vuln-api route not found (HTTP 404) — check CORGEA_VULN_API_URL".into());
-        }
-        code if !status.is_success() => {
-            let suffix = error_body_suffix(response);
-            return Err(format!("vuln-api returned unexpected HTTP {}{}", code, suffix).into());
-        }
-        _ => {}
+    // The /check route answers 200 (empty matches) for unknown packages; a
+    // 404 can only mean a wrong base URL or route, and treating it as "clean"
+    // would silently disable the gate on a misconfigured endpoint.
+    if response.status().as_u16() == 404 {
+        return Err("vuln-api route not found (HTTP 404) — check CORGEA_VULN_API_URL".into());
     }
+    let response = shared_status_error(response, token)?;
 
     let response_text = response.text()?;
     let parsed: VulnCheckResponse = serde_json::from_str(&response_text).map_err(|e| {
@@ -371,41 +461,8 @@ pub fn check_package_version(
     })?;
 
     // Confused-deputy guard: refuse to attribute advisories to a different
-    // (name, version, ecosystem) than what we asked about. The current
-    // server echoes ecosystem/name/version verbatim from the request path
-    // (worker.js `packageVersionCheckCliHandler`), so this can only fire on
-    // a tampering or misbehaving intermediary — defense in depth, not a live
-    // server contract. Comparisons stay case-insensitive to tolerate a
-    // future server that echoes a stored spelling/casing instead.
-    if !parsed.ecosystem.is_empty()
-        && !parsed
-            .ecosystem
-            .eq_ignore_ascii_case(ecosystem.path_segment())
-    {
-        return Err(format!(
-            "vuln-api response ecosystem '{}' does not match request '{}'",
-            parsed.ecosystem,
-            ecosystem.path_segment()
-        )
-        .into());
-    }
-    // Apply the ecosystem's canonical-name rule (PEP 503) to BOTH sides
-    // before comparing: `name` carries the wire spelling (dots/underscores
-    // preserved), and a response that echoes the registry/stored spelling
-    // (`flask_cors` for a `flask-cors` request, PEP 503-equivalent) must
-    // not be a hard failure — that would fail the gate closed for valid
-    // pypi packages with `_`/`.` in their names.
-    if !parsed.package_name.is_empty()
-        && !ecosystem
-            .normalize_name(&parsed.package_name)
-            .eq_ignore_ascii_case(&ecosystem.normalize_name(name))
-    {
-        return Err(format!(
-            "vuln-api response package '{}' does not match request '{}'",
-            parsed.package_name, name
-        )
-        .into());
-    }
+    // (name, ecosystem) than what we asked about (see verify_response_identity).
+    verify_response_identity(ecosystem, &parsed.ecosystem, &parsed.package_name, name)?;
     if !parsed.version.is_empty() && parsed.version != version {
         return Err(format!(
             "vuln-api response version '{}' does not match request '{}'",
@@ -430,11 +487,195 @@ pub fn check_package_version(
     Ok(parsed)
 }
 
+/// Package profile from `/v1/packages/:eco/:name` (no auth on the worker,
+/// but the token is still attached when the caller has one — same header
+/// policy as every route). Up to the 100 most recently modified advisories
+/// linked to the package (the worker's LIMIT 100 — no total, no
+/// pagination); note: this route carries NO fixed_versions.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PackageProfile {
+    pub package: ProfilePackage,
+    #[serde(default)]
+    pub advisories: Vec<AdvisorySummary>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProfilePackage {
+    #[serde(default)]
+    pub ecosystem: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvisorySummary {
+    pub id: String,
+    #[serde(default)]
+    pub alias: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default)]
+    pub cvss_score: Option<f64>,
+    #[serde(default)]
+    pub tier: Option<u8>,
+    #[serde(default)]
+    pub kev: Option<bool>,
+    #[serde(default)]
+    pub malware: Option<bool>,
+    #[serde(default)]
+    pub published_at: Option<String>,
+    #[serde(default)]
+    pub modified_at: Option<String>,
+}
+
+/// The worker's package-miss sentinel (worker.js `packageProfileHandler`:
+/// `{"error":"Package not found"}`). Matched on the parsed `error` field,
+/// not the raw string, so field order/whitespace can't break it. Pinned
+/// against staging by the vuln_api_contract tests.
+fn is_package_not_found_body(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+        .is_some_and(|e| e == "Package not found")
+}
+
+/// GET /v1/packages/:eco/:name. `Ok(None)` = the package has no row in the
+/// advisory database (the route's sentinel 404) — a legitimate data answer,
+/// unlike /check where 404 can only mean a misconfigured URL. A 404 without
+/// the sentinel body is an error.
+pub fn fetch_package_profile(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    token: Option<&str>,
+    ecosystem: Ecosystem,
+    name: &str,
+) -> Result<Option<PackageProfile>, Box<dyn std::error::Error>> {
+    let base = validated_base(base_url)?;
+    let name = &ecosystem.request_name(name);
+    let encoded_name = encode_package_name(ecosystem, name);
+    let url = format!(
+        "{}/v1/packages/{}/{}",
+        base,
+        ecosystem.path_segment(),
+        encoded_name
+    );
+    debug(&format!("Sending vuln-api request to URL: {}", url));
+
+    let response = send_package_check_with_retry(client, &url, token)?;
+    // Unlike /check, a 404 here CAN be a legitimate data answer — but only
+    // when it carries the route's own package-miss sentinel body. Any other
+    // 404 (wrong host, older deployment without the route, proxy/CDN) must
+    // surface as an error, not read as a clean package.
+    if response.status().as_u16() == 404 {
+        let body = response.text().unwrap_or_default();
+        if is_package_not_found_body(&body) {
+            return Ok(None);
+        }
+        return Err(format!(
+            "vuln-api route not found (HTTP 404) — check CORGEA_VULN_API_URL. Body: {}",
+            body_snippet(&body, ERROR_BODY_SNIPPET_LEN)
+        )
+        .into());
+    }
+    let response = shared_status_error(response, token)?;
+
+    let response_text = response.text()?;
+    let parsed: PackageProfile = serde_json::from_str(&response_text).map_err(|e| {
+        debug(&format!(
+            "Failed to parse vuln-api response: {}. Body: {}",
+            e,
+            body_snippet(&response_text, ERROR_BODY_SNIPPET_LEN)
+        ));
+        format!("Failed to parse vuln-api response: {}", e)
+    })?;
+
+    // The route has no version and no is_vulnerable flag, so only the
+    // (ecosystem, name) identity guard applies — not the version/contradiction
+    // guards that check_package_version adds.
+    verify_response_identity(
+        ecosystem,
+        &parsed.package.ecosystem,
+        &parsed.package.name,
+        name,
+    )?;
+    Ok(Some(parsed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::vuln_api_stub::{self, header_value, spawn_capturing_vuln_api_stub, PackageKey};
     use std::collections::{HashMap, HashSet};
+
+    /// Local `VulnMatch` builder for the `safe_version` suite — avoids a
+    /// cross-module dependency on precheck's `#[cfg(test)]` test_support.
+    fn vm(advisory: &str, fixed: Option<&str>) -> VulnMatch {
+        VulnMatch {
+            advisory_id: advisory.to_string(),
+            severity_level: "high".to_string(),
+            tier: Some(1),
+            vulnerable_version_range: None,
+            fixed_version: fixed.map(str::to_string),
+            malware: false,
+        }
+    }
+
+    #[test]
+    fn safe_version_single_fix() {
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("2.0.0"))]),
+            Some("2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn safe_version_duplicate_fixes_collapse_without_parsing() {
+        // "1.0rc1" is unparsable, but a single distinct value needs no parse.
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("1.0rc1")), vm("A-2", Some("1.0rc1"))]),
+            Some("1.0rc1".to_string())
+        );
+    }
+
+    #[test]
+    fn safe_version_picks_highest_of_distinct_fixes() {
+        // Semver order, not lexical ("1.2.0" > "1.10.0" lexically).
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("1.2.0")), vm("A-2", Some("1.10.0"))]),
+            Some("1.10.0".to_string())
+        );
+    }
+
+    #[test]
+    fn safe_version_two_component_versions_normalize() {
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("4.0")), vm("A-2", Some("3.2.5"))]),
+            Some("4.0".to_string())
+        );
+    }
+
+    #[test]
+    fn safe_version_mixed_fix_and_none_is_none() {
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("2.0.0")), vm("A-2", None)]),
+            None
+        );
+    }
+
+    #[test]
+    fn safe_version_unparsable_among_distinct_is_none() {
+        assert_eq!(
+            safe_version(&[vm("A-1", Some("2!1.0")), vm("A-2", Some("1.0.0"))]),
+            None
+        );
+    }
+
+    #[test]
+    fn safe_version_empty_matches_is_none() {
+        assert_eq!(safe_version(&[]), None);
+    }
 
     fn lodash_key() -> PackageKey {
         vuln_api_stub::key("npm", "lodash", "4.17.20")
@@ -854,6 +1095,153 @@ mod tests {
         assert_eq!(m.vulnerable_version_range.as_deref(), Some(">=3.2,<3.2.5"));
         assert_eq!(m.fixed_version.as_deref(), Some("3.2.5"));
         assert!(!m.malware);
+    }
+
+    #[test]
+    fn fixture_package_profile_deserializes_tolerant_subset() {
+        // The fixture carries the full server serialization (14 advisory
+        // fields + the full package block); the CLI subset must deserialize
+        // it, ignoring the fields it doesn't model.
+        let parsed: PackageProfile =
+            serde_json::from_str(fixture!("package_profile.json")).unwrap();
+        assert_eq!(parsed.package.ecosystem, "npm");
+        assert_eq!(parsed.package.name, "axios");
+        assert_eq!(parsed.advisories.len(), 2);
+        let ghsa = &parsed.advisories[0];
+        assert_eq!(ghsa.id, "GHSA-xxxx-yyyy-zzzz");
+        assert_eq!(ghsa.severity.as_deref(), Some("high"));
+        assert_eq!(ghsa.cvss_score, Some(7.5));
+        assert_eq!(ghsa.tier, Some(1));
+        assert_eq!(ghsa.malware, Some(false));
+        let mal = &parsed.advisories[1];
+        assert!(mal.id.starts_with("MAL-"));
+        assert_eq!(mal.malware, Some(true));
+        assert_eq!(mal.cvss_score, None);
+    }
+
+    fn fetch_profile_with_stub(
+        stub: &vuln_api_stub::VulnApiStub,
+        ecosystem: Ecosystem,
+        name: &str,
+    ) -> Result<Option<PackageProfile>, Box<dyn std::error::Error>> {
+        let client = http_client().expect("test client");
+        fetch_package_profile(&client, &stub.base_url, None, ecosystem, name)
+    }
+
+    #[test]
+    fn fetch_package_profile_parses_body() {
+        let profiles = HashMap::from([(
+            vuln_api_stub::profile_key("npm", "axios"),
+            fixture!("package_profile.json").to_string(),
+        )]);
+        let stub = vuln_api_stub::spawn_with_profiles(
+            HashMap::new(),
+            HashMap::new(),
+            profiles,
+            HashMap::new(),
+        );
+        let profile = fetch_profile_with_stub(&stub, Ecosystem::Npm, "axios")
+            .expect("profile fetch should succeed")
+            .expect("known package should be Some");
+        assert_eq!(profile.advisories.len(), 2);
+    }
+
+    #[test]
+    fn fetch_package_profile_404_is_none() {
+        // Unknown profile key → 404 → Ok(None), a legitimate data answer.
+        let stub = vuln_api_stub::spawn_with_profiles(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let profile =
+            fetch_profile_with_stub(&stub, Ecosystem::Npm, "no-such-pkg").expect("404 is Ok(None)");
+        assert!(profile.is_none());
+    }
+
+    #[test]
+    fn fetch_package_profile_identity_mismatch_is_error() {
+        let profiles = HashMap::from([(
+            vuln_api_stub::profile_key("npm", "axios"),
+            vuln_api_stub::profile_body("npm", "left-pad", "[]"),
+        )]);
+        let stub = vuln_api_stub::spawn_with_profiles(
+            HashMap::new(),
+            HashMap::new(),
+            profiles,
+            HashMap::new(),
+        );
+        let err = fetch_profile_with_stub(&stub, Ecosystem::Npm, "axios")
+            .expect_err("echoed name mismatch should fail");
+        assert!(err.to_string().contains("does not match request"));
+    }
+
+    #[test]
+    fn fetch_package_profile_alternate_pypi_spelling_passes_guard() {
+        // The wire name for `Flask_Cors` is `flask_cors`; a response echoing
+        // a PEP 503-equivalent spelling must NOT trip the identity guard.
+        let profiles = HashMap::from([(
+            vuln_api_stub::profile_key("pypi", "flask_cors"),
+            vuln_api_stub::profile_body("PyPI", "Flask-Cors", "[]"),
+        )]);
+        let stub = vuln_api_stub::spawn_with_profiles(
+            HashMap::new(),
+            HashMap::new(),
+            profiles,
+            HashMap::new(),
+        );
+        let profile = fetch_profile_with_stub(&stub, Ecosystem::Pypi, "Flask_Cors")
+            .expect("alternate spelling must pass the guard")
+            .expect("known package should be Some");
+        assert!(profile.advisories.is_empty());
+    }
+
+    #[test]
+    fn fetch_package_profile_500_is_unavailable() {
+        let profile_statuses =
+            HashMap::from([(vuln_api_stub::profile_key("npm", "axios"), 500u16)]);
+        let stub = vuln_api_stub::spawn_with_profiles(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            profile_statuses,
+        );
+        let err =
+            fetch_profile_with_stub(&stub, Ecosystem::Npm, "axios").expect_err("500 should fail");
+        assert!(err.to_string().contains("unavailable"));
+    }
+
+    #[test]
+    fn fetch_package_profile_generic_404_is_an_error() {
+        // A 404 without the worker's package-miss sentinel body (wrong host,
+        // older deployment, proxy/CDN) must not read as a clean package.
+        // Status-only script: the stub answers 404 with a non-sentinel body.
+        let profile_statuses =
+            HashMap::from([(vuln_api_stub::profile_key("npm", "axios"), 404u16)]);
+        let stub = vuln_api_stub::spawn_with_profiles(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            profile_statuses,
+        );
+        let err = fetch_profile_with_stub(&stub, Ecosystem::Npm, "axios")
+            .expect_err("non-sentinel 404 should fail");
+        assert!(err.to_string().contains("CORGEA_VULN_API_URL"));
+    }
+
+    #[test]
+    fn package_not_found_body_matches_sentinel_only() {
+        assert!(is_package_not_found_body(
+            r#"{"error":"Package not found"}"#
+        ));
+        // Field order/extra fields don't matter; other errors and non-JSON do.
+        assert!(is_package_not_found_body(
+            r#"{ "status": 404, "error": "Package not found" }"#
+        ));
+        assert!(!is_package_not_found_body(r#"{"error":"Invalid url"}"#));
+        assert!(!is_package_not_found_body("<html>404</html>"));
+        assert!(!is_package_not_found_body(""));
     }
 
     #[test]
