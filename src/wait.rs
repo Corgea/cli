@@ -3,13 +3,7 @@ use crate::scanners::blast;
 use crate::utils;
 
 pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>) {
-    let project_name = match utils::generic::get_current_working_directory() {
-        Some(name) => name,
-        None => {
-            log::error!("Unable to retrieve the current working directory. Please check your permissions and try again.");
-            std::process::exit(1);
-        }
-    };
+    let project_name = utils::generic::determine_project_name(None);
 
     let scans_result =
         utils::api::query_scan_list(&config.get_url(), Some(&project_name), Some(1), None);
