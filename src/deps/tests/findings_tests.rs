@@ -58,6 +58,7 @@ fn unresolved_bounded_range_uses_resolution_neutral_dep003_metadata() {
 
     assert!(finding.package.is_none());
     assert!(!finding.reproducible);
+    assert_eq!(finding.recommendation, definition.remediation);
     assert_eq!(
         definition.description,
         "A direct dependency uses a bounded version range."

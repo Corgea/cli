@@ -87,7 +87,7 @@ pub fn constraint_to_findings(
                 Some(declared),
                 resolved,
                 reproducible,
-                "Pin to the resolved version or allow by policy because the lockfile resolves it.",
+                "Pin an exact version or explicitly allow the range by policy.",
             );
         }
         ConstraintKind::BoundedRange => {}
