@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::deps::catalog::emitted_definition;
 use crate::deps::detect::{DepFileKind, DetectedFile};
 use crate::deps::ecosystems::classify_constraint;
 use crate::deps::findings::Finding;
 use crate::deps::model::{
-    ConstraintKind, DependencyGraph, DependencyNode, Ecosystem, PackageId, Severity, SourceType,
+    ConstraintKind, DependencyGraph, DependencyNode, Ecosystem, PackageId, SourceType,
 };
 use crate::deps::policy::Policy;
 use crate::deps::DepsError;
@@ -33,8 +34,6 @@ pub fn scan_all(ctx: &mut ScanContext<'_>) -> Result<(), DepsError> {
 pub fn add_pinning_finding(
     findings: &mut Vec<Finding>,
     code: &str,
-    severity: Severity,
-    title: &str,
     package: Option<PackageId>,
     source_file: &str,
     declared: Option<&str>,
@@ -42,10 +41,14 @@ pub fn add_pinning_finding(
     reproducible: bool,
     recommendation: &str,
 ) {
+    let Some(definition) = emitted_definition(code) else {
+        panic!("dependency finding code must be registered and emitted: {code}");
+    };
+
     findings.push(Finding {
-        id: code.into(),
-        severity,
-        title: title.into(),
+        id: definition.id.into(),
+        severity: definition.severity,
+        title: definition.title.into(),
         package,
         source_file: source_file.into(),
         declared_constraint: declared.map(str::to_string),
@@ -79,8 +82,6 @@ pub fn constraint_to_findings(
             add_pinning_finding(
                 &mut out,
                 "DEP003",
-                Severity::Medium,
-                "Direct dependency uses broad range",
                 package_id,
                 source_file,
                 Some(declared),
@@ -96,8 +97,6 @@ pub fn constraint_to_findings(
             add_pinning_finding(
                 &mut out,
                 "DEP004",
-                Severity::High,
-                "Wildcard or latest dependency",
                 package_id,
                 source_file,
                 Some(declared),
@@ -110,8 +109,6 @@ pub fn constraint_to_findings(
             add_pinning_finding(
                 &mut out,
                 "DEP021",
-                Severity::High,
-                "Mutable artifact version",
                 package_id,
                 source_file,
                 Some(declared),
@@ -124,8 +121,6 @@ pub fn constraint_to_findings(
             add_pinning_finding(
                 &mut out,
                 "DEP005",
-                Severity::High,
-                "Mutable Git branch dependency",
                 package_id,
                 source_file,
                 Some(declared),
@@ -139,8 +134,6 @@ pub fn constraint_to_findings(
             add_pinning_finding(
                 &mut out,
                 "DEP006",
-                Severity::High,
-                "URL/tarball dependency without checksum",
                 package_id,
                 source_file,
                 Some(declared),
@@ -165,8 +158,6 @@ pub fn dep001(
         add_pinning_finding(
             findings,
             "DEP001",
-            Severity::High,
-            "Missing lockfile",
             None,
             source_file,
             None,
@@ -184,8 +175,6 @@ pub fn dep002(findings: &mut Vec<Finding>, policy: &Policy, manifest_file: &str,
         add_pinning_finding(
             findings,
             "DEP002",
-            Severity::High,
-            "Stale lockfile",
             None,
             manifest_file,
             Some(missing),
@@ -206,8 +195,6 @@ pub fn dep019_unsupported_lockfile(
     add_pinning_finding(
         findings,
         "DEP019",
-        Severity::Medium,
-        "Unsupported lockfile",
         None,
         source_file,
         None,
@@ -227,8 +214,6 @@ pub fn dep008(findings: &mut Vec<Finding>, policy: &Policy, node: &DependencyNod
         add_pinning_finding(
             findings,
             "DEP008",
-            Severity::Medium,
-            "Lockfile integrity hash missing",
             Some(node.id.clone()),
             node.lockfile.as_deref().unwrap_or("lockfile"),
             node.declared_constraint.as_deref(),
@@ -287,8 +272,6 @@ pub fn dep014(findings: &mut Vec<Finding>, graph: &DependencyGraph) {
             add_pinning_finding(
                 findings,
                 "DEP014",
-                Severity::Low,
-                "Duplicate versions of same package",
                 Some(PackageId::npm(&name, vers.iter().next().unwrap())),
                 "lockfile",
                 None,

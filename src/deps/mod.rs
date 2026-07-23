@@ -2,6 +2,7 @@
 
 #![allow(dead_code)] // library surface exceeds current bin wiring (Slice 8 vuln-api deferred)
 
+pub mod catalog;
 pub mod detect;
 pub mod diff;
 pub mod ecosystems;

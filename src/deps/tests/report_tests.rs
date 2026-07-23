@@ -1,5 +1,6 @@
 use super::common::scan_fixture;
-use crate::deps::report::{to_cyclonedx, to_json, to_sarif};
+use crate::deps::catalog::emitted_definition;
+use crate::deps::report::{table_output, to_cyclonedx, to_json, to_sarif};
 
 #[test]
 fn report_json_has_findings_and_graph() {
@@ -14,6 +15,57 @@ fn report_sarif_has_rules_and_results() {
     assert_eq!(v["runs"][0]["tool"]["driver"]["name"], "corgea-deps");
     let results = v["runs"][0]["results"].as_array().expect("results array");
     assert!(results.iter().any(|r| r["ruleId"] == "DEP004"));
+}
+
+#[test]
+fn dep004_report_values_remain_catalog_hydrated_and_dynamic() {
+    let inv = scan_fixture("node-app");
+    let definition = emitted_definition("DEP004").unwrap();
+    let finding = inv
+        .with_code("DEP004")
+        .into_iter()
+        .next()
+        .expect("node-app emits DEP004");
+    let expected_recommendation =
+        "Pin to an exact version instead of using wildcard, latest, or unbounded ranges.";
+
+    assert_eq!(finding.title, definition.title);
+    assert_eq!(finding.recommendation, expected_recommendation);
+
+    let json = to_json(&inv);
+    let json_finding = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["id"] == "DEP004")
+        .expect("JSON contains DEP004");
+    assert_eq!(json_finding["severity"], "High");
+    assert_eq!(json_finding["title"], definition.title);
+    assert_eq!(json_finding["recommendation"], finding.recommendation);
+    assert!(json_finding.get("description").is_none());
+    assert!(json_finding.get("remediation").is_none());
+
+    let table = table_output(&inv);
+    assert!(table.contains("DEP004  High  Wildcard or latest dependency"));
+    assert!(table.contains("package: lodash"));
+    assert!(table.contains(expected_recommendation));
+
+    let sarif = to_sarif(&inv);
+    let sarif_rule = sarif["runs"][0]["tool"]["driver"]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|rule| rule["id"] == "DEP004")
+        .expect("SARIF contains DEP004 rule");
+    let sarif_result = sarif["runs"][0]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["ruleId"] == "DEP004")
+        .expect("SARIF contains DEP004 result");
+    assert_eq!(sarif_rule["shortDescription"]["text"], definition.title);
+    assert_eq!(sarif_result["level"], "error");
+    assert_eq!(sarif_result["message"]["text"], finding.recommendation);
 }
 
 #[test]
