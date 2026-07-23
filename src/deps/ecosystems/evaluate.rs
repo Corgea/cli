@@ -8,7 +8,7 @@ use crate::deps::detect::{DepFileKind, DetectedFile};
 use crate::deps::ecosystems::classify_constraint;
 use crate::deps::findings::Finding;
 use crate::deps::model::{
-    ConstraintKind, DependencyGraph, DependencyNode, Ecosystem, PackageId, SourceType,
+    ConstraintKind, DependencyGraph, DependencyNode, Ecosystem, PackageId, Severity, SourceType,
 };
 use crate::deps::policy::Policy;
 use crate::deps::DepsError;
@@ -30,8 +30,34 @@ pub fn scan_all(ctx: &mut ScanContext<'_>) -> Result<(), DepsError> {
     Ok(())
 }
 
+#[deprecated(note = "finding metadata is catalog-backed; use the dependency scan APIs")]
 #[allow(clippy::too_many_arguments)]
 pub fn add_pinning_finding(
+    findings: &mut Vec<Finding>,
+    code: &str,
+    _severity: Severity,
+    _title: &str,
+    package: Option<PackageId>,
+    source_file: &str,
+    declared: Option<&str>,
+    resolved: Option<&str>,
+    reproducible: bool,
+    recommendation: &str,
+) {
+    add_catalog_pinning_finding(
+        findings,
+        code,
+        package,
+        source_file,
+        declared,
+        resolved,
+        reproducible,
+        recommendation,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_catalog_pinning_finding(
     findings: &mut Vec<Finding>,
     code: &str,
     package: Option<PackageId>,
@@ -79,7 +105,7 @@ pub fn constraint_to_findings(
     match kind {
         ConstraintKind::Exact => {}
         ConstraintKind::BoundedRange if is_direct && policy.warn_on_semver_range => {
-            add_pinning_finding(
+            add_catalog_pinning_finding(
                 &mut out,
                 "DEP003",
                 package_id,
@@ -87,14 +113,18 @@ pub fn constraint_to_findings(
                 Some(declared),
                 resolved,
                 reproducible,
-                "Pin an exact version or explicitly allow the range by policy.",
+                if reproducible && resolved.is_some() {
+                    "Pin to the resolved version or allow by policy because the lockfile resolves it."
+                } else {
+                    "Pin an exact version or explicitly allow the range by policy."
+                },
             );
         }
         ConstraintKind::BoundedRange => {}
         ConstraintKind::Unbounded
             if is_direct && (policy.fail_on_wildcard || policy.fail_on_latest) =>
         {
-            add_pinning_finding(
+            add_catalog_pinning_finding(
                 &mut out,
                 "DEP004",
                 package_id,
@@ -106,7 +136,7 @@ pub fn constraint_to_findings(
             );
         }
         ConstraintKind::Mutable if is_direct && policy.fail_on_mutable_sources => {
-            add_pinning_finding(
+            add_catalog_pinning_finding(
                 &mut out,
                 "DEP021",
                 package_id,
@@ -118,7 +148,7 @@ pub fn constraint_to_findings(
             );
         }
         ConstraintKind::GitRef { mutable: true } if is_direct && policy.fail_on_mutable_sources => {
-            add_pinning_finding(
+            add_catalog_pinning_finding(
                 &mut out,
                 "DEP005",
                 package_id,
@@ -131,7 +161,7 @@ pub fn constraint_to_findings(
         }
         ConstraintKind::GitRef { .. } => {}
         ConstraintKind::Url { checksum: false } if is_direct => {
-            add_pinning_finding(
+            add_catalog_pinning_finding(
                 &mut out,
                 "DEP006",
                 package_id,
@@ -155,7 +185,7 @@ pub fn dep001(
     ecosystem_label: &str,
 ) {
     if policy.fail_on_missing_lockfile {
-        add_pinning_finding(
+        add_catalog_pinning_finding(
             findings,
             "DEP001",
             None,
@@ -172,7 +202,7 @@ pub fn dep001(
 
 pub fn dep002(findings: &mut Vec<Finding>, policy: &Policy, manifest_file: &str, missing: &str) {
     if policy.fail_on_stale_lockfile {
-        add_pinning_finding(
+        add_catalog_pinning_finding(
             findings,
             "DEP002",
             None,
@@ -192,7 +222,7 @@ pub fn dep019_unsupported_lockfile(
     source_file: &str,
     ecosystem_label: &str,
 ) {
-    add_pinning_finding(
+    add_catalog_pinning_finding(
         findings,
         "DEP019",
         None,
@@ -211,7 +241,7 @@ pub fn dep008(findings: &mut Vec<Finding>, policy: &Policy, node: &DependencyNod
         return;
     }
     if node.lock_integrity == Some(false) {
-        add_pinning_finding(
+        add_catalog_pinning_finding(
             findings,
             "DEP008",
             Some(node.id.clone()),
@@ -269,7 +299,7 @@ pub fn dep014(findings: &mut Vec<Finding>, graph: &DependencyGraph) {
     }
     for (name, vers) in versions {
         if vers.len() > 1 {
-            add_pinning_finding(
+            add_catalog_pinning_finding(
                 findings,
                 "DEP014",
                 Some(PackageId::npm(&name, vers.iter().next().unwrap())),
