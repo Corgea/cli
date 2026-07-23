@@ -1,7 +1,7 @@
 use super::common::scan_fixture;
 use crate::deps::catalog::emitted_definition;
 #[allow(deprecated)]
-use crate::deps::ecosystems::evaluate::add_pinning_finding;
+use crate::deps::ecosystems::evaluate::{add_catalog_pinning_finding, add_pinning_finding};
 use crate::deps::model::Severity;
 
 #[test]
@@ -72,11 +72,11 @@ fn unresolved_bounded_range_uses_resolution_neutral_dep003_metadata() {
 
 #[test]
 #[allow(deprecated)]
-fn legacy_add_pinning_finding_signature_uses_catalog_metadata() {
+fn legacy_add_pinning_finding_preserves_supplied_metadata() {
     let mut findings = Vec::new();
     add_pinning_finding(
         &mut findings,
-        "DEP003",
+        "CUSTOM001",
         Severity::Critical,
         "Legacy caller title",
         None,
@@ -87,21 +87,19 @@ fn legacy_add_pinning_finding_signature_uses_catalog_metadata() {
         "Legacy caller recommendation",
     );
 
-    assert_eq!(findings[0].severity, Severity::Medium);
-    assert_eq!(findings[0].title, "Direct dependency uses broad range");
+    assert_eq!(findings[0].id, "CUSTOM001");
+    assert_eq!(findings[0].severity, Severity::Critical);
+    assert_eq!(findings[0].title, "Legacy caller title");
 }
 
 #[test]
-#[allow(deprecated)]
 #[should_panic(expected = "dependency finding code must be registered and emitted: DEP010")]
-fn add_pinning_finding_rejects_reserved_codes_before_appending() {
+fn catalog_pinning_finding_rejects_reserved_codes_before_appending() {
     let mut findings = Vec::new();
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        add_pinning_finding(
+        add_catalog_pinning_finding(
             &mut findings,
             "DEP010",
-            Severity::High,
-            "Reserved advisory dependency",
             None,
             "manifest",
             None,

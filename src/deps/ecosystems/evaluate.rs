@@ -35,8 +35,8 @@ pub fn scan_all(ctx: &mut ScanContext<'_>) -> Result<(), DepsError> {
 pub fn add_pinning_finding(
     findings: &mut Vec<Finding>,
     code: &str,
-    _severity: Severity,
-    _title: &str,
+    severity: Severity,
+    title: &str,
     package: Option<PackageId>,
     source_file: &str,
     declared: Option<&str>,
@@ -44,20 +44,22 @@ pub fn add_pinning_finding(
     reproducible: bool,
     recommendation: &str,
 ) {
-    add_catalog_pinning_finding(
-        findings,
-        code,
+    findings.push(Finding {
+        id: code.into(),
+        severity,
+        title: title.into(),
         package,
-        source_file,
-        declared,
-        resolved,
+        source_file: source_file.into(),
+        declared_constraint: declared.map(str::to_string),
+        resolved_version: resolved.map(str::to_string),
+        recommendation: recommendation.into(),
         reproducible,
-        recommendation,
-    );
+        paths: vec![vec![PackageId::root()]],
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
-fn add_catalog_pinning_finding(
+pub(crate) fn add_catalog_pinning_finding(
     findings: &mut Vec<Finding>,
     code: &str,
     package: Option<PackageId>,
