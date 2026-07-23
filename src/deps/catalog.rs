@@ -49,9 +49,8 @@ pub const FINDING_DEFINITIONS: &[FindingDefinition] = &[
         id: "DEP003",
         title: "Direct dependency uses broad range",
         severity: Severity::Medium,
-        description:
-            "A direct dependency uses a bounded range even though a lockfile resolves a version.",
-        remediation: "Pin the resolved version or explicitly allow the range by policy.",
+        description: "A direct dependency uses a bounded version range.",
+        remediation: "Pin an exact version or explicitly allow the range by policy.",
         status: FindingStatus::Emitted,
     },
     FindingDefinition {

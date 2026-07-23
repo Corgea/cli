@@ -136,7 +136,7 @@ Notes: `deps scan --out-format table|json|sarif` is the report/export selector; 
 | --- | --- | --- | --- | --- | --- |
 | `DEP001` | emitted | High | Missing lockfile | The dependency manifest has no expected lockfile, so resolution is not reproducible. | Generate and commit the ecosystem lockfile. |
 | `DEP002` | emitted | High | Stale lockfile | A manifest dependency is missing from its lockfile. | Regenerate and commit the lockfile. |
-| `DEP003` | emitted | Medium | Direct dependency uses broad range | A direct dependency uses a bounded range even though a lockfile resolves a version. | Pin the resolved version or explicitly allow the range by policy. |
+| `DEP003` | emitted | Medium | Direct dependency uses broad range | A direct dependency uses a bounded version range. | Pin an exact version or explicitly allow the range by policy. |
 | `DEP004` | emitted | High | Wildcard or latest dependency | A direct dependency uses wildcard, latest, or another unbounded range. | Pin an exact version. |
 | `DEP005` | emitted | High | Mutable Git branch dependency | A direct dependency is sourced from a mutable Git branch reference. | Pin a commit SHA or immutable release tag. |
 | `DEP006` | emitted | High | URL/tarball dependency without checksum | A direct URL or tarball dependency has no integrity checksum. | Add an integrity checksum or pin a registry package. |

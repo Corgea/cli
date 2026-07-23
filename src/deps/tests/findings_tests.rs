@@ -47,6 +47,28 @@ fn fixture_findings_match_emitted_catalog_definitions() {
 }
 
 #[test]
+fn unresolved_bounded_range_uses_resolution_neutral_dep003_metadata() {
+    let inventory = scan_fixture("node-stale");
+    let finding = inventory
+        .with_code("DEP003")
+        .into_iter()
+        .find(|finding| finding.resolved_version.is_none())
+        .expect("node-stale should emit DEP003 for unresolved chalk");
+    let definition = emitted_definition("DEP003").expect("DEP003 must be emitted");
+
+    assert!(finding.package.is_none());
+    assert!(!finding.reproducible);
+    assert_eq!(
+        definition.description,
+        "A direct dependency uses a bounded version range."
+    );
+    assert_eq!(
+        definition.remediation,
+        "Pin an exact version or explicitly allow the range by policy."
+    );
+}
+
+#[test]
 #[should_panic(expected = "dependency finding code must be registered and emitted: DEP010")]
 fn add_pinning_finding_rejects_reserved_codes_before_appending() {
     let mut findings = Vec::new();
