@@ -1,0 +1,126 @@
+name: Trigger AI Skills Sync on Release
+
+# Skills describe the CLI the user actually has installed, so this syncs on a
+# published release rather than on merge to main. Diffing main would push
+# unreleased commands into the public skill.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: "Previous release tag (for example: v1.9.0). Leave empty to resolve it automatically."
+        required: false
+        type: string
+      head_tag:
+        description: "Release tag to sync from (for example: v1.9.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Serialize runs so two releases published close together cannot open competing
+# pull requests against the skills repo.
+concurrency:
+  group: sync-skills
+  cancel-in-progress: false
+
+jobs:
+  run-codex-skills-sync:
+    if: github.event_name == 'workflow_dispatch' || (github.event.release.draft == false && github.event.release.prerelease == false)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release range
+        id: range
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_TAG: ${{ github.event.inputs.head_tag || github.event.release.tag_name }}
+          BASE_TAG_INPUT: ${{ github.event.inputs.base_tag }}
+          SKILLS_REPO_TOKEN: ${{ secrets.DOCS_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Corgea/skills is public, so a missing token still clones fine and
+          # only the final push fails — after a full Codex run has been paid
+          # for. Fail here instead.
+          if [[ -z "${SKILLS_REPO_TOKEN:-}" ]]; then
+            echo "::error::DOCS_REPO_TOKEN is unset. It needs write access to Corgea/skills."
+            exit 1
+          fi
+
+          if [[ -n "$BASE_TAG_INPUT" ]]; then
+            PREV_TAG="$BASE_TAG_INPUT"
+          else
+            # Latest non-draft, non-prerelease release published strictly before
+            # the one being synced. Comparing on publishedAt rather than just
+            # excluding NEW_TAG matters for manual dispatch: re-running an older
+            # tag would otherwise resolve a *newer* release as the base and feed
+            # Codex a reversed diff, which reads as commands being removed.
+            # Tag names are inconsistent across the CLI's history (v1.9.1 but
+            # 1.8.8), so never parse them. ISO-8601 UTC sorts lexicographically.
+            #
+            # This needs NEW_TAG to be a published GitHub Release. A manual
+            # dispatch of a plain git tag has no release to read a timestamp
+            # from, so say that instead of dying on a raw gh error.
+            if ! NEW_PUBLISHED=$(gh release view "$NEW_TAG" --repo "$GITHUB_REPOSITORY" --json publishedAt --jq .publishedAt 2>/dev/null); then
+              echo "::error::No published GitHub Release found for tag $NEW_TAG, so the previous release cannot be resolved automatically. Re-run with base_tag set explicitly."
+              exit 1
+            fi
+
+            # A draft release reports publishedAt as null, which would sort
+            # before every real timestamp and silently select the newest
+            # release as the base.
+            if [[ -z "$NEW_PUBLISHED" || "$NEW_PUBLISHED" == "null" ]]; then
+              echo "::error::Release $NEW_TAG has no publishedAt timestamp (draft?). Re-run with base_tag set explicitly."
+              exit 1
+            fi
+            export NEW_PUBLISHED
+            PREV_TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+              --json tagName,isDraft,isPrerelease,publishedAt \
+              --jq '[.[] | select(.isDraft == false and .isPrerelease == false and .publishedAt < env.NEW_PUBLISHED)]
+                    | sort_by(.publishedAt) | reverse | .[0].tagName // ""')
+          fi
+
+          if [[ -z "$PREV_TAG" ]]; then
+            echo "No previous release to diff against; nothing to sync."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Resolve through the API so annotated tags land on their commit.
+          BASE_SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$PREV_TAG" --jq .sha)
+          HEAD_SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$NEW_TAG" --jq .sha)
+
+          echo "Syncing skills for $PREV_TAG ($BASE_SHA) -> $NEW_TAG ($HEAD_SHA)"
+          {
+            echo "skip=false"
+            echo "prev_tag=$PREV_TAG"
+            echo "new_tag=$NEW_TAG"
+            echo "base_sha=$BASE_SHA"
+            echo "head_sha=$HEAD_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      # No checkout here on purpose. The composite action checks the CLI out
+      # into ./source itself; a second checkout at the workspace root would put
+      # the CLI's own skills/corgea/SKILL.md directly under Codex's working
+      # directory, where it is an inviting wrong target for skill edits that
+      # would then be silently discarded.
+      - name: Run AI Skills Sync
+        if: steps.range.outputs.skip == 'false'
+        uses: Corgea/internal_actions/sync-skills-action@main
+        with:
+          base_sha: ${{ steps.range.outputs.base_sha }}
+          head_sha: ${{ steps.range.outputs.head_sha }}
+          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          # DOCS_REPO_TOKEN despite the name: it is the shared bot token, which
+          # has write access to Corgea/skills as well as Corgea/docs. Rotating
+          # it affects the docs sync workflows too, not just this one.
+          skills_repo_token: ${{ secrets.DOCS_REPO_TOKEN }}
+          skills_repo: "Corgea/skills"
+          skills_base_branch: "main"
+          release_info: |
+            Corgea CLI release ${{ steps.range.outputs.new_tag }} (previous release: ${{ steps.range.outputs.prev_tag }}).
+            Release notes:
+            ${{ github.event.release.body }}
