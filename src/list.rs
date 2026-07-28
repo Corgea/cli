@@ -1,40 +1,50 @@
 use crate::config::Config;
 use crate::log::debug;
 use crate::utils;
+use crate::utils::api::ProjectSelector;
 use serde_json::json;
 use std::path::Path;
 
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    config: &Config,
-    issues: &bool,
-    sca_issues: &bool,
-    json: &bool,
-    page: &Option<u16>,
-    page_size: &Option<u16>,
-    scan_id: &Option<String>,
-    project_name_override: Option<String>,
-    repo_override: Option<String>,
-) {
-    if !*json {
+#[derive(Default)]
+pub struct ListArgs {
+    pub issues: bool,
+    pub sca_issues: bool,
+    pub json: bool,
+    pub page: Option<u16>,
+    pub page_size: Option<u16>,
+    pub scan_id: Option<String>,
+    pub selector: ProjectSelector,
+}
+
+pub fn run(config: &Config, args: ListArgs) {
+    let ListArgs {
+        issues,
+        sca_issues,
+        json,
+        page,
+        page_size,
+        scan_id,
+        selector,
+    } = args;
+    if !json {
         println!();
     }
-    if *sca_issues {
+    if sca_issues {
         // SCA has no project parameter; the CWD basename is only error copy.
         let project_name =
             utils::generic::get_current_working_directory().unwrap_or("unknown".to_string());
         let sca_issues_response = match utils::api::get_sca_issues(
             &config.get_url(),
-            Some((*page).unwrap_or(1)),
-            *page_size,
+            Some(page.unwrap_or(1)),
+            page_size,
             scan_id.clone(),
         ) {
             Ok(response) => response,
             Err(e) => {
                 debug(&format!("Error Sending Request: {}", e));
                 if e.to_string().contains("404") {
-                    if scan_id.is_some() {
-                        log::error!("Scan with ID '{}' doesn't exist or has no SCA issues. Please run 'corgea scan' to create a new scan for this project.", scan_id.as_ref().unwrap());
+                    if let Some(id) = &scan_id {
+                        log::error!("Scan with ID '{}' doesn't exist or has no SCA issues. Please run 'corgea scan' to create a new scan for this project.", id);
                     } else {
                         log::error!("No SCA issues found for project '{}'. Please run 'corgea scan' to create a new scan for this project.", project_name);
                     }
@@ -51,7 +61,7 @@ pub fn run(
             }
         };
 
-        if *json {
+        if json {
             let output = serde_json::json!({
                 "page": sca_issues_response.page,
                 "total_pages": sca_issues_response.total_pages,
@@ -115,16 +125,12 @@ pub fn run(
             Some(sca_issues_response.total_pages),
         );
     } else {
-        if *issues {
+        if issues {
             // The --scan-id issue route hits /scan/{id}/issues and ignores the
             // project, so it needs no resolution.
-            let resolved = scan_id.is_none().then(|| {
-                utils::api::resolve_or_exit(
-                    &config.get_url(),
-                    project_name_override.as_deref(),
-                    repo_override.as_deref(),
-                )
-            });
+            let resolved = scan_id
+                .is_none()
+                .then(|| utils::api::resolve_or_exit(&config.get_url(), &selector));
             let project_name = resolved
                 .as_ref()
                 .map(|r| r.query_name.clone())
@@ -132,8 +138,8 @@ pub fn run(
             let issues_response = match utils::api::get_scan_issues(
                 &config.get_url(),
                 &project_name,
-                Some((*page).unwrap_or(1)),
-                *page_size,
+                Some(page.unwrap_or(1)),
+                page_size,
                 scan_id.clone(),
             ) {
                 Ok(response) => response,
@@ -165,14 +171,10 @@ pub fn run(
             let mut blocking_rules: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
 
-            if scan_id.is_some() {
+            if let Some(id) = &scan_id {
                 let mut page: u32 = 1;
                 loop {
-                    match utils::api::check_blocking_rules(
-                        &config.get_url(),
-                        scan_id.as_ref().unwrap(),
-                        Some(page),
-                    ) {
+                    match utils::api::check_blocking_rules(&config.get_url(), id, Some(page)) {
                         Ok(rules) => {
                             if rules.block {
                                 render_blocking_rules = true;
@@ -196,7 +198,7 @@ pub fn run(
                 }
             }
 
-            if *json {
+            if json {
                 let mut json = serde_json::json!({
                     "page": issues_response.page,
                     "total_pages": issues_response.total_pages,
@@ -285,17 +287,13 @@ pub fn run(
 
             utils::terminal::print_table(table, issues_response.page, issues_response.total_pages);
         } else {
-            let resolved = utils::api::resolve_or_exit(
-                &config.get_url(),
-                project_name_override.as_deref(),
-                repo_override.as_deref(),
-            );
+            let resolved = utils::api::resolve_or_exit(&config.get_url(), &selector);
             let project_name = &resolved.query_name;
             let (scans, page, total_pages) = match utils::api::query_scan_list(
                 &config.get_url(),
                 Some(project_name),
-                *page,
-                *page_size,
+                page,
+                page_size,
             ) {
                 Ok(scans) => {
                     let page = scans.page;
@@ -322,7 +320,7 @@ pub fn run(
                     std::process::exit(1);
                 }
             };
-            if *json {
+            if json {
                 let output = json!({
                     "page": page,
                     "total_pages": total_pages,
@@ -341,7 +339,7 @@ pub fn run(
                 );
                 std::process::exit(1);
             }
-            if *json {
+            if json {
                 return;
             }
             if scans.is_empty() {

@@ -1,19 +1,28 @@
 use crate::config::Config;
 use crate::scanners::blast;
 use crate::utils;
+use crate::utils::api::ProjectSelector;
 
-pub fn run(
-    config: &Config,
-    scan_id: Option<String>,
-    project_name_override: Option<String>,
-    repo_override: Option<String>,
-    project_id_override: Option<String>,
-) {
+#[derive(Default)]
+pub struct WaitArgs {
+    pub scan_id: Option<String>,
+    pub selector: ProjectSelector,
+    /// Project id straight from an upload response, skipping resolution.
+    pub upload_project_id: Option<String>,
+}
+
+pub fn run(config: &Config, args: WaitArgs) {
+    let WaitArgs {
+        scan_id,
+        selector,
+        upload_project_id,
+    } = args;
+
     // A scan id plus the project id from the upload response leaves nothing to
     // resolve: everything below keys off the scan, and the id-form URL is
     // already known.
-    let resolved = if scan_id.is_some() && project_id_override.is_some() {
-        let name = project_name_override.clone().unwrap_or_else(|| {
+    let resolved = if scan_id.is_some() && upload_project_id.is_some() {
+        let name = selector.name.clone().unwrap_or_else(|| {
             utils::generic::get_current_working_directory().unwrap_or_else(|| "unknown".to_string())
         });
         utils::api::ResolvedProject {
@@ -24,11 +33,7 @@ pub fn run(
             project_id: None,
         }
     } else {
-        utils::api::resolve_or_exit(
-            &config.get_url(),
-            project_name_override.as_deref(),
-            repo_override.as_deref(),
-        )
+        utils::api::resolve_or_exit(&config.get_url(), &selector)
     };
     let project_name = resolved.query_name.clone();
 
@@ -85,7 +90,7 @@ pub fn run(
         },
     };
 
-    let project_id = project_id_override.or(resolved.project_id);
+    let project_id = upload_project_id.or(resolved.project_id);
     let scan_url = match &project_id {
         Some(pid) => format!("{}/project/{}/?scan_id={}", config.get_url(), pid, scan_id),
         None => {
