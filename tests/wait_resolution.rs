@@ -324,6 +324,10 @@ fn scan_post_wait_uses_upload_project_id_without_resolving() {
         .env("PATH", &bin)
         .env("CORGEA_URL", &url)
         .env("CORGEA_TOKEN", "test-token")
+        // `running_in_ci()` is true under Actions, which sends `upload_scan`
+        // down the GITHUB_REPOSITORY branch. Pin the non-CI path either way.
+        .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
         .current_dir(&repo)
         .output()
         .expect("spawn corgea");
