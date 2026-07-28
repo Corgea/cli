@@ -4,6 +4,12 @@ use std::{env, fs, io};
 
 pub const DEFAULT_VULN_API_URL: &str = "https://cve-worker-staging.corgea.workers.dev";
 
+/// Whether `DEFAULT_VULN_API_URL` points at a production endpoint. While it is
+/// staging, a Corgea token must never be sent there without an explicit opt-in,
+/// so authenticated (fail-closed) verdicts stay off by default. Flip this to
+/// `true` in the same change that points the default at production.
+pub const DEFAULT_VULN_API_URL_IS_PRODUCTION: bool = false;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub(crate) url: String,
