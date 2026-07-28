@@ -268,11 +268,70 @@ fn tokenless_public_check_discloses_mode() {
         stderr.contains("using public CVE checks"),
         "tokenless mode must disclose public CVE checks: {stderr}"
     );
+    let lower = stderr.to_lowercase();
     assert!(
-        stderr.contains("authenticated enforcement")
-            && stderr.contains("private Corgea intelligence"),
+        lower.contains("authenticated enforcement")
+            && lower.contains("private corgea intelligence"),
         "tokenless warning must name the authenticated benefit: {stderr}"
     );
+    // The benefit is conditional: a token alone does not buy enforcement while
+    // the endpoint is one the token is withheld from. Naming the opt-in keeps
+    // the hint from promising fail-closed behavior login cannot deliver.
+    assert!(
+        stderr.contains("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL"),
+        "tokenless warning must state the endpoint requirement, not just login: {stderr}"
+    );
+}
+
+#[test]
+fn withheld_token_discloses_public_mode_and_names_opt_in() {
+    // The cohort this PR creates: a token exists, but it is not sent to this
+    // vuln-api, so verdicts stay public and lookup failures warn. The old hint
+    // keyed off "has a token" and went silent here.
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("pypi", "oldpkg", "1.0.0"),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "CVE-2024-0001", Some("2.0.0")),
+    );
+    let mut h = pip_harness(checks, HashMap::new(), Some("opaque-token"), 0);
+    let out = h
+        .cmd
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("your token is not sent to this vuln-api"),
+        "a withheld token must be disclosed, not silently downgraded: {stderr}"
+    );
+    assert!(
+        stderr.contains("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL"),
+        "withheld-token warning must name the opt-in: {stderr}"
+    );
+    assert!(
+        !stderr.contains("login enables"),
+        "a logged-in user must not be told to log in: {stderr}"
+    );
+}
+
+#[test]
+fn withheld_token_reports_public_verdict_mode_in_json() {
+    let mut checks = HashMap::new();
+    checks.insert(
+        key("pypi", "oldpkg", "1.0.0"),
+        vulnerable_body("pypi", "oldpkg", "1.0.0", "CVE-2024-0001", Some("2.0.0")),
+    );
+    let mut h = pip_harness(checks, HashMap::new(), Some("opaque-token"), 0);
+    let out = h
+        .cmd
+        .args(["pip", "--json", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(1));
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["verdict_mode"], "public");
 }
 
 #[test]

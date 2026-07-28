@@ -823,11 +823,14 @@ mod tests {
         );
     }
 
-    /// A logged-in user on the built-in non-production default gets public
-    /// verdicts, and must be told so — the old hint keyed off "has a token"
-    /// and went silent for exactly this cohort. See COR-1549.
+    /// Selection only: a logged-in user on the built-in non-production default
+    /// gets public verdicts and the withheld-token hint. This is the one cohort
+    /// no integration test can pin, since the test harness always points
+    /// `CORGEA_VULN_API_URL` at a stub and so exercises the custom-URL branch.
+    /// The disclosure wiring itself is covered end-to-end by
+    /// `tests/cli_verdict.rs::withheld_token_discloses_public_mode_and_names_opt_in`.
     #[test]
-    fn withheld_token_still_discloses_public_mode() {
+    fn withheld_token_selects_public_mode_and_withheld_hint() {
         use corgea::precheck::{PublicHint, VerdictMode};
 
         // token + built-in default + no opt-in
