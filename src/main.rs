@@ -297,7 +297,7 @@ fn install_wrap_options(
         verdict: Some(corgea::precheck::VerdictConfig {
             base_url: access.base_url,
             mode: access.mode,
-            public_login_hint: !access.has_token,
+            public_hint: Some(public_hint_for(access.has_token)),
         }),
         npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
         pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
@@ -320,6 +320,17 @@ fn advisories_options(config: &Config) -> corgea::advisories::AdvisoriesOptions 
     corgea::advisories::AdvisoriesOptions {
         base_url: access.base_url,
         token,
+    }
+}
+
+/// Which public-mode disclosure to print. A withheld token is not the same
+/// situation as no token, and telling a logged-in user to log in is useless.
+/// Only consulted in public mode — authenticated runs print no hint.
+fn public_hint_for(has_token: bool) -> corgea::precheck::PublicHint {
+    if has_token {
+        corgea::precheck::PublicHint::TokenWithheld
+    } else {
+        corgea::precheck::PublicHint::NoToken
     }
 }
 
@@ -810,6 +821,23 @@ mod tests {
                 token: "token".to_string()
             }
         );
+    }
+
+    /// A logged-in user on the built-in non-production default gets public
+    /// verdicts, and must be told so — the old hint keyed off "has a token"
+    /// and went silent for exactly this cohort. See COR-1549.
+    #[test]
+    fn withheld_token_still_discloses_public_mode() {
+        use corgea::precheck::{PublicHint, VerdictMode};
+
+        // token + built-in default + no opt-in
+        assert_eq!(
+            select_verdict_mode("token", false, false),
+            VerdictMode::Public
+        );
+        assert_eq!(public_hint_for(true), PublicHint::TokenWithheld);
+        // No token is a different situation with different advice.
+        assert_eq!(public_hint_for(false), PublicHint::NoToken);
     }
 
     /// A token only ever reaches an endpoint it belongs to. The built-in

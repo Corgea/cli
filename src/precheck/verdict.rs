@@ -786,7 +786,7 @@ mod tests {
             mode: super::super::VerdictMode::Authenticated {
                 token: "test-token".to_string(),
             },
-            public_login_hint: false,
+            public_hint: None,
         };
 
         let jobs: Vec<tree::TreePackage> = ["a", "b", "evil", "c", "d", "e"]
