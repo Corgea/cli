@@ -79,10 +79,14 @@ hijacks before advisory feeds catch up. It is on by default; turn it off with
 `recency_gate = false` in `~/.corgea/config.toml`, retune the window with
 `recency_threshold_days`, or pass `--force` for a one-off install.
 
-Logging in (`corgea login`) upgrades the gate to authenticated enforcement —
-unverifiable packages, resolution errors, and lookup failures then fail closed
-(public mode warns and continues). Wrapper flags (`--force`, `--json`) go between
-the manager and its command: `corgea npm --force install <pkg>`.
+Authenticated enforcement makes unverifiable packages, resolution errors, and
+lookup failures fail closed (public mode warns and continues). Corgea only sends
+your token to a vulnerability API the token belongs to, and the built-in default
+is a staging service today, so `corgea login` alone does **not** enable it — set
+`CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` to send the token and turn it on.
+Known-vulnerable and known-malicious packages block either way. Wrapper flags
+(`--force`, `--json`) go between the manager and its command:
+`corgea npm --force install <pkg>`.
 
 See [the CLI docs](https://docs.corgea.app/cli) for the full flag and exit-code reference.
 
