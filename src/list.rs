@@ -16,8 +16,6 @@ pub fn run(
     project_name_override: Option<String>,
     repo_override: Option<String>,
 ) {
-    // Leading blank line is cosmetic spacing for the human tables. Gate it on
-    // non-JSON mode so `--json` (success OR miss) keeps a clean stdout.
     if !*json {
         println!();
     }
@@ -71,6 +69,7 @@ pub fn run(
             "Version".to_string(),
             "Fix Version".to_string(),
             "Severity".to_string(),
+            "Classification".to_string(),
             "CVE".to_string(),
             "Ecosystem".to_string(),
             "File Path".to_string(),
@@ -104,6 +103,7 @@ pub fn run(
                     .clone()
                     .unwrap_or("N/A".to_string()),
                 issue.severity.clone().unwrap_or("N/A".to_string()),
+                issue.classification.clone().unwrap_or("N/A".to_string()),
                 issue.cve.clone().unwrap_or("N/A".to_string()),
                 issue.package.ecosystem.clone(),
                 shortened_path,
@@ -370,6 +370,7 @@ pub fn run(
                 "Status".to_string(),
                 "Repo".to_string(),
                 "Branch".to_string(),
+                "SHA".to_string(),
             ]];
 
             for scan in &scans {
@@ -392,10 +393,38 @@ pub fn run(
                     scan.status.clone(),
                     formatted_repo,
                     scan.branch.clone().unwrap_or("N/A".to_string()),
+                    format_short_sha(scan.git_sha.as_deref()),
                 ]);
             }
 
             utils::terminal::print_table(table, page, total_pages);
         }
+    }
+}
+
+/// Format a git SHA for the list table. Missing/blank → "N/A"; otherwise first 8 chars.
+fn format_short_sha(git_sha: Option<&str>) -> String {
+    git_sha
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(8).collect::<String>())
+        .unwrap_or_else(|| "N/A".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_short_sha_missing_or_blank_is_na() {
+        assert_eq!(format_short_sha(None), "N/A");
+        assert_eq!(format_short_sha(Some("")), "N/A");
+        assert_eq!(format_short_sha(Some("   ")), "N/A");
+    }
+
+    #[test]
+    fn format_short_sha_truncates_to_eight_chars() {
+        assert_eq!(format_short_sha(Some("abcdef0123456789")), "abcdef01");
+        assert_eq!(format_short_sha(Some("abc")), "abc");
     }
 }

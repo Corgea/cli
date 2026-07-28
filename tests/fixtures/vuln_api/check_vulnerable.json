@@ -9,7 +9,8 @@
       "severity_level": "high",
       "tier": 1,
       "vulnerable_version_range": ">=3.2,<3.2.5",
-      "fixed_version": "3.2.5"
+      "fixed_version": "3.2.5",
+      "malware": false
     }
   ]
 }

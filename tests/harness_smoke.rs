@@ -42,7 +42,7 @@ fn http_get(base: &str, path: &str) -> String {
 fn gate_harness_wires_stubs_and_fake_manager() {
     let checks = HashMap::from([(
         common::key("pypi", "evil", "1.0.0"),
-        common::vulnerable_body("pypi", "evil", "1.0.0", "MAL-SMOKE-0001", None),
+        common::vulnerable_body("pypi", "evil", "1.0.0", "CVE-SMOKE-0001", None),
     )]);
     let h = GateHarness::new()
         .fake_recorder("pip", 0)
@@ -64,7 +64,7 @@ fn gate_harness_wires_stubs_and_fake_manager() {
     )
     .expect("vuln-api stub must be reachable");
     assert!(
-        verdict.is_vulnerable && verdict.matches[0].advisory_id == "MAL-SMOKE-0001",
+        verdict.is_vulnerable && verdict.matches[0].advisory_id == "CVE-SMOKE-0001",
         "the scripted vulnerable verdict must come back through the wired stub"
     );
 

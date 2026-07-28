@@ -1,6 +1,7 @@
 //! Report rendering: text output, refusal line, fix/steer helpers.
 
 use crate::verify_deps;
+use crate::vuln_api::{highest_fix, safe_version};
 
 use super::{
     PackageManager, PrecheckOptions, PrecheckReport, TargetOutcome, TreeOrigin, TreeReport,
@@ -13,7 +14,7 @@ const NO_VERDICT_REASON: &str = "vulnerability verdict not checked";
 /// Version stamped on every `--json` document Corgea owns on stdout — the
 /// report body and every blocking `{"error"}` / `{"warning"}` document — so
 /// machine consumers can branch on the shape across install-gate phases.
-pub(super) const SCHEMA_VERSION: u32 = 1;
+pub(super) const SCHEMA_VERSION: u32 = 2;
 
 /// One honest stderr line when a zero-spec install can't be gated:
 /// yarn/pnpm/uv have no safe dry-run, so a bare install pulls its whole
@@ -43,6 +44,9 @@ pub(super) fn bare_install_note(manager: PackageManager, subcommand_label: &str)
 pub(super) fn print_refusal(reason: super::verdict::BlockReason, report: &PrecheckReport) {
     use super::verdict::BlockReason;
     match reason {
+        BlockReason::Malware => eprintln!(
+            "Refusing to run install: known MALICIOUS package(s) detected. Pass --force only if you are certain."
+        ),
         BlockReason::ExistingTree => eprintln!(
             "Refusing to run install: your existing dependency tree has known-vulnerable packages (none were added by this command). Fix them or pass --force."
         ),
@@ -123,45 +127,6 @@ fn fix_note(m: &crate::vuln_api::VulnMatch) -> String {
     }
 }
 
-/// Highest of `fixes` after sort/dedup: a single distinct value is returned
-/// as-is (no parsing — preserves odd-but-unambiguous forms); several distinct
-/// values compare by lenient semver. With `all_must_parse`, one unparsable
-/// candidate among several poisons the answer (`None`); otherwise unparsable
-/// candidates are skipped.
-fn highest_fix(mut fixes: Vec<&str>, all_must_parse: bool) -> Option<String> {
-    fixes.sort_unstable();
-    fixes.dedup();
-    match fixes.as_slice() {
-        [] => None,
-        [only] => Some((*only).to_string()),
-        many => {
-            let mut parsed = Vec::with_capacity(many.len());
-            for raw in many {
-                match semver::Version::parse(&verify_deps::registry::normalize_for_semver(raw)) {
-                    Ok(v) => parsed.push((v, *raw)),
-                    Err(_) if all_must_parse => return None,
-                    Err(_) => {}
-                }
-            }
-            parsed
-                .into_iter()
-                .max_by(|(a, _), (b, _)| a.cmp(b))
-                .map(|(_, raw)| raw.to_string())
-        }
-    }
-}
-
-/// The one version certified to clear every match. Requires every match to
-/// carry a `fixed_version`; any match without one — or an unparsable
-/// candidate among several — means no version can be certified, so `None`.
-fn safe_version(matches: &[crate::vuln_api::VulnMatch]) -> Option<String> {
-    let fixes: Vec<&str> = matches
-        .iter()
-        .map(|m| m.fixed_version.as_deref())
-        .collect::<Option<_>>()?;
-    highest_fix(fixes, true)
-}
-
 /// Highest `fixed_version` the advisories advertise, by lenient semver.
 /// Unlike `safe_version` this is *not* a certification: matches without a
 /// fix are ignored, so the result may still be vulnerable to them. `None`
@@ -201,6 +166,14 @@ fn summary_segment(total: usize, from_tree: usize, label: &str) -> String {
         format!("{total} {label} ({from_tree} from resolved tree)")
     } else {
         format!("{total} {label}")
+    }
+}
+
+/// Render label for a blocking verdict: the stronger claim names it.
+fn known_label(verdict: &VerdictStatus) -> &'static str {
+    match verdict {
+        VerdictStatus::Malicious(_) => "known malicious",
+        _ => "known vulnerable",
     }
 }
 
@@ -275,8 +248,23 @@ pub(super) fn print_text(report: &PrecheckReport) {
     };
 
     println!("Pre-checking `{command}`");
+    // The malicious segment prints only when present: "malicious" appearing
+    // anywhere in the output is itself the signal, and the never-mislabel
+    // guard asserts its absence for merely-vulnerable reports.
+    let malicious_segment = if report.malicious_count() > 0 {
+        format!(
+            "{}, ",
+            summary_segment(
+                report.malicious_count(),
+                report.tree_malicious_count(),
+                "malicious"
+            )
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "  {} ok, {}, {}, {} skipped, {} errors",
+        "  {} ok, {malicious_segment}{}, {}, {} skipped, {} errors",
         report.ok_count(),
         summary_segment(
             report.vulnerable_count(),
@@ -305,9 +293,10 @@ pub(super) fn print_text(report: &PrecheckReport) {
             );
             for t in transitive {
                 match &t.verdict {
-                    VerdictStatus::Vulnerable(matches) => {
+                    VerdictStatus::Vulnerable(matches) | VerdictStatus::Malicious(matches) => {
+                        let label = known_label(&t.verdict);
                         println!(
-                            "  ✗ {}@{} {}  known vulnerable:",
+                            "  ✗ {}@{} {}  {label}:",
                             t.name,
                             t.version,
                             t.origin.label()
@@ -318,8 +307,14 @@ pub(super) fn print_text(report: &PrecheckReport) {
                         // When `safe_version` is `Some` it equals
                         // `advertised_fix` and clears every advisory; otherwise
                         // some advisory has no fix, so the "(advertised fix)"
-                        // hedge marks the bump as partial.
-                        if t.origin == TreeOrigin::PreExisting {
+                        // hedge marks the bump as partial. Malware is the
+                        // exception: it is removed, not upgraded, so never steer
+                        // toward "install another version" of a malicious dep —
+                        // a mixed CVE+MAL payload could otherwise surface the
+                        // CVE's advertised fix here.
+                        if t.origin == TreeOrigin::PreExisting
+                            && !matches!(t.verdict, VerdictStatus::Malicious(_))
+                        {
                             if let Some(fix) = advertised_fix(matches) {
                                 let hedge = if safe_version(matches).is_some() {
                                     ""
@@ -373,9 +368,10 @@ pub(super) fn print_text(report: &PrecheckReport) {
                 age,
                 verdict,
             } => match verdict {
-                VerdictStatus::Vulnerable(matches) => {
+                VerdictStatus::Vulnerable(matches) | VerdictStatus::Malicious(matches) => {
+                    let label = known_label(verdict);
                     println!(
-                        "  ✗ {} → {}@{}  known vulnerable:",
+                        "  ✗ {} → {}@{}  {label}:",
                         target.display, resolved.name, resolved.version,
                     );
                     print_vulnerable_matches(&resolved.name, matches);
@@ -448,6 +444,16 @@ fn verdict_json(verdict: &VerdictStatus) -> serde_json::Value {
                 "remediation": safe_version(matches),
             })
         }
+        VerdictStatus::Malicious(matches) => {
+            // Malware is removed, not upgraded: never advertise a safe-version
+            // remediation for a malicious verdict, even when a co-reported CVE
+            // carries an advertised fix.
+            json!({
+                "status": "malicious",
+                "matches": matches,
+                "remediation": serde_json::Value::Null,
+            })
+        }
         VerdictStatus::Unverifiable(error) => {
             json!({ "status": "unverifiable", "error": error })
         }
@@ -463,6 +469,7 @@ fn verdict_json(verdict: &VerdictStatus) -> serde_json::Value {
 #[derive(Default)]
 struct VerdictCounts {
     clean: usize,
+    malicious: usize,
     vulnerable: usize,
     unverifiable: usize,
     not_checked: usize,
@@ -473,6 +480,7 @@ fn verdict_counts<'a>(verdicts: impl Iterator<Item = &'a VerdictStatus>) -> Verd
     for v in verdicts {
         match v {
             VerdictStatus::Clean => c.clean += 1,
+            VerdictStatus::Malicious(_) => c.malicious += 1,
             VerdictStatus::Vulnerable(_) => c.vulnerable += 1,
             VerdictStatus::Unverifiable(_) => c.unverifiable += 1,
             VerdictStatus::NotChecked => c.not_checked += 1,
@@ -554,6 +562,7 @@ pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
         "summary": {
             "named": {
                 "ok": report.ok_count(),
+                "malicious": named_counts.malicious,
                 "vulnerable": named_counts.vulnerable,
                 "unverifiable": named_counts.unverifiable,
                 "clean": named_counts.clean,
@@ -563,6 +572,7 @@ pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
             },
             "tree": {
                 "resolved_count": tree_resolved,
+                "malicious": tree_counts.malicious,
                 "vulnerable": tree_counts.vulnerable,
                 "unverifiable": tree_counts.unverifiable,
                 "clean": tree_counts.clean,
@@ -603,61 +613,6 @@ mod tests {
     use super::super::test_support::*;
     use super::super::TreeOutcome;
     use super::*;
-
-    #[test]
-    fn safe_version_single_fix() {
-        assert_eq!(
-            safe_version(&[vm("A-1", Some("2.0.0"))]),
-            Some("2.0.0".to_string())
-        );
-    }
-
-    #[test]
-    fn safe_version_duplicate_fixes_collapse_without_parsing() {
-        // "1.0rc1" is unparsable, but a single distinct value needs no parse.
-        assert_eq!(
-            safe_version(&[vm("A-1", Some("1.0rc1")), vm("A-2", Some("1.0rc1"))]),
-            Some("1.0rc1".to_string())
-        );
-    }
-
-    #[test]
-    fn safe_version_picks_highest_of_distinct_fixes() {
-        // Semver order, not lexical ("1.2.0" > "1.10.0" lexically).
-        assert_eq!(
-            safe_version(&[vm("A-1", Some("1.2.0")), vm("A-2", Some("1.10.0"))]),
-            Some("1.10.0".to_string())
-        );
-    }
-
-    #[test]
-    fn safe_version_two_component_versions_normalize() {
-        assert_eq!(
-            safe_version(&[vm("A-1", Some("4.0")), vm("A-2", Some("3.2.5"))]),
-            Some("4.0".to_string())
-        );
-    }
-
-    #[test]
-    fn safe_version_mixed_fix_and_none_is_none() {
-        assert_eq!(
-            safe_version(&[vm("A-1", Some("2.0.0")), vm("A-2", None)]),
-            None
-        );
-    }
-
-    #[test]
-    fn safe_version_unparsable_among_distinct_is_none() {
-        assert_eq!(
-            safe_version(&[vm("A-1", Some("2!1.0")), vm("A-2", Some("1.0.0"))]),
-            None
-        );
-    }
-
-    #[test]
-    fn safe_version_empty_matches_is_none() {
-        assert_eq!(safe_version(&[]), None);
-    }
 
     #[test]
     fn error_prefix_strips_parenthesized_detail() {
@@ -730,5 +685,22 @@ mod tests {
             advertised_fix(&[vm("A-1", Some("1.2.0")), vm("A-2", Some("1.10.0"))]),
             Some("1.10.0".to_string())
         );
+    }
+
+    #[test]
+    fn malicious_verdict_json_never_advertises_remediation() {
+        // Malware is removed, not upgraded: even a co-reported, fixable CVE
+        // must not surface a remediation version on a malicious verdict.
+        let malicious = VerdictStatus::Malicious(vec![
+            vm("CVE-2024-7777", Some("1.0.0")),
+            vm("MAL-2024-8888", None),
+        ]);
+        assert_eq!(
+            verdict_json(&malicious)["remediation"],
+            serde_json::Value::Null
+        );
+        // Contrast: the same fixable match on a Vulnerable verdict still does.
+        let vulnerable = VerdictStatus::Vulnerable(vec![vm("CVE-2024-7777", Some("1.0.0"))]);
+        assert_eq!(verdict_json(&vulnerable)["remediation"], "1.0.0");
     }
 }

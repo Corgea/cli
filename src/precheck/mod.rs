@@ -153,8 +153,13 @@ pub struct VerdictConfig {
 pub enum VerdictStatus {
     /// vuln-api answered: no known advisories for this exact version.
     Clean,
-    /// vuln-api answered: known vulnerable or malicious — blocks.
+    /// vuln-api answered: known vulnerable — blocks.
     Vulnerable(Vec<crate::vuln_api::VulnMatch>),
+    /// vuln-api answered: known malicious (server `malware` flag —
+    /// `VulnMatch::is_malicious`) — blocks. Carries ALL matches, malware
+    /// and ordinary CVEs together, so a package that is both drops nothing;
+    /// the stronger claim names the verdict.
+    Malicious(Vec<crate::vuln_api::VulnMatch>),
     /// The verdict could not be obtained (network/5xx/auth/integrity).
     /// Blocks only in authenticated mode.
     Unverifiable(String),
@@ -169,7 +174,7 @@ impl VerdictStatus {
     /// `verdict::block_reason` and the refusal-blame predicate.
     fn blocks(&self, fail_closed: bool) -> bool {
         match self {
-            VerdictStatus::Vulnerable(_) => true,
+            VerdictStatus::Vulnerable(_) | VerdictStatus::Malicious(_) => true,
             VerdictStatus::Unverifiable(_) => fail_closed,
             VerdictStatus::Clean | VerdictStatus::NotChecked => false,
         }
@@ -352,6 +357,18 @@ impl PrecheckReport {
     pub fn vulnerable_count(&self) -> usize {
         self.verdicts()
             .filter(|v| matches!(v, VerdictStatus::Vulnerable(_)))
+            .count()
+    }
+    /// Malicious findings across named targets and the resolved tree.
+    pub fn malicious_count(&self) -> usize {
+        self.verdicts()
+            .filter(|v| matches!(v, VerdictStatus::Malicious(_)))
+            .count()
+    }
+    /// Malicious findings beyond the named targets (the resolved tree).
+    pub fn tree_malicious_count(&self) -> usize {
+        self.tree_verdicts()
+            .filter(|v| matches!(v, VerdictStatus::Malicious(_)))
             .count()
     }
     pub fn unverifiable_count(&self) -> usize {
@@ -790,6 +807,15 @@ fn run_parsed_install(
     // The named-target registry lookups and the tree dry-run are independent
     // network/subprocess work — overlap them; verdicts need both.
     let now = Utc::now();
+    // Name each resolve phase on stderr so small/short runs don't look hung.
+    // Both lines are stderr (like every gate note), so stdout stays JSON-clean
+    // under --json. Conditional: a non-tree-eligible run prints only its line.
+    if !parsed.targets.is_empty() {
+        eprintln!("resolving named package targets…");
+    }
+    if tree_eligible {
+        eprintln!("resolving the would-install dependency tree…");
+    }
     let (mut outcomes, tree_resolution) = std::thread::scope(|s| {
         let tree = tree_eligible.then(|| s.spawn(|| tree::resolve_tree(manager, rest, &parsed)));
         let outcomes = verdict::verify_all(&parsed.targets, &opts, &now, parsed.allow_prerelease);

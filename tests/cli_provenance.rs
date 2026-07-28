@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 /// Vulnerable verdict body; `fixed: None` renders `"fixed_version":null`.
 fn vulnerable_body(ecosystem: &str, name: &str, version: &str, fixed: Option<&str>) -> String {
-    common::vulnerable_body(ecosystem, name, version, "MAL-2024-0002", fixed)
+    common::vulnerable_body(ecosystem, name, version, "CVE-2024-0002", fixed)
 }
 
 /// Pip report: only `reqpkg`, requested (as if it came from a `-r` file).
@@ -103,10 +103,10 @@ fn npm_preexisting_fix_hint_keeps_hedge_when_fix_is_partial() {
     checks.insert(
         key("npm", "evildep", "0.4.2"),
         r#"{"ecosystem":"npm","package_name":"evildep","version":"0.4.2","is_vulnerable":true,
-        "matches":[{"advisory_id":"MAL-2024-0002","severity_level":"critical","tier":1,
-                    "vulnerable_version_range":null,"fixed_version":"1.2.2"},
-                   {"advisory_id":"MAL-2024-0003","severity_level":"critical","tier":1,
-                    "vulnerable_version_range":null,"fixed_version":null}]}"#
+        "matches":[{"advisory_id":"CVE-2024-0002","severity_level":"critical","tier":1,
+                    "vulnerable_version_range":null,"fixed_version":"1.2.2","malware":false},
+                   {"advisory_id":"CVE-2024-0003","severity_level":"critical","tier":1,
+                    "vulnerable_version_range":null,"fixed_version":null,"malware":false}]}"#
             .to_string(),
     );
     let mut h = npm_project_harness(checks, NPM_LOCK);

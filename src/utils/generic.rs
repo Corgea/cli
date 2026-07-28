@@ -310,10 +310,20 @@ pub fn get_env_var_if_exists(var_name: &str) -> Option<String> {
 }
 
 pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
-    let repo = match Repository::open(Path::new(dir)) {
+    // discover (not open) so worktrees / .git-as-file roots still resolve.
+    let repo = match Repository::discover(Path::new(dir)) {
         Ok(repo) => repo,
-        Err(_) => return Ok(None),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+        Err(e) => return Err(e),
     };
+
+    // Default BLAST packaging walks `dir` (usually "."). Only attach
+    // sha/branch/repo_url when that path is the worktree root — otherwise a
+    // nested CWD would upload a partial zip labeled with the parent HEAD, and
+    // determine_project_name would switch from CWD basename to the remote name.
+    if !is_at_repo_root(dir) {
+        return Ok(None);
+    }
 
     let branch = repo.head().ok().and_then(|head| {
         if head.is_branch() {
@@ -323,14 +333,12 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
         }
     });
 
-    // Get the latest commit SHA
     let sha = repo.head().ok().and_then(|head| {
         head.peel_to_commit()
             .ok()
             .map(|commit| commit.id().to_string())
     });
 
-    // Get the remote URL (assuming "origin")
     let repo_url = repo
         .find_remote("origin")
         .ok()
@@ -343,17 +351,32 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
     }))
 }
 
-/// Find the enclosing repository's `origin` remote URL, searching upward from
-/// the current directory so `corgea list`/`wait` resolve correctly when run
-/// from a subdirectory, not only the repo root. `get_repo_info` uses
-/// `Repository::open`, which succeeds only at the root; this uses
-/// `Repository::discover`. Returns None outside a git repo or when `origin`
-/// carries no URL.
+/// The enclosing repository's `origin` remote URL, searched upward from the
+/// current directory so `corgea list`/`wait` also resolve from a subdirectory.
+/// `get_repo_info` deliberately returns None outside the worktree root; this
+/// does not. None outside a git repo or when `origin` carries no URL.
 pub fn discover_repo_url() -> Option<String> {
     let repo = Repository::discover(Path::new(".")).ok()?;
     repo.find_remote("origin")
         .ok()
         .and_then(|remote| remote.url().map(|url| url.to_string()))
+}
+
+/// True when `dir` is the repository worktree root (not a subdirectory).
+fn is_at_repo_root(dir: &str) -> bool {
+    let Ok(repo) = Repository::discover(Path::new(dir)) else {
+        return false;
+    };
+    let Some(workdir) = repo.workdir() else {
+        return false;
+    };
+    let Ok(workdir) = workdir.canonicalize() else {
+        return false;
+    };
+    let Ok(cwd) = Path::new(dir).canonicalize() else {
+        return false;
+    };
+    workdir == cwd
 }
 
 pub fn get_status(status: &str) -> &str {
@@ -382,6 +405,61 @@ pub struct RepoInfo {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
+
+    #[test]
+    fn get_repo_info_at_root_only_not_nested_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join("README"), "hi").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "README"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+
+        let root_s = root.to_str().unwrap();
+        let nested = root.join("pkg").join("inner");
+        fs::create_dir_all(&nested).unwrap();
+        let nested_s = nested.to_str().unwrap();
+
+        let info = get_repo_info(root_s)
+            .unwrap()
+            .expect("repo root should yield SHA metadata");
+        assert!(info.sha.is_some());
+        assert!(is_at_repo_root(root_s));
+
+        assert!(
+            get_repo_info(nested_s).unwrap().is_none(),
+            "nested CWD must not attach parent HEAD SHA / remote project name"
+        );
+        assert!(!is_at_repo_root(nested_s));
+    }
 
     #[test]
     fn create_zip_from_target_excludes_default_globs() {

@@ -104,5 +104,6 @@ pub(crate) fn vm(advisory: &str, fixed: Option<&str>) -> crate::vuln_api::VulnMa
         tier: Some(1),
         vulnerable_version_range: None,
         fixed_version: fixed.map(str::to_string),
+        malware: false,
     }
 }

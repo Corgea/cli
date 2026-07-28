@@ -226,6 +226,7 @@ pub fn upload_zip(
     repo_info: Option<utils::generic::RepoInfo>,
     scan_type: Option<String>,
     policy: Option<String>,
+    metadata: Option<String>,
 ) -> Result<UploadZipResult, Box<dyn std::error::Error>> {
     let client = http_client();
     let file_size = std::fs::metadata(file_path)?.len();
@@ -346,6 +347,9 @@ pub fn upload_zip(
         }
         if let Some(policy) = policy.clone() {
             form = form.part("target_policies", multipart::Part::text(policy.to_string()));
+        }
+        if let Some(meta) = &metadata {
+            form = form.part("metadata", multipart::Part::text(meta.clone()));
         }
 
         let response = match client
@@ -1133,6 +1137,10 @@ pub struct ScanResponse {
     pub status: String,
     pub engine: String,
     pub created_at: String,
+    #[serde(default)]
+    pub git_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -1272,6 +1280,7 @@ pub struct SCAIssue {
     pub description: Option<String>,
     pub details: Option<String>,
     pub severity: Option<String>,
+    pub classification: Option<String>,
     pub cve: Option<String>,
     pub package: SCAPackage,
     pub location: SCALocation,
@@ -1303,6 +1312,34 @@ pub struct SCAIssuesResponse {
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn scan_response_deserializes_git_sha_and_defaults_when_missing() {
+        let with_sha = r#"{
+            "id": "s1",
+            "project": "p",
+            "repo": null,
+            "branch": "main",
+            "status": "complete",
+            "engine": "corgea-blast",
+            "created_at": "2026-01-01T00:00:00Z",
+            "git_sha": "abcdef0123456789"
+        }"#;
+        let parsed: ScanResponse = serde_json::from_str(with_sha).unwrap();
+        assert_eq!(parsed.git_sha.as_deref(), Some("abcdef0123456789"));
+
+        let without_sha = r#"{
+            "id": "s1",
+            "project": "p",
+            "repo": null,
+            "branch": "main",
+            "status": "complete",
+            "engine": "corgea-blast",
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let parsed: ScanResponse = serde_json::from_str(without_sha).unwrap();
+        assert_eq!(parsed.git_sha, None);
+    }
 
     #[test]
     fn auth_headers_uses_bearer_for_jwt_tokens() {
