@@ -7,43 +7,61 @@ pub fn run(
     scan_id: Option<String>,
     project_name_override: Option<String>,
     repo_override: Option<String>,
+    project_id_override: Option<String>,
 ) {
-    let resolved = match utils::api::resolve_project(
-        &config.get_url(),
-        project_name_override.as_deref(),
-        repo_override.as_deref(),
-    ) {
-        Ok(resolved) => resolved,
-        Err(e) => {
-            log::error!(
-                "Unable to resolve the Corgea project. Please check your connection and ensure that:\n\
-                - The server URL is reachable.\n\
-                - Your authentication token is valid.\n\n\
-                Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli\n\n\
-                Error details: {}",
-                e
-            );
-            std::process::exit(1);
+    // A scan id plus the project id from the upload response leaves nothing to
+    // resolve: everything below keys off the scan, and the id-form URL is
+    // already known.
+    let resolved: Option<utils::api::ResolvedProject> = if scan_id.is_some()
+        && project_id_override.is_some()
+    {
+        None
+    } else {
+        match utils::api::resolve_project(
+            &config.get_url(),
+            project_name_override.as_deref(),
+            repo_override.as_deref(),
+        ) {
+            Ok(resolved) => Some(resolved),
+            Err(e) => {
+                log::error!(
+                        "Unable to resolve the Corgea project. Please check your connection and ensure that:\n\
+                        - The server URL is reachable.\n\
+                        - Your authentication token is valid.\n\n\
+                        Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli\n\n\
+                        Error details: {}",
+                        e
+                    );
+                std::process::exit(1);
+            }
         }
     };
-    let project_name = resolved.query_name.clone();
+    let project_name = match &resolved {
+        Some(r) => r.query_name.clone(),
+        None => project_name_override
+            .clone()
+            .unwrap_or_else(|| utils::generic::get_current_working_directory().unwrap_or_default()),
+    };
 
-    let scans_result =
-        utils::api::query_scan_list(&config.get_url(), Some(&project_name), Some(1), None);
-    let scans: Vec<utils::api::ScanResponse> = match scans_result {
-        Ok(result) => result.scans.unwrap_or_default(),
-        Err(e) => {
-            log::error!(
-                "Unable to query the scan list. Please check your connection and ensure that:
+    // Only the scan-less path reads the listing.
+    let scans: Vec<utils::api::ScanResponse> = if scan_id.is_some() {
+        Vec::new()
+    } else {
+        match utils::api::query_scan_list(&config.get_url(), Some(&project_name), Some(1), None) {
+            Ok(result) => result.scans.unwrap_or_default(),
+            Err(e) => {
+                log::error!(
+                    "Unable to query the scan list. Please check your connection and ensure that:
                 - The server URL is reachable.
                 - Your authentication token is valid.
 
                 Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli
 
                 Error details: {}",
-                e
-            );
-            std::process::exit(1);
+                    e
+                );
+                std::process::exit(1);
+            }
         }
     };
     let (scan_id, processed) = match scan_id {
@@ -62,7 +80,7 @@ pub fn run(
         None => match scans.first() {
             Some(scan) => (scan.id.clone(), scan.status == "Complete"),
             None => {
-                if resolved.confirmed {
+                if resolved.as_ref().map(|r| r.confirmed).unwrap_or(false) {
                     log::error!(
                         "Project '{}' has no scans yet. Run 'corgea scan' to start one.",
                         project_name
@@ -70,7 +88,7 @@ pub fn run(
                 } else {
                     log::error!(
                         "No scan to wait for: no Corgea project found for {}. Run 'corgea scan', or pass --scan-id / --project-name.",
-                        resolved.tried_label
+                        resolved.as_ref().map(|r| r.tried_label.as_str()).unwrap_or_default()
                     );
                 }
                 std::process::exit(1);
@@ -78,14 +96,22 @@ pub fn run(
         },
     };
 
-    let scan_url = match &resolved.project_id {
+    let project_id =
+        project_id_override.or_else(|| resolved.as_ref().and_then(|r| r.project_id.clone()));
+    let scan_url = match &project_id {
         Some(pid) => format!("{}/project/{}/?scan_id={}", config.get_url(), pid, scan_id),
-        None => format!(
-            "{}/project/{}?scan_id={}",
-            config.get_url(),
-            project_name,
-            scan_id
-        ),
+        None => {
+            // Without an id the name goes into the path; an empty or slash-only
+            // name would yield `/project//?scan_id=…`, which resolves nowhere.
+            let name = project_name.trim().trim_matches('/');
+            if name.is_empty() {
+                log::error!(
+                    "Cannot build the scan URL: no Corgea project resolved. Pass --project-name <NAME>."
+                );
+                std::process::exit(1);
+            }
+            format!("{}/project/{}?scan_id={}", config.get_url(), name, scan_id)
+        }
     };
 
     if !processed {

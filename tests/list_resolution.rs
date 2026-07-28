@@ -1,16 +1,6 @@
 //! End-to-end tests for `corgea list` repo-URL project resolution (COR-1577).
-//!
-//! Each test runs the real binary against a one-response-per-connection HTTP
-//! stub (`common::spawn_http_stub`) and, where a git remote matters, a temp
-//! git repo built with `git2` whose directory basename DIFFERS from the stored
-//! canonical project name (the Bank of Hope case: dir `dotnet-azure-web-tsb`
-//! vs project `bohappdev/dotnet-azure-web-tsb`).
-//!
-//! Routing matches on the request-target PATH PREFIX with `starts_with`: the
-//! `/projects` request carries a percent-encoded query string
-//! (`?repo_url=bohappdev%2Fdotnet-azure-web-tsb`), so the full target is not a
-//! stable key. `verify_token_and_exit_when_fail` calls `GET /api/v1/verify`
-//! first, so every stub serves it.
+//! Stubs route on the request-target path PREFIX: `/projects` carries a
+//! percent-encoded query, so the full target is not a stable key.
 
 mod common;
 
@@ -149,20 +139,33 @@ fn list_miss_names_repo_no_empty_table() {
     let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
     let out = run_list(&[], &url, &repo);
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("repo 'bohappdev/dotnet-azure-web-tsb'"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("Scan ID"),
+        "should not render a table; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn list_confirmed_project_with_no_scans_exits_zero() {
+    // A confirmed project that simply has no scans is a valid empty result —
+    // failing it would break CI polling.
+    let url = spawn_stub(projects_match(), scans_empty(), issues_miss());
+    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    let out = run_list(&[], &url, &repo);
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         out.status.code(),
         Some(0),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        stdout.contains("repo 'bohappdev/dotnet-azure-web-tsb'"),
-        "stdout: {stdout}"
-    );
-    assert!(
-        !stdout.contains("Scan ID"),
-        "should not render a table; stdout: {stdout}"
-    );
+    assert!(stdout.contains("has no scans yet"), "stdout: {stdout}");
 }
 
 #[test]
@@ -222,9 +225,10 @@ fn list_json_miss_is_valid_empty_envelope() {
     let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
     let out = run_list(&["--json"], &url, &repo);
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // Envelope on stdout, miss on stderr, exit 1.
     assert_eq!(
         out.status.code(),
-        Some(0),
+        Some(1),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );

@@ -48,6 +48,7 @@ pub fn run_command(base_cmd: &String, mut command: Command) -> String {
 
 pub struct ScanUploadResult {
     pub scan_id: String,
+    pub project_id: Option<String>,
 }
 
 pub fn run_semgrep(config: &Config, project_name: Option<String>) {
@@ -65,9 +66,13 @@ pub fn run_semgrep(config: &Config, project_name: Option<String>) {
     let output = run_command(&base_command.to_string(), command);
 
     if let Some(result) = parse_scan(config, output, true, project_name.clone()) {
-        // Preserve an explicit --project-name for the post-scan wait; when None,
-        // wait resolves by the git remote / CWD (COR-1577).
-        crate::wait::run(config, Some(result.scan_id), project_name, None);
+        crate::wait::run(
+            config,
+            Some(result.scan_id),
+            project_name,
+            None,
+            result.project_id,
+        );
     }
 }
 
@@ -82,9 +87,13 @@ pub fn run_snyk(config: &Config, project_name: Option<String>) {
     let output = run_command(&base_command.to_string(), command);
 
     if let Some(result) = parse_scan(config, output, true, project_name.clone()) {
-        // Preserve an explicit --project-name for the post-scan wait; when None,
-        // wait resolves by the git remote / CWD (COR-1577).
-        crate::wait::run(config, Some(result.scan_id), project_name, None);
+        crate::wait::run(
+            config,
+            Some(result.scan_id),
+            project_name,
+            None,
+            result.project_id,
+        );
     }
 }
 
@@ -372,6 +381,7 @@ pub fn upload_scan(
     };
 
     let mut sast_scan_id: Option<String> = None;
+    let mut project_id: Option<String> = None;
 
     let mut upload_failed = false;
 
@@ -396,6 +406,13 @@ pub fn upload_scan(
                                 } else if let Some(id_num) = id_val.as_i64() {
                                     println!("Scan ID: {}", id_num);
                                     sast_scan_id = Some(id_num.to_string());
+                                }
+                            }
+                            if let Some(pid_val) = json.get("project_id") {
+                                if let Some(pid_str) = pid_val.as_str() {
+                                    project_id = Some(pid_str.to_string());
+                                } else if let Some(pid_num) = pid_val.as_i64() {
+                                    project_id = Some(pid_num.to_string());
                                 }
                             }
                         }
@@ -509,5 +526,8 @@ pub fn upload_scan(
 
     println!("Go to {base_url} to see results.");
 
-    sast_scan_id.map(|scan_id| ScanUploadResult { scan_id })
+    sast_scan_id.map(|scan_id| ScanUploadResult {
+        scan_id,
+        project_id,
+    })
 }

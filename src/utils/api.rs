@@ -735,8 +735,7 @@ pub fn query_scan_list(
 
 #[derive(Deserialize, Debug)]
 pub struct ProjectSummary {
-    // Project.id is an integer in the envelope; model it tolerantly so an
-    // unexpected string id (or a missing field) never fails deserialization.
+    // Tolerant: an unexpected string id (or none) must not fail the parse.
     #[serde(default)]
     pub id: serde_json::Value,
     pub name: String,
@@ -746,17 +745,14 @@ pub struct ProjectSummary {
 
 #[derive(Deserialize, Debug)]
 pub struct ProjectsResponse {
-    // Models the `@paginated` envelope status; deserialized for completeness but
-    // not consumed (the slug guard + non-2xx/parse handling already gate misses).
+    // Part of the `@paginated` envelope; not consumed.
     #[allow(dead_code)]
     pub status: String,
     #[serde(default)]
     pub projects: Option<Vec<ProjectSummary>>,
 }
 
-/// Stringify a scalar JSON id (number -> "123", string -> as-is) for the wait
-/// scan URL. Returns None for null/array/object/missing so a bogus id never
-/// becomes part of a URL like `/project/null/`.
+/// Stringify a scalar JSON id; None otherwise, so no `/project/null/` URL.
 fn id_to_string(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::String(s) => Some(s.clone()),
@@ -765,53 +761,49 @@ fn id_to_string(v: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// True when a stored `repo_url` refers to exactly `slug` (an `org/repo`-style
-/// value, already lowercased). Matches on a path-segment boundary so a sibling
-/// or prefix repo is never mistaken for the target: the backend's
-/// `repo_url__icontains` filter returns `org/repo-v2` for slug `org/repo`, and a
-/// plain substring check would wrongly accept it. Strips `.git`/trailing slash
-/// first so `…/org/repo.git` and `…/org/repo/` both match `org/repo`.
-fn repo_url_matches_slug(repo_url: &str, slug_lc: &str) -> bool {
+/// True when a stored `repo_url` points at exactly `expected_path` (a whole
+/// post-host path, already lowercased). Comparing whole paths keeps the
+/// backend's `repo_url__icontains` results honest: neither the sibling
+/// `acme/api-v2` nor the nested `…/mirrors/acme/api` passes for `acme/api`.
+/// Falls back to a normalized compare for a stored bare `acme/api`.
+fn repo_url_matches_path(repo_url: &str, expected_path: &str) -> bool {
+    if let Some(path) = utils::generic::extract_repo_path(repo_url) {
+        return path == expected_path;
+    }
     let r = repo_url.trim().trim_end_matches('/');
     let r = r.strip_suffix(".git").unwrap_or(r).to_lowercase();
-    r == slug_lc || r.ends_with(&format!("/{}", slug_lc))
+    r == expected_path
 }
 
-/// Resolve the canonical project for a repo slug via GET /api/v1/projects?repo_url=…
+/// Resolve the canonical project for a repo path via GET /api/v1/projects?repo_url=…
 ///
 /// Old-backend safety guard: a pre-COR-1426 backend ignores the unknown
-/// `repo_url` param and returns ALL company projects. Keep only candidates
-/// whose returned `repo_url` matches the slug on a path-segment boundary; on an
-/// old backend none match -> Ok(None) -> caller falls back to the CWD-name path.
+/// `repo_url` param and returns ALL company projects, so every candidate is
+/// re-checked against the path here — on such a backend none match, and the
+/// caller falls back to the CWD-name path.
 ///
-/// Hard failures (network, auth, 5xx) return `Err` so the caller can surface the
-/// backend problem instead of silently resolving to the local-directory project;
-/// only a clean "no match" (or a 404 from a backend without the endpoint) is a
-/// soft `Ok(None)`.
+/// `Err` for hard failures (network/auth/5xx); a clean "no match" (or a 404 from
+/// a backend without the endpoint) is a soft `Ok(None)`.
 pub fn resolve_project_by_repo(
     url: &str,
-    slug: &str,
+    repo_path: &str,
 ) -> Result<Option<ProjectSummary>, Box<dyn std::error::Error>> {
     let request_url = format!("{}{}/projects", url, API_BASE);
     let client = http_client();
     debug(&format!(
         "Resolving project via {} (repo_url={})",
-        request_url, slug
+        request_url, repo_path
     ));
     let response = client
         .get(&request_url)
-        .query(&[("repo_url", slug)])
+        .query(&[("repo_url", repo_path)])
         .send()?;
     check_for_warnings(response.headers(), response.status());
     let status = response.status();
     if status == reqwest::StatusCode::NOT_FOUND {
-        // /projects absent on a very old backend -> soft miss; the caller falls
-        // back to the name-based path, so this stays a no-regression case.
         return Ok(None);
     }
     if !status.is_success() {
-        // Auth (401/403) or server (5xx) failure: surface it rather than
-        // silently resolving to the local-directory project.
         return Err(format!("/projects request failed: HTTP {}", status).into());
     }
     let text = response.text()?;
@@ -825,11 +817,11 @@ pub fn resolve_project_by_repo(
             return Ok(None);
         }
     };
-    let slug_lc = slug.to_lowercase();
+    let expected = repo_path.to_lowercase();
     let matched = parsed.projects.unwrap_or_default().into_iter().find(|p| {
         p.repo_url
             .as_deref()
-            .map(|r| repo_url_matches_slug(r, &slug_lc))
+            .map(|r| repo_url_matches_path(r, &expected))
             .unwrap_or(false)
     });
     Ok(matched)
@@ -840,27 +832,18 @@ pub fn resolve_project_by_repo(
 pub struct ResolvedProject {
     /// Sent as `?project=` to the listing endpoints.
     pub query_name: String,
-    /// True only when a backend project was confirmed via /projects. Drives
-    /// confirmed-but-empty vs unresolved-miss messaging.
+    /// True only when /projects confirmed a backend project.
     pub confirmed: bool,
-    /// Numeric id (stringified) when confirmed and the id is a scalar — used
-    /// for the wait scan URL. None otherwise (falls back to query_name).
     pub project_id: Option<String>,
-    /// What we looked for ("project 'x'" / "repo 'org/repo'" / "directory
-    /// 'dir'"), pre-formatted for the miss message.
+    /// Pre-formatted subject of the miss message ("repo 'org/repo'", …).
     pub tried_label: String,
 }
 
-/// Resolve which project `list`/`wait` should query.
-/// 1) --project-name -> use verbatim, skip resolution.
-/// 2) else slug from --repo or the discovered git remote -> resolve_project_by_repo:
-///    confirmed -> canonical {name,id}.
-/// 3) unconfirmed: explicit --repo -> query the slug as a name (never the CWD);
-///    auto-detected remote -> CWD basename (no-regression fallback).
-/// 4) no remote -> CWD basename (today's behavior).
-///
-/// Returns `Err` only for a hard resolver failure (network/auth/5xx from
-/// /projects); a clean "no match" resolves to the fallback name above.
+/// Resolve which project `list`/`wait` should query: `--project-name` verbatim,
+/// else the repo path from `--repo` or the discovered remote. Unconfirmed, an
+/// explicit `--repo` queries that path as a name and everything else falls back
+/// to the CWD basename (today's behavior). `Err` only for a hard resolver
+/// failure (network/auth/5xx from /projects).
 pub fn resolve_project(
     url: &str,
     project_name_override: Option<&str>,
@@ -877,35 +860,29 @@ pub fn resolve_project(
 
     // Explicit --repo vs auto-detected remote changes the unconfirmed fallback.
     let repo_was_explicit = repo_override.is_some();
-    // --repo may already be a bare `org/repo` slug (extract_repo_slug needs a
-    // host segment, so it returns None for a 2-segment value) -> use raw value.
-    // No --repo: discover the enclosing repo's remote (works from a subdir).
-    let slug = match repo_override {
-        Some(r) => utils::generic::extract_repo_slug(r).or_else(|| Some(r.to_string())),
+    // --repo may already be a bare `org/repo` (extract_repo_path needs a host
+    // segment, so it returns None there) -> use the raw value.
+    let repo_path = match repo_override {
+        Some(r) => utils::generic::extract_repo_path(r).or_else(|| Some(r.to_string())),
         None => {
-            utils::generic::discover_repo_url().and_then(|u| utils::generic::extract_repo_slug(&u))
+            utils::generic::discover_repo_url().and_then(|u| utils::generic::extract_repo_path(&u))
         }
     };
 
-    // CWD basename, resolved lazily — only the fallback paths below read it.
     let cwd =
         || utils::generic::get_current_working_directory().unwrap_or_else(|| "unknown".to_string());
 
-    if let Some(slug) = slug {
-        // `?` propagates hard resolver failures (network/auth/5xx); only a clean
-        // Ok(None) "no match" falls through to the name-based fallback below.
-        if let Some(project) = resolve_project_by_repo(url, &slug)? {
+    if let Some(repo_path) = repo_path {
+        if let Some(project) = resolve_project_by_repo(url, &repo_path)? {
             return Ok(ResolvedProject {
                 query_name: project.name,
                 confirmed: true,
                 project_id: id_to_string(&project.id),
-                tried_label: format!("repo '{}'", slug),
+                tried_label: format!("repo '{}'", repo_path),
             });
         }
-        // Unconfirmed: explicit --repo queries the slug as a name (clean miss,
-        // never wrong CWD results); auto-detected remote keeps the CWD fallback.
         let query_name = if repo_was_explicit {
-            slug.clone()
+            repo_path.clone()
         } else {
             cwd()
         };
@@ -913,7 +890,7 @@ pub fn resolve_project(
             query_name,
             confirmed: false,
             project_id: None,
-            tried_label: format!("repo '{}'", slug),
+            tried_label: format!("repo '{}'", repo_path),
         });
     }
 
@@ -1606,33 +1583,53 @@ mod tests {
     }
 
     #[test]
-    fn repo_url_matches_slug_enforces_path_boundary() {
-        // Exact repo (with/without scheme, .git, trailing slash) matches; a
-        // sibling/prefix repo or a different org must not (COR-1577 review).
-        assert!(repo_url_matches_slug(
+    fn repo_url_matches_path_compares_the_whole_path() {
+        // Same repo across scheme/.git/trailing-slash/port variants.
+        assert!(repo_url_matches_path(
             "https://github.com/acme/api",
             "acme/api"
         ));
-        assert!(repo_url_matches_slug(
+        assert!(repo_url_matches_path(
             "https://github.com/acme/api.git",
             "acme/api"
         ));
-        assert!(repo_url_matches_slug("acme/api", "acme/api"));
-        assert!(!repo_url_matches_slug(
+        assert!(repo_url_matches_path("git@github.com:acme/api", "acme/api"));
+        assert!(repo_url_matches_path("acme/api", "acme/api"));
+        // Sibling / prefix repo, and a different org.
+        assert!(!repo_url_matches_path(
             "https://github.com/acme/api-v2",
             "acme/api"
         ));
-        assert!(!repo_url_matches_slug(
+        assert!(!repo_url_matches_path(
             "https://github.com/notacme/api",
             "acme/api"
+        ));
+        // The owner must be top-level on the host: a nested mirror is a
+        // different repository, as is `org/team/repo` for `team/repo`.
+        assert!(!repo_url_matches_path(
+            "https://github.com/mirrors/acme/api",
+            "acme/api"
+        ));
+        assert!(!repo_url_matches_path(
+            "https://github.com/org/team/repo",
+            "team/repo"
+        ));
+        // Multi-segment paths compare in full.
+        assert!(repo_url_matches_path(
+            "https://dev.azure.com/org/project/_git/repo",
+            "org/project/_git/repo"
+        ));
+        assert!(repo_url_matches_path(
+            "git@gitlab.com:group/subgroup/repo.git",
+            "group/subgroup/repo"
         ));
     }
 
     #[test]
     fn resolve_project_by_repo_rejects_sibling_prefix_repo() {
         // Backend `repo_url__icontains` returns the sibling `acme/api-v2` for
-        // slug `acme/api`; the boundary guard must reject it rather than
-        // confirming the wrong project (COR-1577 review).
+        // `acme/api`; the path guard must reject it rather than confirming the
+        // wrong project (COR-1577 review).
         let base = spawn_projects_stub(
             r#"{"status":"ok","projects":[{"id":9,"name":"acme/api-v2","repo_url":"https://github.com/acme/api-v2"}]}"#,
         );

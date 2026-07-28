@@ -1,19 +1,7 @@
 //! End-to-end tests for `corgea wait` repo-URL project resolution (COR-1577).
-//!
-//! Mirrors `tests/list_resolution.rs`: each test runs the real binary against a
-//! one-response-per-connection HTTP stub (`common::spawn_http_stub`) and, where
-//! a git remote matters, a temp git repo built with `git2` whose directory
-//! basename DIFFERS from the stored canonical project name (the Bank of Hope
-//! case: dir `dotnet-azure-web-tsb` vs project `bohappdev/dotnet-azure-web-tsb`).
-//!
-//! Routing matches on the request-target PATH PREFIX with `starts_with`: the
-//! `/projects` request carries a percent-encoded query string
-//! (`?repo_url=bohappdev%2Fdotnet-azure-web-tsb`), so the full target is not a
-//! stable key. `verify_token_and_exit_when_fail` calls `GET /api/v1/verify`
-//! first, so every stub serves it. The `/api/v1/scan/` arm serves BOTH
-//! `GET /api/v1/scan/{id}` (so `check_scan_status` succeeds) and
-//! `/api/v1/scan/{id}/issues?…` (so `report_scan_status` succeeds) — branching
-//! on `contains("/issues")`.
+//! Stubs route on the request-target path PREFIX. The `/api/v1/scan/` arm
+//! serves both `GET /scan/{id}` (`check_scan_status`) and `/scan/{id}/issues`
+//! (`report_scan_status`), branching on `contains("/issues")`.
 
 mod common;
 
@@ -26,15 +14,14 @@ use std::process::Output;
 
 // --- stub bodies -----------------------------------------------------------
 
-/// `GET /api/v1/scan/{id}` returning a single completed scan (consumed by
-/// `check_scan_status`/`get_scan`, which check the lowercase `complete`).
+/// `GET /api/v1/scan/{id}` returning a completed scan (`check_scan_status`
+/// checks the lowercase `complete`).
 fn scan_complete() -> String {
     r#"{"id":"scan-123","project":"bohappdev/dotnet-azure-web-tsb","repo":"https://github.com/bohappdev/dotnet-azure-web-tsb","branch":"main","status":"complete","engine":"blast","created_at":"2026-01-01T00:00:00Z"}"#.to_string()
 }
 
-/// `GET /api/v1/scan/{id}/issues` returning an empty page (one round-trip:
-/// `total_pages` 1). `report_scan_status` groups by urgency and succeeds with
-/// no issues — enough to print the result link.
+/// `GET /api/v1/scan/{id}/issues` returning an empty page — enough for
+/// `report_scan_status` to succeed and print the result link.
 fn scan_issues_empty() -> String {
     r#"{"status":"ok","page":1,"total_pages":1,"total_issues":0,"issues":[]}"#.to_string()
 }
@@ -90,8 +77,7 @@ fn wait_uses_canonical_project_and_numeric_id_scan_url() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // The scan URL uses the numeric project id (7) returned by /projects,
-    // proving `resolved.project_id` flows through — not the dir basename.
+    // Numeric project id (7) from /projects, not the dir basename.
     assert!(
         stdout.contains("/project/7/?scan_id=scan-123"),
         "stdout: {stdout}"
@@ -156,12 +142,10 @@ fn wait_miss_names_repo_no_bare_error() {
         Some(1),
         "stdout: {stdout}\nstderr: {stderr}"
     );
-    // Clear, actionable miss naming the repo the resolver tried.
     assert!(
         stderr.contains("repo 'bohappdev/dotnet-azure-web-tsb'"),
         "stderr should name the repo; stderr: {stderr}"
     );
-    // The bare cryptic error is gone for good.
     assert!(
         !stdout.contains("Error querying scan list")
             && !stderr.contains("Error querying scan list"),
@@ -181,11 +165,187 @@ fn wait_project_name_override() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // Override skips resolution: no confirmed project id, so the scan URL falls
-    // back to the name form keyed on the exact `--project-name` value.
+    // No confirmed id, so the URL keeps the exact `--project-name` value.
     assert!(
         stdout.contains("/project/some/name?scan_id=scan-123"),
         "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn wait_project_name_trailing_slash_is_trimmed() {
+    // A slash-only or trailing-slash name would build `/project/foo//?scan_id=`.
+    let url = spawn_stub(projects_empty(), scans_one("foo"));
+    let (_tmp, dir) = temp_plain_dir("whatever");
+    let out = run_wait(&["--project-name", "foo/"], &url, &dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("/project/foo?scan_id=scan-123"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn wait_resolves_from_subdirectory() {
+    use std::sync::{Arc, Mutex};
+    let hits = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hits_c = hits.clone();
+    let url = common::spawn_http_stub(move |path| {
+        hits_c.lock().unwrap().push(path.to_string());
+        if path.starts_with("/api/v1/verify") {
+            ("200 OK", r#"{"status":"ok"}"#.to_string())
+        } else if path.starts_with("/api/v1/projects?repo_url=") {
+            ("200 OK", projects_match())
+        } else if path.starts_with("/api/v1/scans?") {
+            ("200 OK", scans_one(CANON))
+        } else if path.starts_with("/api/v1/scan/") {
+            if path.contains("/issues") {
+                ("200 OK", scan_issues_empty())
+            } else {
+                ("200 OK", scan_complete())
+            }
+        } else {
+            ("404 Not Found", r#"{"message":"not found"}"#.to_string())
+        }
+    });
+    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    let subdir = repo.join("src");
+    std::fs::create_dir(&subdir).expect("create subdir");
+    let out = run_wait(&[], &url, &subdir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Discovery walks up from src/, so the remote — not the `src` basename —
+    // drives resolution.
+    let hits = hits.lock().unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h.starts_with("/api/v1/projects?repo_url=bohappdev%2Fdotnet-azure-web-tsb")),
+        "expected /projects resolution from the subdir; hits: {hits:?}"
+    );
+    assert!(
+        stdout.contains("/project/7/?scan_id=scan-123"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn wait_with_scan_id_does_not_list_scans() {
+    use std::sync::{Arc, Mutex};
+    let hits = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hits_c = hits.clone();
+    let url = common::spawn_http_stub(move |path| {
+        hits_c.lock().unwrap().push(path.to_string());
+        if path.starts_with("/api/v1/verify") {
+            ("200 OK", r#"{"status":"ok"}"#.to_string())
+        } else if path.starts_with("/api/v1/projects?repo_url=") {
+            ("200 OK", projects_match())
+        } else if path.starts_with("/api/v1/scan/") {
+            if path.contains("/issues") {
+                ("200 OK", scan_issues_empty())
+            } else {
+                ("200 OK", scan_complete())
+            }
+        } else {
+            ("404 Not Found", r#"{"message":"not found"}"#.to_string())
+        }
+    });
+    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    let out = run_wait(&["scan-123"], &url, &repo);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The listing is only read when no scan id was given.
+    let hits = hits.lock().unwrap();
+    assert!(
+        !hits.iter().any(|h| h.starts_with("/api/v1/scans")),
+        "no scan listing with --scan-id; hits: {hits:?}"
+    );
+}
+
+/// `corgea scan semgrep` with a fake `semgrep` on PATH: the post-scan wait gets
+/// the project id straight from the upload response, so it must resolve nothing
+/// — no `/projects`, no `/scans` — and still link the id-form URL.
+#[cfg(unix)]
+#[test]
+fn scan_post_wait_uses_upload_project_id_without_resolving() {
+    use std::sync::{Arc, Mutex};
+    let hits = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hits_c = hits.clone();
+    let url = common::spawn_http_stub(move |path| {
+        hits_c.lock().unwrap().push(path.to_string());
+        if path.starts_with("/api/v1/verify")
+            || path.starts_with("/api/v1/code-upload")
+            || path.starts_with("/api/v1/git-config-upload")
+        {
+            ("200 OK", r#"{"status":"ok"}"#.to_string())
+        } else if path.starts_with("/api/v1/scan-upload") {
+            (
+                "200 OK",
+                r#"{"status":"ok","sast_scan_id":"scan-123","project_id":42}"#.to_string(),
+            )
+        } else if path.starts_with("/api/v1/scan/") {
+            if path.contains("/issues") {
+                ("200 OK", scan_issues_empty())
+            } else {
+                ("200 OK", scan_complete())
+            }
+        } else {
+            ("404 Not Found", r#"{"message":"not found"}"#.to_string())
+        }
+    });
+    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    std::fs::write(repo.join("app.py"), "x = 1\n").expect("write source");
+    let bin = repo.join("fakebin");
+    std::fs::create_dir(&bin).expect("create fake bin dir");
+    let report = r#"{"version":"1.0.0","errors":[],"results":[{"check_id":"rule","path":"app.py","start":{"line":1},"end":{"line":1},"extra":{"message":"m","severity":"ERROR","metadata":{"source":"https://semgrep.dev/r/rule"}}}]}"#;
+    common::write_script(
+        &bin,
+        "semgrep",
+        &format!("#!/bin/sh\nprintf '%s' '{report}'\n"),
+    );
+
+    let (mut cmd, _home) = common::corgea_isolated();
+    let out = cmd
+        .args(["scan", "semgrep"])
+        .env("PATH", &bin)
+        .env("CORGEA_URL", &url)
+        .env("CORGEA_TOKEN", "test-token")
+        .current_dir(&repo)
+        .output()
+        .expect("spawn corgea");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("/project/42/?scan_id=scan-123"),
+        "expected the id-form scan URL; stdout: {stdout}"
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        !hits.iter().any(|h| h.starts_with("/api/v1/projects")),
+        "no /projects resolution after an upload that carried the id; hits: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| h.starts_with("/api/v1/scans")),
+        "no scan listing after an upload that carried the id; hits: {hits:?}"
     );
 }
 

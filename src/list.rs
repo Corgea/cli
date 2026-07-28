@@ -20,8 +20,7 @@ pub fn run(
         println!();
     }
     if *sca_issues {
-        // SCA has no project parameter (get_sca_issues); keep the CWD basename
-        // for its legacy error copy and do NOT resolve here.
+        // SCA has no project parameter; the CWD basename is only error copy.
         let project_name =
             utils::generic::get_current_working_directory().unwrap_or("unknown".to_string());
         let sca_issues_response = match utils::api::get_sca_issues(
@@ -117,8 +116,7 @@ pub fn run(
         );
     } else {
         // The --scan-id issue route hits /scan/{id}/issues and ignores the
-        // project, so skip the extra /projects resolution in that one mode;
-        // every other path here queries by project and needs it resolved.
+        // project, so it needs no resolution; every other path queries by name.
         let resolved: Option<utils::api::ResolvedProject> = if *issues && scan_id.is_some() {
             None
         } else {
@@ -303,8 +301,6 @@ pub fn run(
 
             utils::terminal::print_table(table, issues_response.page, issues_response.total_pages);
         } else {
-            // Scan-listing always resolves (the skip only applies to
-            // --issues --scan-id), so `resolved` is present here.
             let resolved = resolved
                 .as_ref()
                 .expect("scan listing always resolves the project");
@@ -318,8 +314,8 @@ pub fn run(
                     let page = scans.page;
                     let total_pages = scans.total_pages;
                     // The server already filtered by the resolved project; the old
-                    // client-side `scan.project == cwd_basename` pass is redundant
-                    // and would discard every repo-resolved scan. (COR-1577)
+                    // client-side `scan.project == cwd_basename` pass would discard
+                    // every repo-resolved scan. (COR-1577)
                     (scans.scans.unwrap_or_default(), page, total_pages)
                 }
                 Err(e) => {
@@ -339,7 +335,9 @@ pub fn run(
                     std::process::exit(1);
                 }
             };
-            // JSON mode stays a valid machine envelope even when empty.
+            // An unresolved project is a miss (exit 1, as --issues and `wait`);
+            // a confirmed project with no scans is a valid empty result.
+            let unresolved_miss = scans.is_empty() && !resolved.confirmed;
             if *json {
                 let output = json!({
                     "page": page,
@@ -347,21 +345,27 @@ pub fn run(
                     "results": scans
                 });
                 println!("{}", serde_json::to_string_pretty(&output).unwrap());
-                return;
-            }
-            // Human mode: never render a silent empty table on a miss.
-            if scans.is_empty() {
-                if resolved.confirmed {
-                    println!(
-                        "Project '{}' has no scans yet. Run 'corgea scan' to create one.",
-                        project_name
-                    );
-                } else {
-                    println!(
+                if unresolved_miss {
+                    log::error!(
                         "No Corgea project found for {}. Run 'corgea scan' to create one, or pass --project-name <NAME>.",
                         resolved.tried_label
                     );
+                    std::process::exit(1);
                 }
+                return;
+            }
+            if scans.is_empty() {
+                if unresolved_miss {
+                    log::error!(
+                        "No Corgea project found for {}. Run 'corgea scan' to create one, or pass --project-name <NAME>.",
+                        resolved.tried_label
+                    );
+                    std::process::exit(1);
+                }
+                println!(
+                    "Project '{}' has no scans yet. Run 'corgea scan' to create one.",
+                    project_name
+                );
                 return;
             }
             let mut table = vec![vec![

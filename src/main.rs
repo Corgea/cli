@@ -700,6 +700,7 @@ fn main() {
                 scan_id.clone(),
                 project_name.clone(),
                 repo.clone(),
+                None,
             );
         }
         Some(Commands::List {

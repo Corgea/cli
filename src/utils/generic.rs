@@ -260,46 +260,33 @@ fn extract_repo_name_from_url(url: &str) -> Option<String> {
     None
 }
 
-/// Extract the `org/repo` slug from a git remote URL. Returns the last two
-/// meaningful path segments so it is a substring of essentially every stored
-/// (normalized) `repo_url` form. Distinct from `extract_repo_name_from_url`,
-/// which returns only the final segment (`repo`).
-///
-/// Handles:
-///   https://github.com/org/repo(.git)            -> org/repo
-///   git@github.com:org/repo(.git)                -> org/repo
-///   ssh://git@github.com/org/repo                -> org/repo
-///   https://dev.azure.com/org/project/_git/repo  -> project/_git/repo
-///
-/// Azure `_git` is kept (and the preceding project segment included) because
-/// doghouse `normalize_repo_url` stores Azure as `.../project/_git/repo`
-/// (`heeler/models.py:208-212`) — `project/_git/repo` is a substring of that,
-/// `project/repo` is NOT. Azure SSH remotes (`ssh.dev.azure.com/v3/...`, which
-/// carry no `_git` segment) are a known limitation; users pass --project-name.
-///
-/// Returns None when fewer than two path segments follow the host (a bare host
-/// or garbage input).
-pub fn extract_repo_slug(url: &str) -> Option<String> {
+/// The whole repository path after the host, lowercased (`org/repo`,
+/// `group/subgroup/repo`, Azure `org/project/_git/repo`). The host is excluded
+/// so SSH/HTTPS/port variants of one remote compare equal; None when fewer than
+/// two path segments follow it. The full path — not a trailing `org/repo` slug
+/// — is what doghouse `normalize_repo_url` stores (`heeler/models.py:201-246`),
+/// so it is what an equality compare needs. Azure SSH remotes
+/// (`ssh.dev.azure.com/v3/org/…`, no `_git` segment) remain a known limitation.
+pub fn extract_repo_path(url: &str) -> Option<String> {
     let url = url.trim().trim_end_matches('/');
     let url = url.strip_suffix(".git").unwrap_or(url);
-    // Drop scheme (`https://`, `ssh://`, …) if present.
     let url = url.rsplit("://").next().unwrap_or(url);
-    // Split host from path: URL forms use '/', scp-like `git@host:org/repo`
-    // uses ':'. After filtering empties, segments[0] is the host.
-    let segments: Vec<&str> = url.split(['/', ':']).filter(|s| !s.is_empty()).collect();
+    // Drop userinfo (`git@`, `oauth2:token@`) so it is never read as the host.
+    let host_end = url.find('/').unwrap_or(url.len());
+    let url = match url[..host_end].rfind('@') {
+        Some(at) => &url[at + 1..],
+        None => url,
+    };
+    // URL forms split host from path on '/', scp-like `git@host:org/repo` on ':'.
+    let mut segments: Vec<&str> = url.split(['/', ':']).filter(|s| !s.is_empty()).collect();
+    // segments[0] is the host; an all-digit segment right after it is a port.
+    if segments.len() >= 4 && segments[1].chars().all(|c| c.is_ascii_digit()) {
+        segments.remove(1);
+    }
     if segments.len() < 3 {
         return None; // need host + at least org + repo
     }
-    let last = segments[segments.len() - 1];
-    let prev = segments[segments.len() - 2];
-    if prev == "_git" && segments.len() >= 4 {
-        // Azure DevOps: keep the project so the slug stays a substring of the
-        // normalized stored URL (.../project/_git/repo).
-        let project = segments[segments.len() - 3];
-        Some(format!("{}/_git/{}", project, last))
-    } else {
-        Some(format!("{}/{}", prev, last))
-    }
+    Some(segments[1..].join("/").to_lowercase())
 }
 
 pub fn get_env_var_if_exists(var_name: &str) -> Option<String> {
@@ -505,53 +492,65 @@ mod tests {
     }
 
     #[test]
-    fn extract_repo_slug_handles_common_remote_forms() {
+    fn extract_repo_path_handles_common_remote_forms() {
         assert_eq!(
-            extract_repo_slug("https://github.com/org/repo.git").as_deref(),
+            extract_repo_path("https://github.com/org/repo.git").as_deref(),
             Some("org/repo")
         );
         assert_eq!(
-            extract_repo_slug("https://github.com/org/repo").as_deref(),
+            extract_repo_path("https://github.com/org/repo").as_deref(),
             Some("org/repo")
         );
         assert_eq!(
-            extract_repo_slug("git@github.com:org/repo.git").as_deref(),
+            extract_repo_path("git@github.com:org/repo.git").as_deref(),
             Some("org/repo")
         );
         assert_eq!(
-            extract_repo_slug("git@github.com:org/repo").as_deref(),
+            extract_repo_path("git@github.com:org/repo").as_deref(),
             Some("org/repo")
         );
         assert_eq!(
-            extract_repo_slug("ssh://git@github.com/org/repo").as_deref(),
+            extract_repo_path("ssh://git@github.com/org/repo").as_deref(),
             Some("org/repo")
         );
         assert_eq!(
-            extract_repo_slug("https://github.com/org/repo/").as_deref(),
+            extract_repo_path("https://github.com/org/repo/").as_deref(),
             Some("org/repo")
         );
-        // host:port should not leak the port into the slug
         assert_eq!(
-            extract_repo_slug("https://git.example.com:8443/org/repo").as_deref(),
+            extract_repo_path("https://github.com/Org/Repo").as_deref(),
+            Some("org/repo")
+        );
+        // host:port must not leak the port into the path
+        assert_eq!(
+            extract_repo_path("https://git.example.com:8443/org/repo").as_deref(),
+            Some("org/repo")
+        );
+        // token userinfo must not be read as the host
+        assert_eq!(
+            extract_repo_path("https://oauth2:tok@gitlab.com/org/repo").as_deref(),
             Some("org/repo")
         );
         // Bank of Hope case
         assert_eq!(
-            extract_repo_slug("git@github.com:bohappdev/dotnet-azure-web-tsb.git").as_deref(),
+            extract_repo_path("git@github.com:bohappdev/dotnet-azure-web-tsb.git").as_deref(),
             Some("bohappdev/dotnet-azure-web-tsb")
         );
-        // Azure DevOps `_git` HTTPS -> keeps project + _git so it stays a substring
-        // of the normalized stored URL.
+        // Whole path is kept: Azure `_git` and GitLab subgroups
         assert_eq!(
-            extract_repo_slug("https://dev.azure.com/org/project/_git/repo").as_deref(),
-            Some("project/_git/repo")
+            extract_repo_path("https://dev.azure.com/org/project/_git/repo").as_deref(),
+            Some("org/project/_git/repo")
+        );
+        assert_eq!(
+            extract_repo_path("git@gitlab.com:group/subgroup/repo.git").as_deref(),
+            Some("group/subgroup/repo")
         );
     }
 
     #[test]
-    fn extract_repo_slug_returns_none_for_unsplittable_input() {
-        assert_eq!(extract_repo_slug("not a url"), None);
-        assert_eq!(extract_repo_slug(""), None);
-        assert_eq!(extract_repo_slug("github.com"), None); // host only
+    fn extract_repo_path_returns_none_for_unsplittable_input() {
+        assert_eq!(extract_repo_path("not a url"), None);
+        assert_eq!(extract_repo_path(""), None);
+        assert_eq!(extract_repo_path("github.com"), None); // host only
     }
 }
