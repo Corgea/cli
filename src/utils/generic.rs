@@ -326,16 +326,18 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
             .map(|commit| commit.id().to_string())
     });
 
-    let repo_url = repo
-        .find_remote("origin")
-        .ok()
-        .and_then(|remote| remote.url().map(|url| url.to_string()));
-
     Ok(Some(RepoInfo {
         branch,
-        repo_url,
+        repo_url: origin_url(&repo),
         sha,
     }))
+}
+
+/// `origin`'s URL, or None when the remote is missing or carries no URL.
+fn origin_url(repo: &Repository) -> Option<String> {
+    repo.find_remote("origin")
+        .ok()
+        .and_then(|remote| remote.url().map(|url| url.to_string()))
 }
 
 /// The enclosing repository's `origin` remote URL, searched upward from the
@@ -343,10 +345,7 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
 /// `get_repo_info` deliberately returns None outside the worktree root; this
 /// does not. None outside a git repo or when `origin` carries no URL.
 pub fn discover_repo_url() -> Option<String> {
-    let repo = Repository::discover(Path::new(".")).ok()?;
-    repo.find_remote("origin")
-        .ok()
-        .and_then(|remote| remote.url().map(|url| url.to_string()))
+    origin_url(&Repository::discover(Path::new(".")).ok()?)
 }
 
 /// True when `dir` is the repository worktree root (not a subdirectory).
@@ -394,41 +393,34 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
+    /// `git <args>` in `dir`. Scrubs the GIT_* env a parent git process
+    /// injects (e.g. when these tests run from a pre-commit hook): an
+    /// inherited GIT_DIR would point `git init` at the developer's repo
+    /// instead of `dir`. Same scrub as `tests/cli_deps.rs::run_git`.
+    fn git(dir: &Path, args: &[&str]) {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_PREFIX")
+            .status()
+            .unwrap()
+            .success());
+    }
+
     #[test]
     fn get_repo_info_at_root_only_not_nested_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        assert!(Command::new("git")
-            .args(["init"])
-            .current_dir(root)
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(root)
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(root)
-            .status()
-            .unwrap()
-            .success());
+        git(root, &["init"]);
+        git(root, &["config", "user.email", "test@example.com"]);
+        git(root, &["config", "user.name", "Test"]);
         fs::write(root.join("README"), "hi").unwrap();
-        assert!(Command::new("git")
-            .args(["add", "README"])
-            .current_dir(root)
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(root)
-            .status()
-            .unwrap()
-            .success());
+        git(root, &["add", "README"]);
+        git(root, &["commit", "-m", "init"]);
 
         let root_s = root.to_str().unwrap();
         let nested = root.join("pkg").join("inner");

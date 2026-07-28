@@ -745,9 +745,6 @@ pub struct ProjectSummary {
 
 #[derive(Deserialize, Debug)]
 pub struct ProjectsResponse {
-    // Part of the `@paginated` envelope; not consumed.
-    #[allow(dead_code)]
-    pub status: String,
     #[serde(default)]
     pub projects: Option<Vec<ProjectSummary>>,
 }
@@ -858,8 +855,6 @@ pub fn resolve_project(
         });
     }
 
-    // Explicit --repo vs auto-detected remote changes the unconfirmed fallback.
-    let repo_was_explicit = repo_override.is_some();
     // --repo may already be a bare `org/repo` (extract_repo_path needs a host
     // segment, so it returns None there) -> use the raw value.
     let repo_path = match repo_override {
@@ -870,7 +865,7 @@ pub fn resolve_project(
     };
 
     let cwd =
-        || utils::generic::get_current_working_directory().unwrap_or_else(|| "unknown".to_string());
+        utils::generic::get_current_working_directory().unwrap_or_else(|| "unknown".to_string());
 
     if let Some(repo_path) = repo_path {
         if let Some(project) = resolve_project_by_repo(url, &repo_path)? {
@@ -881,10 +876,11 @@ pub fn resolve_project(
                 tried_label: format!("repo '{}'", repo_path),
             });
         }
-        let query_name = if repo_was_explicit {
+        // Explicit --repo vs auto-detected remote changes the unconfirmed fallback.
+        let query_name = if repo_override.is_some() {
             repo_path.clone()
         } else {
-            cwd()
+            cwd
         };
         return Ok(ResolvedProject {
             query_name,
@@ -894,13 +890,35 @@ pub fn resolve_project(
         });
     }
 
-    let cwd = cwd();
     Ok(ResolvedProject {
         tried_label: format!("directory '{}'", cwd),
         query_name: cwd,
         confirmed: false,
         project_id: None,
     })
+}
+
+/// `resolve_project`, or a hard exit with the shared failure copy. Every
+/// caller treats a resolver error as fatal.
+pub fn resolve_or_exit(
+    url: &str,
+    project_name_override: Option<&str>,
+    repo_override: Option<&str>,
+) -> ResolvedProject {
+    match resolve_project(url, project_name_override, repo_override) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            log::error!(
+                "Unable to resolve the Corgea project. Please check your connection and ensure that:\n\
+                - The server URL is reachable.\n\
+                - Your authentication token is valid.\n\n\
+                Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli\n\n\
+                Error details: {}",
+                e
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 pub fn exchange_code_for_token(
@@ -1518,7 +1536,7 @@ mod tests {
     // As `spawn_projects_stub` but with a caller-chosen status line, for the
     // resolver error-path tests (404 soft-miss vs 5xx hard error).
     fn spawn_projects_stub_status(status_line: &'static str, body: &'static str) -> String {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         thread::spawn(move || {
@@ -1528,23 +1546,8 @@ mod tests {
                 // socket with an unread request still in the kernel buffer
                 // triggers a TCP RST that surfaces on the client as hyper
                 // `UnexpectedMessage` (flaky, timing-dependent).
-                let mut chunk = [0u8; 1024];
-                let mut buf = Vec::new();
-                while let Ok(n) = stream.read(&mut chunk) {
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let resp = format!(
-                    "HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
-                    status_line,
-                    body.len(),
-                    body
-                );
+                let _ = corgea::vuln_api_stub::read_http_request(&mut stream);
+                let resp = corgea::vuln_api_stub::http_response(status_line, "", body);
                 let _ = stream.write_all(resp.as_bytes());
             }
         });

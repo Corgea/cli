@@ -115,35 +115,20 @@ pub fn run(
             Some(sca_issues_response.total_pages),
         );
     } else {
-        // The --scan-id issue route hits /scan/{id}/issues and ignores the
-        // project, so it needs no resolution; every other path queries by name.
-        let resolved: Option<utils::api::ResolvedProject> = if *issues && scan_id.is_some() {
-            None
-        } else {
-            match utils::api::resolve_project(
-                &config.get_url(),
-                project_name_override.as_deref(),
-                repo_override.as_deref(),
-            ) {
-                Ok(resolved) => Some(resolved),
-                Err(e) => {
-                    log::error!(
-                        "Unable to resolve the Corgea project. Please check your connection and ensure that:\n\
-                        - The server URL is reachable.\n\
-                        - Your authentication token is valid.\n\n\
-                        Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli\n\n\
-                        Error details: {}",
-                        e
-                    );
-                    std::process::exit(1);
-                }
-            }
-        };
-        let project_name = resolved
-            .as_ref()
-            .map(|r| r.query_name.clone())
-            .unwrap_or_default();
         if *issues {
+            // The --scan-id issue route hits /scan/{id}/issues and ignores the
+            // project, so it needs no resolution.
+            let resolved = scan_id.is_none().then(|| {
+                utils::api::resolve_or_exit(
+                    &config.get_url(),
+                    project_name_override.as_deref(),
+                    repo_override.as_deref(),
+                )
+            });
+            let project_name = resolved
+                .as_ref()
+                .map(|r| r.query_name.clone())
+                .unwrap_or_default();
             let issues_response = match utils::api::get_scan_issues(
                 &config.get_url(),
                 &project_name,
@@ -155,15 +140,14 @@ pub fn run(
                 Err(e) => {
                     debug(&format!("Error Sending Request: {}", e));
                     if e.to_string().contains("404") {
-                        if scan_id.is_some() {
-                            log::error!("Scan with ID '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", scan_id.as_ref().unwrap());
-                        } else if resolved.as_ref().map(|r| r.confirmed).unwrap_or(false) {
-                            log::error!("Project '{}' has no issues yet. Run 'corgea scan' to create a scan for this project.", project_name);
-                        } else {
-                            log::error!(
+                        // `resolved` is None exactly on the --scan-id route.
+                        match &resolved {
+                            None => log::error!("Scan with ID '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", scan_id.as_ref().unwrap()),
+                            Some(r) if r.confirmed => log::error!("Project '{}' has no issues yet. Run 'corgea scan' to create a scan for this project.", project_name),
+                            Some(r) => log::error!(
                                 "No Corgea project found for {}. Run 'corgea scan' to create one, or pass --project-name <NAME>.",
-                                resolved.as_ref().map(|r| r.tried_label.as_str()).unwrap_or_default()
-                            );
+                                r.tried_label
+                            ),
                         }
                     } else {
                         log::error!(
@@ -301,12 +285,15 @@ pub fn run(
 
             utils::terminal::print_table(table, issues_response.page, issues_response.total_pages);
         } else {
-            let resolved = resolved
-                .as_ref()
-                .expect("scan listing always resolves the project");
+            let resolved = utils::api::resolve_or_exit(
+                &config.get_url(),
+                project_name_override.as_deref(),
+                repo_override.as_deref(),
+            );
+            let project_name = &resolved.query_name;
             let (scans, page, total_pages) = match utils::api::query_scan_list(
                 &config.get_url(),
-                Some(&project_name),
+                Some(project_name),
                 *page,
                 *page_size,
             ) {
@@ -335,33 +322,29 @@ pub fn run(
                     std::process::exit(1);
                 }
             };
-            // An unresolved project is a miss (exit 1, as --issues and `wait`);
-            // a confirmed project with no scans is a valid empty result.
-            let unresolved_miss = scans.is_empty() && !resolved.confirmed;
             if *json {
                 let output = json!({
                     "page": page,
                     "total_pages": total_pages,
                     "results": scans
                 });
+                // The envelope prints first so JSON consumers get valid stdout
+                // even when the miss below exits 1.
                 println!("{}", serde_json::to_string_pretty(&output).unwrap());
-                if unresolved_miss {
-                    log::error!(
-                        "No Corgea project found for {}. Run 'corgea scan' to create one, or pass --project-name <NAME>.",
-                        resolved.tried_label
-                    );
-                    std::process::exit(1);
-                }
+            }
+            // An unresolved project is a miss (exit 1, as --issues and `wait`);
+            // a confirmed project with no scans is a valid empty result.
+            if scans.is_empty() && !resolved.confirmed {
+                log::error!(
+                    "No Corgea project found for {}. Run 'corgea scan' to create one, or pass --project-name <NAME>.",
+                    resolved.tried_label
+                );
+                std::process::exit(1);
+            }
+            if *json {
                 return;
             }
             if scans.is_empty() {
-                if unresolved_miss {
-                    log::error!(
-                        "No Corgea project found for {}. Run 'corgea scan' to create one, or pass --project-name <NAME>.",
-                        resolved.tried_label
-                    );
-                    std::process::exit(1);
-                }
                 println!(
                     "Project '{}' has no scans yet. Run 'corgea scan' to create one.",
                     project_name

@@ -12,36 +12,25 @@ pub fn run(
     // A scan id plus the project id from the upload response leaves nothing to
     // resolve: everything below keys off the scan, and the id-form URL is
     // already known.
-    let resolved: Option<utils::api::ResolvedProject> = if scan_id.is_some()
-        && project_id_override.is_some()
-    {
-        None
+    let resolved = if scan_id.is_some() && project_id_override.is_some() {
+        let name = project_name_override.clone().unwrap_or_else(|| {
+            utils::generic::get_current_working_directory().unwrap_or_else(|| "unknown".to_string())
+        });
+        utils::api::ResolvedProject {
+            // `confirmed`/`tried_label` are only read on the no-scan-id path.
+            tried_label: format!("project '{}'", name),
+            query_name: name,
+            confirmed: false,
+            project_id: None,
+        }
     } else {
-        match utils::api::resolve_project(
+        utils::api::resolve_or_exit(
             &config.get_url(),
             project_name_override.as_deref(),
             repo_override.as_deref(),
-        ) {
-            Ok(resolved) => Some(resolved),
-            Err(e) => {
-                log::error!(
-                        "Unable to resolve the Corgea project. Please check your connection and ensure that:\n\
-                        - The server URL is reachable.\n\
-                        - Your authentication token is valid.\n\n\
-                        Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli\n\n\
-                        Error details: {}",
-                        e
-                    );
-                std::process::exit(1);
-            }
-        }
+        )
     };
-    let project_name = match &resolved {
-        Some(r) => r.query_name.clone(),
-        None => project_name_override
-            .clone()
-            .unwrap_or_else(|| utils::generic::get_current_working_directory().unwrap_or_default()),
-    };
+    let project_name = resolved.query_name.clone();
 
     // Only the scan-less path reads the listing.
     let scans: Vec<utils::api::ScanResponse> = if scan_id.is_some() {
@@ -80,7 +69,7 @@ pub fn run(
         None => match scans.first() {
             Some(scan) => (scan.id.clone(), scan.status == "Complete"),
             None => {
-                if resolved.as_ref().map(|r| r.confirmed).unwrap_or(false) {
+                if resolved.confirmed {
                     log::error!(
                         "Project '{}' has no scans yet. Run 'corgea scan' to start one.",
                         project_name
@@ -88,7 +77,7 @@ pub fn run(
                 } else {
                     log::error!(
                         "No scan to wait for: no Corgea project found for {}. Run 'corgea scan', or pass --scan-id / --project-name.",
-                        resolved.as_ref().map(|r| r.tried_label.as_str()).unwrap_or_default()
+                        resolved.tried_label
                     );
                 }
                 std::process::exit(1);
@@ -96,8 +85,7 @@ pub fn run(
         },
     };
 
-    let project_id =
-        project_id_override.or_else(|| resolved.as_ref().and_then(|r| r.project_id.clone()));
+    let project_id = project_id_override.or(resolved.project_id);
     let scan_url = match &project_id {
         Some(pid) => format!("{}/project/{}/?scan_id={}", config.get_url(), pid, scan_id),
         None => {
