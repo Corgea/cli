@@ -1,12 +1,11 @@
 //! End-to-end tests for `corgea list` repo-URL project resolution (COR-1577).
-//! Stubs route on the request-target path PREFIX: `/projects` carries a
-//! percent-encoded query, so the full target is not a stable key.
+//! The stub route table lives in `common::Routes`.
 
 mod common;
 
 use common::{
-    projects_empty, projects_match, scans_empty, scans_one, temp_git_repo, temp_plain_dir, CANON,
-    REMOTE,
+    projects_empty, projects_match, scans_empty, scans_one, temp_git_repo, temp_plain_dir, Routes,
+    CANON, REMOTE,
 };
 use std::path::Path;
 use std::process::Output;
@@ -25,34 +24,22 @@ fn issues_miss() -> String {
 
 // --- harness ---------------------------------------------------------------
 
-/// Stub serving verify + the three listing endpoints, keyed on path prefix.
-fn spawn_stub(projects: String, scans: String, issues: String) -> String {
-    common::spawn_http_stub(move |path| {
-        if path.starts_with("/api/v1/verify") {
-            ("200 OK", r#"{"status":"ok"}"#.to_string())
-        } else if path.starts_with("/api/v1/projects?repo_url=") {
-            ("200 OK", projects.clone())
-        } else if path.starts_with("/api/v1/scans?") {
-            ("200 OK", scans.clone())
-        } else if path.starts_with("/api/v1/issues?") {
-            ("200 OK", issues.clone())
-        } else {
-            ("404 Not Found", r#"{"message":"not found"}"#.to_string())
-        }
-    })
+/// The three listing endpoints `list` reads.
+fn routes(projects: String, scans: String, issues: String) -> Routes {
+    Routes {
+        projects: Some(projects),
+        scans: Some(scans),
+        issues: Some(issues),
+        ..Default::default()
+    }
 }
 
-/// Run `corgea list <args...>` against `url` from `cwd`, isolated from the
-/// host (temp HOME). `CORGEA_URL`/`CORGEA_TOKEN` are layered back on after
-/// `corgea_isolated` strips them.
+fn spawn_stub(projects: String, scans: String, issues: String) -> String {
+    common::spawn_resolution_stub(routes(projects, scans, issues))
+}
+
 fn run_list(args: &[&str], url: &str, cwd: &Path) -> Output {
-    let (mut cmd, _home) = common::corgea_isolated();
-    cmd.arg("list");
-    cmd.args(args);
-    cmd.env("CORGEA_URL", url)
-        .env("CORGEA_TOKEN", "test-token")
-        .current_dir(cwd);
-    cmd.output().expect("spawn corgea")
+    common::run_corgea("list", args, url, cwd)
 }
 
 // --- tests -----------------------------------------------------------------
@@ -95,21 +82,11 @@ fn list_issues_shows_repo_resolved_issue() {
 
 #[test]
 fn list_repo_flag_resolves_from_flag_not_remote() {
-    use std::sync::{Arc, Mutex};
-    let hits = Arc::new(Mutex::new(Vec::<String>::new()));
-    let hits_c = hits.clone();
     // Records every request target so we can prove the slug came from --repo.
-    let url = common::spawn_http_stub(move |path| {
-        hits_c.lock().unwrap().push(path.to_string());
-        if path.starts_with("/api/v1/verify") {
-            ("200 OK", r#"{"status":"ok"}"#.to_string())
-        } else if path.starts_with("/api/v1/projects?repo_url=") {
-            ("200 OK", projects_match())
-        } else if path.starts_with("/api/v1/scans?") {
-            ("200 OK", scans_one(CANON))
-        } else {
-            ("404 Not Found", r#"{"message":"not found"}"#.to_string())
-        }
+    let (url, hits) = common::spawn_recording_resolution_stub(Routes {
+        projects: Some(projects_match()),
+        scans: Some(scans_one(CANON)),
+        ..Default::default()
     });
     // Non-git dir: no remote, so a resolved slug can ONLY have come from --repo.
     let (_tmp, dir) = temp_plain_dir("unrelated-dir");
@@ -247,28 +224,23 @@ fn list_json_miss_is_valid_empty_envelope() {
 
 #[test]
 fn list_issues_with_scan_id_skips_project_resolution() {
-    use std::sync::{Arc, Mutex};
-    let hits = Arc::new(Mutex::new(Vec::<String>::new()));
-    let hits_c = hits.clone();
     // The scan-id issue route ignores the project, so no /projects call should
     // be made even from a real git repo where a remote IS present. (COR-1577)
-    let url = common::spawn_http_stub(move |path| {
-        hits_c.lock().unwrap().push(path.to_string());
-        if path.starts_with("/api/v1/verify") {
-            ("200 OK", r#"{"status":"ok"}"#.to_string())
-        } else if path.contains("/check_blocking_rules") {
+    // `projects` stays unset: dialing it would 404 and show up in the hits.
+    let routes = Routes {
+        scan_issues: Some(
+            r#"{"status":"ok","page":1,"total_pages":1,"total_issues":0,"issues":[]}"#.to_string(),
+        ),
+        ..Default::default()
+    };
+    let (url, hits) = common::spawn_recording_http_stub(move |path| {
+        if path.contains("/check_blocking_rules") {
             (
                 "200 OK",
                 r#"{"block":false,"blocking_issues":[],"total_pages":1}"#.to_string(),
             )
-        } else if path.starts_with("/api/v1/scan/") && path.contains("/issues") {
-            (
-                "200 OK",
-                r#"{"status":"ok","page":1,"total_pages":1,"total_issues":0,"issues":[]}"#
-                    .to_string(),
-            )
         } else {
-            ("404 Not Found", r#"{"message":"not found"}"#.to_string())
+            routes.answer(path)
         }
     });
     let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
@@ -292,20 +264,10 @@ fn list_issues_with_scan_id_skips_project_resolution() {
 
 #[test]
 fn list_resolves_from_subdirectory() {
-    use std::sync::{Arc, Mutex};
-    let hits = Arc::new(Mutex::new(Vec::<String>::new()));
-    let hits_c = hits.clone();
-    let url = common::spawn_http_stub(move |path| {
-        hits_c.lock().unwrap().push(path.to_string());
-        if path.starts_with("/api/v1/verify") {
-            ("200 OK", r#"{"status":"ok"}"#.to_string())
-        } else if path.starts_with("/api/v1/projects?repo_url=") {
-            ("200 OK", projects_match())
-        } else if path.starts_with("/api/v1/scans?") {
-            ("200 OK", scans_one(CANON))
-        } else {
-            ("404 Not Found", r#"{"message":"not found"}"#.to_string())
-        }
+    let (url, hits) = common::spawn_recording_resolution_stub(Routes {
+        projects: Some(projects_match()),
+        scans: Some(scans_one(CANON)),
+        ..Default::default()
     });
     let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
     let subdir = repo.join("src");

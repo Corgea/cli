@@ -127,6 +127,27 @@ where
     base_url
 }
 
+/// Every request target a stub was asked for, in order.
+#[allow(dead_code)]
+pub type Hits = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// `spawn_http_stub` that also records every request target, so a test can
+/// assert which endpoints were (not) dialed. Mirrors
+/// `vuln_api_stub::spawn_capturing_vuln_api_stub`.
+#[allow(dead_code)]
+pub fn spawn_recording_http_stub<F>(route: F) -> (String, Hits)
+where
+    F: Fn(&str) -> (&'static str, String) + Send + 'static,
+{
+    let hits: Hits = Default::default();
+    let recorder = hits.clone();
+    let base_url = spawn_http_stub(move |path| {
+        recorder.lock().unwrap().push(path.to_string());
+        route(path)
+    });
+    (base_url, hits)
+}
+
 /// Registry stub serving `/pypi/oldpkg/json` (pypi) and `/oldpkg` (npm
 /// packument), both published 2020 → never recent. Everything else 404s.
 #[allow(dead_code)]
@@ -491,4 +512,83 @@ pub fn temp_plain_dir(dirname: &str) -> (TempDir, std::path::PathBuf) {
     let dir = tmp.path().join(dirname);
     std::fs::create_dir(&dir).expect("create dir");
     (tmp, dir)
+}
+
+/// The endpoints the `list`/`wait` resolution tests stub. `/verify` is always
+/// answered `ok`; a field left `None` 404s, as does any other path — so a test
+/// asserting an endpoint was never dialed simply leaves it unset.
+///
+/// Routing is on the request-target PREFIX: `/projects` carries a
+/// percent-encoded query, so the full target is not a stable key.
+#[allow(dead_code)]
+#[derive(Default, Clone)]
+pub struct Routes {
+    pub projects: Option<String>,
+    pub scans: Option<String>,
+    pub issues: Option<String>,
+    /// `GET /scan/{id}` — `check_scan_status`.
+    pub scan: Option<String>,
+    /// `GET /scan/{id}/issues` — `report_scan_status` and the `--scan-id`
+    /// issue route.
+    pub scan_issues: Option<String>,
+}
+
+#[allow(dead_code)]
+impl Routes {
+    /// The stub answer for `path`: a served body, else 404. Tests needing an
+    /// endpoint outside this table match it first and delegate here.
+    pub fn answer(&self, path: &str) -> (&'static str, String) {
+        let body = if path.starts_with("/api/v1/verify") {
+            Some(r#"{"status":"ok"}"#.to_string())
+        } else if path.starts_with("/api/v1/projects?repo_url=") {
+            self.projects.clone()
+        } else if path.starts_with("/api/v1/scans?") {
+            self.scans.clone()
+        } else if path.starts_with("/api/v1/issues?") {
+            self.issues.clone()
+        } else if path.starts_with("/api/v1/scan/") {
+            if path.contains("/issues") {
+                self.scan_issues.clone()
+            } else {
+                self.scan.clone()
+            }
+        } else {
+            None
+        };
+        match body {
+            Some(body) => ("200 OK", body),
+            None => ("404 Not Found", NOT_FOUND_JSON.to_string()),
+        }
+    }
+}
+
+/// `Routes` behind a plain stub; returns the base URL.
+#[allow(dead_code)]
+pub fn spawn_resolution_stub(routes: Routes) -> String {
+    spawn_http_stub(move |path| routes.answer(path))
+}
+
+/// `Routes` behind a recording stub; returns the base URL and the hit log.
+#[allow(dead_code)]
+pub fn spawn_recording_resolution_stub(routes: Routes) -> (String, Hits) {
+    spawn_recording_http_stub(move |path| routes.answer(path))
+}
+
+/// Run `corgea <subcommand> <args...>` against `url` from `cwd`, isolated from
+/// the host (temp HOME). `CORGEA_URL`/`CORGEA_TOKEN` are layered back on after
+/// `corgea_isolated` strips them.
+#[allow(dead_code)]
+pub fn run_corgea(
+    subcommand: &str,
+    args: &[&str],
+    url: &str,
+    cwd: &std::path::Path,
+) -> std::process::Output {
+    let (mut cmd, _home) = corgea_isolated();
+    cmd.arg(subcommand);
+    cmd.args(args);
+    cmd.env("CORGEA_URL", url)
+        .env("CORGEA_TOKEN", "test-token")
+        .current_dir(cwd);
+    cmd.output().expect("spawn corgea")
 }
