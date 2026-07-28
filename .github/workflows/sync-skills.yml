@@ -1,12 +1,19 @@
 name: Trigger AI Skills Sync on Release
 
-# Skills describe the CLI the user actually has installed, so this syncs on a
-# published release rather than on merge to main. Diffing main would push
-# unreleased commands into the public skill.
+# Syncs on a published release rather than on merge to main: skills describe the
+# CLI users have installed, and diffing main would document unreleased commands.
+#
+# Triggered by the Native Binary Release workflow rather than release.published.
+# On the tag-first path in RELEASING.md the release is created by
+# action-gh-release using GITHUB_TOKEN, and GitHub does not start workflow runs
+# for GITHUB_TOKEN events, so release.published would never fire. Native Binary
+# Release runs on the tag push either way. npm-publish.yml uses the same pattern.
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Native Binary Release"]
+    types:
+      - completed
   workflow_dispatch:
     inputs:
       base_tag:
@@ -21,62 +28,85 @@ on:
 permissions:
   contents: read
 
-# Serialize runs so two releases published close together cannot open competing
-# pull requests against the skills repo.
+# Serialize runs so two releases cannot open competing pull requests. The default
+# queue holds only one pending run, which would drop the middle of three releases
+# published in quick succession.
 concurrency:
   group: sync-skills
   cancel-in-progress: false
+  queue: max
 
 jobs:
   run-codex-skills-sync:
-    if: github.event_name == 'workflow_dispatch' || (github.event.release.draft == false && github.event.release.prerelease == false)
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Resolve release range
         id: range
         env:
           GH_TOKEN: ${{ github.token }}
-          NEW_TAG: ${{ github.event.inputs.head_tag || github.event.release.tag_name }}
+          # For a tag push, workflow_run reports the tag name as head_branch.
+          NEW_TAG: ${{ github.event.inputs.head_tag || github.event.workflow_run.head_branch }}
           BASE_TAG_INPUT: ${{ github.event.inputs.base_tag }}
           SKILLS_REPO_TOKEN: ${{ secrets.DOCS_REPO_TOKEN }}
         run: |
           set -euo pipefail
 
-          # Corgea/skills is public, so a missing token still clones fine and
-          # only the final push fails — after a full Codex run has been paid
-          # for. Fail here instead.
+          # Corgea/skills is public, so a missing token clones fine and only
+          # fails on the final push, after a full Codex run. Fail fast instead.
           if [[ -z "${SKILLS_REPO_TOKEN:-}" ]]; then
             echo "::error::DOCS_REPO_TOKEN is unset. It needs write access to Corgea/skills."
             exit 1
           fi
 
-          if [[ -n "$BASE_TAG_INPUT" ]]; then
-            PREV_TAG="$BASE_TAG_INPUT"
-          else
-            # Latest non-draft, non-prerelease release published strictly before
-            # the one being synced. Comparing on publishedAt rather than just
-            # excluding NEW_TAG matters for manual dispatch: re-running an older
-            # tag would otherwise resolve a *newer* release as the base and feed
-            # Codex a reversed diff, which reads as commands being removed.
-            # Tag names are inconsistent across the CLI's history (v1.9.1 but
-            # 1.8.8), so never parse them. ISO-8601 UTC sorts lexicographically.
-            #
-            # This needs NEW_TAG to be a published GitHub Release. A manual
-            # dispatch of a plain git tag has no release to read a timestamp
-            # from, so say that instead of dying on a raw gh error.
-            if ! NEW_PUBLISHED=$(gh release view "$NEW_TAG" --repo "$GITHUB_REPOSITORY" --json publishedAt --jq .publishedAt 2>/dev/null); then
+          # Native Binary Release also runs on branch pushes, where head_branch
+          # is a branch name with no release. Ask the API instead of matching on
+          # the ref: tag names are inconsistent here (v1.9.1 but 1.8.8).
+          if ! RELEASE_JSON=$(gh release view "$NEW_TAG" --repo "$GITHUB_REPOSITORY" \
+                 --json publishedAt,isDraft,isPrerelease,body 2>/dev/null); then
+            RELEASE_JSON=""
+
+            if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
+              echo "$NEW_TAG is not a published release (branch push?); nothing to sync."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # A plain tag with no release still syncs if the caller names a base.
+            if [[ -z "$BASE_TAG_INPUT" ]]; then
               echo "::error::No published GitHub Release found for tag $NEW_TAG, so the previous release cannot be resolved automatically. Re-run with base_tag set explicitly."
               exit 1
             fi
+            echo "No GitHub Release for $NEW_TAG; continuing with the base_tag given."
+          fi
 
-            # A draft release reports publishedAt as null, which would sort
-            # before every real timestamp and silently select the newest
-            # release as the base.
+          # workflow_run carries no release payload, so filter drafts here.
+          # Manual dispatch names its tag deliberately and stays an override.
+          if [[ -n "$RELEASE_JSON" && "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]] \
+             && [[ "$(jq -r '.isDraft' <<<"$RELEASE_JSON")" == "true" || \
+                   "$(jq -r '.isPrerelease' <<<"$RELEASE_JSON")" == "true" ]]; then
+            echo "$NEW_TAG is a draft or prerelease; nothing to sync."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ -n "$BASE_TAG_INPUT" ]]; then
+            PREV_TAG="$BASE_TAG_INPUT"
+          else
+            # Drafts report publishedAt as null, which sorts before every real
+            # timestamp and would select the newest release as the base.
+            NEW_PUBLISHED=$(jq -r '.publishedAt // ""' <<<"$RELEASE_JSON")
             if [[ -z "$NEW_PUBLISHED" || "$NEW_PUBLISHED" == "null" ]]; then
               echo "::error::Release $NEW_TAG has no publishedAt timestamp (draft?). Re-run with base_tag set explicitly."
               exit 1
             fi
             export NEW_PUBLISHED
+
+            # Newest release published before this one. Comparing timestamps
+            # rather than just excluding NEW_TAG matters on manual dispatch: an
+            # older tag would otherwise pick a newer base and feed Codex a
+            # reversed diff, which reads as commands being removed.
+            # ISO-8601 UTC sorts lexicographically.
             PREV_TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
               --json tagName,isDraft,isPrerelease,publishedAt \
               --jq '[.[] | select(.isDraft == false and .isPrerelease == false and .publishedAt < env.NEW_PUBLISHED)]
@@ -102,11 +132,21 @@ jobs:
             echo "head_sha=$HEAD_SHA"
           } >> "$GITHUB_OUTPUT"
 
-      # No checkout here on purpose. The composite action checks the CLI out
-      # into ./source itself; a second checkout at the workspace root would put
-      # the CLI's own skills/corgea/SKILL.md directly under Codex's working
-      # directory, where it is an inviting wrong target for skill edits that
-      # would then be silently discarded.
+          # Release notes are multi-line and author-supplied, so end the output
+          # with a delimiter the body will not contain.
+          if [[ -n "$RELEASE_JSON" ]]; then
+            NOTES_DELIM="NOTES_EOF_$(date +%s)$RANDOM"
+            {
+              echo "notes<<${NOTES_DELIM}"
+              jq -r '.body // ""' <<<"$RELEASE_JSON"
+              echo "${NOTES_DELIM}"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      # No checkout on purpose: the action checks the CLI out into ./source. A
+      # checkout at the workspace root would leave the CLI's own
+      # skills/corgea/SKILL.md under Codex's working directory as a tempting
+      # wrong edit target, whose changes would then be silently discarded.
       - name: Run AI Skills Sync
         if: steps.range.outputs.skip == 'false'
         uses: Corgea/internal_actions/sync-skills-action@main
@@ -114,13 +154,13 @@ jobs:
           base_sha: ${{ steps.range.outputs.base_sha }}
           head_sha: ${{ steps.range.outputs.head_sha }}
           openai_api_key: ${{ secrets.OPENAI_API_KEY }}
-          # DOCS_REPO_TOKEN despite the name: it is the shared bot token, which
-          # has write access to Corgea/skills as well as Corgea/docs. Rotating
-          # it affects the docs sync workflows too, not just this one.
+          # Shared bot token; the name is historical. It has write access to
+          # Corgea/skills as well as Corgea/docs, so rotating it affects the
+          # docs sync workflows too.
           skills_repo_token: ${{ secrets.DOCS_REPO_TOKEN }}
           skills_repo: "Corgea/skills"
           skills_base_branch: "main"
           release_info: |
             Corgea CLI release ${{ steps.range.outputs.new_tag }} (previous release: ${{ steps.range.outputs.prev_tag }}).
             Release notes:
-            ${{ github.event.release.body }}
+            ${{ steps.range.outputs.notes }}
