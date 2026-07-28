@@ -129,6 +129,22 @@ Agent environments default to compact TSV; force output with `--format human|age
   Examples: `corgea deps policy init`; `corgea deps policy init --exist-ok --format quiet`
 
 Notes: `deps scan --out-format table|json|sarif` is the report/export selector; do not combine it with `deps scan --format`.
+
+### Dependency finding catalog
+
+| ID | Status | Severity | Title | Description | Remediation |
+| --- | --- | --- | --- | --- | --- |
+| `DEP001` | emitted | High | Missing lockfile | The dependency manifest has no expected lockfile, so resolution is not reproducible. | Generate and commit the ecosystem lockfile. |
+| `DEP002` | emitted | High | Stale lockfile | A manifest dependency is missing from its lockfile. | Regenerate and commit the lockfile. |
+| `DEP003` | emitted | Medium | Direct dependency uses broad range | A direct dependency uses a bounded version range. | Pin an exact version or explicitly allow the range by policy. |
+| `DEP004` | emitted | High | Wildcard or latest dependency | A direct dependency uses wildcard, latest, or another unbounded range. | Pin an exact version. |
+| `DEP005` | emitted | High | Mutable Git branch dependency | A direct dependency is sourced from a mutable Git branch reference. | Pin a commit SHA or immutable release tag. |
+| `DEP006` | emitted | High | URL/tarball dependency without checksum | A direct URL or tarball dependency has no integrity checksum. | Add an integrity checksum or pin a registry package. |
+| `DEP008` | emitted | Medium | Lockfile integrity hash missing | A lockfile entry lacks its integrity hash. | Add the integrity hash to the lockfile entry. |
+| `DEP010` | reserved | Medium | Vulnerable package advisory | Reserved for vulnerable-package/advisory findings; `corgea deps` does not emit it. | Handle this code in an advisory or install-wrapper flow, never in `corgea deps`. |
+| `DEP014` | emitted | Low | Duplicate versions of same package | More than one resolved version of a package is present. | Align or deduplicate the resolved dependency versions. |
+| `DEP019` | emitted | Medium | Unsupported lockfile | A detected lockfile format is not supported by the parser. | Use a supported lockfile or wait for parser support. |
+| `DEP021` | emitted | High | Mutable artifact version | A direct artifact version is mutable, such as a Maven SNAPSHOT. | Pin an immutable release version. |
 <!-- END GENERATED CORGEA DEPS SKILL -->
 
 ### Advisories — `corgea advisories check`

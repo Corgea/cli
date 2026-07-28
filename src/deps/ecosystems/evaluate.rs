@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::deps::catalog::emitted_definition;
 use crate::deps::detect::{DepFileKind, DetectedFile};
 use crate::deps::ecosystems::classify_constraint;
 use crate::deps::findings::Finding;
@@ -29,6 +30,7 @@ pub fn scan_all(ctx: &mut ScanContext<'_>) -> Result<(), DepsError> {
     Ok(())
 }
 
+#[deprecated(note = "finding metadata is catalog-backed; use the dependency scan APIs")]
 #[allow(clippy::too_many_arguments)]
 pub fn add_pinning_finding(
     findings: &mut Vec<Finding>,
@@ -46,6 +48,35 @@ pub fn add_pinning_finding(
         id: code.into(),
         severity,
         title: title.into(),
+        package,
+        source_file: source_file.into(),
+        declared_constraint: declared.map(str::to_string),
+        resolved_version: resolved.map(str::to_string),
+        recommendation: recommendation.into(),
+        reproducible,
+        paths: vec![vec![PackageId::root()]],
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_catalog_pinning_finding(
+    findings: &mut Vec<Finding>,
+    code: &str,
+    package: Option<PackageId>,
+    source_file: &str,
+    declared: Option<&str>,
+    resolved: Option<&str>,
+    reproducible: bool,
+    recommendation: &str,
+) {
+    let Some(definition) = emitted_definition(code) else {
+        panic!("dependency finding code must be registered and emitted: {code}");
+    };
+
+    findings.push(Finding {
+        id: definition.id.into(),
+        severity: definition.severity,
+        title: definition.title.into(),
         package,
         source_file: source_file.into(),
         declared_constraint: declared.map(str::to_string),
@@ -76,28 +107,28 @@ pub fn constraint_to_findings(
     match kind {
         ConstraintKind::Exact => {}
         ConstraintKind::BoundedRange if is_direct && policy.warn_on_semver_range => {
-            add_pinning_finding(
+            add_catalog_pinning_finding(
                 &mut out,
                 "DEP003",
-                Severity::Medium,
-                "Direct dependency uses broad range",
                 package_id,
                 source_file,
                 Some(declared),
                 resolved,
                 reproducible,
-                "Pin to the resolved version or allow by policy because the lockfile resolves it.",
+                if reproducible && resolved.is_some() {
+                    "Pin to the resolved version or allow by policy because the lockfile resolves it."
+                } else {
+                    "Pin an exact version or explicitly allow the range by policy."
+                },
             );
         }
         ConstraintKind::BoundedRange => {}
         ConstraintKind::Unbounded
             if is_direct && (policy.fail_on_wildcard || policy.fail_on_latest) =>
         {
-            add_pinning_finding(
+            add_catalog_pinning_finding(
                 &mut out,
                 "DEP004",
-                Severity::High,
-                "Wildcard or latest dependency",
                 package_id,
                 source_file,
                 Some(declared),
@@ -107,11 +138,9 @@ pub fn constraint_to_findings(
             );
         }
         ConstraintKind::Mutable if is_direct && policy.fail_on_mutable_sources => {
-            add_pinning_finding(
+            add_catalog_pinning_finding(
                 &mut out,
                 "DEP021",
-                Severity::High,
-                "Mutable artifact version",
                 package_id,
                 source_file,
                 Some(declared),
@@ -121,11 +150,9 @@ pub fn constraint_to_findings(
             );
         }
         ConstraintKind::GitRef { mutable: true } if is_direct && policy.fail_on_mutable_sources => {
-            add_pinning_finding(
+            add_catalog_pinning_finding(
                 &mut out,
                 "DEP005",
-                Severity::High,
-                "Mutable Git branch dependency",
                 package_id,
                 source_file,
                 Some(declared),
@@ -136,11 +163,9 @@ pub fn constraint_to_findings(
         }
         ConstraintKind::GitRef { .. } => {}
         ConstraintKind::Url { checksum: false } if is_direct => {
-            add_pinning_finding(
+            add_catalog_pinning_finding(
                 &mut out,
                 "DEP006",
-                Severity::High,
-                "URL/tarball dependency without checksum",
                 package_id,
                 source_file,
                 Some(declared),
@@ -162,11 +187,9 @@ pub fn dep001(
     ecosystem_label: &str,
 ) {
     if policy.fail_on_missing_lockfile {
-        add_pinning_finding(
+        add_catalog_pinning_finding(
             findings,
             "DEP001",
-            Severity::High,
-            "Missing lockfile",
             None,
             source_file,
             None,
@@ -181,11 +204,9 @@ pub fn dep001(
 
 pub fn dep002(findings: &mut Vec<Finding>, policy: &Policy, manifest_file: &str, missing: &str) {
     if policy.fail_on_stale_lockfile {
-        add_pinning_finding(
+        add_catalog_pinning_finding(
             findings,
             "DEP002",
-            Severity::High,
-            "Stale lockfile",
             None,
             manifest_file,
             Some(missing),
@@ -203,11 +224,9 @@ pub fn dep019_unsupported_lockfile(
     source_file: &str,
     ecosystem_label: &str,
 ) {
-    add_pinning_finding(
+    add_catalog_pinning_finding(
         findings,
         "DEP019",
-        Severity::Medium,
-        "Unsupported lockfile",
         None,
         source_file,
         None,
@@ -224,11 +243,9 @@ pub fn dep008(findings: &mut Vec<Finding>, policy: &Policy, node: &DependencyNod
         return;
     }
     if node.lock_integrity == Some(false) {
-        add_pinning_finding(
+        add_catalog_pinning_finding(
             findings,
             "DEP008",
-            Severity::Medium,
-            "Lockfile integrity hash missing",
             Some(node.id.clone()),
             node.lockfile.as_deref().unwrap_or("lockfile"),
             node.declared_constraint.as_deref(),
@@ -284,11 +301,9 @@ pub fn dep014(findings: &mut Vec<Finding>, graph: &DependencyGraph) {
     }
     for (name, vers) in versions {
         if vers.len() > 1 {
-            add_pinning_finding(
+            add_catalog_pinning_finding(
                 findings,
                 "DEP014",
-                Severity::Low,
-                "Duplicate versions of same package",
                 Some(PackageId::npm(&name, vers.iter().next().unwrap())),
                 "lockfile",
                 None,

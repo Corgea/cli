@@ -97,7 +97,9 @@ fn cli_scan_agent_env_defaults_to_agent_format() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.starts_with("record\troot\t"), "stdout: {stdout}");
     assert!(
-        stdout.contains("\nfinding\tDEP004\tHigh\tpkg:npm/lodash@4.17.21\t"),
+        stdout.contains(
+            "\nfinding\tDEP004\tHigh\tpkg:npm/lodash@4.17.21\tWildcard or latest dependency\tPin to an exact version instead of using wildcard, latest, or unbounded ranges."
+        ),
         "stdout: {stdout}"
     );
 }
@@ -120,6 +122,17 @@ fn cli_scan_format_human_overrides_agent_env() {
         stdout.contains("Corgea dependency inventory"),
         "stdout: {stdout}"
     );
+    assert!(
+        stdout.contains("DEP004  High  Wildcard or latest dependency"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("package: lodash"), "stdout: {stdout}");
+    assert!(
+        stdout.contains(
+            "Pin to an exact version instead of using wildcard, latest, or unbounded ranges."
+        ),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -138,6 +151,20 @@ fn cli_scan_format_json_outputs_parseable_inventory() {
         serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
     assert!(parsed.get("nodes").is_some());
     assert!(parsed.get("findings").is_some());
+    let findings = parsed["findings"]
+        .as_array()
+        .expect("findings must be an array");
+    let dep004 = findings
+        .iter()
+        .find(|finding| finding["id"] == "DEP004" && finding["package"] == "pkg:npm/lodash@4.17.21")
+        .expect("node-app emits DEP004 for lodash");
+    assert_eq!(dep004["severity"], "High");
+    assert_eq!(dep004["title"], "Wildcard or latest dependency");
+    assert_eq!(
+        dep004["recommendation"],
+        "Pin to an exact version instead of using wildcard, latest, or unbounded ranges."
+    );
+    assert!(findings.iter().all(|finding| finding["id"] != "DEP010"));
     assert!(
         !String::from_utf8_lossy(&out.stdout).contains("Hint:"),
         "stdout: {}",
