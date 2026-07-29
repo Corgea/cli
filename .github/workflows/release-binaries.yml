@@ -91,6 +91,31 @@ jobs:
             "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" \
             "${{ matrix.target }}"
 
+      # The aarch64 artifacts are cross-built, so nothing else in CI would ever
+      # execute them. Run them under qemu to catch a binary that passes the
+      # header checks but cannot actually start.
+      - name: Smoke Test Linux Binary
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
+
+          case "${{ matrix.target }}" in
+            aarch64-*-gnu)
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq qemu-user-static libc6-arm64-cross
+              qemu-aarch64-static -L /usr/aarch64-linux-gnu "$binary" --version
+              ;;
+            aarch64-*-musl)
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq qemu-user-static
+              qemu-aarch64-static "$binary" --version
+              ;;
+            *)
+              "$binary" --version
+              ;;
+          esac
+
       - name: Archive Binary (Unix)
         if: runner.os != 'Windows'
         shell: bash
