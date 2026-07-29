@@ -130,6 +130,41 @@ fn list_issues_percent_encodes_the_project_name() {
 }
 
 #[test]
+fn list_resolves_through_an_ssh_config_host_alias() {
+    // `git@github.com-corgea:org/repo.git` — the shape this very repository's
+    // origin uses. Its host never equals the stored `github.com`, so treating
+    // the host as a gate rather than a tie-breaker would leave COR-1577
+    // unfixed for every aliased remote. (PR #122 review)
+    let (url, hits) = common::spawn_recording_resolution_stub(routes(
+        projects_match(),
+        scans_one(CANON),
+        issues_one(),
+    ));
+    let (_tmp, repo) = temp_git_repo(
+        "build-123",
+        "git@github.com-corgea:bohappdev/dotnet-azure-web-tsb.git",
+    );
+    let out = run_list(&[], &url, &repo);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("bohappdev/dotnet-azure-web-tsb"),
+        "stdout: {stdout}"
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        hits.iter().any(|h| h.starts_with("/api/v1/scans?")
+            && h.contains("project=bohappdev%2Fdotnet-azure-web-tsb")),
+        "the alias must still resolve the canonical project; hits: {hits:?}"
+    );
+}
+
+#[test]
 fn list_repo_flag_resolves_from_flag_not_remote() {
     // Records every request target so we can prove the slug came from --repo.
     let (url, hits) = common::spawn_recording_resolution_stub(Routes {

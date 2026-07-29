@@ -775,27 +775,22 @@ fn id_to_string(v: &serde_json::Value) -> Option<String> {
 }
 
 /// True when a stored `repo_url` points at exactly `expected_path` (a whole
-/// post-host path, already lowercased), on `expected_host` when both carry one.
-/// Comparing whole paths keeps the backend's `repo_url__icontains` results
-/// honest: neither the sibling `acme/api-v2` nor the nested `…/mirrors/acme/api`
-/// passes for `acme/api`. The host compare then separates two repositories that
-/// share a path across forges — `github.com/acme/api` is not
-/// `gitlab.com/acme/api` — and is skipped when either side is hostless (a bare
-/// `--repo acme/api`, or a stored bare `acme/api`), which carries no host to
-/// contradict. Falls back to a normalized compare for a stored bare `acme/api`.
-fn repo_url_matches_path(repo_url: &str, expected_path: &str, expected_host: Option<&str>) -> bool {
+/// post-host path, already lowercased). Comparing whole paths keeps the
+/// backend's `repo_url__icontains` results honest: neither the sibling
+/// `acme/api-v2` nor the nested `…/mirrors/acme/api` passes for `acme/api`.
+/// Falls back to a normalized compare for a stored bare `acme/api`.
+fn repo_url_matches_path(repo_url: &str, expected_path: &str) -> bool {
     if let Some(path) = utils::generic::extract_repo_path(repo_url) {
-        if path != expected_path {
-            return false;
-        }
-        return match (expected_host, utils::generic::extract_repo_host(repo_url)) {
-            (Some(expected), Some(actual)) => actual == expected,
-            _ => true,
-        };
+        return path == expected_path;
     }
     let r = repo_url.trim().trim_end_matches('/');
     let r = r.strip_suffix(".git").unwrap_or(r).to_lowercase();
     r == expected_path
+}
+
+/// True when a candidate is stored on exactly `expected_host`.
+fn repo_url_on_host(repo_url: &str, expected_host: &str) -> bool {
+    utils::generic::extract_repo_host(repo_url).as_deref() == Some(expected_host)
 }
 
 /// One page of GET /api/v1/projects?repo_url=…
@@ -852,14 +847,23 @@ fn fetch_projects_page(
 /// re-checked against the path here — on such a backend none match, and the
 /// caller falls back to the CWD-name path.
 ///
-/// `Err` for hard failures (network/auth/5xx/unparseable body); a clean "no
-/// match" (or a 404 from a backend without the endpoint) is a soft `Ok(None)`.
+/// The host is a tie-breaker, not a gate: it settles which of several
+/// same-path candidates is ours (`github.com/acme/api` is not
+/// `gitlab.com/acme/api`), but a lone path match is accepted whatever its
+/// host — an SSH-config alias origin (`corp-github:acme/api`) never matches
+/// the stored `github.com` and must still resolve. Several path matches with
+/// none on our host is genuinely ambiguous and errors rather than guessing.
+///
+/// `Err` for hard failures (network/auth/5xx/unparseable body/ambiguity); a
+/// clean "no match" (or a 404 from a backend without the endpoint) is a soft
+/// `Ok(None)`.
 pub fn resolve_project_by_repo(
     url: &str,
     repo_path: &str,
     expected_host: Option<&str>,
 ) -> Result<Option<ProjectSummary>, Box<dyn std::error::Error>> {
     let expected = repo_path.to_lowercase();
+    let mut candidates: Vec<ProjectSummary> = Vec::new();
     let mut page = 1;
     loop {
         let Some(parsed) = fetch_projects_page(url, repo_path, page)? else {
@@ -868,19 +872,23 @@ pub fn resolve_project_by_repo(
         let total_pages = parsed.total_pages.unwrap_or(1);
         let projects = parsed.projects;
         if projects.is_empty() {
-            return Ok(None);
+            break;
         }
-        let matched = projects.into_iter().find(|p| {
-            p.repo_url
-                .as_deref()
-                .map(|r| repo_url_matches_path(r, &expected, expected_host))
-                .unwrap_or(false)
-        });
-        if matched.is_some() {
-            return Ok(matched);
+        for project in projects {
+            let Some(repo_url) = project.repo_url.as_deref() else {
+                continue;
+            };
+            if !repo_url_matches_path(repo_url, &expected) {
+                continue;
+            }
+            // Our own host settles it; no need to read further pages.
+            if expected_host.is_some_and(|h| repo_url_on_host(repo_url, h)) {
+                return Ok(Some(project));
+            }
+            candidates.push(project);
         }
         if page >= total_pages {
-            return Ok(None);
+            break;
         }
         // Every reported page was NOT searched, so this is not a clean miss:
         // saying so would send the caller to the legacy-name fallback, which
@@ -894,6 +902,21 @@ pub fn resolve_project_by_repo(
         }
         page += 1;
     }
+
+    if candidates.len() > 1 {
+        let hosts: Vec<&str> = candidates
+            .iter()
+            .filter_map(|p| p.repo_url.as_deref())
+            .collect();
+        return Err(format!(
+            "{} Corgea projects claim repo '{}' ({}); pass --project-name <NAME> to choose one",
+            candidates.len(),
+            repo_path,
+            hosts.join(", ")
+        )
+        .into());
+    }
+    Ok(candidates.pop())
 }
 
 /// What `list`/`wait` need to drive the existing name-based queries.
@@ -1729,93 +1752,64 @@ mod tests {
         // Same repo across scheme/.git/trailing-slash/port variants.
         assert!(repo_url_matches_path(
             "https://github.com/acme/api",
-            "acme/api",
-            None
+            "acme/api"
         ));
         assert!(repo_url_matches_path(
             "https://github.com/acme/api.git",
-            "acme/api",
-            None
+            "acme/api"
         ));
-        assert!(repo_url_matches_path(
-            "git@github.com:acme/api",
-            "acme/api",
-            None
-        ));
-        assert!(repo_url_matches_path("acme/api", "acme/api", None));
+        assert!(repo_url_matches_path("git@github.com:acme/api", "acme/api"));
+        assert!(repo_url_matches_path("acme/api", "acme/api"));
         // Sibling / prefix repo, and a different org.
         assert!(!repo_url_matches_path(
             "https://github.com/acme/api-v2",
-            "acme/api",
-            None
+            "acme/api"
         ));
         assert!(!repo_url_matches_path(
             "https://github.com/notacme/api",
-            "acme/api",
-            None
+            "acme/api"
         ));
         // The owner must be top-level on the host: a nested mirror is a
         // different repository, as is `org/team/repo` for `team/repo`.
         assert!(!repo_url_matches_path(
             "https://github.com/mirrors/acme/api",
-            "acme/api",
-            None
+            "acme/api"
         ));
         assert!(!repo_url_matches_path(
             "https://github.com/org/team/repo",
-            "team/repo",
-            None
+            "team/repo"
         ));
         // Multi-segment paths compare in full.
         assert!(repo_url_matches_path(
             "https://dev.azure.com/org/project/_git/repo",
-            "org/project/_git/repo",
-            None
+            "org/project/_git/repo"
         ));
         assert!(repo_url_matches_path(
             "git@gitlab.com:group/subgroup/repo.git",
-            "group/subgroup/repo",
-            None
+            "group/subgroup/repo"
         ));
     }
 
     #[test]
-    fn repo_url_matches_path_separates_the_same_path_on_two_forges() {
-        // `?repo_url=acme/api` is hostless, so `icontains` returns the GitLab
-        // project too; confirming it would list another repo's scans.
-        assert!(repo_url_matches_path(
+    fn repo_url_on_host_reads_through_url_forms() {
+        assert!(repo_url_on_host(
             "https://github.com/acme/api",
-            "acme/api",
-            Some("github.com")
+            "github.com"
         ));
-        assert!(!repo_url_matches_path(
-            "https://gitlab.com/acme/api",
-            "acme/api",
-            Some("github.com")
-        ));
-        // Scheme/userinfo/port variants of the same host still match.
-        assert!(repo_url_matches_path(
+        assert!(repo_url_on_host(
             "git@github.com:acme/api.git",
-            "acme/api",
-            Some("github.com")
+            "github.com"
         ));
-        assert!(repo_url_matches_path(
+        assert!(repo_url_on_host(
             "https://gitlab.acme.com:8443/acme/api",
-            "acme/api",
-            Some("gitlab.acme.com")
+            "gitlab.acme.com"
         ));
-        // Hostless on either side carries no host to contradict: a bare
-        // `--repo acme/api` still matches, as does a stored bare `acme/api`.
-        assert!(repo_url_matches_path(
+        assert!(!repo_url_on_host(
             "https://gitlab.com/acme/api",
-            "acme/api",
-            None
+            "github.com"
         ));
-        assert!(repo_url_matches_path(
-            "acme/api",
-            "acme/api",
-            Some("github.com")
-        ));
+        // A stored bare `acme/api` is on no host at all.
+        assert!(!repo_url_on_host("acme/api", "github.com"));
     }
 
     #[test]
@@ -1895,21 +1889,42 @@ mod tests {
     }
 
     #[test]
-    fn resolve_project_by_repo_rejects_the_same_path_on_another_host() {
-        // The backend's hostless `icontains` returns the GitLab project for a
-        // GitHub origin; confirming it would resolve the wrong project.
+    fn resolve_project_by_repo_picks_the_candidate_on_the_origin_host() {
+        // `?repo_url=acme/api` is hostless, so `icontains` returns both forges;
+        // the origin host is what says which one is ours.
         let base = spawn_projects_stub(
-            r#"{"status":"ok","projects":[{"id":3,"name":"acme/api","repo_url":"https://gitlab.com/acme/api"}]}"#,
+            r#"{"status":"ok","projects":[{"id":3,"name":"gl","repo_url":"https://gitlab.com/acme/api"},{"id":4,"name":"gh","repo_url":"https://github.com/acme/api"}]}"#,
         );
-        assert!(
-            resolve_project_by_repo(&base, "acme/api", Some("gitlab.com"))
-                .unwrap()
-                .is_some()
+        let got = resolve_project_by_repo(&base, "acme/api", Some("github.com")).unwrap();
+        assert_eq!(got.map(|p| p.name).as_deref(), Some("gh"));
+        let got = resolve_project_by_repo(&base, "acme/api", Some("gitlab.com")).unwrap();
+        assert_eq!(got.map(|p| p.name).as_deref(), Some("gl"));
+    }
+
+    #[test]
+    fn resolve_project_by_repo_accepts_a_lone_match_from_an_unknown_host() {
+        // An SSH-config alias origin (`corp-github:acme/api`) never equals the
+        // stored `github.com`, but there is nothing to disambiguate — holding
+        // out for a host match would leave COR-1577 unfixed for exactly the
+        // alias remotes this repo itself uses (PR #122 review).
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","projects":[{"id":4,"name":"acme/api","repo_url":"https://github.com/acme/api"}]}"#,
         );
+        let got = resolve_project_by_repo(&base, "acme/api", Some("corp-github")).unwrap();
+        assert_eq!(got.map(|p| p.name).as_deref(), Some("acme/api"));
+    }
+
+    #[test]
+    fn resolve_project_by_repo_errors_when_the_path_is_claimed_twice() {
+        // Two forges, neither ours: picking either would be a coin flip, and
+        // reporting no match would quietly list a third project's scans.
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","projects":[{"id":3,"name":"gl","repo_url":"https://gitlab.com/acme/api"},{"id":4,"name":"gh","repo_url":"https://github.com/acme/api"}]}"#,
+        );
+        let err = resolve_project_by_repo(&base, "acme/api", Some("corp-github")).unwrap_err();
         assert!(
-            resolve_project_by_repo(&base, "acme/api", Some("github.com"))
-                .unwrap()
-                .is_none()
+            err.to_string().contains("--project-name"),
+            "the error should say how to disambiguate: {err}"
         );
     }
 
