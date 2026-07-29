@@ -136,12 +136,10 @@ Notes: `deps scan --out-format table|json|sarif` is the report/export selector; 
 Query Corgea's vulnerability database for a package **before** choosing or
 installing it. Read-only: it reports, never blocks. Network access to the
 vuln-api is required. The package-level form needs no token; the versioned
-form uses the same auth story as the install gate (a Corgea token is sent
-only to a vuln-api the token belongs to — not the built-in default while it
-is a staging service, so requests are tokenless unless
-`CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` — and the production
-version-check route may require one, where a tokenless 401 exits 2 with a
-clear message).
+form uses the same auth story as the install gate (a Corgea token is
+attached automatically when logged in on the default vuln-api, and the
+production version-check route may require one — a tokenless 401 exits 2
+with a clear message).
 
 **Before adding or choosing a dependency version, run
 `corgea advisories check <ecosystem> <package>` to see its advisory history,
@@ -188,10 +186,8 @@ package's publish time is shown for provenance (`published <age> ago at
 <UTC timestamp>`), but it never blocks.
 Baseline public CVE checks need no token: known-vulnerable or malicious
 versions block, but vuln-api lookup outages warn and continue because public
-mode is fail-open. Authenticated enforcement requires the token to actually
-be sent, which the built-in staging default does not do — it is off by
-default today (see the token rule below); in that mode, verdict lookup
-failures, resolution
+mode is fail-open. A Corgea token on the default vuln-api enables
+authenticated enforcement; in that mode, verdict lookup failures, resolution
 errors, and unverifiable git/URL/path specs (including `pip install .`, PEP
 508 `name @ url` direct references, and npm GitHub shorthand `user/repo`) all
 block (fail-closed) unless `--force`. In public mode those same specs are
@@ -274,12 +270,11 @@ not upgraded. A top-level
 `recency_threshold_days` reports the active recency window (or `null` when
 the recency gate is off); pair it with each result's `age_seconds`.
 
-Baseline CVE checks need no token. A token is sent only to a vuln-api it
-belongs to: neither a custom `CORGEA_VULN_API_URL` nor the built-in default
-while that default is a staging service — which is the case today — so both
-stay public even when `CORGEA_TOKEN` or a `corgea login` token exists. Set
-`CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` to send the token to such an
-endpoint and make lookup failures fail closed. Recency gate:
+Baseline CVE checks need no token. The default vuln-api
+uses `CORGEA_TOKEN` (or the `corgea login` token) when present. A custom
+`CORGEA_VULN_API_URL` is public by default, even when a token exists; set
+`CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` to send the token to that
+custom URL and make lookup failures fail closed. Recency gate:
 `recency_gate` / `recency_threshold_days` in `~/.corgea/config.toml`, overridden
 by `CORGEA_RECENCY_GATE` and `CORGEA_RECENCY_THRESHOLD_DAYS`. Overrides for
 testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`, `CORGEA_VULN_API_URL`.

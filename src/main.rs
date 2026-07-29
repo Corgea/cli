@@ -823,19 +823,16 @@ mod tests {
         );
     }
 
-    /// Selection only: a logged-in user on the built-in non-production default
-    /// gets public verdicts and the withheld-token hint. This is the one cohort
-    /// no integration test can pin, since the test harness always points
-    /// `CORGEA_VULN_API_URL` at a stub and so exercises the custom-URL branch.
-    /// The disclosure wiring itself is covered end-to-end by
-    /// `tests/cli_verdict.rs::withheld_token_discloses_public_mode_and_names_opt_in`.
+    /// A token reaches only an endpoint it belongs to. A custom vuln-api is
+    /// not one, so it stays public and says so — the withheld hint exists for
+    /// exactly that cohort. See COR-1549.
     #[test]
     fn withheld_token_selects_public_mode_and_withheld_hint() {
         use corgea::precheck::{PublicHint, VerdictMode};
 
-        // token + built-in default + no opt-in
+        // token + custom URL + no opt-in
         assert_eq!(
-            select_verdict_mode("token", false, false),
+            select_verdict_mode("token", true, false),
             VerdictMode::Public
         );
         assert_eq!(public_hint_for(true), PublicHint::TokenWithheld);
@@ -843,20 +840,18 @@ mod tests {
         assert_eq!(public_hint_for(false), PublicHint::NoToken);
     }
 
-    /// A token only ever reaches an endpoint it belongs to. The built-in
-    /// default is staging today, so it needs the same opt-in as a custom URL
-    /// — see COR-1549.
+    /// The opt-in is what makes an otherwise untrusted endpoint eligible for
+    /// the token — and it never manufactures a token that does not exist.
     #[test]
-    fn token_needs_opt_in_for_non_production_default() {
+    fn opt_in_enables_authenticated_for_untrusted_endpoints() {
         use corgea::precheck::VerdictMode;
 
-        // The opt-in still works, for staging validation runs.
         assert_eq!(
-            select_verdict_mode("token", false, true),
+            select_verdict_mode("token", true, true),
             VerdictMode::Authenticated {
                 token: "token".to_string()
             }
         );
-        assert_eq!(select_verdict_mode("", false, true), VerdictMode::Public);
+        assert_eq!(select_verdict_mode("", true, true), VerdictMode::Public);
     }
 }

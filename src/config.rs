@@ -4,11 +4,13 @@ use std::{env, fs, io};
 
 pub const DEFAULT_VULN_API_URL: &str = "https://cve-worker-staging.corgea.workers.dev";
 
-/// Whether `DEFAULT_VULN_API_URL` points at a production endpoint. While it is
-/// staging, a Corgea token must never be sent there without an explicit opt-in,
-/// so authenticated (fail-closed) verdicts stay off by default. Flip this to
-/// `true` in the same change that points the default at production.
-pub const DEFAULT_VULN_API_URL_IS_PRODUCTION: bool = false;
+/// Whether `DEFAULT_VULN_API_URL` is an endpoint Corgea tokens belong to.
+/// The `-staging` hostname is historical: this worker serves as the production
+/// vuln-api, so a token may be sent to it and authenticated (fail-closed)
+/// verdicts apply by default. Set to `false` if the default is ever repointed
+/// at an endpoint that customer tokens should not reach — token-send and
+/// fail-closed then both require the explicit opt-in.
+pub const DEFAULT_VULN_API_URL_IS_PRODUCTION: bool = true;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {

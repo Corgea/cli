@@ -165,7 +165,7 @@ impl PublicHint {
     fn message(self) -> &'static str {
         match self {
             PublicHint::NoToken => {
-                "warning: using public CVE checks, so lookup failures warn instead of blocking. Authenticated enforcement and private Corgea intelligence need both a token (`corgea login`) and a vuln-api it can be sent to — with the current default endpoint that also means CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1."
+                "warning: using public CVE checks; login enables authenticated enforcement and private Corgea intelligence."
             }
             PublicHint::TokenWithheld => {
                 "warning: using public CVE checks; your token is not sent to this vuln-api, so lookup failures warn instead of blocking. Set CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1 to enable authenticated enforcement."

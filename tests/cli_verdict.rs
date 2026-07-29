@@ -268,18 +268,10 @@ fn tokenless_public_check_discloses_mode() {
         stderr.contains("using public CVE checks"),
         "tokenless mode must disclose public CVE checks: {stderr}"
     );
-    let lower = stderr.to_lowercase();
     assert!(
-        lower.contains("authenticated enforcement")
-            && lower.contains("private corgea intelligence"),
+        stderr.contains("authenticated enforcement")
+            && stderr.contains("private Corgea intelligence"),
         "tokenless warning must name the authenticated benefit: {stderr}"
-    );
-    // The benefit is conditional: a token alone does not buy enforcement while
-    // the endpoint is one the token is withheld from. Naming the opt-in keeps
-    // the hint from promising fail-closed behavior login cannot deliver.
-    assert!(
-        stderr.contains("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL"),
-        "tokenless warning must state the endpoint requirement, not just login: {stderr}"
     );
 }
 
