@@ -330,6 +330,13 @@ pub fn extract_repo_path(url: &str) -> Option<String> {
     Some(split_remote(url)?[1..].join("/").to_lowercase())
 }
 
+/// The host of a git remote (`github.com`), lowercased and without userinfo or
+/// port. None for a hostless value such as a bare `org/repo` — the same inputs
+/// `extract_repo_path` rejects.
+pub fn extract_repo_host(url: &str) -> Option<String> {
+    Some(split_remote(url)?[0].to_lowercase())
+}
+
 /// Split a git remote into `[host, path segments…]`, dropping scheme, userinfo
 /// and port. None when fewer than two path segments follow the host, or when
 /// nothing marks the value as a network remote.

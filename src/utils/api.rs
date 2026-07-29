@@ -742,9 +742,23 @@ pub struct ProjectSummary {
 
 #[derive(Deserialize, Debug)]
 pub struct ProjectsResponse {
-    #[serde(default)]
+    /// Required: doghouse's `@paginated` emits this key on every 200, empty
+    /// array included (`api/decorators.py:228,241,259`). A 200 without it is
+    /// not this endpoint answering, so it must fail the parse rather than read
+    /// as "no matches" and take the legacy-name fallback.
     pub projects: Vec<ProjectSummary>,
+    /// Absent on a backend that does not paginate -> treated as a single page.
+    #[serde(default)]
+    pub total_pages: Option<u32>,
 }
+
+/// The backend's `@paginated` `max_page_size` for /projects; a larger value is
+/// clamped server-side.
+const PROJECTS_PAGE_SIZE: u16 = 50;
+
+/// Ceiling on pages walked looking for an exact repo match, so a bogus
+/// server-reported `total_pages` cannot drive an unbounded request loop.
+const PROJECTS_MAX_PAGES: u32 = 20;
 
 /// True when a stored `repo_url` points at exactly `expected_path` (a whole
 /// post-host path, already lowercased). Comparing whole paths keeps the
@@ -760,29 +774,35 @@ fn repo_url_matches_path(repo_url: &str, expected_path: &str) -> bool {
     r == expected_path
 }
 
-/// Resolve the canonical project for a repo path via GET /api/v1/projects?repo_url=…
+/// True when a candidate is stored on exactly `expected_host`.
+fn repo_url_on_host(repo_url: &str, expected_host: &str) -> bool {
+    utils::generic::extract_repo_host(repo_url).as_deref() == Some(expected_host)
+}
+
+/// One page of GET /api/v1/projects?repo_url=…
 ///
-/// Old-backend safety guard: a pre-COR-1426 backend ignores the unknown
-/// `repo_url` param and returns ALL company projects, so every candidate is
-/// re-checked against the path here — on such a backend none match, and the
-/// caller falls back to the CWD-name path rather than listing a stranger's
-/// scans.
-///
-/// `Err` for hard failures (network/auth/5xx); a clean "no match" (or a 404
-/// from a backend without the endpoint) is a soft `Ok(None)`.
-pub fn resolve_project_by_repo(
+/// `Ok(None)` only for a 404 (a backend without the endpoint). A 5xx or a body
+/// that does not parse is an `Err`: both are hard failures, and treating them
+/// as a clean miss would silently fall back to the CWD-name path.
+fn fetch_projects_page(
     url: &str,
     repo_path: &str,
-) -> Result<Option<ProjectSummary>, Box<dyn std::error::Error>> {
+    page: u32,
+) -> Result<Option<ProjectsResponse>, Box<dyn std::error::Error>> {
     let request_url = format!("{}{}/projects", url, API_BASE);
     let client = http_client();
     debug(&format!(
-        "Resolving project via {} (repo_url={})",
-        request_url, repo_path
+        "Resolving project via {} (repo_url={}, page={})",
+        request_url, repo_path, page
     ));
+    let (page, page_size) = (page.to_string(), PROJECTS_PAGE_SIZE.to_string());
     let response = client
         .get(&request_url)
-        .query(&[("repo_url", repo_path)])
+        .query(&[
+            ("repo_url", repo_path),
+            ("page", &page),
+            ("page_size", &page_size),
+        ])
         .send()?;
     check_for_warnings(response.headers(), response.status());
     let status = response.status();
@@ -793,22 +813,95 @@ pub fn resolve_project_by_repo(
         return Err(format!("/projects request failed: HTTP {}", status).into());
     }
     let text = response.text()?;
-    let parsed: ProjectsResponse = match serde_json::from_str(&text) {
-        Ok(parsed) => parsed,
+    match serde_json::from_str(&text) {
+        Ok(parsed) => Ok(Some(parsed)),
         Err(e) => {
-            debug(&format!(
-                "Failed to parse /projects response: {} | body: {}",
-                e, text
-            ));
-            return Ok(None);
+            debug(&format!("/projects response body: {}", text));
+            Err(format!("Failed to parse the /projects response: {}", e).into())
         }
-    };
+    }
+}
+
+/// Resolve the canonical project for a repo path via GET /api/v1/projects?repo_url=…
+///
+/// The backend filters `repo_url__icontains` over a paginated list, so the
+/// exact repo can sit behind a page of siblings (`acme/api-v2`, …) — pages are
+/// walked until it turns up or they run out.
+///
+/// Old-backend safety guard: a pre-COR-1426 backend ignores the unknown
+/// `repo_url` param and returns ALL company projects, so every candidate is
+/// re-checked against the path here — on such a backend none match, and the
+/// caller falls back to the CWD-name path.
+///
+/// The host is a tie-breaker, not a gate: it settles which of several
+/// same-path candidates is ours (`github.com/acme/api` is not
+/// `gitlab.com/acme/api`), but a lone path match is accepted whatever its
+/// host — an SSH-config alias origin (`corp-github:acme/api`) never matches
+/// the stored `github.com` and must still resolve. Several path matches with
+/// none on our host is genuinely ambiguous and errors rather than guessing.
+///
+/// `Err` for hard failures (network/auth/5xx/unparseable body/ambiguity); a
+/// clean "no match" (or a 404 from a backend without the endpoint) is a soft
+/// `Ok(None)`.
+pub fn resolve_project_by_repo(
+    url: &str,
+    repo_path: &str,
+    expected_host: Option<&str>,
+) -> Result<Option<ProjectSummary>, Box<dyn std::error::Error>> {
     let expected = repo_path.to_lowercase();
-    Ok(parsed.projects.into_iter().find(|p| {
-        p.repo_url
-            .as_deref()
-            .is_some_and(|r| repo_url_matches_path(r, &expected))
-    }))
+    let mut candidates: Vec<ProjectSummary> = Vec::new();
+    let mut page = 1;
+    loop {
+        let Some(parsed) = fetch_projects_page(url, repo_path, page)? else {
+            return Ok(None);
+        };
+        let total_pages = parsed.total_pages.unwrap_or(1);
+        if parsed.projects.is_empty() {
+            break;
+        }
+        for project in parsed.projects {
+            let Some(repo_url) = project.repo_url.as_deref() else {
+                continue;
+            };
+            if !repo_url_matches_path(repo_url, &expected) {
+                continue;
+            }
+            // Our own host settles it; no need to read further pages.
+            if expected_host.is_some_and(|h| repo_url_on_host(repo_url, h)) {
+                return Ok(Some(project));
+            }
+            candidates.push(project);
+        }
+        if page >= total_pages {
+            break;
+        }
+        // Every reported page was NOT searched, so this is not a clean miss:
+        // saying so would send the caller to the legacy-name fallback, which
+        // can list a different same-basename project and exit 0.
+        if page >= PROJECTS_MAX_PAGES {
+            return Err(format!(
+                "/projects reported {} pages; refusing to guess after searching {}",
+                total_pages, PROJECTS_MAX_PAGES
+            )
+            .into());
+        }
+        page += 1;
+    }
+
+    if candidates.len() > 1 {
+        let urls: Vec<&str> = candidates
+            .iter()
+            .filter_map(|p| p.repo_url.as_deref())
+            .collect();
+        return Err(format!(
+            "{} Corgea projects claim repo '{}' ({}); pass --project-name <NAME> to choose one",
+            candidates.len(),
+            repo_path,
+            urls.join(", ")
+        )
+        .into());
+    }
+    Ok(candidates.pop())
 }
 
 /// What `list`/`wait` need to drive the existing name-based queries.
@@ -859,17 +952,22 @@ pub fn resolve_project(
     // --repo may be a bare path (`org/repo`, or a GitLab `group/subgroup/repo`)
     // rather than a URL; `extract_repo_path` returns None for those, so the
     // whole value is the path.
-    let repo_path = match repo_override {
-        Some(r) => {
-            Some(utils::generic::extract_repo_path(r).unwrap_or_else(|| r.trim().to_string()))
-        }
-        None => {
-            utils::generic::discover_repo_url().and_then(|u| utils::generic::extract_repo_path(&u))
-        }
+    let (repo_path, repo_host) = match repo_override {
+        Some(r) => match utils::generic::extract_repo_path(r) {
+            Some(path) => (Some(path), utils::generic::extract_repo_host(r)),
+            None => (Some(r.trim().to_string()), None),
+        },
+        None => match utils::generic::discover_repo_url() {
+            Some(u) => (
+                utils::generic::extract_repo_path(&u),
+                utils::generic::extract_repo_host(&u),
+            ),
+            None => (None, None),
+        },
     };
 
     if let Some(repo_path) = repo_path {
-        if let Some(project) = resolve_project_by_repo(url, &repo_path)? {
+        if let Some(project) = resolve_project_by_repo(url, &repo_path, repo_host.as_deref())? {
             return Ok(ResolvedProject {
                 query_name: project.name,
                 confirmed: true,
@@ -1571,7 +1669,7 @@ mod tests {
         let base = spawn_projects_stub(
             r#"{"status":"ok","projects":[{"name":"bohappdev/dotnet-azure-web-tsb","repo_url":"https://github.com/bohappdev/dotnet-azure-web-tsb"}]}"#,
         );
-        let got = resolve_project_by_repo(&base, "bohappdev/dotnet-azure-web-tsb").unwrap();
+        let got = resolve_project_by_repo(&base, "bohappdev/dotnet-azure-web-tsb", None).unwrap();
         assert_eq!(
             got.map(|p| p.name).as_deref(),
             Some("bohappdev/dotnet-azure-web-tsb")
@@ -1587,7 +1685,7 @@ mod tests {
             r#"{"status":"ok","projects":[{"name":"other/repo","repo_url":"https://github.com/other/repo"},{"name":"misc/thing","repo_url":"https://github.com/misc/thing"}]}"#,
         );
         assert!(
-            resolve_project_by_repo(&base, "bohappdev/dotnet-azure-web-tsb")
+            resolve_project_by_repo(&base, "bohappdev/dotnet-azure-web-tsb", None)
                 .unwrap()
                 .is_none()
         );
@@ -1599,7 +1697,7 @@ mod tests {
         let base = spawn_projects_stub(
             r#"{"status":"ok","projects":[{"name":"acme/api-v2","repo_url":"https://github.com/acme/api-v2"}]}"#,
         );
-        assert!(resolve_project_by_repo(&base, "acme/api")
+        assert!(resolve_project_by_repo(&base, "acme/api", None)
             .unwrap()
             .is_none());
     }
@@ -1607,12 +1705,12 @@ mod tests {
     #[test]
     fn resolve_project_by_repo_empty_and_404_are_soft_none() {
         let base = spawn_projects_stub(r#"{"status":"ok","projects":[]}"#);
-        assert!(resolve_project_by_repo(&base, "org/repo")
+        assert!(resolve_project_by_repo(&base, "org/repo", None)
             .unwrap()
             .is_none());
         // /projects absent on a very old backend -> soft miss, not a failure.
         let base = spawn_projects_stub_status("404 Not Found", r#"{"message":"not found"}"#);
-        assert!(resolve_project_by_repo(&base, "org/repo")
+        assert!(resolve_project_by_repo(&base, "org/repo", None)
             .unwrap()
             .is_none());
     }
@@ -1621,7 +1719,107 @@ mod tests {
     fn resolve_project_by_repo_server_error_is_hard_err() {
         // 5xx must surface, not silently fall back to the local-dir project.
         let base = spawn_projects_stub_status("500 Internal Server Error", r#"{"error":"boom"}"#);
-        assert!(resolve_project_by_repo(&base, "org/repo").is_err());
+        assert!(resolve_project_by_repo(&base, "org/repo", None).is_err());
+    }
+
+    // Serves `page_one` until a request carries `page=2`, then `page_two`.
+    fn spawn_paged_projects_stub(page_one: &'static str, page_two: &'static str) -> String {
+        use std::io::Write;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let request = corgea::vuln_api_stub::read_http_request(&mut stream);
+                let body = if String::from_utf8_lossy(&request).contains("page=2") {
+                    page_two
+                } else {
+                    page_one
+                };
+                let resp = corgea::vuln_api_stub::http_response("200 OK", "", body);
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn resolve_project_by_repo_walks_past_the_first_page() {
+        // `repo_url__icontains` over a 20-per-page list: enough `acme/api-*`
+        // siblings push the exact `acme/api` onto page 2, and stopping at page
+        // 1 would recreate the very miss this resolves.
+        let base = spawn_paged_projects_stub(
+            r#"{"status":"ok","total_pages":2,"projects":[{"name":"acme/api-v2","repo_url":"https://github.com/acme/api-v2"}]}"#,
+            r#"{"status":"ok","total_pages":2,"projects":[{"name":"acme/api","repo_url":"https://github.com/acme/api"}]}"#,
+        );
+        let got = resolve_project_by_repo(&base, "acme/api", None).unwrap();
+        assert_eq!(got.map(|p| p.name).as_deref(), Some("acme/api"));
+    }
+
+    #[test]
+    fn resolve_project_by_repo_truncated_search_is_hard_err() {
+        // The ceiling stops the walk before every reported page was searched,
+        // so "no match" would be a guess — and the caller acts on it by
+        // querying the legacy name, which can list a different project.
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","total_pages":999,"projects":[{"name":"acme/api-v2","repo_url":"https://github.com/acme/api-v2"}]}"#,
+        );
+        let err = resolve_project_by_repo(&base, "acme/api", None).unwrap_err();
+        assert!(err.to_string().contains("999 pages"), "{err}");
+    }
+
+    #[test]
+    fn resolve_project_by_repo_bad_envelope_is_hard_err() {
+        // `@paginated` always emits `projects`, empty array included, so a 200
+        // without it — or one that is not JSON at all — is an error envelope or
+        // a foreign responder, not a clean miss.
+        for body in [
+            r#"{"status":"error","message":"boom"}"#,
+            "<html><body>Access denied</body></html>",
+        ] {
+            let base = spawn_projects_stub(body);
+            assert!(
+                resolve_project_by_repo(&base, "org/repo", None).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_project_by_repo_picks_the_candidate_on_the_origin_host() {
+        // `?repo_url=acme/api` is hostless, so `icontains` returns both forges;
+        // the origin host is what says which one is ours.
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","projects":[{"name":"gl","repo_url":"https://gitlab.com/acme/api"},{"name":"gh","repo_url":"https://github.com/acme/api"}]}"#,
+        );
+        let got = resolve_project_by_repo(&base, "acme/api", Some("github.com")).unwrap();
+        assert_eq!(got.map(|p| p.name).as_deref(), Some("gh"));
+        let got = resolve_project_by_repo(&base, "acme/api", Some("gitlab.com")).unwrap();
+        assert_eq!(got.map(|p| p.name).as_deref(), Some("gl"));
+    }
+
+    #[test]
+    fn resolve_project_by_repo_accepts_a_lone_match_from_an_unknown_host() {
+        // An SSH-config alias origin (`corp-github:acme/api`) never equals the
+        // stored `github.com`, but there is nothing to disambiguate — holding
+        // out for a host match would leave COR-1577 unfixed for exactly the
+        // alias remotes this repo itself uses.
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","projects":[{"name":"acme/api","repo_url":"https://github.com/acme/api"}]}"#,
+        );
+        let got = resolve_project_by_repo(&base, "acme/api", Some("corp-github")).unwrap();
+        assert_eq!(got.map(|p| p.name).as_deref(), Some("acme/api"));
+    }
+
+    #[test]
+    fn resolve_project_by_repo_errors_when_the_path_is_claimed_twice() {
+        // Two forges, neither ours: picking either would be a coin flip, and
+        // reporting no match would quietly list a third project's scans.
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","projects":[{"name":"gl","repo_url":"https://gitlab.com/acme/api"},{"name":"gh","repo_url":"https://github.com/acme/api"}]}"#,
+        );
+        let err = resolve_project_by_repo(&base, "acme/api", Some("corp-github")).unwrap_err();
+        assert!(err.to_string().contains("--project-name"), "{err}");
     }
 
     #[test]
