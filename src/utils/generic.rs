@@ -293,6 +293,9 @@ fn split_remote(url: &str) -> Option<Vec<&str>> {
         Some(at) => (true, &url[at + 1..]),
         None => (false, url),
     };
+    // A colon before the first '/' is the scp-style `host:org/repo` separator.
+    let first_slash = url.find('/').unwrap_or(url.len());
+    let had_scp_colon = url[..first_slash].contains(':');
     // URL forms split host from path on '/', scp-like `git@host:org/repo` on ':'.
     let mut segments: Vec<&str> = url.split(['/', ':']).filter(|s| !s.is_empty()).collect();
     // segments[0] is the host; an all-digit segment right after it is a port.
@@ -303,10 +306,11 @@ fn split_remote(url: &str) -> Option<Vec<&str>> {
     if segments.len() < 3 {
         return None;
     }
-    // With no scheme or userinfo to mark a URL, the leading segment is a host
-    // only if it looks like one — otherwise this is a bare multi-segment path
-    // such as a GitLab `group/subgroup/repo`, whose every segment is the path.
-    if !had_scheme && !had_userinfo && !segments[0].contains('.') && segments[0] != "localhost" {
+    // A scheme, userinfo or scp colon is what marks a network remote. Without
+    // one this is a bare path — a GitLab `group/subgroup/repo`, whose namespace
+    // may itself contain dots — so every segment belongs to the path and there
+    // is no host to take.
+    if !had_scheme && !had_userinfo && !had_scp_colon {
         return None;
     }
     Some(segments)
@@ -573,5 +577,45 @@ mod tests {
         assert_eq!(extract_repo_path("not a url"), None);
         assert_eq!(extract_repo_path(""), None);
         assert_eq!(extract_repo_path("github.com"), None); // host only
+    }
+
+    #[test]
+    fn extract_repo_path_leaves_unmarked_bare_paths_alone() {
+        // Nothing marks these as a network remote, so they are paths in full —
+        // the caller keeps the value verbatim. A GitLab namespace may contain
+        // dots, so a dotted leading segment is no evidence of a host.
+        assert_eq!(extract_repo_path("group/subgroup/repo"), None);
+        assert_eq!(extract_repo_path("my.group/sub/repo"), None);
+        assert_eq!(extract_repo_host("my.group/sub/repo"), None);
+        // A scheme, userinfo or scp colon still marks one.
+        assert_eq!(
+            extract_repo_path("https://my.group/sub/repo").as_deref(),
+            Some("sub/repo")
+        );
+        assert_eq!(
+            extract_repo_path("git@my.group:sub/repo").as_deref(),
+            Some("sub/repo")
+        );
+    }
+
+    #[test]
+    fn extract_repo_host_reads_the_host_from_marked_remotes() {
+        assert_eq!(
+            extract_repo_host("https://github.com/acme/api").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            extract_repo_host("git@gitlab.com:group/subgroup/repo.git").as_deref(),
+            Some("gitlab.com")
+        );
+        // Port and userinfo are not part of the host.
+        assert_eq!(
+            extract_repo_host("https://git.example.com:8443/org/repo").as_deref(),
+            Some("git.example.com")
+        );
+        assert_eq!(
+            extract_repo_host("https://oauth2:tok@gitlab.com/org/repo").as_deref(),
+            Some("gitlab.com")
+        );
     }
 }

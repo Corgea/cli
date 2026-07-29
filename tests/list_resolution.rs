@@ -256,6 +256,27 @@ fn list_repo_flag_keeps_every_segment_of_a_bare_slug() {
 }
 
 #[test]
+fn list_repo_flag_keeps_a_dotted_bare_namespace_whole() {
+    // GitLab namespaces may contain dots, so a dotted leading segment is no
+    // evidence of a host: `my.group/sub/repo` is a path in full. (PR #122
+    // review)
+    let (url, hits) = common::spawn_recording_resolution_stub(Routes {
+        projects: Some(projects_empty()),
+        scans: Some(scans_empty()),
+        ..Default::default()
+    });
+    let (_tmp, dir) = temp_plain_dir("unrelated-dir");
+    let out = run_list(&["--repo", "my.group/sub/repo"], &url, &dir);
+    assert_eq!(out.status.code(), Some(1), "an empty miss still exits 1");
+    let hits = hits.lock().unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h.starts_with("/api/v1/projects?repo_url=my.group%2Fsub%2Frepo&")),
+        "the dotted namespace must not be read as a host; hits: {hits:?}"
+    );
+}
+
+#[test]
 fn list_no_remote_falls_back_to_the_sanitized_dir_name() {
     // `determine_project_name` sanitized the basename before this PR, so a
     // project onboarded from `my app` is stored as `my_app` — query that, not
