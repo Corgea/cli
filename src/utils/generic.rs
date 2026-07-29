@@ -596,6 +596,16 @@ mod tests {
             extract_repo_path("git@my.group:sub/repo").as_deref(),
             Some("sub/repo")
         );
+        // An SSH-config host alias carries no userinfo and no dot, but the
+        // colon before the first slash still marks it scp-style.
+        assert_eq!(
+            extract_repo_path("corp-github:bohappdev/dotnet-azure-web-tsb.git").as_deref(),
+            Some("bohappdev/dotnet-azure-web-tsb")
+        );
+        assert_eq!(
+            extract_repo_host("corp-github:bohappdev/dotnet-azure-web-tsb.git").as_deref(),
+            Some("corp-github")
+        );
     }
 
     #[test]

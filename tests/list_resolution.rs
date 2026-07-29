@@ -97,12 +97,35 @@ fn list_issues_shows_repo_resolved_issue() {
     );
     assert!(stdout.contains("issue-abc"), "stdout: {stdout}");
     let hits = hits.lock().unwrap();
-    // `get_scan_issues` builds this target by hand, so the slash arrives
-    // unencoded — unlike the `.query()`-built /scans target above.
     assert!(
         hits.iter().any(|h| h.starts_with("/api/v1/issues?")
-            && h.contains("project=bohappdev/dotnet-azure-web-tsb")),
+            && h.contains("project=bohappdev%2Fdotnet-azure-web-tsb")),
         "the canonical project must drive /issues; hits: {hits:?}"
+    );
+}
+
+#[test]
+fn list_issues_percent_encodes_the_project_name() {
+    // A project name is user- and server-supplied; interpolated raw, an `&`
+    // would split the query and address the project `foo` instead. (PR #122
+    // review)
+    let (url, hits) = common::spawn_recording_resolution_stub(routes(
+        projects_empty(),
+        scans_empty(),
+        issues_one(),
+    ));
+    let (_tmp, dir) = temp_plain_dir("whatever");
+    let out = run_list(&["--issues", "--project-name", "foo&bar#baz"], &url, &dir);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        hits.iter().any(|h| h.contains("project=foo%26bar%23baz")),
+        "the delimiters must be encoded, not split the query; hits: {hits:?}"
     );
 }
 

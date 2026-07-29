@@ -471,27 +471,29 @@ pub fn get_scan_issues(
     page_size: Option<u16>,
     scan_id: Option<String>,
 ) -> Result<ProjectIssuesResponse, Box<dyn std::error::Error>> {
-    let mut seperator = "?";
-    let mut url = match scan_id {
-        Some(scan_id) => format!("{}{}/scan/{}/issues", url, API_BASE, scan_id),
-        None => {
-            seperator = "&";
-            format!("{}{}/issues?project={}", url, API_BASE, project)
-        }
+    // Built with `query`, not `format!`: a project name is user- and
+    // server-supplied, so an `&`/`#`/`?` in it would otherwise split the query
+    // and address a different project.
+    let (url, mut query_params) = match scan_id {
+        Some(scan_id) => (
+            format!("{}{}/scan/{}/issues", url, API_BASE, scan_id),
+            vec![],
+        ),
+        None => (
+            format!("{}{}/issues", url, API_BASE),
+            vec![("project", project.to_string())],
+        ),
     };
     if let Some(p) = page {
-        url.push_str(&format!("{}page={}", seperator, p));
+        query_params.push(("page", p.to_string()));
     }
-    if let Some(p_size) = page_size {
-        url.push_str(&format!("&page_size={}", p_size));
-    } else {
-        url.push_str("&page_size=30");
-    }
+    query_params.push(("page_size", page_size.unwrap_or(30).to_string()));
     let client = http_client();
 
     debug(&format!("Sending request to URL: {}", url));
+    debug(&format!("Query params: {:?}", query_params));
 
-    let response = match client.get(&url).send() {
+    let response = match client.get(&url).query(&query_params).send() {
         Ok(res) => {
             check_for_warnings(res.headers(), res.status());
             res
@@ -877,14 +879,18 @@ pub fn resolve_project_by_repo(
         if matched.is_some() {
             return Ok(matched);
         }
-        if page >= total_pages.min(PROJECTS_MAX_PAGES) {
-            if total_pages > PROJECTS_MAX_PAGES {
-                debug(&format!(
-                    "Gave up after {} /projects pages ({} reported)",
-                    PROJECTS_MAX_PAGES, total_pages
-                ));
-            }
+        if page >= total_pages {
             return Ok(None);
+        }
+        // Every reported page was NOT searched, so this is not a clean miss:
+        // saying so would send the caller to the legacy-name fallback, which
+        // can list a different same-basename project and exit 0.
+        if page >= PROJECTS_MAX_PAGES {
+            return Err(format!(
+                "/projects reported {} pages; refusing to guess after searching {}",
+                total_pages, PROJECTS_MAX_PAGES
+            )
+            .into());
         }
         page += 1;
     }
@@ -1861,6 +1867,21 @@ mod tests {
         );
         let got = resolve_project_by_repo(&base, "acme/api", None).unwrap();
         assert_eq!(got.map(|p| p.name).as_deref(), Some("acme/api"));
+    }
+
+    #[test]
+    fn resolve_project_by_repo_truncated_search_is_hard_err() {
+        // The ceiling stops the walk before every reported page was searched,
+        // so "no match" would be a guess — and the caller acts on it by
+        // querying the legacy name, which can list a different project.
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","total_pages":999,"projects":[{"id":1,"name":"acme/api-v2","repo_url":"https://github.com/acme/api-v2"}]}"#,
+        );
+        let err = resolve_project_by_repo(&base, "acme/api", None).unwrap_err();
+        assert!(
+            err.to_string().contains("999 pages"),
+            "error should name the reported page count: {err}"
+        );
     }
 
     #[test]
