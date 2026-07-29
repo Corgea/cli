@@ -331,9 +331,12 @@ pub fn run(config: &Config, args: ListArgs) {
             // even when the miss below exits 1.
             println!("{}", serde_json::to_string_pretty(&output).unwrap());
         }
-        // An unresolved project is a miss (exit 1, as --issues and `wait`);
-        // a confirmed project with no scans is a valid empty result.
-        if scans.is_empty() && !resolved.confirmed {
+        // An unresolved project is a miss (exit 1, as --issues and `wait`); a
+        // confirmed project with no scans is a valid empty result. So is an
+        // explicit --project-name: /scans answers 200-empty either way, so the
+        // caller's own exact name is the better authority than a guess that it
+        // does not exist.
+        if scans.is_empty() && !resolved.confirmed && selector.name.is_none() {
             log::error!(
                 "No Corgea project found for {}. Run 'corgea scan' to create one, or pass --project-name <NAME>.",
                 resolved.tried_label

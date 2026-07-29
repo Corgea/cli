@@ -241,6 +241,21 @@ fn wait_project_id_flag_skips_resolution() {
     );
 }
 
+#[test]
+fn wait_project_id_requires_a_scan_id() {
+    // Without a scan id the scan is still picked by the resolved project name,
+    // so a lone --project-id would only relabel the link — pointing at a
+    // different project than the scan. clap rejects it. (PR #122 review)
+    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    let out = run_wait(&["--project-id", "42"], "http://127.0.0.1:1", &repo);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `corgea scan semgrep` with a fake `semgrep` on PATH: the post-scan wait gets
 /// the project id straight from the upload response, so it must resolve nothing
 /// — no `/projects`, no `/scans` — and still link the id-form URL.

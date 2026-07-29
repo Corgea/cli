@@ -156,7 +156,9 @@ enum Commands {
         repo: Option<String>,
         #[arg(
             long,
-            help = "Use this known Corgea project id for the result link. Together with a scan id it skips project resolution entirely."
+            requires = "scan_id",
+            value_parser = clap::builder::NonEmptyStringValueParser::new(),
+            help = "Use this known Corgea project id for the result link, skipping project resolution. Requires a scan id, which is what the id then belongs to."
         )]
         project_id: Option<String>,
     },

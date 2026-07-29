@@ -268,6 +268,19 @@ fn extract_repo_name_from_url(url: &str) -> Option<String> {
 /// so it is what an equality compare needs. Azure SSH remotes
 /// (`ssh.dev.azure.com/v3/org/…`, no `_git` segment) remain a known limitation.
 pub fn extract_repo_path(url: &str) -> Option<String> {
+    Some(split_remote(url)?[1..].join("/").to_lowercase())
+}
+
+/// The host of a git remote (`github.com`), lowercased and without userinfo or
+/// port. None for a hostless value such as a bare `org/repo` — the same inputs
+/// `extract_repo_path` rejects.
+pub fn extract_repo_host(url: &str) -> Option<String> {
+    Some(split_remote(url)?[0].to_lowercase())
+}
+
+/// Split a git remote into `[host, path segments…]`, dropping scheme, userinfo
+/// and port. None when fewer than two path segments follow the host.
+fn split_remote(url: &str) -> Option<Vec<&str>> {
     let url = url.trim().trim_end_matches('/');
     let url = url.strip_suffix(".git").unwrap_or(url);
     let url = url.rsplit("://").next().unwrap_or(url);
@@ -283,10 +296,8 @@ pub fn extract_repo_path(url: &str) -> Option<String> {
     if segments.len() >= 4 && segments[1].chars().all(|c| c.is_ascii_digit()) {
         segments.remove(1);
     }
-    if segments.len() < 3 {
-        return None; // need host + at least org + repo
-    }
-    Some(segments[1..].join("/").to_lowercase())
+    // Need host + at least org + repo.
+    (segments.len() >= 3).then_some(segments)
 }
 
 pub fn get_env_var_if_exists(var_name: &str) -> Option<String> {

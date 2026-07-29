@@ -179,6 +179,55 @@ fn list_project_name_override() {
 }
 
 #[test]
+fn list_unconfirmed_falls_back_to_the_repo_name_not_the_checkout_dir() {
+    // Cloned into `build-123`: on a /projects soft miss (old or not-yet-
+    // onboarded backend) the query must stay what the pre-COR-1577 CLI sent —
+    // the repo basename — or a working setup starts missing. (PR #122 review)
+    let (url, hits) = common::spawn_recording_resolution_stub(Routes {
+        projects: Some(projects_empty()),
+        scans: Some(scans_one("dotnet-azure-web-tsb")),
+        ..Default::default()
+    });
+    let (_tmp, repo) = temp_git_repo("build-123", REMOTE);
+    let out = run_list(&[], &url, &repo);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h.contains("project=dotnet-azure-web-tsb")),
+        "expected the repo basename, not the checkout dir; hits: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| h.contains("project=build-123")),
+        "the checkout dir name must not be queried; hits: {hits:?}"
+    );
+}
+
+#[test]
+fn list_project_name_with_no_scans_exits_zero() {
+    // /scans answers 200-empty both for "project has no scans" and "no such
+    // project", so an explicit --project-name is the better authority: report
+    // the empty result, do not claim the project does not exist. (PR #122
+    // review)
+    let url = spawn_stub(projects_empty(), scans_empty(), issues_miss());
+    let (_tmp, dir) = temp_plain_dir("whatever");
+    let out = run_list(&["--project-name", "some/name"], &url, &dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("has no scans yet"), "stdout: {stdout}");
+}
+
+#[test]
 fn list_project_name_and_repo_are_mutually_exclusive() {
     let (_tmp, dir) = temp_plain_dir("whatever");
     let (mut cmd, _home) = common::corgea_isolated();
