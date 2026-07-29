@@ -6,7 +6,7 @@ mod common;
 
 use common::{
     projects_empty, projects_match, scans_empty, scans_one, temp_git_repo, temp_plain_dir, Hits,
-    CANON, NOT_FOUND_JSON, REMOTE,
+    Routes, CANON, REMOTE,
 };
 use std::path::Path;
 use std::process::Output;
@@ -25,38 +25,21 @@ fn issues_miss() -> String {
 
 // --- harness ---------------------------------------------------------------
 
-/// Stub serving verify + the three listing endpoints, and recording every
-/// request target so a test can assert what the CLI actually sent.
+/// The three listing endpoints `list` reads.
 fn spawn_stub(projects: String, scans: String, issues: String) -> (String, Hits) {
-    common::spawn_recording_http_stub(move |path| {
-        if path.starts_with("/api/v1/verify") {
-            ("200 OK", r#"{"status":"ok"}"#.to_string())
-        } else if path.starts_with("/api/v1/projects?repo_url=") {
-            ("200 OK", projects.clone())
-        } else if path.starts_with("/api/v1/scans?") {
-            ("200 OK", scans.clone())
-        } else if path.starts_with("/api/v1/issues?") {
-            ("200 OK", issues.clone())
-        } else {
-            ("404 Not Found", NOT_FOUND_JSON.to_string())
-        }
+    common::spawn_resolution_stub(Routes {
+        projects: Some(projects),
+        scans: Some(scans),
+        issues: Some(issues),
+        ..Default::default()
     })
 }
 
 /// Stub serving verify + the SCA listing endpoint only.
 fn spawn_sca_stub() -> (String, Hits) {
-    common::spawn_recording_http_stub(|path| {
-        if path.starts_with("/api/v1/verify") {
-            ("200 OK", r#"{"status":"ok"}"#.to_string())
-        } else if path.starts_with("/api/v1/issues/sca") {
-            (
-                "200 OK",
-                r#"{"status":"ok","page":1,"total_pages":1,"total_issues":0,"issues":[]}"#
-                    .to_string(),
-            )
-        } else {
-            ("404 Not Found", NOT_FOUND_JSON.to_string())
-        }
+    common::spawn_resolution_stub(Routes {
+        sca_issues: Some(common::sca_issues_empty()),
+        ..Default::default()
     })
 }
 
@@ -360,22 +343,19 @@ fn list_json_miss_is_valid_empty_envelope() {
 fn list_issues_with_scan_id_skips_project_resolution() {
     // The scan-id issue route ignores the project, so no /projects call should
     // be made even from a real git repo where a remote IS present. (COR-1577)
-    let (url, hits) = common::spawn_recording_http_stub(|path| {
-        if path.starts_with("/api/v1/verify") {
-            ("200 OK", r#"{"status":"ok"}"#.to_string())
-        } else if path.contains("/check_blocking_rules") {
+    // `projects` stays unset: dialing it would 404 and show up in the hits.
+    let routes = Routes {
+        scan_issues: Some(common::scan_issues_empty()),
+        ..Default::default()
+    };
+    let (url, hits) = common::spawn_recording_http_stub(move |path| {
+        if path.contains("/check_blocking_rules") {
             (
                 "200 OK",
                 r#"{"block":false,"blocking_issues":[],"total_pages":1}"#.to_string(),
             )
-        } else if path.starts_with("/api/v1/scan/") && path.contains("/issues") {
-            (
-                "200 OK",
-                r#"{"status":"ok","page":1,"total_pages":1,"total_issues":0,"issues":[]}"#
-                    .to_string(),
-            )
         } else {
-            ("404 Not Found", NOT_FOUND_JSON.to_string())
+            routes.answer(path)
         }
     });
     let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);

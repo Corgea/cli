@@ -6,37 +6,22 @@ mod common;
 
 use common::{
     projects_empty, projects_match, scans_empty, scans_one, temp_git_repo, temp_plain_dir, Hits,
-    CANON, NOT_FOUND_JSON, REMOTE,
+    Routes, CANON, REMOTE,
 };
 use std::path::Path;
 use std::process::Output;
 
 // --- harness ---------------------------------------------------------------
 
-/// `GET /api/v1/scan/{id}` returning a completed scan (`check_scan_status`
-/// checks the lowercase `complete`); `/issues` under it returns an empty page,
-/// enough for `report_scan_status` to succeed and print the result link.
+/// The endpoints a `wait` run reads: resolution, the listing, and — once it
+/// has a scan id — the single-scan routes.
 fn spawn_stub(projects: String, scans: String) -> (String, Hits) {
-    common::spawn_recording_http_stub(move |path| {
-        if path.starts_with("/api/v1/verify") {
-            ("200 OK", r#"{"status":"ok"}"#.to_string())
-        } else if path.starts_with("/api/v1/projects?repo_url=") {
-            ("200 OK", projects.clone())
-        } else if path.starts_with("/api/v1/scans?") {
-            ("200 OK", scans.clone())
-        } else if path.starts_with("/api/v1/scan/") {
-            if path.contains("/issues") {
-                (
-                    "200 OK",
-                    r#"{"status":"ok","page":1,"total_pages":1,"total_issues":0,"issues":[]}"#
-                        .to_string(),
-                )
-            } else {
-                ("200 OK", r#"{"id":"scan-123","project":"bohappdev/dotnet-azure-web-tsb","repo":"https://github.com/bohappdev/dotnet-azure-web-tsb","branch":"main","status":"complete","engine":"blast","created_at":"2026-01-01T00:00:00Z"}"#.to_string())
-            }
-        } else {
-            ("404 Not Found", NOT_FOUND_JSON.to_string())
-        }
+    common::spawn_resolution_stub(Routes {
+        projects: Some(projects),
+        scans: Some(scans),
+        scan: Some(common::scan_complete()),
+        scan_issues: Some(common::scan_issues_empty()),
+        ..Default::default()
     })
 }
 
@@ -193,10 +178,15 @@ fn wait_project_id_requires_a_scan_id() {
 #[cfg(unix)]
 #[test]
 fn scan_post_wait_uses_upload_project_id_without_resolving() {
-    let (url, hits) = common::spawn_recording_http_stub(|path| {
-        if path.starts_with("/api/v1/verify")
-            || path.starts_with("/api/v1/code-upload")
-            || path.starts_with("/api/v1/git-config-upload")
+    // Neither `projects` nor `scans` is served — the assertions are that
+    // neither is dialed. The upload endpoints are this test's own.
+    let routes = Routes {
+        scan: Some(common::scan_complete()),
+        scan_issues: Some(common::scan_issues_empty()),
+        ..Default::default()
+    };
+    let (url, hits) = common::spawn_recording_http_stub(move |path| {
+        if path.starts_with("/api/v1/code-upload") || path.starts_with("/api/v1/git-config-upload")
         {
             ("200 OK", r#"{"status":"ok"}"#.to_string())
         } else if path.starts_with("/api/v1/scan-upload") {
@@ -204,18 +194,8 @@ fn scan_post_wait_uses_upload_project_id_without_resolving() {
                 "200 OK",
                 r#"{"status":"ok","sast_scan_id":"scan-123","project_id":42}"#.to_string(),
             )
-        } else if path.starts_with("/api/v1/scan/") {
-            if path.contains("/issues") {
-                (
-                    "200 OK",
-                    r#"{"status":"ok","page":1,"total_pages":1,"total_issues":0,"issues":[]}"#
-                        .to_string(),
-                )
-            } else {
-                ("200 OK", r#"{"id":"scan-123","project":"p","repo":null,"branch":"main","status":"complete","engine":"blast","created_at":"2026-01-01T00:00:00Z"}"#.to_string())
-            }
         } else {
-            ("404 Not Found", NOT_FOUND_JSON.to_string())
+            routes.answer(path)
         }
     });
     let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
