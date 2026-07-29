@@ -279,16 +279,19 @@ pub fn extract_repo_host(url: &str) -> Option<String> {
 }
 
 /// Split a git remote into `[host, path segments…]`, dropping scheme, userinfo
-/// and port. None when fewer than two path segments follow the host.
+/// and port. None when fewer than two path segments follow the host, or when
+/// the value carries no host at all.
 fn split_remote(url: &str) -> Option<Vec<&str>> {
-    let url = url.trim().trim_end_matches('/');
-    let url = url.strip_suffix(".git").unwrap_or(url);
-    let url = url.rsplit("://").next().unwrap_or(url);
+    let url = strip_git_suffix(url);
+    let (had_scheme, url) = match url.split_once("://") {
+        Some((_, rest)) => (true, rest),
+        None => (false, url),
+    };
     // Drop userinfo (`git@`, `oauth2:token@`) so it is never read as the host.
     let host_end = url.find('/').unwrap_or(url.len());
-    let url = match url[..host_end].rfind('@') {
-        Some(at) => &url[at + 1..],
-        None => url,
+    let (had_userinfo, url) = match url[..host_end].rfind('@') {
+        Some(at) => (true, &url[at + 1..]),
+        None => (false, url),
     };
     // URL forms split host from path on '/', scp-like `git@host:org/repo` on ':'.
     let mut segments: Vec<&str> = url.split(['/', ':']).filter(|s| !s.is_empty()).collect();
@@ -297,7 +300,22 @@ fn split_remote(url: &str) -> Option<Vec<&str>> {
         segments.remove(1);
     }
     // Need host + at least org + repo.
-    (segments.len() >= 3).then_some(segments)
+    if segments.len() < 3 {
+        return None;
+    }
+    // With no scheme or userinfo to mark a URL, the leading segment is a host
+    // only if it looks like one — otherwise this is a bare multi-segment path
+    // such as a GitLab `group/subgroup/repo`, whose every segment is the path.
+    if !had_scheme && !had_userinfo && !segments[0].contains('.') && segments[0] != "localhost" {
+        return None;
+    }
+    Some(segments)
+}
+
+/// Trim surrounding space, a trailing `/`, and a `.git` suffix.
+pub fn strip_git_suffix(url: &str) -> &str {
+    let url = url.trim().trim_end_matches('/');
+    url.strip_suffix(".git").unwrap_or(url)
 }
 
 pub fn get_env_var_if_exists(var_name: &str) -> Option<String> {

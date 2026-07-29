@@ -144,8 +144,11 @@ fn wait_project_name_override() {
 
 #[test]
 fn wait_project_name_trailing_slash_is_trimmed() {
-    // A slash-only or trailing-slash name would build `/project/foo//?scan_id=`.
-    let url = spawn_stub(projects_empty(), scans_one("foo"));
+    // The trailing slash must go before the name reaches `?project=`, which the
+    // backend matches exactly — asserting only the printed URL would pass even
+    // if `project=foo%2F` were sent. (PR #122 review)
+    let (url, hits) =
+        common::spawn_recording_resolution_stub(routes(projects_empty(), scans_one("foo")));
     let (_tmp, dir) = temp_plain_dir("whatever");
     let out = run_wait(&["--project-name", "foo/"], &url, &dir);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -158,6 +161,27 @@ fn wait_project_name_trailing_slash_is_trimmed() {
     assert!(
         stdout.contains("/project/foo?scan_id=scan-123"),
         "stdout: {stdout}"
+    );
+    let hits = hits.lock().unwrap();
+    // `project` is the last query param, so `ends_with` also proves the value
+    // is not the un-trimmed `foo%2F`.
+    assert!(
+        hits.iter()
+            .any(|h| h.starts_with("/api/v1/scans?") && h.ends_with("project=foo")),
+        "the scan listing must be queried for `foo`; hits: {hits:?}"
+    );
+}
+
+#[test]
+fn wait_project_name_slash_only_is_rejected() {
+    let url = common::spawn_resolution_stub(scan_routes());
+    let (_tmp, dir) = temp_plain_dir("whatever");
+    let out = run_wait(&["--project-name", "/"], &url, &dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("--project-name must name a project"),
+        "stderr: {stderr}"
     );
 }
 

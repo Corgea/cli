@@ -931,6 +931,12 @@ pub fn resolve_project(
 ) -> Result<ResolvedProject, Box<dyn std::error::Error>> {
     let repo_override = selector.repo.as_deref();
     if let Some(name) = selector.name.as_deref() {
+        // Normalize before it reaches `?project=`, which the backend matches
+        // exactly: `--project-name foo/` must not miss the project `foo`.
+        let name = name.trim().trim_matches('/');
+        if name.is_empty() {
+            return Err("--project-name must name a project".into());
+        }
         return Ok(ResolvedProject {
             query_name: name.to_string(),
             confirmed: false,
@@ -939,14 +945,14 @@ pub fn resolve_project(
         });
     }
 
-    // --repo may already be a bare `org/repo` (extract_repo_path needs a host
-    // segment, so it returns None there) -> use the raw value, and with it no
-    // host to hold candidates to.
+    // --repo may be a bare path (`org/repo`, or a GitLab `group/subgroup/repo`)
+    // rather than a URL; `extract_repo_path` returns None for those, so the
+    // whole value is the path and there is no host to hold candidates to.
     let (repo_path, repo_host) = match repo_override {
-        Some(r) => (
-            utils::generic::extract_repo_path(r).or_else(|| Some(r.to_string())),
-            utils::generic::extract_repo_host(r),
-        ),
+        Some(r) => match utils::generic::extract_repo_path(r) {
+            Some(path) => (Some(path), utils::generic::extract_repo_host(r)),
+            None => (Some(utils::generic::strip_git_suffix(r).to_string()), None),
+        },
         None => match utils::generic::discover_repo_url() {
             Some(u) => (
                 utils::generic::extract_repo_path(&u),
@@ -986,7 +992,9 @@ pub fn resolve_project(
         utils::generic::get_current_working_directory().unwrap_or_else(|| "unknown".to_string());
     Ok(ResolvedProject {
         tried_label: format!("directory '{}'", cwd),
-        query_name: cwd,
+        // Same legacy query as above: the sanitized basename here, since a
+        // directory named `my app` was onboarded as `my_app`.
+        query_name: utils::generic::determine_project_name(None),
         confirmed: false,
         project_id: None,
     })

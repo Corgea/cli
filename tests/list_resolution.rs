@@ -46,8 +46,16 @@ fn run_list(args: &[&str], url: &str, cwd: &Path) -> Output {
 
 #[test]
 fn list_uses_canonical_name_from_repo() {
-    let url = spawn_stub(projects_match(), scans_one(CANON), issues_one());
-    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    // The checkout is `build-123`, so the canonical name can only come from
+    // resolution — and the assertion is on the query the CLI SENT, since the
+    // stub answers every /scans the same way and stdout alone would stay green
+    // through a regression. (PR #122 review)
+    let (url, hits) = common::spawn_recording_resolution_stub(routes(
+        projects_match(),
+        scans_one(CANON),
+        issues_one(),
+    ));
+    let (_tmp, repo) = temp_git_repo("build-123", REMOTE);
     let out = run_list(&[], &url, &repo);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
@@ -56,19 +64,29 @@ fn list_uses_canonical_name_from_repo() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // Project column shows the canonical org/repo, proving resolution, not the
-    // dir basename, drove the listing.
     assert!(
         stdout.contains("bohappdev/dotnet-azure-web-tsb"),
         "stdout: {stdout}"
     );
     assert!(stdout.contains("scan-123"), "stdout: {stdout}");
+    let hits = hits.lock().unwrap();
+    assert!(
+        hits.iter().any(|h| h.starts_with("/api/v1/scans?")
+            && h.contains("project=bohappdev%2Fdotnet-azure-web-tsb")),
+        "the canonical project must drive /scans; hits: {hits:?}"
+    );
 }
 
 #[test]
 fn list_issues_shows_repo_resolved_issue() {
-    let url = spawn_stub(projects_match(), scans_one(CANON), issues_one());
-    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    // Same shape as above: `build-123` plus an assertion on the sent query, so
+    // a fallback to the checkout name cannot pass.
+    let (url, hits) = common::spawn_recording_resolution_stub(routes(
+        projects_match(),
+        scans_one(CANON),
+        issues_one(),
+    ));
+    let (_tmp, repo) = temp_git_repo("build-123", REMOTE);
     let out = run_list(&["--issues"], &url, &repo);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
@@ -78,6 +96,14 @@ fn list_issues_shows_repo_resolved_issue() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(stdout.contains("issue-abc"), "stdout: {stdout}");
+    let hits = hits.lock().unwrap();
+    // `get_scan_issues` builds this target by hand, so the slash arrives
+    // unencoded — unlike the `.query()`-built /scans target above.
+    assert!(
+        hits.iter().any(|h| h.starts_with("/api/v1/issues?")
+            && h.contains("project=bohappdev/dotnet-azure-web-tsb")),
+        "the canonical project must drive /issues; hits: {hits:?}"
+    );
 }
 
 #[test]
@@ -205,6 +231,51 @@ fn list_unconfirmed_falls_back_to_the_repo_name_not_the_checkout_dir() {
     assert!(
         !hits.iter().any(|h| h.contains("project=build-123")),
         "the checkout dir name must not be queried; hits: {hits:?}"
+    );
+}
+
+#[test]
+fn list_repo_flag_keeps_every_segment_of_a_bare_slug() {
+    // A GitLab `group/subgroup/repo` has no host: all three segments are the
+    // path. Reading `group` as the host would query `subgroup/repo` and hit a
+    // different project. (PR #122 review)
+    let (url, hits) = common::spawn_recording_resolution_stub(Routes {
+        projects: Some(projects_empty()),
+        scans: Some(scans_empty()),
+        ..Default::default()
+    });
+    let (_tmp, dir) = temp_plain_dir("unrelated-dir");
+    let out = run_list(&["--repo", "group/subgroup/repo.git"], &url, &dir);
+    assert_eq!(out.status.code(), Some(1), "an empty miss still exits 1");
+    let hits = hits.lock().unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h.starts_with("/api/v1/projects?repo_url=group%2Fsubgroup%2Frepo&")),
+        "every segment must survive, .git trimmed; hits: {hits:?}"
+    );
+}
+
+#[test]
+fn list_no_remote_falls_back_to_the_sanitized_dir_name() {
+    // `determine_project_name` sanitized the basename before this PR, so a
+    // project onboarded from `my app` is stored as `my_app` — query that, not
+    // the raw name. (PR #122 review)
+    let (url, hits) = common::spawn_recording_resolution_stub(Routes {
+        scans: Some(scans_one("my_app")),
+        ..Default::default()
+    });
+    let (_tmp, dir) = temp_plain_dir("my app");
+    let out = run_list(&[], &url, &dir);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        hits.iter().any(|h| h.contains("project=my_app")),
+        "expected the sanitized dir name; hits: {hits:?}"
     );
 }
 
