@@ -56,7 +56,12 @@ case "$triple" in
     ;;
 
   *-gnu)
-    needed=$(readelf -V "$binary" | grep -o 'GLIBC_[0-9.]*' | sed 's/^GLIBC_//' | sort -uV)
+    # A binary with no versioned glibc references is fine, but grep exits 1 on
+    # no match, so run it outside the pipeline that feeds the assignment.
+    # Requiring a digit keeps unversioned tags such as GLIBC_PRIVATE out.
+    version_info=$(readelf -V "$binary")
+    needed=$(grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' <<<"$version_info" | sed 's/^GLIBC_//' | sort -uV || true)
+
     if [ -z "$needed" ]; then
       echo "OK: $binary ($triple) requires no versioned glibc symbols"
       exit 0
