@@ -28,13 +28,23 @@ pub fn run(config: &Config, args: ListArgs) {
     } = args;
     println!();
     if sca_issues {
-        // SCA has no project parameter; this name is only error copy.
-        let project_name = utils::generic::determine_project_name(None);
+        // Only an explicit --project-name/--repo scopes the SCA listing: the
+        // endpoint takes `project`, but unflagged `--sca-issues` has always
+        // returned the company-wide latest scan and narrowing that silently is
+        // not this change's to make. Without a selector the name below stays
+        // what it was — error copy only.
+        let resolved = (scan_id.is_none() && selector.is_set())
+            .then(|| utils::api::resolve_project_or_exit(&config.get_url(), &selector));
+        let project_name = resolved
+            .as_ref()
+            .map(|r| r.query_name.clone())
+            .unwrap_or_else(|| utils::generic::determine_project_name(None));
         let sca_issues_response = match utils::api::get_sca_issues(
             &config.get_url(),
             Some(page.unwrap_or(1)),
             page_size,
             scan_id.clone(),
+            resolved.as_ref().map(|r| r.query_name.as_str()),
         ) {
             Ok(response) => response,
             Err(e) => {

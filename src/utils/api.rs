@@ -471,27 +471,29 @@ pub fn get_scan_issues(
     page_size: Option<u16>,
     scan_id: Option<String>,
 ) -> Result<ProjectIssuesResponse, Box<dyn std::error::Error>> {
-    let mut seperator = "?";
-    let mut url = match scan_id {
-        Some(scan_id) => format!("{}{}/scan/{}/issues", url, API_BASE, scan_id),
-        None => {
-            seperator = "&";
-            format!("{}{}/issues?project={}", url, API_BASE, project)
-        }
+    // Built with `query`, not `format!`: a project name is user- and
+    // server-supplied, so an `&`/`#`/`?` in it would otherwise split the query
+    // and address a different project.
+    let (url, mut query_params) = match scan_id {
+        Some(scan_id) => (
+            format!("{}{}/scan/{}/issues", url, API_BASE, scan_id),
+            vec![],
+        ),
+        None => (
+            format!("{}{}/issues", url, API_BASE),
+            vec![("project", project.to_string())],
+        ),
     };
     if let Some(p) = page {
-        url.push_str(&format!("{}page={}", seperator, p));
+        query_params.push(("page", p.to_string()));
     }
-    if let Some(p_size) = page_size {
-        url.push_str(&format!("&page_size={}", p_size));
-    } else {
-        url.push_str("&page_size=30");
-    }
+    query_params.push(("page_size", page_size.unwrap_or(30).to_string()));
     let client = http_client();
 
     debug(&format!("Sending request to URL: {}", url));
+    debug(&format!("Query params: {:?}", query_params));
 
-    let response = match client.get(&url).send() {
+    let response = match client.get(&url).query(&query_params).send() {
         Ok(res) => {
             check_for_warnings(res.headers(), res.status());
             res
@@ -925,6 +927,14 @@ pub struct ProjectSelector {
     pub repo: Option<String>,
 }
 
+impl ProjectSelector {
+    /// True when the caller named a project or repo explicitly, rather than
+    /// leaving it to auto-detection.
+    pub fn is_set(&self) -> bool {
+        self.name.is_some() || self.repo.is_some()
+    }
+}
+
 /// Resolve which project `list`/`wait` should query: `--project-name` verbatim,
 /// else the repo path from `--repo` or the discovered remote. Unconfirmed, an
 /// explicit `--repo` queries that path as a name and everything else falls back
@@ -1125,6 +1135,7 @@ pub fn get_sca_issues(
     page: Option<u16>,
     page_size: Option<u16>,
     scan_id: Option<String>,
+    project: Option<&str>,
 ) -> Result<SCAIssuesResponse, Box<dyn std::error::Error>> {
     let client = http_client();
     let mut query_params = vec![];
@@ -1133,6 +1144,11 @@ pub fn get_sca_issues(
     }
     if let Some(page_size) = page_size {
         query_params.push(("page_size", page_size.to_string()));
+    }
+    // Scopes the scan-less route to one project (doghouse `list_sca_issues`
+    // reads `project`); the scan route already keys off the scan.
+    if let Some(project) = project {
+        query_params.push(("project", project.to_string()));
     }
 
     let endpoint = if let Some(scan_id) = scan_id {
@@ -1197,11 +1213,18 @@ pub fn get_all_sca_issues(
     let mut current_page: u32 = 1;
 
     loop {
-        let response =
-            match get_sca_issues(url, Some(current_page as u16), Some(30), scan_id.clone()) {
-                Ok(response) => response,
-                Err(e) => return Err(format!("Failed to get SCA issues: {}", e).into()),
-            };
+        // No project scope: every caller passes a scan id, which selects the
+        // scan on its own.
+        let response = match get_sca_issues(
+            url,
+            Some(current_page as u16),
+            Some(30),
+            scan_id.clone(),
+            None,
+        ) {
+            Ok(response) => response,
+            Err(e) => return Err(format!("Failed to get SCA issues: {}", e).into()),
+        };
 
         if response.issues.is_empty() {
             break;

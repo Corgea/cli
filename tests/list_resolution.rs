@@ -43,6 +43,23 @@ fn spawn_stub(projects: String, scans: String, issues: String) -> (String, Hits)
     })
 }
 
+/// Stub serving verify + the SCA listing endpoint only.
+fn spawn_sca_stub() -> (String, Hits) {
+    common::spawn_recording_http_stub(|path| {
+        if path.starts_with("/api/v1/verify") {
+            ("200 OK", r#"{"status":"ok"}"#.to_string())
+        } else if path.starts_with("/api/v1/issues/sca") {
+            (
+                "200 OK",
+                r#"{"status":"ok","page":1,"total_pages":1,"total_issues":0,"issues":[]}"#
+                    .to_string(),
+            )
+        } else {
+            ("404 Not Found", NOT_FOUND_JSON.to_string())
+        }
+    })
+}
+
 fn run_list(args: &[&str], url: &str, cwd: &Path) -> Output {
     common::run_corgea("list", args, url, cwd)
 }
@@ -226,6 +243,72 @@ fn list_project_name_override_skips_resolution() {
     assert!(
         !hits.iter().any(|h| h.starts_with("/api/v1/projects")),
         "an exact name needs no resolution round trip; hits: {hits:?}"
+    );
+}
+
+#[test]
+fn list_issues_percent_encodes_the_project_name() {
+    // A project name is user- and server-supplied; interpolated raw, an `&`
+    // would split the query and address the project `foo` instead.
+    let (url, hits) = spawn_stub(projects_empty(), scans_empty(), issues_one());
+    let (_tmp, dir) = temp_plain_dir("whatever");
+    let out = run_list(&["--issues", "--project-name", "foo&bar#baz"], &url, &dir);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        hits.iter().any(|h| h.contains("project=foo%26bar%23baz")),
+        "the delimiters must be encoded, not split the query; hits: {hits:?}"
+    );
+}
+
+#[test]
+fn list_sca_issues_scopes_to_an_explicit_project_name() {
+    // The flags are offered on every `list` mode, so with --sca-issues they
+    // must actually scope the request rather than silently return every
+    // project's findings. `list_sca_issues` reads `project`.
+    let (url, hits) = spawn_sca_stub();
+    let (_tmp, dir) = temp_plain_dir("whatever");
+    let out = run_list(&["--sca-issues", "--project-name", "some/name"], &url, &dir);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h.starts_with("/api/v1/issues/sca") && h.contains("project=some%2Fname")),
+        "the SCA request must carry the named project; hits: {hits:?}"
+    );
+}
+
+#[test]
+fn list_sca_issues_without_a_selector_stays_unscoped() {
+    // Unflagged --sca-issues has always returned the company-wide latest scan;
+    // adding the flags must not silently narrow it.
+    let (url, hits) = spawn_sca_stub();
+    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    let out = run_list(&["--sca-issues"], &url, &repo);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        !hits.iter().any(|h| h.contains("project=")),
+        "no selector means no project scope; hits: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| h.starts_with("/api/v1/projects")),
+        "and no resolution round trip; hits: {hits:?}"
     );
 }
 

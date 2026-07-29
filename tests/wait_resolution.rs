@@ -144,6 +144,49 @@ fn wait_with_scan_id_does_not_list_scans() {
     );
 }
 
+#[test]
+fn wait_project_id_flag_skips_resolution() {
+    // A caller who already knows the id (CI passing it between steps) needs no
+    // lookup at all: neither /projects nor /scans is dialed, and the id-form
+    // URL still comes out.
+    let (url, hits) = spawn_stub(projects_match(), scans_one(CANON));
+    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    let out = run_wait(&["scan-123", "--project-id", "42"], &url, &repo);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("/project/42/?scan_id=scan-123"),
+        "stdout: {stdout}"
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        !hits
+            .iter()
+            .any(|h| h.starts_with("/api/v1/projects") || h.starts_with("/api/v1/scans")),
+        "--project-id must resolve nothing; hits: {hits:?}"
+    );
+}
+
+#[test]
+fn wait_project_id_requires_a_scan_id() {
+    // Without a scan id the scan is still picked by the resolved project name,
+    // so a lone --project-id would only relabel the link — pointing at a
+    // different project than the scan. clap rejects it.
+    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    let out = run_wait(&["--project-id", "42"], "http://127.0.0.1:1", &repo);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `corgea scan semgrep` with a fake `semgrep` on PATH: the post-scan wait gets
 /// the project id straight from the upload response, so it must resolve nothing
 /// — no `/projects`, no `/scans` — and still link the id-form URL.
