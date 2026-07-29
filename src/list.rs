@@ -132,7 +132,7 @@ pub fn run(config: &Config, args: ListArgs) {
         // project, so it needs no resolution.
         let resolved = scan_id
             .is_none()
-            .then(|| utils::api::resolve_or_exit(&config.get_url(), &selector));
+            .then(|| utils::api::resolve_project_or_exit(&config.get_url(), &selector));
         let project_name = resolved
             .as_ref()
             .map(|r| r.query_name.clone())
@@ -288,7 +288,7 @@ pub fn run(config: &Config, args: ListArgs) {
 
         utils::terminal::print_table(table, issues_response.page, issues_response.total_pages);
     } else {
-        let resolved = utils::api::resolve_or_exit(&config.get_url(), &selector);
+        let resolved = utils::api::resolve_project_or_exit(&config.get_url(), &selector);
         let project_name = &resolved.query_name;
         let (scans, page, total_pages) = match utils::api::query_scan_list(
             &config.get_url(),

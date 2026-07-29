@@ -74,7 +74,7 @@ pub fn run_semgrep(config: &Config, project_name: Option<String>) {
                     name: project_name,
                     ..Default::default()
                 },
-                upload_project_id: result.project_id,
+                project_id: result.project_id,
             },
         );
     }
@@ -99,7 +99,7 @@ pub fn run_snyk(config: &Config, project_name: Option<String>) {
                     name: project_name,
                     ..Default::default()
                 },
-                upload_project_id: result.project_id,
+                project_id: result.project_id,
             },
         );
     }

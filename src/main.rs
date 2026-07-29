@@ -154,6 +154,11 @@ enum Commands {
             help = "Resolve the project from this repo (org/repo slug or remote URL) instead of the git remote."
         )]
         repo: Option<String>,
+        #[arg(
+            long,
+            help = "Use this known Corgea project id for the result link. Together with a scan id it skips project resolution entirely."
+        )]
+        project_id: Option<String>,
     },
     /// List something, by default it lists the scans
     #[command(alias = "ls")]
@@ -693,6 +698,7 @@ fn main() {
             scan_id,
             project_name,
             repo,
+            project_id,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             wait::run(
@@ -703,7 +709,7 @@ fn main() {
                         name: project_name.clone(),
                         repo: repo.clone(),
                     },
-                    upload_project_id: None,
+                    project_id: project_id.clone(),
                 },
             );
         }

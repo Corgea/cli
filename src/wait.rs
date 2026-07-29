@@ -7,21 +7,21 @@ use crate::utils::api::ProjectSelector;
 pub struct WaitArgs {
     pub scan_id: Option<String>,
     pub selector: ProjectSelector,
-    /// Project id straight from an upload response, skipping resolution.
-    pub upload_project_id: Option<String>,
+    /// Known project id — `--project-id`, or straight from an upload response.
+    /// Paired with a scan id it skips resolution entirely.
+    pub project_id: Option<String>,
 }
 
 pub fn run(config: &Config, args: WaitArgs) {
     let WaitArgs {
         scan_id,
         selector,
-        upload_project_id,
+        project_id: known_project_id,
     } = args;
 
-    // A scan id plus the project id from the upload response leaves nothing to
-    // resolve: everything below keys off the scan, and the id-form URL is
-    // already known.
-    let resolved = if scan_id.is_some() && upload_project_id.is_some() {
+    // A scan id plus a known project id leaves nothing to resolve: everything
+    // below keys off the scan, and the id-form URL is already known.
+    let resolved = if scan_id.is_some() && known_project_id.is_some() {
         let name = selector.name.clone().unwrap_or_else(|| {
             utils::generic::get_current_working_directory().unwrap_or_else(|| "unknown".to_string())
         });
@@ -33,7 +33,7 @@ pub fn run(config: &Config, args: WaitArgs) {
             project_id: None,
         }
     } else {
-        utils::api::resolve_or_exit(&config.get_url(), &selector)
+        utils::api::resolve_project_or_exit(&config.get_url(), &selector)
     };
     let project_name = resolved.query_name.clone();
 
@@ -90,7 +90,7 @@ pub fn run(config: &Config, args: WaitArgs) {
         },
     };
 
-    let project_id = upload_project_id.or(resolved.project_id);
+    let project_id = known_project_id.or(resolved.project_id);
     let scan_url = match &project_id {
         Some(pid) => format!("{}/project/{}/?scan_id={}", config.get_url(), pid, scan_id),
         None => {

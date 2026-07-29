@@ -213,6 +213,34 @@ fn wait_with_scan_id_does_not_list_scans() {
     );
 }
 
+#[test]
+fn wait_project_id_flag_skips_resolution() {
+    // A caller who already knows the id (CI passing it between steps) needs no
+    // lookup at all: neither `projects` nor `scans` is served, and the id-form
+    // URL still comes out. (PR #122 review)
+    let (url, hits) = common::spawn_recording_resolution_stub(scan_routes());
+    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    let out = run_wait(&["scan-123", "--project-id", "42"], &url, &repo);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("/project/42/?scan_id=scan-123"),
+        "stdout: {stdout}"
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        !hits
+            .iter()
+            .any(|h| h.starts_with("/api/v1/projects") || h.starts_with("/api/v1/scans")),
+        "--project-id must resolve nothing; hits: {hits:?}"
+    );
+}
+
 /// `corgea scan semgrep` with a fake `semgrep` on PATH: the post-scan wait gets
 /// the project id straight from the upload response, so it must resolve nothing
 /// — no `/projects`, no `/scans` — and still link the id-form URL.

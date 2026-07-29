@@ -962,7 +962,7 @@ pub fn resolve_project(
 
 /// `resolve_project`, or a hard exit with the shared failure copy. Every
 /// caller treats a resolver error as fatal.
-pub fn resolve_or_exit(url: &str, selector: &ProjectSelector) -> ResolvedProject {
+pub fn resolve_project_or_exit(url: &str, selector: &ProjectSelector) -> ResolvedProject {
     match resolve_project(url, selector) {
         Ok(resolved) => resolved,
         Err(e) => {
