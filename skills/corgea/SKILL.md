@@ -33,12 +33,16 @@ corgea scan --scan-type secrets                # Single scan type
 corgea scan --scan-type blast,policy,secrets,pii  # Multiple scan types
 corgea scan --scan-type policy --policy 1      # Specific policy ID
 corgea scan --fail-on CR                       # Exit 1 on critical issues (CR, HI, ME, LO)
+corgea scan --fail-on malicious                # Exit 1 if any dependency is classified malicious
+corgea scan --fail-on HI,malicious             # Comma-separated conditions combine
 corgea scan --fail                             # Exit 1 based on project blocking rules
 corgea scan --out-format json --out-file r.json   # Export (json, html, sarif, markdown)
 corgea scan --project-name my-service          # Override project name
 ```
 
 Scan types: `blast` (base AI), `policy` (PolicyIQ), `malicious`, `secrets`, `pii`.
+
+`--fail-on` takes comma-separated conditions: severity thresholds `CR`, `HI`, `ME`, `LO` (trip at or above the level) and/or `malicious` (trips when any dependency in the scan is classified malicious). Use `malicious` to block supply-chain findings in CI across every ecosystem the scan covers, including those the `corgea npm`/`corgea pip` install gate does not.
 
 `--only-uncommitted` and `--target` are mutually exclusive. `--fail-on` and `--fail` are mutually exclusive.
 
@@ -346,6 +350,7 @@ corgea inspect --issue --diff ISSUE_ID
 
 ```bash
 corgea scan --fail-on CR --out-format sarif --out-file results.sarif
+corgea scan --fail-on CR,malicious --out-format sarif --out-file results.sarif  # also block malicious dependencies
 ```
 
 ### Upload third-party reports
