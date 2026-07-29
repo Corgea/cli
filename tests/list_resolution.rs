@@ -228,6 +228,76 @@ fn list_project_name_with_no_scans_exits_zero() {
 }
 
 #[test]
+fn list_sca_issues_scopes_to_an_explicit_project_name() {
+    // The flags are offered on every `list` mode, so with --sca-issues they
+    // must actually scope the request rather than silently return every
+    // project's findings. `list_sca_issues` reads `project`. (PR #122 review)
+    let (url, hits) = common::spawn_recording_http_stub(|path| {
+        if path.starts_with("/api/v1/verify") {
+            ("200 OK", r#"{"status":"ok"}"#.to_string())
+        } else if path.starts_with("/api/v1/issues/sca") {
+            (
+                "200 OK",
+                r#"{"status":"ok","page":1,"total_pages":1,"total_issues":0,"issues":[]}"#
+                    .to_string(),
+            )
+        } else {
+            ("404 Not Found", common::NOT_FOUND_JSON.to_string())
+        }
+    });
+    let (_tmp, dir) = temp_plain_dir("whatever");
+    let out = run_list(&["--sca-issues", "--project-name", "some/name"], &url, &dir);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h.starts_with("/api/v1/issues/sca") && h.contains("project=some%2Fname")),
+        "the SCA request must carry the named project; hits: {hits:?}"
+    );
+}
+
+#[test]
+fn list_sca_issues_without_a_selector_stays_unscoped() {
+    // Unflagged --sca-issues has always returned the company-wide latest scan;
+    // adding the flags must not silently narrow it.
+    let (url, hits) = common::spawn_recording_http_stub(|path| {
+        if path.starts_with("/api/v1/verify") {
+            ("200 OK", r#"{"status":"ok"}"#.to_string())
+        } else if path.starts_with("/api/v1/issues/sca") {
+            (
+                "200 OK",
+                r#"{"status":"ok","page":1,"total_pages":1,"total_issues":0,"issues":[]}"#
+                    .to_string(),
+            )
+        } else {
+            ("404 Not Found", common::NOT_FOUND_JSON.to_string())
+        }
+    });
+    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    let out = run_list(&["--sca-issues"], &url, &repo);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        !hits.iter().any(|h| h.contains("project=")),
+        "no selector means no project scope; hits: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| h.starts_with("/api/v1/projects")),
+        "and no resolution round trip; hits: {hits:?}"
+    );
+}
+
+#[test]
 fn list_project_name_and_repo_are_mutually_exclusive() {
     let (_tmp, dir) = temp_plain_dir("whatever");
     let (mut cmd, _home) = common::corgea_isolated();

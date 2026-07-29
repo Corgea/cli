@@ -745,8 +745,11 @@ pub struct ProjectSummary {
 
 #[derive(Deserialize, Debug)]
 pub struct ProjectsResponse {
-    #[serde(default)]
-    pub projects: Option<Vec<ProjectSummary>>,
+    /// Required: doghouse's `@paginated` emits this key on every 200, empty
+    /// array included (`api/decorators.py:228,241,259`). A 200 without it is
+    /// not this endpoint answering, so it must fail the parse rather than read
+    /// as "no matches" and take the legacy-name fallback.
+    pub projects: Vec<ProjectSummary>,
     /// Absent on a backend that does not paginate -> treated as a single page.
     #[serde(default)]
     pub total_pages: Option<u32>,
@@ -861,7 +864,7 @@ pub fn resolve_project_by_repo(
             return Ok(None);
         };
         let total_pages = parsed.total_pages.unwrap_or(1);
-        let projects = parsed.projects.unwrap_or_default();
+        let projects = parsed.projects;
         if projects.is_empty() {
             return Ok(None);
         }
@@ -907,6 +910,14 @@ pub struct ResolvedProject {
 pub struct ProjectSelector {
     pub name: Option<String>,
     pub repo: Option<String>,
+}
+
+impl ProjectSelector {
+    /// True when the caller named a project or repo explicitly, rather than
+    /// leaving it to auto-detection.
+    pub fn is_set(&self) -> bool {
+        self.name.is_some() || self.repo.is_some()
+    }
 }
 
 /// Resolve which project `list`/`wait` should query: `--project-name` verbatim,
@@ -1109,6 +1120,7 @@ pub fn get_sca_issues(
     page: Option<u16>,
     page_size: Option<u16>,
     scan_id: Option<String>,
+    project: Option<&str>,
 ) -> Result<SCAIssuesResponse, Box<dyn std::error::Error>> {
     let client = http_client();
     let mut query_params = vec![];
@@ -1117,6 +1129,11 @@ pub fn get_sca_issues(
     }
     if let Some(page_size) = page_size {
         query_params.push(("page_size", page_size.to_string()));
+    }
+    // Scopes the scan-less route to one project (doghouse `list_sca_issues`
+    // reads `project`); the scan route already keys off the scan.
+    if let Some(project) = project {
+        query_params.push(("project", project.to_string()));
     }
 
     let endpoint = if let Some(scan_id) = scan_id {
@@ -1181,11 +1198,18 @@ pub fn get_all_sca_issues(
     let mut current_page: u32 = 1;
 
     loop {
-        let response =
-            match get_sca_issues(url, Some(current_page as u16), Some(30), scan_id.clone()) {
-                Ok(response) => response,
-                Err(e) => return Err(format!("Failed to get SCA issues: {}", e).into()),
-            };
+        // No project scope: every caller passes a scan id, which selects the
+        // scan on its own.
+        let response = match get_sca_issues(
+            url,
+            Some(current_page as u16),
+            Some(30),
+            scan_id.clone(),
+            None,
+        ) {
+            Ok(response) => response,
+            Err(e) => return Err(format!("Failed to get SCA issues: {}", e).into()),
+        };
 
         if response.issues.is_empty() {
             break;
@@ -1829,6 +1853,16 @@ mod tests {
         );
         let got = resolve_project_by_repo(&base, "acme/api", None).unwrap();
         assert_eq!(got.map(|p| p.name).as_deref(), Some("acme/api"));
+    }
+
+    #[test]
+    fn resolve_project_by_repo_missing_projects_key_is_hard_err() {
+        // `@paginated` always emits `projects`, empty array included, so a 200
+        // without it is an error envelope or a foreign responder. Reading it as
+        // "no matches" would take the legacy-name fallback and quietly query a
+        // different project (PR #122 review).
+        let base = spawn_projects_stub(r#"{"status":"error","message":"boom"}"#);
+        assert!(resolve_project_by_repo(&base, "org/repo", None).is_err());
     }
 
     #[test]
