@@ -4,6 +4,7 @@ use crate::utils;
 use serde_json::json;
 use std::path::Path;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     config: &Config,
     issues: &bool,
@@ -12,10 +13,13 @@ pub fn run(
     page: &Option<u16>,
     page_size: &Option<u16>,
     scan_id: &Option<String>,
+    project_name_override: Option<String>,
+    repo_override: Option<String>,
 ) {
-    let project_name = utils::generic::determine_project_name(None);
     println!();
     if *sca_issues {
+        // SCA has no project parameter; this name is only error copy.
+        let project_name = utils::generic::determine_project_name(None);
         let sca_issues_response = match utils::api::get_sca_issues(
             &config.get_url(),
             Some((*page).unwrap_or(1)),
@@ -108,6 +112,18 @@ pub fn run(
             Some(sca_issues_response.total_pages),
         );
     } else if *issues {
+        // The --scan-id route hits /scan/{id}/issues and ignores the project.
+        let resolved = scan_id.is_none().then(|| {
+            utils::api::resolve_project_or_exit(
+                &config.get_url(),
+                project_name_override.as_deref(),
+                repo_override.as_deref(),
+            )
+        });
+        let project_name = resolved
+            .as_ref()
+            .map(|r| r.query_name.clone())
+            .unwrap_or_default();
         let issues_response = match utils::api::get_scan_issues(
             &config.get_url(),
             &project_name,
@@ -119,10 +135,14 @@ pub fn run(
             Err(e) => {
                 debug(&format!("Error Sending Request: {}", e));
                 if e.to_string().contains("404") {
-                    if scan_id.is_some() {
-                        log::error!("Scan with ID '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", scan_id.as_ref().unwrap());
-                    } else {
-                        log::error!("Project with name '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", project_name);
+                    // `resolved` is None exactly on the --scan-id route.
+                    match &resolved {
+                        None => log::error!("Scan with ID '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", scan_id.as_ref().unwrap()),
+                        Some(r) if r.confirmed => log::error!("Project '{}' has no issues yet. Run 'corgea scan' to create a scan for this project.", project_name),
+                        Some(r) => log::error!(
+                            "No Corgea project found for {}. Run 'corgea scan' to create one, or pass --project-name <NAME>.",
+                            r.tried_label
+                        ),
                     }
                 } else {
                     log::error!(
@@ -259,26 +279,32 @@ pub fn run(
 
         utils::terminal::print_table(table, issues_response.page, issues_response.total_pages);
     } else {
+        let resolved = utils::api::resolve_project_or_exit(
+            &config.get_url(),
+            project_name_override.as_deref(),
+            repo_override.as_deref(),
+        );
+        let project_name = &resolved.query_name;
         let (scans, page, total_pages) = match utils::api::query_scan_list(
             &config.get_url(),
-            Some(&project_name),
+            Some(project_name),
             *page,
             *page_size,
         ) {
             Ok(scans) => {
                 let page = scans.page;
                 let total_pages = scans.total_pages;
-                let filtered_scans: Vec<utils::api::ScanResponse> = scans
-                    .scans
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|scan| scan.project == project_name)
-                    .collect();
-                (filtered_scans, page, total_pages)
+                // The server already filtered by the resolved project; the old
+                // client-side `scan.project == cwd_basename` pass would discard
+                // every repo-resolved scan. (COR-1577)
+                (scans.scans.unwrap_or_default(), page, total_pages)
             }
             Err(e) => {
                 if e.to_string().contains("404") {
-                    log::error!("Project with name '{}' doesn't exist. Please run 'corgea scan' to create a new scan for this project.", project_name);
+                    log::error!(
+                        "No Corgea project found for {}. Run 'corgea scan' to create one, or pass --project-name <NAME>.",
+                        resolved.tried_label
+                    );
                 } else {
                     log::error!(
                         "Unable to fetch scans. Please check your connection and ensure that:\n\
@@ -296,7 +322,29 @@ pub fn run(
                 "total_pages": total_pages,
                 "results": scans
             });
+            // The envelope prints first so JSON consumers get valid stdout even
+            // when the miss below exits 1.
             println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        // An unresolved project is a miss (exit 1, as --issues and `wait`); a
+        // confirmed project with no scans is a valid empty result. So is an
+        // explicit --project-name: /scans answers 200-empty either way, so the
+        // caller's own exact name is the better authority.
+        if scans.is_empty() && !resolved.confirmed && project_name_override.is_none() {
+            log::error!(
+                "No Corgea project found for {}. Run 'corgea scan' to create one, or pass --project-name <NAME>.",
+                resolved.tried_label
+            );
+            std::process::exit(1);
+        }
+        if *json {
+            return;
+        }
+        if scans.is_empty() {
+            println!(
+                "Project '{}' has no scans yet. Run 'corgea scan' to create one.",
+                project_name
+            );
             return;
         }
         let mut table = vec![vec![
