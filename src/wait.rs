@@ -1,19 +1,29 @@
 use crate::config::Config;
 use crate::scanners::blast;
 use crate::utils;
+use crate::utils::api::ProjectSelector;
 
-pub fn run(
-    config: &Config,
-    scan_id: Option<String>,
-    project_name_override: Option<String>,
-    repo_override: Option<String>,
-    project_id: Option<String>,
-) {
+#[derive(Default)]
+pub struct WaitArgs {
+    pub scan_id: Option<String>,
+    pub selector: ProjectSelector,
+    /// Known project id — `--project-id`, or straight from an upload response.
+    /// Paired with a scan id it skips resolution entirely.
+    pub project_id: Option<String>,
+}
+
+pub fn run(config: &Config, args: WaitArgs) {
+    let WaitArgs {
+        scan_id,
+        selector,
+        project_id,
+    } = args;
     // A scan id plus the project id from the upload response leaves nothing to
     // resolve: everything below keys off the scan, and the id-form URL is
     // already known.
     let resolved = if scan_id.is_some() && project_id.is_some() {
-        let name = project_name_override
+        let name = selector
+            .name
             .clone()
             .unwrap_or_else(|| utils::generic::determine_project_name(None));
         utils::api::ResolvedProject {
@@ -23,11 +33,7 @@ pub fn run(
             confirmed: false,
         }
     } else {
-        utils::api::resolve_project_or_exit(
-            &config.get_url(),
-            project_name_override.as_deref(),
-            repo_override.as_deref(),
-        )
+        utils::api::resolve_project_or_exit(&config.get_url(), &selector)
     };
     let project_name = resolved.query_name.clone();
 

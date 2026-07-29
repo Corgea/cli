@@ -822,6 +822,16 @@ pub struct ResolvedProject {
     pub tried_label: String,
 }
 
+/// How the caller asked for a project: `--project-name` and `--repo` are
+/// mutually exclusive at the CLI, but both travel together to the resolver.
+/// One struct so the two same-typed options cannot be transposed at a call
+/// site.
+#[derive(Default, Clone)]
+pub struct ProjectSelector {
+    pub name: Option<String>,
+    pub repo: Option<String>,
+}
+
 /// Resolve which project `list`/`wait` should query: `--project-name` verbatim,
 /// else the repo path from `--repo` or the discovered remote. Unconfirmed, an
 /// explicit `--repo` queries that path as a name and everything else falls back
@@ -829,10 +839,10 @@ pub struct ResolvedProject {
 /// (network/auth/5xx from /projects).
 pub fn resolve_project(
     url: &str,
-    project_name_override: Option<&str>,
-    repo_override: Option<&str>,
+    selector: &ProjectSelector,
 ) -> Result<ResolvedProject, Box<dyn std::error::Error>> {
-    if let Some(name) = project_name_override {
+    let repo_override = selector.repo.as_deref();
+    if let Some(name) = selector.name.as_deref() {
         // Normalize before it reaches `?project=`, which the backend matches
         // exactly: `--project-name foo/` must not miss the project `foo`.
         let name = name.trim().trim_matches('/');
@@ -891,12 +901,8 @@ pub fn resolve_project(
 
 /// `resolve_project`, or a hard exit with the shared failure copy. Every
 /// caller treats a resolver error as fatal.
-pub fn resolve_project_or_exit(
-    url: &str,
-    project_name_override: Option<&str>,
-    repo_override: Option<&str>,
-) -> ResolvedProject {
-    match resolve_project(url, project_name_override, repo_override) {
+pub fn resolve_project_or_exit(url: &str, selector: &ProjectSelector) -> ResolvedProject {
+    match resolve_project(url, selector) {
         Ok(resolved) => resolved,
         Err(e) => {
             log::error!(
@@ -1622,10 +1628,24 @@ mod tests {
     fn resolve_project_name_override_is_normalized_and_never_empty() {
         // The name goes straight into `?project=`, which the backend matches
         // exactly, so a trailing slash would miss the project.
-        let r = resolve_project("http://127.0.0.1:1", Some("foo/"), None).unwrap();
+        let r = resolve_project(
+            "http://127.0.0.1:1",
+            &ProjectSelector {
+                name: Some("foo/".into()),
+                repo: None,
+            },
+        )
+        .unwrap();
         assert_eq!(r.query_name, "foo");
         assert!(!r.confirmed);
-        assert!(resolve_project("http://127.0.0.1:1", Some("/"), None).is_err());
+        assert!(resolve_project(
+            "http://127.0.0.1:1",
+            &ProjectSelector {
+                name: Some("/".into()),
+                repo: None
+            }
+        )
+        .is_err());
     }
 
     #[test]

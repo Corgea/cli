@@ -723,10 +723,14 @@ fn main() {
             verify_token_and_exit_when_fail(&corgea_config);
             wait::run(
                 &corgea_config,
-                scan_id.clone(),
-                project_name.clone(),
-                repo.clone(),
-                None,
+                wait::WaitArgs {
+                    scan_id: scan_id.clone(),
+                    selector: utils::api::ProjectSelector {
+                        name: project_name.clone(),
+                        repo: repo.clone(),
+                    },
+                    project_id: None,
+                },
             );
         }
         Some(Commands::List {
@@ -750,14 +754,18 @@ fn main() {
             }
             list::run(
                 &corgea_config,
-                issues,
-                sca_issues,
-                json,
-                page,
-                page_size,
-                scan_id,
-                project_name.clone(),
-                repo.clone(),
+                list::ListArgs {
+                    issues: *issues,
+                    sca_issues: *sca_issues,
+                    json: *json,
+                    page: *page,
+                    page_size: *page_size,
+                    scan_id: scan_id.clone(),
+                    selector: utils::api::ProjectSelector {
+                        name: project_name.clone(),
+                        repo: repo.clone(),
+                    },
+                },
             );
         }
         Some(Commands::Inspect {
