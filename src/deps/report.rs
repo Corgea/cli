@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::fmt::Write as _;
 
 use crate::deps::detect::DetectedFile;
-use crate::deps::model::{DependencyGraph, Ecosystem};
+use crate::deps::model::{DependencyGraph, Ecosystem, PackageId};
 use crate::deps::Inventory;
 
 /// Load the policy at `root`, scan the tree, and emit a CycloneDX SBOM.
@@ -121,7 +121,7 @@ pub fn to_cyclonedx(inv: &Inventory) -> Value {
     // Deduplicate by bom-ref: multi-module trees list the same package once
     // per manifest, but the schema sets uniqueItems on components.
     let mut components: std::collections::BTreeMap<&str, Value> = std::collections::BTreeMap::new();
-    for n in graph.nodes.iter().filter(|n| n.id().0 != "root") {
+    for n in graph.nodes.iter().filter(|n| *n.id() != PackageId::root()) {
         let mut c = json!({
             "type": "library",
             "bom-ref": n.id().0,

@@ -121,16 +121,23 @@ fn parse_pom_dependencies(content: &str) -> Result<Vec<MavenDep>, DepsError> {
 /// for the project's dependencies but are not dependencies themselves.
 /// Returns (pom without the section, the section's inner content).
 fn split_dependency_management(content: &str) -> (String, &str) {
-    const OPEN: &str = "<dependencyManagement>";
-    const CLOSE: &str = "</dependencyManagement>";
-    if let (Some(s), Some(e)) = (content.find(OPEN), content.find(CLOSE)) {
-        if s < e {
-            let management = &content[s + OPEN.len()..e];
-            let rest = format!("{}{}", &content[..s], &content[e + CLOSE.len()..]);
-            return (rest, management);
-        }
+    split_section(content, "dependencyManagement").unwrap_or_else(|| (content.to_string(), ""))
+}
+
+/// Locate a `<tag>...</tag>` section and split content into (content with
+/// the section removed, the section's inner content). `None` if the tag
+/// isn't present or is malformed (close before open).
+fn split_section<'a>(content: &'a str, tag: &str) -> Option<(String, &'a str)> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let s = content.find(&open)?;
+    let e = content.find(&close)?;
+    if s >= e {
+        return None;
     }
-    (content.to_string(), "")
+    let inner = &content[s + open.len()..e];
+    let rest = format!("{}{}", &content[..s], &content[e + close.len()..]);
+    Some((rest, inner))
 }
 
 /// Collect `<properties>` entries plus the built-in `project.version`.
@@ -212,15 +219,12 @@ fn pom_project_version(content: &str) -> String {
         Some(pos) => &head[..pos],
         None => head,
     };
-    if let (Some(ps), Some(pe)) = (head.find("<parent>"), head.find("</parent>")) {
-        if ps < pe {
-            let cleaned = format!("{}{}", &head[..ps], &head[pe + "</parent>".len()..]);
-            let own = extract_xml_tag(&cleaned, "version");
-            if !own.is_empty() {
-                return own;
-            }
-            return extract_xml_tag(&head[ps..pe], "version");
+    if let Some((cleaned, parent)) = split_section(head, "parent") {
+        let own = extract_xml_tag(&cleaned, "version");
+        if !own.is_empty() {
+            return own;
         }
+        return extract_xml_tag(parent, "version");
     }
     extract_xml_tag(head, "version")
 }
