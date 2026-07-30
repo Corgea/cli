@@ -222,6 +222,16 @@ fn maven_project_version_resolves_revision_property() {
     assert_eq!(*n.id(), PackageId("pkg:maven/com.acme/core@2.0.0".into()));
 }
 
+/// A property aliasing `${project.version}` (e.g. `<shared.version>`) must
+/// resolve once `project.version` is derived, not just plain properties.
+#[test]
+fn maven_property_aliasing_project_version_resolves() {
+    let inv = scan_fixture("java-maven-alias");
+    let n = inv.node("shared").expect("shared node missing");
+    assert_eq!(n.version(), Some("1.2.3"));
+    assert_eq!(*n.id(), PackageId("pkg:maven/com.acme/shared@1.2.3".into()));
+}
+
 #[test]
 fn maven_scan_yields_root_edges() {
     let inv = scan_fixture("java-maven");

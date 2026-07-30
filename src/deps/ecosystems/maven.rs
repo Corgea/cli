@@ -164,21 +164,30 @@ fn parse_pom_properties(content: &str) -> std::collections::HashMap<String, Stri
     }
     // Property values may reference other properties; resolve the map to a
     // fixed point, bounded to guard against definition cycles.
-    for _ in 0..5 {
-        let resolved: std::collections::HashMap<String, String> = props
-            .iter()
-            .map(|(k, v)| (k.clone(), resolve_placeholders(v, &props)))
-            .collect();
-        if resolved == props {
-            break;
-        }
-        props = resolved;
-    }
+    resolve_props_fixed_point(&mut props);
     let project_version = resolve_placeholders(&pom_project_version(content), &props);
     if !project_version.is_empty() && !project_version.contains("${") {
         props.insert("project.version".to_string(), project_version);
     }
+    // Properties aliasing ${project.version} (e.g. `<shared.version>`) only
+    // resolve now that project.version itself is in the map.
+    resolve_props_fixed_point(&mut props);
     props
+}
+
+/// Resolve `${...}` references among property values to a fixed point,
+/// bounded to guard against definition cycles.
+fn resolve_props_fixed_point(props: &mut std::collections::HashMap<String, String>) {
+    for _ in 0..5 {
+        let resolved: std::collections::HashMap<String, String> = props
+            .iter()
+            .map(|(k, v)| (k.clone(), resolve_placeholders(v, props)))
+            .collect();
+        if resolved == *props {
+            break;
+        }
+        *props = resolved;
+    }
 }
 
 /// The pom's own `<version>`: first `<version>` before `<dependencies>`,
@@ -186,6 +195,23 @@ fn parse_pom_properties(content: &str) -> std::collections::HashMap<String, Stri
 /// none of its own, so fall back to the parent's (Maven's inheritance rule).
 fn pom_project_version(content: &str) -> String {
     let head = content.split("<dependencies>").next().unwrap_or(content);
+    // The project's own <version> lives among its coordinates, before any
+    // nested section that may carry unrelated <version> tags of its own
+    // (plugin versions in <build>, managed versions in
+    // <dependencyManagement>, etc).
+    let nested_start = [
+        "<dependencyManagement>",
+        "<build>",
+        "<reporting>",
+        "<profiles>",
+    ]
+    .iter()
+    .filter_map(|tag| head.find(tag))
+    .min();
+    let head = match nested_start {
+        Some(pos) => &head[..pos],
+        None => head,
+    };
     if let (Some(ps), Some(pe)) = (head.find("<parent>"), head.find("</parent>")) {
         if ps < pe {
             let cleaned = format!("{}{}", &head[..ps], &head[pe + "</parent>".len()..]);

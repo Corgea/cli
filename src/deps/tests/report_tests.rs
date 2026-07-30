@@ -171,6 +171,37 @@ fn report_cyclonedx_dedups_components_and_depends_on() {
     );
 }
 
+/// The synthetic root is `PackageId("root")` (an id), not a package named
+/// "root". A real package named "root" must keep its component and not be
+/// dropped by the root filter, or its `dependsOn` ref dangles.
+#[test]
+fn report_cyclonedx_keeps_component_named_root() {
+    let n = DependencyNode::new_npm("root", "1.0.0");
+    let id = n.id().clone();
+    let inv = inventory_with(vec![n], vec![root_edge(&id)]);
+    let v = to_cyclonedx(&inv);
+    let components = v["components"].as_array().expect("components array");
+    assert!(
+        components.iter().any(|c| c["purl"] == "pkg:npm/root@1.0.0"),
+        "package literally named root must keep its component"
+    );
+
+    let bom_refs: Vec<&str> = components
+        .iter()
+        .filter_map(|c| c["bom-ref"].as_str())
+        .collect();
+    let deps = v["dependencies"].as_array().expect("dependencies array");
+    for d in deps {
+        for to in d["dependsOn"].as_array().expect("dependsOn") {
+            let to = to.as_str().unwrap();
+            assert!(
+                to == "root" || bom_refs.contains(&to),
+                "dependsOn ref {to} must resolve to a component or the literal root"
+            );
+        }
+    }
+}
+
 #[test]
 fn report_cyclonedx_groups_depends_on_per_ref() {
     let inv = scan_fixture("node-app");
