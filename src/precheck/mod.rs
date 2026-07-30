@@ -144,8 +144,34 @@ impl VerdictMode {
 pub struct VerdictConfig {
     pub base_url: String,
     pub mode: VerdictMode,
-    /// Print the tokenless public-mode hint after a check is attempted.
-    pub public_login_hint: bool,
+    /// Disclosure printed after a check is attempted in public mode, so a
+    /// fail-open run never looks like an enforced one. `None` suppresses it.
+    pub public_hint: Option<PublicHint>,
+}
+
+/// Why the gate is running public (fail-open) checks. Both cases warn, but a
+/// user who never logged in needs different advice from one whose token is
+/// deliberately withheld from this endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicHint {
+    /// No token at all — logging in is the next step.
+    NoToken,
+    /// A token exists but is not sent to this vuln-api, so it cannot enable
+    /// authenticated enforcement.
+    TokenWithheld,
+}
+
+impl PublicHint {
+    fn message(self) -> &'static str {
+        match self {
+            PublicHint::NoToken => {
+                "warning: using public CVE checks; login enables authenticated enforcement and private Corgea intelligence."
+            }
+            PublicHint::TokenWithheld => {
+                "warning: using public CVE checks; your token is not sent to this vuln-api, so lookup failures warn instead of blocking. Set CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1 to enable authenticated enforcement."
+            }
+        }
+    }
 }
 
 /// Threat verdict for one resolved target.
@@ -845,10 +871,8 @@ fn run_parsed_install(
             "warning: transitive dependencies not checked ({reason}); only named packages were verified."
         );
     }
-    if verdict::public_verdict(&opts).is_some_and(|cfg| cfg.public_login_hint) {
-        eprintln!(
-            "warning: using public CVE checks; login enables authenticated enforcement and private Corgea intelligence."
-        );
+    if let Some(hint) = verdict::public_verdict(&opts).and_then(|cfg| cfg.public_hint) {
+        eprintln!("{}", hint.message());
     }
 
     let report = PrecheckReport {
@@ -877,12 +901,10 @@ fn run_locked_install(
         // Direct callers may still disable verdicts completely.
         return exec();
     };
-    // Same disclosure as run_parsed_install: a tokenless `npm ci`/`uv sync`
-    // runs public checks — say so rather than gate silently.
-    if verdict::public_verdict(opts).is_some_and(|cfg| cfg.public_login_hint) {
-        eprintln!(
-            "warning: using public CVE checks; login enables authenticated enforcement and private Corgea intelligence."
-        );
+    // Same disclosure as run_parsed_install: an `npm ci`/`uv sync` running
+    // public checks says so rather than gating silently.
+    if let Some(hint) = verdict::public_verdict(opts).and_then(|cfg| cfg.public_hint) {
+        eprintln!("{}", hint.message());
     }
     let jobs = match lock {
         Ok(jobs) => jobs,

@@ -32,7 +32,7 @@ pub(crate) fn verdict_opts(base_url: &str) -> PrecheckOptions {
             mode: VerdictMode::Authenticated {
                 token: "test-token".to_string(),
             },
-            public_login_hint: false,
+            public_hint: None,
         }),
         ..stub_opts()
     }
@@ -44,7 +44,7 @@ pub(crate) fn public_opts(force: bool) -> PrecheckOptions {
         verdict: Some(VerdictConfig {
             base_url: "http://127.0.0.1:9".to_string(),
             mode: VerdictMode::Public,
-            public_login_hint: true,
+            public_hint: Some(super::PublicHint::NoToken),
         }),
         ..stub_opts()
     }

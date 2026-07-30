@@ -275,8 +275,8 @@ struct VulnApiAccess {
 }
 
 /// Resolve the shared vuln-api access policy once so both surfaces apply the
-/// same base-URL/token-isolation rule (never send a token to a custom URL
-/// without explicit opt-in).
+/// same base-URL/token-isolation rule (never send a token to an endpoint it
+/// does not belong to without explicit opt-in).
 fn resolve_vuln_api_access(config: &Config) -> VulnApiAccess {
     let token = config.get_token();
     let token = token.trim();
@@ -303,7 +303,7 @@ fn install_wrap_options(
         verdict: Some(corgea::precheck::VerdictConfig {
             base_url: access.base_url,
             mode: access.mode,
-            public_login_hint: !access.has_token,
+            public_hint: Some(public_hint_for(access.has_token)),
         }),
         npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
         pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
@@ -329,15 +329,28 @@ fn advisories_options(config: &Config) -> corgea::advisories::AdvisoriesOptions 
     }
 }
 
-/// A token enables authenticated (fail-closed) verdicts — but never against
-/// a custom vuln-api URL unless the user explicitly opts in to sending the
-/// token there.
+/// Which public-mode disclosure to print. A withheld token is not the same
+/// situation as no token, and telling a logged-in user to log in is useless.
+/// Only consulted in public mode — authenticated runs print no hint.
+fn public_hint_for(has_token: bool) -> corgea::precheck::PublicHint {
+    if has_token {
+        corgea::precheck::PublicHint::TokenWithheld
+    } else {
+        corgea::precheck::PublicHint::NoToken
+    }
+}
+
+/// A token enables authenticated (fail-closed) verdicts — but only against a
+/// vuln-api the token belongs to. That means neither a custom URL nor a
+/// non-production built-in default, unless the user explicitly opts in to
+/// sending the token there.
 fn select_verdict_mode(
     token: &str,
     custom_vuln_api_url: bool,
     send_token_to_custom: bool,
 ) -> corgea::precheck::VerdictMode {
-    if !token.is_empty() && (!custom_vuln_api_url || send_token_to_custom) {
+    let trusted_default = !custom_vuln_api_url && config::DEFAULT_VULN_API_URL_IS_PRODUCTION;
+    if !token.is_empty() && (trusted_default || send_token_to_custom) {
         corgea::precheck::VerdictMode::Authenticated {
             token: token.to_string(),
         }
@@ -798,12 +811,18 @@ mod tests {
     fn verdict_mode_selection_matrix() {
         use corgea::precheck::VerdictMode;
 
-        assert_eq!(
-            select_verdict_mode("token", false, false),
-            VerdictMode::Authenticated {
-                token: "token".to_string()
-            }
-        );
+        // Built-in default: authenticated only when that default is production.
+        let default_mode = select_verdict_mode("token", false, false);
+        if config::DEFAULT_VULN_API_URL_IS_PRODUCTION {
+            assert_eq!(
+                default_mode,
+                VerdictMode::Authenticated {
+                    token: "token".to_string()
+                }
+            );
+        } else {
+            assert_eq!(default_mode, VerdictMode::Public);
+        }
         assert_eq!(select_verdict_mode("", false, false), VerdictMode::Public);
         assert_eq!(
             select_verdict_mode("token", true, false),
@@ -815,5 +834,37 @@ mod tests {
                 token: "token".to_string()
             }
         );
+    }
+
+    /// A token reaches only an endpoint it belongs to. A custom vuln-api is
+    /// not one, so it stays public and says so — the withheld hint exists for
+    /// exactly that cohort. See COR-1549.
+    #[test]
+    fn withheld_token_selects_public_mode_and_withheld_hint() {
+        use corgea::precheck::{PublicHint, VerdictMode};
+
+        // token + custom URL + no opt-in
+        assert_eq!(
+            select_verdict_mode("token", true, false),
+            VerdictMode::Public
+        );
+        assert_eq!(public_hint_for(true), PublicHint::TokenWithheld);
+        // No token is a different situation with different advice.
+        assert_eq!(public_hint_for(false), PublicHint::NoToken);
+    }
+
+    /// The opt-in is what makes an otherwise untrusted endpoint eligible for
+    /// the token — and it never manufactures a token that does not exist.
+    #[test]
+    fn opt_in_enables_authenticated_for_untrusted_endpoints() {
+        use corgea::precheck::VerdictMode;
+
+        assert_eq!(
+            select_verdict_mode("token", true, true),
+            VerdictMode::Authenticated {
+                token: "token".to_string()
+            }
+        );
+        assert_eq!(select_verdict_mode("", true, true), VerdictMode::Public);
     }
 }
