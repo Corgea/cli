@@ -422,7 +422,10 @@ pub fn run(
         match corgea::deps::report::sbom(std::path::Path::new(".")) {
             Ok(doc) => {
                 let json = serde_json::to_string_pretty(&doc).expect("serialize SBOM");
-                fs::write(&sbom_file, json).expect("Failed to write SBOM file, check if the file path is valid and you have the necessary permissions to write to it.");
+                if let Err(e) = fs::write(&sbom_file, json) {
+                    log::error!("\n\nFailed to write SBOM to '{}': {}\n\n", sbom_file, e);
+                    std::process::exit(1);
+                }
                 println!("CycloneDX SBOM written to: {}\n", sbom_file);
             }
             Err(e) => {

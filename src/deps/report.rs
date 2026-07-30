@@ -106,27 +106,37 @@ fn severity_to_sarif(sev: crate::deps::model::Severity) -> &'static str {
     }
 }
 
+/// A version is resolved when it names a concrete release — not the `?`
+/// placeholder for lockfile-less manifests or an unsubstituted `${...}`
+/// Maven property. Unresolved versions (and the purls fabricated from
+/// them) must be omitted, or the document fails CycloneDX 1.7 validation.
+fn is_resolved_version(version: &str) -> bool {
+    version != "?" && !version.contains("${")
+}
+
 pub fn to_cyclonedx(inv: &Inventory) -> Value {
     let graph = &inv.graph;
-    let components: Vec<Value> = graph
-        .nodes
-        .iter()
-        .filter(|n| n.name() != "root")
-        .map(|n| {
-            json!({
-                "type": "library",
-                "bom-ref": n.id().0,
-                "name": n.name(),
-                "version": n.version(),
-                "purl": n.id().0,
-            })
-        })
-        .collect();
+    // Deduplicate by bom-ref: multi-module trees list the same package once
+    // per manifest, but the schema sets uniqueItems on components.
+    let mut components: std::collections::BTreeMap<&str, Value> = std::collections::BTreeMap::new();
+    for n in graph.nodes.iter().filter(|n| n.name() != "root") {
+        let mut c = json!({
+            "type": "library",
+            "bom-ref": n.id().0,
+            "name": n.name(),
+        });
+        if let Some(v) = n.version().filter(|v| is_resolved_version(v)) {
+            c["version"] = json!(v);
+            c["purl"] = json!(n.id().0);
+        }
+        components.entry(&n.id().0).or_insert(c);
+    }
+    let components: Vec<Value> = components.into_values().collect();
 
-    let mut depends_on: std::collections::BTreeMap<&str, Vec<&str>> =
+    let mut depends_on: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
         std::collections::BTreeMap::new();
     for e in &graph.edges {
-        depends_on.entry(&e.from.0).or_default().push(&e.to.0);
+        depends_on.entry(&e.from.0).or_default().insert(&e.to.0);
     }
     let deps: Vec<Value> = depends_on
         .iter()

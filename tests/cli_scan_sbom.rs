@@ -166,6 +166,34 @@ fn scan_sbom_custom_filename() {
     assert_eq!(bom["specVersion"], "1.7");
 }
 
+/// An unwritable `--sbom` path fails with a clean error and exit 1, not a panic.
+#[test]
+fn scan_sbom_unwritable_path_errors_cleanly() {
+    let base_url = spawn_scan_stub("scan-badpath");
+    let (mut cmd, _home) = corgea_isolated();
+    let project = TempDir::new().expect("project dir");
+    write_node_project(project.path());
+
+    cmd.current_dir(project.path())
+        .env("CORGEA_URL", &base_url)
+        .env("CORGEA_TOKEN", "test-token")
+        .args(["scan", "--sbom", "missing-dir/bom.json"]);
+
+    let output = cmd
+        .output()
+        .expect("run corgea scan --sbom missing-dir/bom.json");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "clean exit 1, not a panic (101)"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to write SBOM"),
+        "stderr should name the write failure, got:\n{stderr}"
+    );
+}
+
 /// Without `--sbom`, no bom file is produced anywhere in the project.
 #[test]
 fn scan_without_sbom_flag_writes_no_bom_file() {

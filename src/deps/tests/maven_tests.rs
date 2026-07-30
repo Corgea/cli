@@ -152,7 +152,35 @@ fn maven_property_version_resolves_in_cyclonedx_purl() {
         .any(|c| c["purl"] == "pkg:maven/com.google.guava/guava@32.1.3-jre"));
     assert!(components
         .iter()
-        .all(|c| !c["purl"].as_str().unwrap().contains("${guava.version}")));
+        .filter_map(|c| c["purl"].as_str())
+        .all(|p| !p.contains("${")));
+    // mystery-lib's ${undefined.version} never resolves: no version, no purl.
+    let mystery = components
+        .iter()
+        .find(|c| c["name"] == "mystery-lib")
+        .expect("mystery-lib component present");
+    assert!(mystery.get("version").is_none());
+    assert!(mystery.get("purl").is_none());
+}
+
+/// A child POM with no `<version>` of its own inherits the parent's, so
+/// `${project.version}` must resolve to the parent version.
+#[test]
+fn maven_project_version_inherits_from_parent() {
+    let inv = scan_fixture("java-maven-parent");
+    let n = inv.node("shared").expect("shared node missing");
+    assert_eq!(n.version(), Some("1.2.3"));
+    assert_eq!(*n.id(), PackageId("pkg:maven/com.acme/shared@1.2.3".into()));
+}
+
+/// CI-friendly versioning: `<version>${revision}</version>` resolves through
+/// `<properties>` before feeding `${project.version}`.
+#[test]
+fn maven_project_version_resolves_revision_property() {
+    let inv = scan_fixture("java-maven-revision");
+    let n = inv.node("core").expect("core node missing");
+    assert_eq!(n.version(), Some("2.0.0"));
+    assert_eq!(*n.id(), PackageId("pkg:maven/com.acme/core@2.0.0".into()));
 }
 
 #[test]

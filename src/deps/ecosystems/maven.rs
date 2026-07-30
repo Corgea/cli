@@ -135,7 +135,7 @@ fn parse_pom_properties(content: &str) -> std::collections::HashMap<String, Stri
             }
         }
     }
-    let project_version = pom_project_version(content);
+    let project_version = resolve_placeholders(&pom_project_version(content), &props);
     if !project_version.is_empty() && !project_version.contains("${") {
         props.insert("project.version".to_string(), project_version);
     }
@@ -143,13 +143,18 @@ fn parse_pom_properties(content: &str) -> std::collections::HashMap<String, Stri
 }
 
 /// The pom's own `<version>`: first `<version>` before `<dependencies>`,
-/// ignoring any `<parent>` block.
+/// excluding the `<parent>` block. A child that inherits its version has
+/// none of its own, so fall back to the parent's (Maven's inheritance rule).
 fn pom_project_version(content: &str) -> String {
     let head = content.split("<dependencies>").next().unwrap_or(content);
     if let (Some(ps), Some(pe)) = (head.find("<parent>"), head.find("</parent>")) {
         if ps < pe {
             let cleaned = format!("{}{}", &head[..ps], &head[pe + "</parent>".len()..]);
-            return extract_xml_tag(&cleaned, "version");
+            let own = extract_xml_tag(&cleaned, "version");
+            if !own.is_empty() {
+                return own;
+            }
+            return extract_xml_tag(&head[ps..pe], "version");
         }
     }
     extract_xml_tag(head, "version")
