@@ -46,12 +46,14 @@ pub fn warn_unsupported_ecosystems(detected: &[DetectedFile]) {
 }
 
 fn unsupported_ecosystem_label(ecosystem: Ecosystem) -> Option<&'static str> {
-    match ecosystem {
-        Ecosystem::Npm | Ecosystem::PyPI | Ecosystem::Maven => None,
-        Ecosystem::Go => Some("Go"),
-        Ecosystem::Cargo => Some("Cargo"),
-        Ecosystem::Unknown => Some("this ecosystem"),
+    if crate::deps::ecosystems::is_graphed(ecosystem) {
+        return None;
     }
+    Some(match ecosystem {
+        Ecosystem::Go => "Go",
+        Ecosystem::Cargo => "Cargo",
+        _ => "this ecosystem",
+    })
 }
 
 pub fn to_json(inv: &Inventory) -> Value {
