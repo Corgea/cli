@@ -5,6 +5,7 @@
 *.zip
 *.profraw
 node_modules/
+/vendor/
 /packages/*/vendor/
 
 .claude/

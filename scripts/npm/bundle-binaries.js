@@ -7,7 +7,7 @@ const { unzipSync } = require("fflate");
 
 const TARGETS = [
   { triple: "x86_64-unknown-linux-musl", binary: "corgea" },
-  { triple: "aarch64-unknown-linux-gnu", binary: "corgea" },
+  { triple: "aarch64-unknown-linux-musl", binary: "corgea" },
   { triple: "x86_64-apple-darwin", binary: "corgea" },
   { triple: "aarch64-apple-darwin", binary: "corgea" },
   { triple: "x86_64-pc-windows-msvc", binary: "corgea.exe" },

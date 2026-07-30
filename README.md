@@ -20,6 +20,11 @@ pip install corgea-cli
 ### Manual Installation
 You can get the latest binaries for your OS from https://github.com/Corgea/cli/releases.
 
+On Linux, both a `-gnu` and a `-musl` binary are published for x86_64 and
+aarch64. The `-gnu` builds run on glibc 2.17 and newer; the `-musl` builds are
+fully static and have no libc requirement at all, which makes them the safer
+pick for minimal containers and CI runners.
+
 ### Setup
 Once the binary is installed, login with your token from the Corgea app.
 ```
