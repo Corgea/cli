@@ -124,27 +124,31 @@ fn report_cyclonedx_has_metadata_and_serial_number() {
     assert_eq!(v["metadata"]["component"]["name"], "node-app");
 }
 
-/// Unresolved versions (`?` placeholder, `${...}` Maven properties) must not
-/// surface as a `version` or a fabricated purl — both fail 1.7 validation.
+/// Unresolved versions (empty, `?` placeholder, `${...}` Maven properties)
+/// must not surface as a `version` or a fabricated purl — both fail 1.7
+/// validation.
 #[test]
 fn report_cyclonedx_omits_unresolved_versions_and_purls() {
-    let unresolved = DependencyNode::new_npm("left-pad", "?");
-    let inv = inventory_with(vec![unresolved], vec![]);
-    let v = to_cyclonedx(&inv);
-    let c = &v["components"][0];
-    assert_eq!(c["name"], "left-pad");
-    assert!(
-        c.get("version").is_none(),
-        "unresolved version must be omitted"
-    );
-    assert!(
-        c.get("purl").is_none(),
-        "fabricated @? purl must be omitted"
-    );
-    assert_eq!(
-        c["bom-ref"], "pkg:npm/left-pad@?",
-        "bom-ref still identifies the node"
-    );
+    for bad_version in ["?", ""] {
+        let unresolved = DependencyNode::new_npm("left-pad", bad_version);
+        let inv = inventory_with(vec![unresolved], vec![]);
+        let v = to_cyclonedx(&inv);
+        let c = &v["components"][0];
+        assert_eq!(c["name"], "left-pad");
+        assert!(
+            c.get("version").is_none(),
+            "version {bad_version:?} must be omitted"
+        );
+        assert!(
+            c.get("purl").is_none(),
+            "purl fabricated from {bad_version:?} must be omitted"
+        );
+        assert_eq!(
+            c["bom-ref"].as_str().unwrap(),
+            format!("pkg:npm/left-pad@{bad_version}"),
+            "bom-ref still identifies the node"
+        );
+    }
 }
 
 /// Multi-module trees list the same package once per manifest; the schema

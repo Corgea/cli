@@ -108,12 +108,12 @@ fn severity_to_sarif(sev: crate::deps::model::Severity) -> &'static str {
     }
 }
 
-/// A version is resolved when it names a concrete release — not the `?`
-/// placeholder for lockfile-less manifests or an unsubstituted `${...}`
-/// Maven property. Unresolved versions (and the purls fabricated from
-/// them) must be omitted, or the document fails CycloneDX 1.7 validation.
+/// A version is resolved when it names a concrete release — not empty, not
+/// the `?` placeholder for lockfile-less manifests, not an unsubstituted
+/// `${...}` Maven property. Unresolved versions (and the purls fabricated
+/// from them) must be omitted, or the document fails CycloneDX 1.7 validation.
 fn is_resolved_version(version: &str) -> bool {
-    version != "?" && !version.contains("${")
+    !version.is_empty() && version != "?" && !version.contains("${")
 }
 
 pub fn to_cyclonedx(inv: &Inventory) -> Value {

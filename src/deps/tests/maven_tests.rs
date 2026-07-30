@@ -173,6 +173,45 @@ fn maven_project_version_inherits_from_parent() {
     assert_eq!(*n.id(), PackageId("pkg:maven/com.acme/shared@1.2.3".into()));
 }
 
+/// `<dependencyManagement>` entries pin versions but are not dependencies:
+/// they must not surface as nodes, and a versionless direct declaration
+/// takes its version from the managed entry.
+#[test]
+fn maven_dependency_management_pins_versions_without_emitting_nodes() {
+    let inv = scan_fixture("java-maven-managed");
+    let n = inv.node("guava").expect("guava node missing");
+    assert_eq!(n.version(), Some("32.1.3-jre"));
+    assert_eq!(
+        *n.id(),
+        PackageId("pkg:maven/com.google.guava/guava@32.1.3-jre".into())
+    );
+    assert!(
+        inv.node("junit-bom").is_none(),
+        "management-only entries must not become nodes"
+    );
+    assert_eq!(
+        inv.graph
+            .nodes
+            .iter()
+            .filter(|n| n.name() == "guava")
+            .count(),
+        1,
+        "managed + declared must collapse to one node"
+    );
+}
+
+/// Properties referencing other properties resolve to a fixed point.
+#[test]
+fn maven_chained_properties_resolve_to_fixed_point() {
+    let inv = scan_fixture("java-maven-chained");
+    let n = inv.node("guava").expect("guava node missing");
+    assert_eq!(n.version(), Some("2.5.0"));
+    assert_eq!(
+        *n.id(),
+        PackageId("pkg:maven/com.google.guava/guava@2.5.0".into())
+    );
+}
+
 /// CI-friendly versioning: `<version>${revision}</version>` resolves through
 /// `<properties>` before feeding `${project.version}`.
 #[test]

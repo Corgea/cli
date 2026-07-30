@@ -99,11 +99,38 @@ fn scan_maven_pom(ctx: &mut ScanContext<'_>, dir: &Path, pom_path: &Path) -> Res
 
 fn parse_pom_dependencies(content: &str) -> Result<Vec<MavenDep>, DepsError> {
     let props = parse_pom_properties(content);
-    let mut deps = parse_pom_regex(content);
+    let (rest, management) = split_dependency_management(content);
+    let managed: std::collections::HashMap<(String, String), String> = parse_pom_regex(management)
+        .into_iter()
+        .filter(|d| !d.version.is_empty())
+        .map(|d| ((d.group, d.artifact), d.version))
+        .collect();
+    let mut deps = parse_pom_regex(&rest);
     for dep in &mut deps {
+        if dep.version.is_empty() {
+            if let Some(v) = managed.get(&(dep.group.clone(), dep.artifact.clone())) {
+                dep.version = v.clone();
+            }
+        }
         dep.version = resolve_placeholders(&dep.version, &props);
     }
     Ok(deps)
+}
+
+/// Split out the `<dependencyManagement>` section: its entries pin versions
+/// for the project's dependencies but are not dependencies themselves.
+/// Returns (pom without the section, the section's inner content).
+fn split_dependency_management(content: &str) -> (String, &str) {
+    const OPEN: &str = "<dependencyManagement>";
+    const CLOSE: &str = "</dependencyManagement>";
+    if let (Some(s), Some(e)) = (content.find(OPEN), content.find(CLOSE)) {
+        if s < e {
+            let management = &content[s + OPEN.len()..e];
+            let rest = format!("{}{}", &content[..s], &content[e + CLOSE.len()..]);
+            return (rest, management);
+        }
+    }
+    (content.to_string(), "")
 }
 
 /// Collect `<properties>` entries plus the built-in `project.version`.
@@ -134,6 +161,18 @@ fn parse_pom_properties(content: &str) -> std::collections::HashMap<String, Stri
                 }
             }
         }
+    }
+    // Property values may reference other properties; resolve the map to a
+    // fixed point, bounded to guard against definition cycles.
+    for _ in 0..5 {
+        let resolved: std::collections::HashMap<String, String> = props
+            .iter()
+            .map(|(k, v)| (k.clone(), resolve_placeholders(v, &props)))
+            .collect();
+        if resolved == props {
+            break;
+        }
+        props = resolved;
     }
     let project_version = resolve_placeholders(&pom_project_version(content), &props);
     if !project_version.is_empty() && !project_version.contains("${") {
