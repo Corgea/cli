@@ -54,17 +54,22 @@ pub struct ScanUploadResult {
 
 /// Build the URL to the Corgea scan page so users can track results.
 pub fn build_scan_url(config: &Config, result: &ScanUploadResult) -> String {
+    build_scan_url_from_base(&config.get_url(), result)
+}
+
+/// Build the scan page URL from an explicit base URL. Split out from
+/// `build_scan_url` so the project-segment encoding contract can be unit
+/// tested without constructing a `Config`.
+fn build_scan_url_from_base(base_url: &str, result: &ScanUploadResult) -> String {
     match &result.project_id {
-        Some(pid) => format!(
-            "{}/project/{}/?scan_id={}",
-            config.get_url(),
-            pid,
-            result.scan_id
-        ),
+        Some(pid) => format!("{}/project/{}/?scan_id={}", base_url, pid, result.scan_id),
+        // The project name is a free-form path segment. In CI it is
+        // `{owner/repo}-{pr}`, so it must be percent-encoded or the `/`
+        // would route the tracking link to the wrong project.
         None => format!(
             "{}/project/{}?scan_id={}",
-            config.get_url(),
-            result.project_name,
+            base_url,
+            urlencoding::encode(&result.project_name),
             result.scan_id
         ),
     }
@@ -563,4 +568,36 @@ pub fn upload_scan(
         project_id,
         project_name: project.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(project_id: Option<&str>, project_name: &str) -> ScanUploadResult {
+        ScanUploadResult {
+            scan_id: "scan-123".to_string(),
+            project_id: project_id.map(|p| p.to_string()),
+            project_name: project_name.to_string(),
+        }
+    }
+
+    #[test]
+    fn scan_url_prefers_project_id_when_present() {
+        let url =
+            build_scan_url_from_base("https://www.corgea.app", &result(Some("42"), "some/name"));
+        assert_eq!(url, "https://www.corgea.app/project/42/?scan_id=scan-123");
+    }
+
+    #[test]
+    fn scan_url_percent_encodes_project_name_fallback() {
+        // CI project names are `{owner/repo}-{pr}`; the `/` must be encoded so
+        // the link resolves to the intended project rather than a nested path.
+        let url =
+            build_scan_url_from_base("https://www.corgea.app", &result(None, "corgea/cli-15"));
+        assert_eq!(
+            url,
+            "https://www.corgea.app/project/corgea%2Fcli-15?scan_id=scan-123"
+        );
+    }
 }
