@@ -5,7 +5,7 @@ use crate::deps::ecosystems::classify_constraint;
 use crate::deps::ecosystems::evaluate::{
     constraint_to_findings, dep001, file_in_dir, parent_dir, ScanContext,
 };
-use crate::deps::model::{DependencyNode, Ecosystem, PackageId, Scope, SourceType};
+use crate::deps::model::{DependencyEdge, DependencyNode, Ecosystem, PackageId, Scope, SourceType};
 use crate::deps::DepsError;
 
 pub fn scan_maven_projects(ctx: &mut ScanContext<'_>) -> Result<(), DepsError> {
@@ -68,6 +68,14 @@ fn scan_maven_pom(ctx: &mut ScanContext<'_>, dir: &Path, pom_path: &Path) -> Res
             Some(package_id.clone()),
             false,
         ));
+        ctx.graph.edges.push(DependencyEdge {
+            from: PackageId::root(),
+            to: package_id.clone(),
+            declared_constraint: declared.clone(),
+            resolved_version: Some(dep.version.clone()),
+            scope: dep.scope,
+            source_file: rel.clone(),
+        });
         ctx.graph.nodes.push(DependencyNode {
             id: package_id,
             name,
@@ -90,7 +98,86 @@ fn scan_maven_pom(ctx: &mut ScanContext<'_>, dir: &Path, pom_path: &Path) -> Res
 }
 
 fn parse_pom_dependencies(content: &str) -> Result<Vec<MavenDep>, DepsError> {
-    Ok(parse_pom_regex(content))
+    let props = parse_pom_properties(content);
+    let mut deps = parse_pom_regex(content);
+    for dep in &mut deps {
+        dep.version = resolve_placeholders(&dep.version, &props);
+    }
+    Ok(deps)
+}
+
+/// Collect `<properties>` entries plus the built-in `project.version`.
+fn parse_pom_properties(content: &str) -> std::collections::HashMap<String, String> {
+    let mut props = std::collections::HashMap::new();
+    if let Some(start) = content.find("<properties>") {
+        let rest = &content[start + "<properties>".len()..];
+        if let Some(end) = rest.find("</properties>") {
+            let mut block = &rest[..end];
+            while let Some(open_start) = block.find('<') {
+                let after = &block[open_start + 1..];
+                let Some(open_end) = after.find('>') else {
+                    break;
+                };
+                let tag = after[..open_end].trim();
+                let body = &after[open_end + 1..];
+                if tag.starts_with('/') || tag.starts_with('!') || tag.ends_with('/') {
+                    block = body;
+                    continue;
+                }
+                let close = format!("</{tag}>");
+                match body.find(&close) {
+                    Some(close_pos) => {
+                        props.insert(tag.to_string(), body[..close_pos].trim().to_string());
+                        block = &body[close_pos + close.len()..];
+                    }
+                    None => block = body,
+                }
+            }
+        }
+    }
+    let project_version = pom_project_version(content);
+    if !project_version.is_empty() && !project_version.contains("${") {
+        props.insert("project.version".to_string(), project_version);
+    }
+    props
+}
+
+/// The pom's own `<version>`: first `<version>` before `<dependencies>`,
+/// ignoring any `<parent>` block.
+fn pom_project_version(content: &str) -> String {
+    let head = content.split("<dependencies>").next().unwrap_or(content);
+    if let (Some(ps), Some(pe)) = (head.find("<parent>"), head.find("</parent>")) {
+        if ps < pe {
+            let cleaned = format!("{}{}", &head[..ps], &head[pe + "</parent>".len()..]);
+            return extract_xml_tag(&cleaned, "version");
+        }
+    }
+    extract_xml_tag(head, "version")
+}
+
+/// Substitute `${name}` placeholders; unresolved ones pass through unchanged.
+fn resolve_placeholders(raw: &str, props: &std::collections::HashMap<String, String>) -> String {
+    if !raw.contains("${") {
+        return raw.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let key = &after[..end];
+        match props.get(key) {
+            Some(v) => out.push_str(v),
+            None => out.push_str(&rest[start..start + 2 + end + 1]),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn parse_pom_regex(content: &str) -> Vec<MavenDep> {

@@ -71,11 +71,46 @@ fn dep004_report_values_remain_catalog_hydrated_and_dynamic() {
 #[test]
 fn report_cyclonedx_has_components_and_deps() {
     let inv = scan_fixture("node-app");
-    let v = to_cyclonedx(&inv.graph);
+    let v = to_cyclonedx(&inv);
     assert_eq!(v["bomFormat"], "CycloneDX");
+    assert_eq!(v["specVersion"], "1.7");
     let components = v["components"].as_array().expect("components array");
     assert!(components
         .iter()
         .any(|c| c["purl"] == "pkg:npm/express@4.18.2"));
+    assert!(components
+        .iter()
+        .all(|c| c["bom-ref"] == c["purl"] && c["bom-ref"] != "root"));
     assert!(v.get("dependencies").is_some());
+}
+
+#[test]
+fn report_cyclonedx_has_metadata_and_serial_number() {
+    let inv = scan_fixture("node-app");
+    let v = to_cyclonedx(&inv);
+    let serial = v["serialNumber"].as_str().expect("serialNumber");
+    assert!(serial.starts_with("urn:uuid:"));
+    assert!(v["metadata"]["timestamp"].as_str().is_some());
+    assert_eq!(v["metadata"]["tools"]["components"][0]["name"], "corgea");
+    assert_eq!(
+        v["metadata"]["tools"]["components"][0]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(v["metadata"]["component"]["type"], "application");
+    assert_eq!(v["metadata"]["component"]["name"], "node-app");
+}
+
+#[test]
+fn report_cyclonedx_groups_depends_on_per_ref() {
+    let inv = scan_fixture("node-app");
+    let v = to_cyclonedx(&inv);
+    let deps = v["dependencies"].as_array().expect("dependencies array");
+    let mut refs: Vec<&str> = deps.iter().filter_map(|d| d["ref"].as_str()).collect();
+    let total = refs.len();
+    refs.sort();
+    refs.dedup();
+    assert_eq!(refs.len(), total, "each ref appears exactly once");
+    assert!(deps
+        .iter()
+        .all(|d| d["dependsOn"].as_array().is_some_and(|a| !a.is_empty())));
 }

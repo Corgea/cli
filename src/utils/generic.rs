@@ -354,41 +354,32 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
+    // Git exports GIT_DIR/GIT_INDEX_FILE/etc. to hooks; scrub them so the
+    // test's git subprocesses operate on the temp repo even when the test
+    // suite itself runs inside a pre-commit hook.
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let mut cmd = Command::new("git");
+        for (name, _) in std::env::vars() {
+            if name.starts_with("GIT_") {
+                cmd.env_remove(name);
+            }
+        }
+        assert!(
+            cmd.args(args).current_dir(root).status().unwrap().success(),
+            "git {args:?} failed"
+        );
+    }
+
     #[test]
     fn get_repo_info_at_root_only_not_nested_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        assert!(Command::new("git")
-            .args(["init"])
-            .current_dir(root)
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(root)
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(root)
-            .status()
-            .unwrap()
-            .success());
+        git(root, &["init"]);
+        git(root, &["config", "user.email", "test@example.com"]);
+        git(root, &["config", "user.name", "Test"]);
         fs::write(root.join("README"), "hi").unwrap();
-        assert!(Command::new("git")
-            .args(["add", "README"])
-            .current_dir(root)
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(root)
-            .status()
-            .unwrap()
-            .success());
+        git(root, &["add", "README"]);
+        git(root, &["commit", "-m", "init"]);
 
         let root_s = root.to_str().unwrap();
         let nested = root.join("pkg").join("inner");
