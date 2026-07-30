@@ -55,9 +55,12 @@ corgea upload path/to/report.json              # JSON, SARIF, Coverity XML
 corgea upload path/to/report.fpr               # Fortify FPR
 corgea upload report.sarif --project-name svc  # Custom project name
 cat report.json | corgea upload                # From stdin
+corgea upload report.json --wait               # Wait for scan to complete and print results
 ```
 
 Supported: Semgrep JSON, SARIF, Checkmarx (CLI/Web/XML), Coverity, Fortify FPR.
+
+By default `upload` prints the scan page URL so you can track the results. Pass `--wait` to block until the scan completes and print the results (like `corgea scan`).
 
 ### Wait — `corgea wait [scan_id]`
 

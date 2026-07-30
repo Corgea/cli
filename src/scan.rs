@@ -49,6 +49,48 @@ pub fn run_command(base_cmd: &String, mut command: Command) -> String {
 pub struct ScanUploadResult {
     pub scan_id: String,
     pub project_id: Option<String>,
+    pub project_name: String,
+}
+
+/// Build the URL to the Corgea scan page so users can track results.
+pub fn build_scan_url(config: &Config, result: &ScanUploadResult) -> String {
+    build_scan_url_from_base(&config.get_url(), result)
+}
+
+/// Build the scan page URL from an explicit base URL. Split out from
+/// `build_scan_url` so the project-segment encoding contract can be unit
+/// tested without constructing a `Config`.
+fn build_scan_url_from_base(base_url: &str, result: &ScanUploadResult) -> String {
+    match &result.project_id {
+        Some(pid) => format!("{}/project/{}/?scan_id={}", base_url, pid, result.scan_id),
+        // The project name is a free-form path segment. In CI it is
+        // `{owner/repo}-{pr}`, so it must be percent-encoded or the `/`
+        // would route the tracking link to the wrong project.
+        None => format!(
+            "{}/project/{}?scan_id={}",
+            base_url,
+            urlencoding::encode(&result.project_name),
+            result.scan_id
+        ),
+    }
+}
+
+/// Print the scan page URL so the user can track the scan results without
+/// waiting for it to complete.
+pub fn print_scan_tracking_url(config: &Config, result: &ScanUploadResult) {
+    let scan_url = build_scan_url(config, result);
+    print!(
+        "\n\nScan has started with ID: {}.\n\nYou can view it populate at the link:\n{}\n\n",
+        result.scan_id,
+        utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
+    );
+    print!(
+        "{}",
+        utils::terminal::set_text_color(
+            "Your scan will continue securely in the Corgea cloud.\n",
+            utils::terminal::TerminalColor::Blue
+        )
+    );
 }
 
 pub fn run_semgrep(config: &Config, project_name: Option<String>) {
@@ -85,14 +127,21 @@ pub fn run_snyk(config: &Config, project_name: Option<String>) {
     }
 }
 
-pub fn read_stdin_report(config: &Config, project_name: Option<String>) {
+pub fn read_stdin_report(
+    config: &Config,
+    project_name: Option<String>,
+) -> Option<ScanUploadResult> {
     let mut input = String::new();
     let _ = io::stdin().read_to_string(&mut input);
 
-    let _ = parse_scan(config, input, false, project_name);
+    parse_scan(config, input, false, project_name)
 }
 
-pub fn read_file_report(config: &Config, file_path: &str, project_name: Option<String>) {
+pub fn read_file_report(
+    config: &Config,
+    file_path: &str,
+    project_name: Option<String>,
+) -> Option<ScanUploadResult> {
     let input = match std::fs::read_to_string(file_path) {
         Ok(input) => input,
         Err(e) => {
@@ -101,7 +150,7 @@ pub fn read_file_report(config: &Config, file_path: &str, project_name: Option<S
         }
     };
 
-    let _ = parse_scan(config, input, false, project_name);
+    parse_scan(config, input, false, project_name)
 }
 
 pub fn parse_scan(
@@ -517,5 +566,38 @@ pub fn upload_scan(
     sast_scan_id.map(|scan_id| ScanUploadResult {
         scan_id,
         project_id,
+        project_name: project.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(project_id: Option<&str>, project_name: &str) -> ScanUploadResult {
+        ScanUploadResult {
+            scan_id: "scan-123".to_string(),
+            project_id: project_id.map(|p| p.to_string()),
+            project_name: project_name.to_string(),
+        }
+    }
+
+    #[test]
+    fn scan_url_prefers_project_id_when_present() {
+        let url =
+            build_scan_url_from_base("https://www.corgea.app", &result(Some("42"), "some/name"));
+        assert_eq!(url, "https://www.corgea.app/project/42/?scan_id=scan-123");
+    }
+
+    #[test]
+    fn scan_url_percent_encodes_project_name_fallback() {
+        // CI project names are `{owner/repo}-{pr}`; the `/` must be encoded so
+        // the link resolves to the intended project rather than a nested path.
+        let url =
+            build_scan_url_from_base("https://www.corgea.app", &result(None, "corgea/cli-15"));
+        assert_eq!(
+            url,
+            "https://www.corgea.app/project/corgea%2Fcli-15?scan_id=scan-123"
+        );
+    }
 }

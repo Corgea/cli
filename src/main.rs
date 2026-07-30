@@ -65,6 +65,12 @@ enum Commands {
             help = "The name of the Corgea project. Defaults to git repository name if found, otherwise to the current directory name."
         )]
         project_name: Option<String>,
+
+        #[arg(
+            long,
+            help = "Wait for the uploaded scan to complete and print the results. Without this flag, the command prints the scan page URL so you can track the results."
+        )]
+        wait: bool,
     },
     /// Scan the current directory. Supports blast, semgrep and snyk.
     Scan {
@@ -516,18 +522,25 @@ fn main() {
         Some(Commands::Upload {
             report,
             project_name,
+            wait,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
-            match report {
+            let result = match report {
                 Some(report) => {
                     if report.ends_with(".fpr") {
-                        fortify_parse(&corgea_config, report, project_name.clone());
+                        fortify_parse(&corgea_config, report, project_name.clone())
                     } else {
-                        scan::read_file_report(&corgea_config, report, project_name.clone());
+                        scan::read_file_report(&corgea_config, report, project_name.clone())
                     }
                 }
-                None => {
-                    scan::read_stdin_report(&corgea_config, project_name.clone());
+                None => scan::read_stdin_report(&corgea_config, project_name.clone()),
+            };
+
+            if let Some(result) = result {
+                if *wait {
+                    wait::run(&corgea_config, Some(result.scan_id), result.project_id);
+                } else {
+                    scan::print_scan_tracking_url(&corgea_config, &result);
                 }
             }
         }
