@@ -7,6 +7,9 @@ on:
       - master
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   rust-tests:
     runs-on: ubuntu-latest
@@ -14,6 +17,24 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Select private fixture coverage
+        id: fixtures
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "pull_request" ]] &&
+             { [[ "$HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]] || [[ "$ACTOR" == "dependabot[bot]" ]]; }; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping private test-cli fixtures for a fork or Dependabot pull request."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -31,3 +52,90 @@ jobs:
 
       - name: CI gate
         run: ./harness ci
+
+      - name: Build CLI for fixture smoke
+        if: steps.fixtures.outputs.run == 'true'
+        run: cargo build --locked --bin corgea
+
+      - name: Resolve test-cli revision
+        id: test_cli
+        if: steps.fixtures.outputs.run == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TEST_CLI_TOKEN }}
+          HEAD_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::TEST_CLI_TOKEN is required for trusted CLI builds."
+            exit 1
+          fi
+
+          resolve_branch() {
+            local branch="$1"
+            local encoded response status sha
+            encoded="$(jq -rn --arg branch "$branch" '$branch | @uri')"
+            response="$(mktemp)"
+            status="$(curl --silent --show-error --location \
+              --connect-timeout 10 --max-time 30 \
+              --output "$response" --write-out '%{http_code}' \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/Corgea/test-cli/branches/$encoded")"
+
+            case "$status" in
+              200)
+                if ! sha="$(jq -er '.commit.sha' "$response")"; then
+                  rm -f "$response"
+                  echo "::error::Corgea/test-cli branch '$branch' returned no commit SHA." >&2
+                  return 1
+                fi
+                rm -f "$response"
+                printf '%s' "$sha"
+                ;;
+              404)
+                rm -f "$response"
+                return 4
+                ;;
+              *)
+                rm -f "$response"
+                echo "::error::Failed to resolve Corgea/test-cli branch '$branch' (HTTP $status)." >&2
+                return 1
+                ;;
+            esac
+          }
+
+          branch="$HEAD_BRANCH"
+          if sha="$(resolve_branch "$branch")"; then
+            :
+          else
+            status=$?
+            if [[ "$status" -ne 4 || "$branch" == "main" ]]; then
+              exit "$status"
+            fi
+            echo "No matching test-cli branch '$branch'; falling back to main."
+            branch=main
+            sha="$(resolve_branch "$branch")"
+          fi
+
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Using Corgea/test-cli@$sha ($branch)."
+
+      - name: Checkout test-cli (${{ steps.test_cli.outputs.branch }})
+        if: steps.fixtures.outputs.run == 'true'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: Corgea/test-cli
+          ref: ${{ steps.test_cli.outputs.sha }}
+          token: ${{ secrets.TEST_CLI_TOKEN }}
+          path: test-cli
+          persist-credentials: false
+
+      - name: Validate CLI repository fixtures
+        if: steps.fixtures.outputs.run == 'true'
+        env:
+          CORGEA_BIN: ${{ github.workspace }}/target/debug/corgea
+        run: ./test-cli/scripts/validate-fixtures.sh
