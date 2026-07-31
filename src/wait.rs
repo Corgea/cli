@@ -8,7 +8,7 @@ pub struct WaitArgs {
     pub scan_id: Option<String>,
     pub selector: ProjectSelector,
     /// Known project id — `--project-id`, or straight from an upload response.
-    /// Paired with a scan id it skips resolution entirely.
+    /// Clap requires it to be paired with a scan id.
     pub project_id: Option<String>,
 }
 
@@ -18,10 +18,10 @@ pub fn run(config: &Config, args: WaitArgs) {
         selector,
         project_id,
     } = args;
-    // A scan id plus the project id from the upload response leaves nothing to
-    // resolve: everything below keys off the scan, and the id-form URL is
-    // already known.
-    let resolved = if scan_id.is_some() && project_id.is_some() {
+    // A scan id alone leaves nothing to resolve: everything below keys off
+    // the scan, and `blast::check_scan_status`/`report_scan_status` fetch by
+    // scan id regardless of whether the project id came along too.
+    let resolved = if scan_id.is_some() {
         let name = selector
             .name
             .clone()
@@ -81,7 +81,7 @@ pub fn run(config: &Config, args: WaitArgs) {
                     );
                 } else {
                     log::error!(
-                        "No scan to wait for: no Corgea project found for {}. Run 'corgea scan', or pass --scan-id / --project-name.",
+                        "No scans found for {}. Run 'corgea scan', or pass --scan-id.",
                         resolved.tried_label
                     );
                 }
@@ -93,9 +93,9 @@ pub fn run(config: &Config, args: WaitArgs) {
     let scan_url = match &project_id {
         Some(pid) => format!("{}/project/{}/?scan_id={}", config.get_url(), pid, scan_id),
         None => {
-            // The web route is `project/<id_or_name>/`, so the canonical name
-            // works — but an empty or slash-only one would yield `/project//`,
-            // which resolves nowhere.
+            // The project name is a free-form path segment (canonical names
+            // contain `/`, e.g. `bohappdev/dotnet-azure-web-tsb`), so it must
+            // be percent-encoded — see `build_scan_url_from_base` in scan.rs.
             let name = project_name.trim().trim_matches('/');
             if name.is_empty() {
                 log::error!(
@@ -103,7 +103,12 @@ pub fn run(config: &Config, args: WaitArgs) {
                 );
                 std::process::exit(1);
             }
-            format!("{}/project/{}?scan_id={}", config.get_url(), name, scan_id)
+            format!(
+                "{}/project/{}?scan_id={}",
+                config.get_url(),
+                urlencoding::encode(name),
+                scan_id
+            )
         }
     };
 

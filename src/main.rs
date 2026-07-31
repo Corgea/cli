@@ -584,7 +584,14 @@ fn main() {
 
             if let Some(result) = result {
                 if *wait {
-                    wait::run(&corgea_config, Some(result.scan_id), result.project_id);
+                    wait::run(
+                        &corgea_config,
+                        wait::WaitArgs {
+                            scan_id: Some(result.scan_id),
+                            project_id: result.project_id,
+                            ..Default::default()
+                        },
+                    );
                 } else {
                     scan::print_scan_tracking_url(&corgea_config, &result);
                 }
