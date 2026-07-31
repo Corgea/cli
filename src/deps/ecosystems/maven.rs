@@ -105,6 +105,7 @@ fn parse_pom_dependencies(content: &str) -> Result<Vec<MavenDep>, DepsError> {
         .filter(|d| !d.version.is_empty())
         .map(|d| ((d.group, d.artifact), d.version))
         .collect();
+    let rest = strip_sections(rest, &["profiles", "build"]);
     let mut deps = parse_pom_regex(&rest);
     for dep in &mut deps {
         if dep.version.is_empty() {
@@ -115,6 +116,17 @@ fn parse_pom_dependencies(content: &str) -> Result<Vec<MavenDep>, DepsError> {
         dep.version = resolve_placeholders(&dep.version, &props);
     }
     Ok(deps)
+}
+
+/// Remove every `<tag>...</tag>` section; their contents (plugin and
+/// profile dependency blocks) are not application dependencies.
+fn strip_sections(mut content: String, tags: &[&str]) -> String {
+    for tag in tags {
+        while let Some((rest, _)) = split_section(&content, tag) {
+            content = rest;
+        }
+    }
+    content
 }
 
 /// Split out the `<dependencyManagement>` section: its entries pin versions
@@ -182,10 +194,11 @@ fn parse_pom_properties(content: &str) -> std::collections::HashMap<String, Stri
     props
 }
 
-/// Resolve `${...}` references among property values to a fixed point,
-/// bounded to guard against definition cycles.
+/// Resolve `${...}` references among property values to a fixed point. A
+/// resolution chain can't be longer than the number of properties without
+/// a cycle, so bound the iteration count by the map size.
 fn resolve_props_fixed_point(props: &mut std::collections::HashMap<String, String>) {
-    for _ in 0..5 {
+    for _ in 0..=props.len() {
         let resolved: std::collections::HashMap<String, String> = props
             .iter()
             .map(|(k, v)| (k.clone(), resolve_placeholders(v, props)))

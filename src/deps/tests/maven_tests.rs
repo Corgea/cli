@@ -268,6 +268,35 @@ fn maven_cyclonedx_dependencies_refs_resolve_to_components() {
     }
 }
 
+/// Plugin dependencies (`<build><plugins><plugin><dependencies>`) and
+/// profile dependencies (`<profiles><profile><dependencies>`) are not
+/// application dependencies and must not appear in the graph.
+#[test]
+fn maven_plugin_and_profile_deps_are_excluded() {
+    let inv = scan_fixture("java-maven-plugin-deps");
+    let n = inv.node("guava").expect("guava node missing");
+    assert_eq!(
+        *n.id(),
+        PackageId("pkg:maven/com.google.guava/guava@32.1.3-jre".into())
+    );
+    for name in ["ant", "maven-antrun-plugin", "commons-io"] {
+        assert!(
+            inv.node(name).is_none(),
+            "{name} must not be an application dependency"
+        );
+    }
+}
+
+/// The property fixed-point resolution must handle chains deeper than the
+/// old hardcoded cap of 5 iterations.
+#[test]
+fn maven_deep_property_chain_resolves_fully() {
+    let inv = scan_fixture("java-maven-deep-chain");
+    let n = inv.node("deep").expect("deep node missing");
+    assert_eq!(n.version(), Some("3.3.3"));
+    assert_eq!(*n.id(), PackageId("pkg:maven/com.acme/deep@3.3.3".into()));
+}
+
 #[test]
 fn maven_snapshot_is_dep021_high() {
     let inv = scan_fixture("java-maven");
