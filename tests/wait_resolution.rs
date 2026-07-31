@@ -60,9 +60,9 @@ fn wait_uses_the_canonical_project_from_the_repo() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // The web route is `project/<id_or_name>/`, so the canonical name links.
+    // The name is a free-form path segment and must be percent-encoded.
     assert!(
-        stdout.contains("/project/bohappdev/dotnet-azure-web-tsb?scan_id=scan-123"),
+        stdout.contains("/project/bohappdev%2Fdotnet-azure-web-tsb?scan_id=scan-123"),
         "stdout: {stdout}"
     );
     let hits = hits.lock().unwrap();
@@ -141,6 +141,45 @@ fn wait_with_scan_id_does_not_list_scans() {
     assert!(
         !hits.iter().any(|h| h.starts_with("/api/v1/scans")),
         "no scan listing with a scan id; hits: {hits:?}"
+    );
+}
+
+#[test]
+fn wait_with_scan_id_survives_resolver_failure() {
+    // `/projects` hard-fails (HTTP 500) but a scan id alone leaves nothing to
+    // resolve, so `resolve_project_or_exit` must never be called on this path
+    // — the scan-status fetch (keyed by scan id) still succeeds.
+    let (url, hits) = common::spawn_recording_http_stub(|path| {
+        if path.starts_with("/api/v1/verify") {
+            ("200 OK", r#"{"status":"ok"}"#.to_string())
+        } else if path.starts_with("/api/v1/projects") {
+            ("500 Internal Server Error", "".to_string())
+        } else if path.starts_with("/api/v1/scan/") {
+            if path.contains("/issues") {
+                (
+                    "200 OK",
+                    r#"{"status":"ok","page":1,"total_pages":1,"total_issues":0,"issues":[]}"#
+                        .to_string(),
+                )
+            } else {
+                ("200 OK", r#"{"id":"scan-123","project":"bohappdev/dotnet-azure-web-tsb","repo":"https://github.com/bohappdev/dotnet-azure-web-tsb","branch":"main","status":"complete","engine":"blast","created_at":"2026-01-01T00:00:00Z"}"#.to_string())
+            }
+        } else {
+            ("404 Not Found", NOT_FOUND_JSON.to_string())
+        }
+    });
+    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    let out = run_wait(&["scan-123"], &url, &repo);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        !hits.iter().any(|h| h.starts_with("/api/v1/projects")),
+        "a scan id alone must not resolve via /projects; hits: {hits:?}"
     );
 }
 
