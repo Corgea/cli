@@ -579,10 +579,10 @@ fn main() {
                 if *wait {
                     wait::run(
                         &corgea_config,
-                        Some(result.scan_id),
+                        Some(result.scan_id.clone()),
+                        Some(result.project_name.clone()),
                         None,
-                        None,
-                        result.project_id,
+                        result.project_id.clone(),
                     );
                 } else {
                     scan::print_scan_tracking_url(&corgea_config, &result);
