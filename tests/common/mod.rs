@@ -44,7 +44,21 @@ pub fn corgea_isolated() -> (Command, TempDir) {
         .env_remove("CURSOR_AGENT")
         .env_remove("CURSOR_TRACE_ID")
         .env_remove("GEMINI_CLI")
-        .env_remove("PI_AGENT");
+        .env_remove("PI_AGENT")
+        .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("GITHUB_REPOSITORY")
+        .env_remove("GITHUB_PR")
+        .env_remove("REPO_DATA")
+        .env_remove("DEBUG_CORGEA_OVERRIDE_REPORT_CHUNK_SIZE")
+        .env_remove("RUST_LOG")
+        .env_remove("CORGEA_DEBUG")
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("ALL_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("all_proxy");
     (cmd, home)
 }
 
