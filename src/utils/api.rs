@@ -963,6 +963,17 @@ impl ScanErrorSummary {
     }
 }
 
+/// Reads a missing field, an explicit `null`, and a list all as a list.
+///
+/// `#[serde(default)]` alone only covers the missing case, and the API sends
+/// `"scan_errors": null` for scans with nothing to report.
+fn scan_errors_or_empty<'de, D>(deserializer: D) -> Result<Vec<ScanErrorSummary>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<ScanErrorSummary>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ScanResponse {
     pub id: String,
@@ -982,7 +993,11 @@ pub struct ScanResponse {
     /// Per-scanner problems, present on completed scans too, where they mean a
     /// scanner's results are missing. Skipped when empty, since the scan list
     /// never carries them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "scan_errors_or_empty",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub scan_errors: Vec<ScanErrorSummary>,
 }
 

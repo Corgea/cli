@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::scan::build_scan_url;
 use crate::scanners::blast;
 use crate::utils;
 
@@ -52,15 +53,12 @@ pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>)
     // never matched and finished scans were polled again.
     let state = blast::classify_scan_status(&scan.status);
 
-    let scan_url = match &project_id {
-        Some(pid) => format!("{}/project/{}/?scan_id={}", config.get_url(), pid, scan_id),
-        None => format!(
-            "{}/project/{}?scan_id={}",
-            config.get_url(),
-            project_name,
-            scan_id
-        ),
-    };
+    let scan_url = build_scan_url(
+        &config.get_url(),
+        project_id.as_deref(),
+        &project_name,
+        &scan_id,
+    );
 
     match state {
         blast::ScanState::Running => {

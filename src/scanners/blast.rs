@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::scan::build_scan_url;
 use crate::targets;
 use crate::utils;
 use crate::utils::api::SCAIssue;
@@ -239,15 +240,12 @@ pub fn run(
     };
 
     let scan_id = upload_result.scan_id;
-    let scan_url = match &upload_result.project_id {
-        Some(pid) => format!("{}/project/{}/?scan_id={}", config.get_url(), pid, scan_id),
-        None => format!(
-            "{}/project/{}?scan_id={}",
-            config.get_url(),
-            project_name,
-            scan_id
-        ),
-    };
+    let scan_url = build_scan_url(
+        &config.get_url(),
+        upload_result.project_id.as_deref(),
+        &project_name,
+        &scan_id,
+    );
 
     let _ = utils::generic::delete_directory(&temp_dir);
     print!(
@@ -581,27 +579,28 @@ pub fn classify_scan_status(status: &str) -> ScanState {
     }
 }
 
-/// Upper bound on polling, overridable with `SCAN_TIMEOUT_ENV`.
+/// Upper bound on polling, from the raw `SCAN_TIMEOUT_ENV` value.
 ///
 /// A scan that never reaches a terminal state (dropped worker, superseded scan)
 /// would otherwise burn a CI job's whole time budget. The default sits far
-/// above any real scan.
-fn scan_poll_timeout() -> Duration {
+/// above any real scan. Takes the raw value rather than reading the environment
+/// so the override can be tested without mutating the process.
+fn parse_poll_timeout(raw: Option<&str>) -> Duration {
     const DEFAULT_SECONDS: u64 = 4 * 60 * 60;
-    let seconds = match env::var(SCAN_TIMEOUT_ENV) {
-        Ok(raw) => match raw.trim().parse::<u64>() {
+    let seconds = match raw {
+        Some(raw) => match raw.trim().parse::<u64>() {
             Ok(seconds) if seconds > 0 => seconds,
             _ => {
                 log::warn!(
-                    "Ignoring {}='{}': expected a positive whole number of seconds. Waiting up to {}s instead.",
+                    "Ignoring {}='{}': expected a positive whole number of seconds. Waiting up to {} hours instead.",
                     SCAN_TIMEOUT_ENV,
                     raw,
-                    DEFAULT_SECONDS
+                    DEFAULT_SECONDS / 3600
                 );
                 DEFAULT_SECONDS
             }
         },
-        Err(_) => DEFAULT_SECONDS,
+        None => DEFAULT_SECONDS,
     };
     Duration::from_secs(seconds)
 }
@@ -706,7 +705,7 @@ pub fn wait_for_scan(config: &Config, scan_id: &str) {
         );
     });
 
-    let timeout = scan_poll_timeout();
+    let timeout = parse_poll_timeout(env::var(SCAN_TIMEOUT_ENV).ok().as_deref());
     let started_at = Instant::now();
 
     let result = loop {
@@ -1087,6 +1086,20 @@ mod tests {
     }
 
     #[test]
+    fn poll_timeout_rejects_overrides_that_are_not_a_positive_number() {
+        // A bad value must not shorten or disable the wait: anything that is
+        // not a positive count of seconds falls back to the default.
+        let default = Duration::from_secs(4 * 60 * 60);
+        assert_eq!(parse_poll_timeout(None), default);
+        assert_eq!(parse_poll_timeout(Some("")), default);
+        assert_eq!(parse_poll_timeout(Some("abc")), default);
+        assert_eq!(parse_poll_timeout(Some("0")), default);
+        assert_eq!(parse_poll_timeout(Some("-30")), default);
+        assert_eq!(parse_poll_timeout(Some("1.5")), default);
+        assert_eq!(parse_poll_timeout(Some(" 90 ")), Duration::from_secs(90));
+    }
+
+    #[test]
     fn scan_failure_reports_reason_and_errors() {
         let scan = scan_with(
             "incomplete",
@@ -1247,5 +1260,28 @@ mod tests {
         let round_tripped = serde_json::to_string(&scan).unwrap();
         assert!(!round_tripped.contains("scan_errors"));
         assert!(!round_tripped.contains("failed_reason"));
+    }
+
+    #[test]
+    fn scan_response_deserializes_null_scan_errors() {
+        // The API sends `"scan_errors": null` when there is nothing to report,
+        // including on failed scans, where a parse error would hide the reason.
+        let json = r#"{
+            "id": "abc",
+            "project": "p",
+            "repo": null,
+            "branch": "main",
+            "status": "incomplete",
+            "engine": "corgea-blast",
+            "created_at": "2026-01-01T00:00:00Z",
+            "failed_reason": "the scanner ran out of memory",
+            "scan_errors": null
+        }"#;
+
+        let scan: utils::api::ScanResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(classify_scan_status(&scan.status), ScanState::Failed);
+        assert!(scan.scan_errors.is_empty());
+        assert!(format_scan_failure(&scan).contains("the scanner ran out of memory"));
     }
 }

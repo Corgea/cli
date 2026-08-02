@@ -24,12 +24,18 @@ fn scan_json(status: &str, failed_reason: &str, scan_errors: &str) -> String {
     } else {
         format!("\"{}\"", failed_reason)
     };
+    // The API sends `null`, not `[]`, when a scan has no problems to report.
+    let errors = if scan_errors.is_empty() {
+        String::from("null")
+    } else {
+        format!("[{}]", scan_errors)
+    };
     format!(
         r#"{{"id":"{SCAN_ID}","project":"proj","repo":null,"branch":"main",
            "status":"{status}","engine":"corgea-blast",
            "created_at":"2026-08-01T15:16:31Z","time_taken":480,
            "git_sha":"abc123","metadata":null,
-           "failed_reason":{reason},"scan_errors":[{scan_errors}]}}"#
+           "failed_reason":{reason},"scan_errors":{errors}}}"#
     )
 }
 
@@ -128,6 +134,26 @@ fn wait_on_already_failed_scan_exits_nonzero() {
     assert!(
         !output.contains("Scan Completed Successfully"),
         "a failed scan must never print the success banner: {output}"
+    );
+}
+
+#[test]
+fn failed_scan_without_scanner_errors_still_reports_the_reason() {
+    // A failed scan with nothing per-scanner to report carries
+    // `"scan_errors": null`. Rejecting that shape while parsing would turn the
+    // failure into a generic read error and lose the reason entirely.
+    let url = spawn_scan_api(&["incomplete"], "The scan worker ran out of memory.", "");
+
+    let (code, output) = run_wait(&url, &[]);
+
+    assert_eq!(
+        code,
+        Some(1),
+        "a failed scan must fail the command: {output}"
+    );
+    assert!(
+        output.contains("The scan worker ran out of memory."),
+        "failure reason must reach the user: {output}"
     );
 }
 
