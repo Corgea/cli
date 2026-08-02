@@ -37,6 +37,8 @@ corgea scan --fail-on malicious                # Exit 1 if any dependency is cla
 corgea scan --fail-on HI,malicious             # Comma-separated conditions combine
 corgea scan --fail                             # Exit 1 based on project blocking rules
 corgea scan --out-format json --out-file r.json   # Export (json, html, sarif, markdown)
+corgea scan --sbom                             # Also write a CycloneDX SBOM to bom.json
+corgea scan --sbom sbom.cdx.json               # SBOM to a custom file
 corgea scan --project-name my-service          # Override project name
 ```
 
@@ -372,6 +374,7 @@ corgea upload report.json --project-name my-app
 ```bash
 corgea scan --out-format html --out-file report.html
 corgea scan --out-format sarif --out-file report.sarif
+corgea scan --out-format sarif --out-file report.sarif --sbom bom.json  # SARIF + CycloneDX SBOM
 ```
 
 ## Severity Levels

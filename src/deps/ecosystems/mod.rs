@@ -10,6 +10,16 @@ pub fn scan_all(ctx: &mut ScanContext<'_>) -> Result<(), DepsError> {
     evaluate::scan_all(ctx)
 }
 
+/// Whether `scan_all` builds graph nodes for this ecosystem. Keep in sync
+/// with the scanners wired in `evaluate::scan_all` — detect-only ecosystems
+/// (Go, Cargo) are found on disk but contribute nothing to the graph or SBOM.
+pub fn is_graphed(ecosystem: Ecosystem) -> bool {
+    matches!(
+        ecosystem,
+        Ecosystem::Npm | Ecosystem::PyPI | Ecosystem::Maven
+    )
+}
+
 use crate::deps::model::{ConstraintKind, Ecosystem};
 
 /// Classify a raw declared constraint string.
