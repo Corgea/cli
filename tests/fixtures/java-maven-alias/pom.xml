@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.acme</groupId>
+  <artifactId>app</artifactId>
+  <version>1.2.3</version>
+
+  <properties>
+    <shared.version>${project.version}</shared.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>shared</artifactId>
+      <version>${shared.version}</version>
+    </dependency>
+  </dependencies>
+</project>

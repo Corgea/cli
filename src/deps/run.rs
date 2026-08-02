@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use crate::deps::findings::Finding;
 use crate::deps::model::{DependencyNode, Severity};
 use crate::deps::policy::Policy;
-use crate::deps::report::{graph_nodes_json, table_output, to_cyclonedx, to_json, to_sarif};
+use crate::deps::report::{graph_nodes_json, table_output, to_json, to_sarif};
 use crate::deps::{scan, DepsError};
 
 #[derive(Subcommand, Debug, Clone)]
@@ -236,13 +236,10 @@ fn run_inner(sub: DepsSubcommand) -> Result<u8, DepsError> {
             Ok(0)
         }
         DepsSubcommand::Sbom { format, path, out } => {
-            let root = Path::new(&path);
-            let policy = load_policy(root)?;
-            let inv = scan(root, &policy)?;
             if format != "cyclonedx" {
                 return Err(DepsError(format!("unsupported SBOM format: {format}")));
             }
-            let sbom = to_cyclonedx(&inv.graph).to_string();
+            let sbom = crate::deps::report::sbom(Path::new(&path))?.to_string();
             if let Some(out_path) = out {
                 std::fs::write(&out_path, sbom)
                     .map_err(|e| DepsError(format!("write sbom: {e}")))?;
@@ -728,7 +725,7 @@ fn shell_word(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn load_policy(root: &Path) -> Result<Policy, DepsError> {
+pub(crate) fn load_policy(root: &Path) -> Result<Policy, DepsError> {
     let policy_path = root.join(".corgea").join("deps.yml");
     if !policy_path.exists() {
         return Ok(Policy::default());

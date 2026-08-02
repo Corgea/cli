@@ -413,22 +413,20 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
-    /// `git <args>` in `dir`. Scrubs the GIT_* env a parent git process
-    /// injects (e.g. when these tests run from a pre-commit hook): an
-    /// inherited GIT_DIR would point `git init` at the developer's repo
-    /// instead of `dir`. Same scrub as `tests/cli_deps.rs::run_git`.
-    fn git(dir: &Path, args: &[&str]) {
-        assert!(Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_COMMON_DIR")
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_PREFIX")
-            .status()
-            .unwrap()
-            .success());
+    // Git exports GIT_DIR/GIT_INDEX_FILE/etc. to hooks; scrub them so the
+    // test's git subprocesses operate on the temp repo even when the test
+    // suite itself runs inside a pre-commit hook.
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let mut cmd = Command::new("git");
+        for (name, _) in std::env::vars() {
+            if name.starts_with("GIT_") {
+                cmd.env_remove(name);
+            }
+        }
+        assert!(
+            cmd.args(args).current_dir(root).status().unwrap().success(),
+            "git {args:?} failed"
+        );
     }
 
     #[test]

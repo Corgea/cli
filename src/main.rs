@@ -145,6 +145,15 @@ enum Commands {
             help = "The name of the Corgea project. Defaults to git repository name if found, otherwise to the current directory name."
         )]
         project_name: Option<String>,
+
+        #[arg(
+            long,
+            value_name = "FILE",
+            num_args = 0..=1,
+            default_missing_value = "bom.json",
+            help = "Generate a CycloneDX SBOM of the project after the scan completes, alongside any report. Optionally specify the output file. Defaults to bom.json."
+        )]
+        sbom: Option<String>,
     },
     /// Wait for the latest in progress scan
     Wait {
@@ -602,6 +611,7 @@ fn main() {
             target,
             exclude,
             project_name,
+            sbom,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             if let Some(level) = fail_on {
@@ -702,6 +712,11 @@ fn main() {
                 std::process::exit(1);
             }
 
+            if sbom.is_some() && *scanner != Scanner::Blast {
+                ::log::error!("sbom is only supported with blast scanner.");
+                std::process::exit(1);
+            }
+
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config, project_name.clone()),
                 Scanner::Semgrep => scan::run_semgrep(&corgea_config, project_name.clone()),
@@ -718,6 +733,7 @@ fn main() {
                     target.clone(),
                     exclude.clone(),
                     project_name.clone(),
+                    sbom.clone(),
                 ),
             }
         }
