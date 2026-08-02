@@ -587,9 +587,12 @@ fn main() {
                     wait::run(
                         &corgea_config,
                         wait::WaitArgs {
-                            scan_id: Some(result.scan_id),
-                            project_id: result.project_id,
-                            ..Default::default()
+                            scan_id: Some(result.scan_id.clone()),
+                            selector: utils::api::ProjectSelector {
+                                name: Some(result.project_name.clone()),
+                                ..Default::default()
+                            },
+                            project_id: result.project_id.clone(),
                         },
                     );
                 } else {

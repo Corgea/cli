@@ -273,3 +273,73 @@ fn scan_post_wait_uses_upload_project_id_without_resolving() {
         "an upload that carried the id must resolve nothing; hits: {hits:?}"
     );
 }
+
+/// `corgea upload --wait` when the upload response carries no `project_id`:
+/// the scan-id shortcut must link the name the upload itself used (the
+/// sanitized `--project-name` override), not a name recomputed from the
+/// checkout — which here is a different basename and, pre-fix, would also
+/// skip the override entirely since `wait::run` was called with `None`.
+#[cfg(unix)]
+#[test]
+fn upload_wait_without_project_id_uses_uploaded_name() {
+    // The upload endpoints are this test's own; everything else rides Routes.
+    let routes = Routes {
+        scan: Some(r#"{"id":"scan-123","project":"foo_bar","repo":null,"branch":"main","status":"complete","engine":"blast","created_at":"2026-01-01T00:00:00Z"}"#.to_string()),
+        scan_issues: Some(common::scan_issues_empty()),
+        ..Default::default()
+    };
+    let (url, hits) = common::spawn_recording_http_stub(move |path| {
+        if path.starts_with("/api/v1/code-upload") || path.starts_with("/api/v1/git-config-upload")
+        {
+            ("200 OK", r#"{"status":"ok"}"#.to_string())
+        } else if path.starts_with("/api/v1/scan-upload") {
+            (
+                "200 OK",
+                r#"{"status":"ok","sast_scan_id":"scan-123"}"#.to_string(),
+            )
+        } else {
+            routes.answer(path)
+        }
+    });
+    // The checkout's basename (`dotnet-azure-web-tsb`) differs from the
+    // uploaded `--project-name` (`foo/bar`, sanitized to `foo_bar`) — the
+    // pre-fix bug recomputed the name from this basename instead.
+    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    let report_path = repo.join("report.json");
+    std::fs::write(repo.join("app.py"), "x = 1\n").expect("write source");
+    let report = r#"{"version":"1.0.0","errors":[],"results":[{"check_id":"rule","path":"app.py","start":{"line":1},"end":{"line":1},"extra":{"message":"m","severity":"ERROR","metadata":{"source":"https://semgrep.dev/r/rule"}}}]}"#;
+    std::fs::write(&report_path, report).expect("write report");
+
+    let (mut cmd, _home) = common::corgea_isolated();
+    let out = cmd
+        .args([
+            "upload",
+            report_path.to_str().unwrap(),
+            "--project-name",
+            "foo/bar",
+            "--wait",
+        ])
+        .env("CORGEA_URL", &url)
+        .env("CORGEA_TOKEN", "test-token")
+        .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
+        .current_dir(&repo)
+        .output()
+        .expect("spawn corgea");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("/project/foo_bar?scan_id=scan-123"),
+        "expected the sanitized uploaded name in the URL, not a recomputed one; stdout: {stdout}"
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        !hits.iter().any(|h| h.starts_with("/api/v1/projects")),
+        "a scan id alone must not resolve via /projects; hits: {hits:?}"
+    );
+}

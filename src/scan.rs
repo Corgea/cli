@@ -113,7 +113,7 @@ pub fn run_semgrep(config: &Config, project_name: Option<String>) {
             crate::wait::WaitArgs {
                 scan_id: Some(result.scan_id),
                 selector: crate::utils::api::ProjectSelector {
-                    name: project_name,
+                    name: Some(result.project_name.clone()),
                     ..Default::default()
                 },
                 project_id: result.project_id,
@@ -138,7 +138,7 @@ pub fn run_snyk(config: &Config, project_name: Option<String>) {
             crate::wait::WaitArgs {
                 scan_id: Some(result.scan_id),
                 selector: crate::utils::api::ProjectSelector {
-                    name: project_name,
+                    name: Some(result.project_name.clone()),
                     ..Default::default()
                 },
                 project_id: result.project_id,
