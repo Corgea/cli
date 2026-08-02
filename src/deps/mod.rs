@@ -62,6 +62,13 @@ impl Inventory {
 
 /// Scan a directory tree: detect files, build the graph, evaluate policy.
 pub fn scan(root: &Path, policy: &Policy) -> Result<Inventory, DepsError> {
+    if !root.exists() {
+        return Err(DepsError(format!(
+            "path does not exist: {}",
+            root.display()
+        )));
+    }
+
     let detected = detect::detect_dependency_files(root);
     let mut graph = DependencyGraph::default();
     let mut findings = Vec::new();

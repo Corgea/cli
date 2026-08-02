@@ -24,6 +24,7 @@ pub fn run(
     target: Option<String>,
     exclude: Option<String>,
     project_name: Option<String>,
+    sbom: Option<String>,
 ) {
     // Validate that only_uncommitted and target are not used together
     if *only_uncommitted && target.is_some() {
@@ -413,6 +414,23 @@ pub fn run(
                 fs::write(out_file.clone(), report).expect("\n\nFailed to write Markdown file, check if the file path is valid and you have the necessary permissions to write to it.");
                 utils::terminal::clear_previous_line();
                 println!("\n\nScan report written to: {}\n\n", out_file.clone());
+            }
+        }
+    }
+
+    if let Some(sbom_file) = sbom {
+        match corgea::deps::report::sbom(std::path::Path::new(".")) {
+            Ok(doc) => {
+                let json = serde_json::to_string_pretty(&doc).expect("serialize SBOM");
+                if let Err(e) = fs::write(&sbom_file, json) {
+                    log::error!("\n\nFailed to write SBOM to '{}': {}\n\n", sbom_file, e);
+                    std::process::exit(1);
+                }
+                println!("CycloneDX SBOM written to: {}\n", sbom_file);
+            }
+            Err(e) => {
+                log::error!("\n\nFailed to generate SBOM: {}\n\n", e);
+                std::process::exit(1);
             }
         }
     }
