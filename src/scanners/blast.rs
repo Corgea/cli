@@ -4,11 +4,14 @@ use crate::utils;
 use crate::utils::api::SCAIssue;
 use std::collections::HashMap;
 use std::env;
-use std::error::Error;
 use std::fs;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+/// Overrides how long `wait_for_scan` polls before giving up.
+const SCAN_TIMEOUT_ENV: &str = "CORGEA_SCAN_TIMEOUT_SECONDS";
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -538,50 +541,207 @@ pub fn fail_on_gate_trips(
     })
 }
 
-pub fn wait_for_scan(config: &Config, scan_id: &str) {
-    // Create loading animation
-    let stop_signal = Arc::new(Mutex::new(false));
+/// Whether a scan status means the scan has stopped, and if so, how it ended.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ScanState {
+    Completed,
+    Failed,
+    Running,
+}
 
-    // Spawn a new thread for the spinner animation
+/// Classify the scan status reported by the API.
+///
+/// The contract is a frozen four-value set: `complete`, `incomplete`,
+/// `processing`, `scanning`. `incomplete` is terminal, and treating it as
+/// running is what made the CLI poll a finished scan forever. The extra
+/// aliases are defensive: terminal-sounding statuses must stop the loop.
+pub fn classify_scan_status(status: &str) -> ScanState {
+    match status.trim().to_lowercase().as_str() {
+        "complete" | "completed" => ScanState::Completed,
+        "incomplete" | "failed" | "error" | "cancelled" | "canceled" => ScanState::Failed,
+        _ => ScanState::Running,
+    }
+}
+
+/// Upper bound on polling, overridable with `SCAN_TIMEOUT_ENV`.
+///
+/// A scan that never reaches a terminal state (dropped worker, superseded scan)
+/// would otherwise burn a CI job's whole time budget. The default sits far
+/// above any real scan.
+fn scan_poll_timeout() -> Duration {
+    const DEFAULT_SECONDS: u64 = 4 * 60 * 60;
+    let seconds = match env::var(SCAN_TIMEOUT_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(seconds) if seconds > 0 => seconds,
+            _ => {
+                log::warn!(
+                    "Ignoring {}='{}': expected a positive whole number of seconds. Waiting up to {}s instead.",
+                    SCAN_TIMEOUT_ENV,
+                    raw,
+                    DEFAULT_SECONDS
+                );
+                DEFAULT_SECONDS
+            }
+        },
+        Err(_) => DEFAULT_SECONDS,
+    };
+    Duration::from_secs(seconds)
+}
+
+/// Human-readable explanation of why a scan failed, for the terminal.
+///
+/// Falls back from `failed_reason` to the reported scanner problems, so the
+/// output is always more specific than "the scan failed".
+pub fn format_scan_failure(scan: &utils::api::ScanResponse) -> String {
+    let mut lines = vec![format!("Scan {} did not complete.", scan.id)];
+    if let Some(reason) = scan
+        .failed_reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+    {
+        lines.push(format!("Reason: {}", reason));
+    }
+    let problems = scan_problem_lines(scan);
+    if !problems.is_empty() {
+        lines.push(String::from("Scanner problems:"));
+        lines.extend(problems);
+    }
+    lines.join("\n")
+}
+
+/// Warnings for a scan that finished but is missing some scanner's results.
+///
+/// `None` when nothing degraded. A secondary scanner breaking no longer fails
+/// the scan, so this is the only place coverage loss surfaces.
+pub fn format_scan_warnings(scan: &utils::api::ScanResponse) -> Option<String> {
+    let problems = scan_problem_lines(scan);
+    if problems.is_empty() {
+        return None;
+    }
+    let mut lines = vec![String::from(
+        "Some scanners reported problems, so this scan may be missing results:",
+    )];
+    lines.extend(problems);
+    Some(lines.join("\n"))
+}
+
+/// One bullet per scanner problem, capped so dozens of file-level errors
+/// cannot bury the rest of the output.
+fn scan_problem_lines(scan: &utils::api::ScanResponse) -> Vec<String> {
+    const MAX_LINES: usize = 10;
+    let problems: Vec<&utils::api::ScanErrorSummary> = scan
+        .scan_errors
+        .iter()
+        .filter(|error| error.is_problem())
+        .collect();
+    let mut lines: Vec<String> = problems
+        .iter()
+        .take(MAX_LINES)
+        .map(|error| format_scan_error_line(error))
+        .collect();
+    if problems.len() > MAX_LINES {
+        lines.push(format!(
+            "  ...and {} more; see the scan page for the full list.",
+            problems.len() - MAX_LINES
+        ));
+    }
+    lines
+}
+
+fn format_scan_error_line(error: &utils::api::ScanErrorSummary) -> String {
+    let message = error
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or("No details provided.");
+    let mut prefix = String::new();
+    if let Some(scan_type) = error.scan_type.as_deref().filter(|s| !s.is_empty()) {
+        prefix.push_str(scan_type);
+    }
+    if let Some(location) = error.location.as_deref().filter(|l| !l.is_empty()) {
+        if prefix.is_empty() {
+            prefix.push_str(location);
+        } else {
+            prefix.push_str(&format!(" @ {}", location));
+        }
+    }
+    if prefix.is_empty() {
+        format!("  - {}", message)
+    } else {
+        format!("  - [{}] {}", prefix, message)
+    }
+}
+
+/// Block until the scan reaches a terminal state, then report it.
+///
+/// Exits non-zero on failure or poll timeout, so CI cannot mistake a broken
+/// scan for a clean one.
+pub fn wait_for_scan(config: &Config, scan_id: &str) {
+    let stop_signal = Arc::new(Mutex::new(false));
     let stop_signal_clone = Arc::clone(&stop_signal);
-    thread::spawn(move || {
+    let spinner = thread::spawn(move || {
         utils::terminal::show_loading_message(
             "Scanning... The Hunt Is On! ([T]s)",
             stop_signal_clone,
         );
     });
 
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        match check_scan_status(scan_id, &config.get_url()) {
-            Ok(true) => {
-                *stop_signal.lock().unwrap() = true;
-                break;
-            }
-            Ok(false) => {}
-            Err(e) => {
-                log::error!(
-                    "\n\nUnable to check the scan status for scan ID '{}'.\nPlease verify that:
-            - The server URL '{}' is reachable.
-            - Your authentication token is valid.
-            - The scan ID '{}' exists and is correct.
+    let timeout = scan_poll_timeout();
+    let started_at = Instant::now();
 
-            Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli
-            
-            Error details:\n{}",
+    let result = loop {
+        thread::sleep(Duration::from_secs(1));
+        match utils::api::get_scan(&config.get_url(), scan_id) {
+            Ok(scan) => match classify_scan_status(&scan.status) {
+                ScanState::Completed => break Ok(scan),
+                ScanState::Failed => break Err(format_scan_failure(&scan)),
+                ScanState::Running if started_at.elapsed() >= timeout => {
+                    break Err(format!(
+                        "Stopped waiting for scan {} after {}s; it is still reported as '{}'.\n\
+                         The scan may still finish in the Corgea cloud — check the scan page, \
+                         or set {} to wait longer.",
+                        scan_id,
+                        timeout.as_secs(),
+                        scan.status,
+                        SCAN_TIMEOUT_ENV
+                    ))
+                }
+                ScanState::Running => {}
+            },
+            Err(e) => {
+                break Err(format!(
+                    "Unable to check the status of scan '{}'.\n\
+                     Please verify that:\n\
+                     - The server URL '{}' is reachable.\n\
+                     - Your authentication token is valid.\n\
+                     - The scan ID is correct.\n\n\
+                     Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli\n\n\
+                     Error details: {}",
                     scan_id,
                     config.get_url(),
-                    scan_id,
                     e
-                );
-                std::process::exit(1);
+                ))
             }
         }
-    }
+    };
+
+    *stop_signal.lock().unwrap() = true;
+    let _ = spinner.join();
     print!(
-        "{}",
+        "\r{}",
         utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
     );
+
+    let scan = match result {
+        Ok(scan) => scan,
+        Err(message) => {
+            log::error!("\n\n{}\n", message);
+            std::process::exit(1);
+        }
+    };
+
     println!(
         "\r╭────────────────────────────────────────────╮\n\
              │ {: <42} │\n\
@@ -590,12 +750,8 @@ pub fn wait_for_scan(config: &Config, scan_id: &str) {
              ╰────────────────────────────────────────────╯\n",
         " ", " "
     );
-}
-
-pub fn check_scan_status(scan_id: &str, url: &str) -> Result<bool, Box<dyn Error>> {
-    match utils::api::get_scan(url, scan_id) {
-        Ok(scan) => Ok(scan.status == "complete"),
-        Err(e) => Err(e),
+    if let Some(warnings) = format_scan_warnings(&scan) {
+        log::warn!("{}\n", warnings);
     }
 }
 
@@ -846,5 +1002,232 @@ mod tests {
         let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json).unwrap();
         assert_eq!(map.get("k").and_then(|v| v.as_str()), Some(""));
         assert!(metadata_json_from_pairs(&[]).unwrap().is_none());
+    }
+
+    fn scan_with(
+        status: &str,
+        failed_reason: Option<&str>,
+        scan_errors: Vec<utils::api::ScanErrorSummary>,
+    ) -> utils::api::ScanResponse {
+        utils::api::ScanResponse {
+            id: "scan-123".to_string(),
+            project: "proj".to_string(),
+            repo: None,
+            branch: None,
+            status: status.to_string(),
+            engine: "corgea-blast".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            git_sha: None,
+            metadata: None,
+            failed_reason: failed_reason.map(|r| r.to_string()),
+            scan_errors,
+        }
+    }
+
+    fn scan_error(
+        scan_type: Option<&str>,
+        level: Option<&str>,
+        location: Option<&str>,
+        message: Option<&str>,
+    ) -> utils::api::ScanErrorSummary {
+        utils::api::ScanErrorSummary {
+            scan_type: scan_type.map(|s| s.to_string()),
+            level: level.map(|s| s.to_string()),
+            location: location.map(|s| s.to_string()),
+            message: message.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn incomplete_status_is_terminal_not_still_running() {
+        // The hang: "incomplete" is terminal, and treating it as running meant
+        // polling a finished scan indefinitely.
+        assert_eq!(classify_scan_status("incomplete"), ScanState::Failed);
+    }
+
+    #[test]
+    fn classify_scan_status_covers_the_api_contract() {
+        assert_eq!(classify_scan_status("complete"), ScanState::Completed);
+        assert_eq!(classify_scan_status("processing"), ScanState::Running);
+        assert_eq!(classify_scan_status("scanning"), ScanState::Running);
+        assert_eq!(classify_scan_status("incomplete"), ScanState::Failed);
+    }
+
+    #[test]
+    fn classify_scan_status_ignores_case_and_padding() {
+        // `corgea wait` compared against "Complete" while the API sends
+        // lowercase, so a finished scan was polled again.
+        assert_eq!(classify_scan_status("Complete"), ScanState::Completed);
+        assert_eq!(classify_scan_status("  COMPLETE  "), ScanState::Completed);
+        assert_eq!(classify_scan_status("Incomplete"), ScanState::Failed);
+    }
+
+    #[test]
+    fn unknown_status_keeps_waiting_rather_than_failing_the_build() {
+        assert_eq!(classify_scan_status("queued"), ScanState::Running);
+        assert_eq!(classify_scan_status(""), ScanState::Running);
+    }
+
+    #[test]
+    fn scan_failure_reports_reason_and_errors() {
+        let scan = scan_with(
+            "incomplete",
+            Some("Dependency Analysis did not finish."),
+            vec![scan_error(
+                Some("sca"),
+                Some("error"),
+                Some("Project-wide"),
+                Some("Could not reach the public package registry."),
+            )],
+        );
+
+        let output = format_scan_failure(&scan);
+
+        assert!(output.contains("scan-123"));
+        assert!(output.contains("Dependency Analysis did not finish."));
+        assert!(output.contains("[sca @ Project-wide]"));
+        assert!(output.contains("Could not reach the public package registry."));
+    }
+
+    #[test]
+    fn scan_failure_without_reason_still_explains_itself() {
+        let output = format_scan_failure(&scan_with("incomplete", None, vec![]));
+
+        assert!(output.contains("did not complete"));
+        assert!(!output.contains("Reason:"));
+    }
+
+    #[test]
+    fn scan_failure_omits_blank_reason() {
+        let output = format_scan_failure(&scan_with("incomplete", Some("   "), vec![]));
+
+        assert!(!output.contains("Reason:"));
+    }
+
+    #[test]
+    fn scan_output_skips_informational_notes() {
+        // `info` entries are bookkeeping, not missing results.
+        let scan = scan_with(
+            "incomplete",
+            None,
+            vec![
+                scan_error(Some("sca"), Some("info"), None, Some("some info")),
+                scan_error(Some("sca"), Some("warning"), None, Some("a warning")),
+                scan_error(Some("iac"), Some("error"), None, Some("a real error")),
+            ],
+        );
+
+        let output = format_scan_failure(&scan);
+
+        assert!(output.contains("a real error"));
+        assert!(output.contains("a warning"));
+        assert!(!output.contains("some info"));
+    }
+
+    #[test]
+    fn info_only_scan_produces_no_warnings() {
+        let scan = scan_with(
+            "complete",
+            None,
+            vec![scan_error(Some("sca"), Some("info"), None, Some("skipped"))],
+        );
+
+        assert!(format_scan_warnings(&scan).is_none());
+    }
+
+    #[test]
+    fn missing_or_unknown_level_is_still_reported() {
+        // The server defaults an absent level to "error" and may add levels
+        // this client does not know; neither may drop a real failure.
+        assert!(scan_error(Some("sca"), None, None, Some("boom")).is_problem());
+        assert!(scan_error(Some("sca"), Some("critical"), None, Some("boom")).is_problem());
+        assert!(!scan_error(Some("sca"), Some("INFO"), None, Some("fyi")).is_problem());
+    }
+
+    #[test]
+    fn long_error_lists_are_capped() {
+        let errors = (0..25)
+            .map(|i| {
+                scan_error(
+                    Some("sast"),
+                    Some("error"),
+                    None,
+                    Some(&format!("boom {}", i)),
+                )
+            })
+            .collect();
+
+        let output = format_scan_failure(&scan_with("incomplete", None, errors));
+
+        assert!(output.contains("boom 9"));
+        assert!(!output.contains("boom 10"));
+        assert!(output.contains("...and 15 more"));
+    }
+
+    #[test]
+    fn completed_scan_with_scanner_errors_produces_warnings() {
+        // Warnings on a completed scan are the only signal coverage dropped.
+        let scan = scan_with(
+            "complete",
+            None,
+            vec![scan_error(
+                Some("sca"),
+                Some("error"),
+                Some("Project-wide"),
+                Some("Dependency Analysis did not finish."),
+            )],
+        );
+
+        let warnings = format_scan_warnings(&scan).expect("expected warnings");
+
+        assert!(warnings.contains("may be missing results"));
+        assert!(warnings.contains("Dependency Analysis did not finish."));
+    }
+
+    #[test]
+    fn clean_scan_produces_no_warnings() {
+        assert!(format_scan_warnings(&scan_with("complete", None, vec![])).is_none());
+    }
+
+    #[test]
+    fn scan_error_line_survives_missing_fields() {
+        assert_eq!(
+            format_scan_error_line(&scan_error(None, None, None, None)),
+            "  - No details provided."
+        );
+        assert_eq!(
+            format_scan_error_line(&scan_error(None, None, Some("pom.xml"), Some("bad"))),
+            "  - [pom.xml] bad"
+        );
+        assert_eq!(
+            format_scan_error_line(&scan_error(Some("sca"), None, None, Some("bad"))),
+            "  - [sca] bad"
+        );
+    }
+
+    #[test]
+    fn scan_response_deserializes_without_new_fields() {
+        // Older servers do not send failed_reason/scan_errors; the client must
+        // still parse their responses.
+        let json = r#"{
+            "id": "abc",
+            "project": "p",
+            "repo": null,
+            "branch": "main",
+            "status": "complete",
+            "engine": "corgea-blast",
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+
+        let scan: utils::api::ScanResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(classify_scan_status(&scan.status), ScanState::Completed);
+        assert!(scan.failed_reason.is_none());
+        assert!(scan.scan_errors.is_empty());
+        // `corgea ls --json` serializes from the scan list, which never carries
+        // these fields; empty ones there would claim a scan had no problems.
+        let round_tripped = serde_json::to_string(&scan).unwrap();
+        assert!(!round_tripped.contains("scan_errors"));
+        assert!(!round_tripped.contains("failed_reason"));
     }
 }

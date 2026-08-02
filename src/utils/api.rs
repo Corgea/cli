@@ -935,7 +935,35 @@ pub fn get_all_sca_issues(
     Ok(all_issues)
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+/// One scanner problem reported against a scan, already sanitized server-side.
+///
+/// Fields are optional so older servers still deserialize.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct ScanErrorSummary {
+    #[serde(default)]
+    pub scan_type: Option<String>,
+    #[serde(default)]
+    pub level: Option<String>,
+    #[serde(default)]
+    pub location: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+impl ScanErrorSummary {
+    /// Whether this entry means the scan is missing results.
+    ///
+    /// `info` entries are notes. Everything else counts, including absent or
+    /// unrecognized levels, which the server treats as `error`.
+    pub fn is_problem(&self) -> bool {
+        !self
+            .level
+            .as_deref()
+            .is_some_and(|level| level.trim().eq_ignore_ascii_case("info"))
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ScanResponse {
     pub id: String,
     pub project: String,
@@ -948,6 +976,14 @@ pub struct ScanResponse {
     pub git_sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// Why a scan ended without finishing. Only set for failed scans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_reason: Option<String>,
+    /// Per-scanner problems, present on completed scans too, where they mean a
+    /// scanner's results are missing. Skipped when empty, since the scan list
+    /// never carries them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scan_errors: Vec<ScanErrorSummary>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

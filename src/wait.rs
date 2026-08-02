@@ -2,48 +2,55 @@ use crate::config::Config;
 use crate::scanners::blast;
 use crate::utils;
 
-pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>) {
+/// Most recent scan of the project in the current directory.
+fn latest_scan_id(config: &Config) -> String {
     let project_name = utils::generic::determine_project_name(None);
-
-    let scans_result =
-        utils::api::query_scan_list(&config.get_url(), Some(&project_name), Some(1), None);
-    let scans: Vec<utils::api::ScanResponse> = match scans_result {
+    let scans = match utils::api::query_scan_list(
+        &config.get_url(),
+        Some(&project_name),
+        Some(1),
+        None,
+    ) {
         Ok(result) => result.scans.unwrap_or_default(),
         Err(e) => {
             log::error!(
-                "Unable to query the scan list. Please check your connection and ensure that:
-                - The server URL is reachable.
-                - Your authentication token is valid.
+                    "Unable to query the scan list. Please check your connection and ensure that:\n\
+                     - The server URL is reachable.\n\
+                     - Your authentication token is valid.\n\n\
+                     Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli\n\n\
+                     Error details: {}",
+                    e
+                );
+            std::process::exit(1);
+        }
+    };
+    match scans.first() {
+        Some(scan) => scan.id.clone(),
+        None => {
+            log::error!("No scans found for project '{}'.", project_name);
+            std::process::exit(1);
+        }
+    }
+}
 
-                Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli
-
-                Error details: {}",
+pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>) {
+    let scan_id = scan_id.unwrap_or_else(|| latest_scan_id(config));
+    // Read the scan itself: the scan list omits failed_reason and scan_errors.
+    let scan = match utils::api::get_scan(&config.get_url(), &scan_id) {
+        Ok(scan) => scan,
+        Err(e) => {
+            log::error!(
+                "\nUnable to read scan '{}'. Please check your connection and token, then try again.\n\nError details: {}\n",
+                scan_id,
                 e
             );
             std::process::exit(1);
         }
     };
-    let (scan_id, processed) = match scan_id {
-        Some(scan_id) => {
-            let processed = match blast::check_scan_status(&scan_id, &config.get_url()) {
-                Ok(processed) => processed,
-                Err(_) => {
-                    log::error!(
-                        "\nOops! Something went wrong. Please try again later or check your setup.\n"
-                    );
-                    std::process::exit(1);
-                }
-            };
-            (scan_id.to_string(), processed)
-        }
-        None => match scans.first() {
-            Some(scan) => (scan.id.clone(), scan.status == "Complete"),
-            None => {
-                log::error!("Error querying scan list");
-                std::process::exit(1);
-            }
-        },
-    };
+    let project_name = scan.project.clone();
+    // The API reports lowercase statuses, so comparing against "Complete"
+    // never matched and finished scans were polled again.
+    let state = blast::classify_scan_status(&scan.status);
 
     let scan_url = match &project_id {
         Some(pid) => format!("{}/project/{}/?scan_id={}", config.get_url(), pid, scan_id),
@@ -55,19 +62,34 @@ pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>)
         ),
     };
 
-    if !processed {
-        print!(
-            "\n\nWaiting for scan with ID: {}.\n\nYou can view it populate at the link:\n{}\n\n",
-            scan_id,
-            utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
-        );
-        print!(
-           "{}",
-           utils::terminal::set_text_color("Your scan will continue securely in the Corgea cloud.\nYou can safely exit the process now if you prefer not to wait for it to complete.\n\n", utils::terminal::TerminalColor::Blue)
-        );
-        blast::wait_for_scan(config, &scan_id);
-    } else {
-        println!("Scan has been processed successfully!");
+    match state {
+        blast::ScanState::Running => {
+            print!(
+                "\n\nWaiting for scan with ID: {}.\n\nYou can view it populate at the link:\n{}\n\n",
+                scan_id,
+                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
+            );
+            print!(
+               "{}",
+               utils::terminal::set_text_color("Your scan will continue securely in the Corgea cloud.\nYou can safely exit the process now if you prefer not to wait for it to complete.\n\n", utils::terminal::TerminalColor::Blue)
+            );
+            blast::wait_for_scan(config, &scan_id);
+        }
+        blast::ScanState::Completed => {
+            println!("Scan has been processed successfully!");
+            if let Some(warnings) = blast::format_scan_warnings(&scan) {
+                log::warn!("\n{}\n", warnings);
+            }
+        }
+        // Report the failure rather than claim success or poll forever.
+        blast::ScanState::Failed => {
+            log::error!("\n\n{}\n", blast::format_scan_failure(&scan));
+            println!(
+                "\nYou can view the scan details at the following link:\n{}",
+                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Blue)
+            );
+            std::process::exit(1);
+        }
     }
 
     match blast::report_scan_status(&config.get_url(), &project_name, &scan_id) {

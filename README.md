@@ -31,6 +31,16 @@ Once the binary is installed, login with your token from the Corgea app.
 corgea login <token>
 ```
 
+## Scanning
+
+`corgea scan` uploads your project and waits for results. `corgea wait [scan_id]`
+attaches to a running scan; `corgea upload <report> --wait` does the same for a
+third-party report.
+
+All three exit 1 if the scan fails, printing the reason and the scanners that hit
+problems. A scan that completes with a scanner missing exits 0 with a warning.
+Waiting gives up after 4 hours; override with `CORGEA_SCAN_TIMEOUT_SECONDS`.
+
 ## Dependency Inventory (offline)
 
 `corgea deps` builds a dependency inventory from npm, Python, and Java manifests
