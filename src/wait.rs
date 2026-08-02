@@ -58,10 +58,10 @@ pub fn run(config: &Config, args: WaitArgs) {
             }
         }
     };
-    let (scan_id, processed) = match scan_id {
+    let (scan_id, processed, project_name) = match scan_id {
         Some(scan_id) => {
-            let processed = match blast::check_scan_status(&scan_id, &config.get_url()) {
-                Ok(processed) => processed,
+            let scan = match utils::api::get_scan(&config.get_url(), &scan_id) {
+                Ok(scan) => scan,
                 Err(_) => {
                     log::error!(
                         "\nOops! Something went wrong. Please try again later or check your setup.\n"
@@ -69,10 +69,22 @@ pub fn run(config: &Config, args: WaitArgs) {
                     std::process::exit(1);
                 }
             };
-            (scan_id.to_string(), processed)
+            let processed = scan.status == "complete";
+            // Explicit `--project-name` (or an uploaded name passed in) wins;
+            // otherwise trust the canonical project the backend just
+            // returned for this scan over the locally recomputed name.
+            let project_name = selector.name.clone().unwrap_or_else(|| {
+                let canonical = scan.project.trim();
+                if canonical.is_empty() {
+                    project_name.clone()
+                } else {
+                    canonical.to_string()
+                }
+            });
+            (scan_id.to_string(), processed, project_name)
         }
         None => match scans.first() {
-            Some(scan) => (scan.id.clone(), scan.status == "Complete"),
+            Some(scan) => (scan.id.clone(), scan.status == "Complete", project_name),
             None => {
                 if resolved.confirmed {
                     log::error!(

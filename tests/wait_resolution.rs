@@ -114,13 +114,21 @@ fn wait_with_scan_id_does_not_list_scans() {
     // `scans` is served but must never be dialed: the listing is only read
     // when no scan id was given.
     let (url, hits) = spawn_stub(projects_match(), scans_one(CANON));
+    // Checkout basename differs from the scan's canonical project (CANON):
+    // the URL must come from the fetched `ScanResponse.project`, not a name
+    // recomputed locally from the checkout.
     let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
     let out = run_wait(&["scan-123"], &url, &repo);
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         out.status.code(),
         Some(0),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("/project/bohappdev%2Fdotnet-azure-web-tsb?scan_id=scan-123"),
+        "stdout: {stdout}"
     );
     let hits = hits.lock().unwrap();
     assert!(
@@ -148,11 +156,16 @@ fn wait_with_scan_id_survives_resolver_failure() {
     });
     let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
     let out = run_wait(&["scan-123"], &url, &repo);
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         out.status.code(),
         Some(0),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("/project/bohappdev%2Fdotnet-azure-web-tsb?scan_id=scan-123"),
+        "stdout: {stdout}"
     );
     let hits = hits.lock().unwrap();
     assert!(
