@@ -156,7 +156,27 @@ enum Commands {
         sbom: Option<String>,
     },
     /// Wait for the latest in progress scan
-    Wait { scan_id: Option<String> },
+    Wait {
+        scan_id: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "repo",
+            help = "Query this exact Corgea project name directly (skips repo auto-resolution)."
+        )]
+        project_name: Option<String>,
+        #[arg(
+            long,
+            help = "Resolve the project from this repo (org/repo slug or remote URL) instead of the git remote."
+        )]
+        repo: Option<String>,
+        #[arg(
+            long,
+            requires = "scan_id",
+            value_parser = clap::builder::NonEmptyStringValueParser::new(),
+            help = "Use this known Corgea project id for the result link, skipping project resolution. Requires a scan id, which is what the id then belongs to."
+        )]
+        project_id: Option<String>,
+    },
     /// List something, by default it lists the scans
     #[command(alias = "ls")]
     List {
@@ -181,6 +201,19 @@ enum Commands {
 
         #[arg(long, value_parser = clap::value_parser!(u16), help = "Number of items per page")]
         page_size: Option<u16>,
+
+        #[arg(
+            long,
+            conflicts_with = "repo",
+            help = "Query this exact Corgea project name directly (skips repo auto-resolution)."
+        )]
+        project_name: Option<String>,
+
+        #[arg(
+            long,
+            help = "Resolve the project from this repo (org/repo slug or remote URL) instead of the git remote."
+        )]
+        repo: Option<String>,
     },
     /// Inspect something, by default it will inspect a scan
     Inspect {
@@ -560,7 +593,17 @@ fn main() {
 
             if let Some(result) = result {
                 if *wait {
-                    wait::run(&corgea_config, Some(result.scan_id), result.project_id);
+                    wait::run(
+                        &corgea_config,
+                        wait::WaitArgs {
+                            scan_id: Some(result.scan_id.clone()),
+                            selector: utils::api::ProjectSelector {
+                                name: Some(result.project_name.clone()),
+                                ..Default::default()
+                            },
+                            project_id: result.project_id.clone(),
+                        },
+                    );
                 } else {
                     scan::print_scan_tracking_url(&corgea_config, &result);
                 }
@@ -705,9 +748,24 @@ fn main() {
                 ),
             }
         }
-        Some(Commands::Wait { scan_id }) => {
+        Some(Commands::Wait {
+            scan_id,
+            project_name,
+            repo,
+            project_id,
+        }) => {
             verify_token_and_exit_when_fail(&corgea_config);
-            wait::run(&corgea_config, scan_id.clone(), None);
+            wait::run(
+                &corgea_config,
+                wait::WaitArgs {
+                    scan_id: scan_id.clone(),
+                    selector: utils::api::ProjectSelector {
+                        name: project_name.clone(),
+                        repo: repo.clone(),
+                    },
+                    project_id: project_id.clone(),
+                },
+            );
         }
         Some(Commands::List {
             issues,
@@ -716,6 +774,8 @@ fn main() {
             page_size,
             scan_id,
             sca_issues,
+            project_name,
+            repo,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             if *issues && *sca_issues {
@@ -728,12 +788,18 @@ fn main() {
             }
             list::run(
                 &corgea_config,
-                issues,
-                sca_issues,
-                json,
-                page,
-                page_size,
-                scan_id,
+                list::ListArgs {
+                    issues: *issues,
+                    sca_issues: *sca_issues,
+                    json: *json,
+                    page: *page,
+                    page_size: *page_size,
+                    scan_id: scan_id.clone(),
+                    selector: utils::api::ProjectSelector {
+                        name: project_name.clone(),
+                        repo: repo.clone(),
+                    },
+                },
             );
         }
         Some(Commands::Inspect {

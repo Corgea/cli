@@ -30,6 +30,23 @@
     </plugins>
   </build>
 
+  <reporting>
+    <plugins>
+      <plugin>
+        <groupId>org.example</groupId>
+        <artifactId>report-plugin</artifactId>
+        <version>1.0.0</version>
+        <dependencies>
+          <dependency>
+            <groupId>org.example</groupId>
+            <artifactId>report-helper</artifactId>
+            <version>1.0</version>
+          </dependency>
+        </dependencies>
+      </plugin>
+    </plugins>
+  </reporting>
+
   <profiles>
     <profile>
       <id>extra</id>

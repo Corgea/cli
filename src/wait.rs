@@ -2,41 +2,78 @@ use crate::config::Config;
 use crate::scan::build_scan_url;
 use crate::scanners::blast;
 use crate::utils;
+use crate::utils::api::ProjectSelector;
 
-/// Most recent scan of the project in the current directory.
-fn latest_scan_id(config: &Config) -> String {
-    let project_name = utils::generic::determine_project_name(None);
+#[derive(Default)]
+pub struct WaitArgs {
+    pub scan_id: Option<String>,
+    pub selector: ProjectSelector,
+    /// Known project id — `--project-id`, or straight from an upload response.
+    /// Clap requires it to be paired with a scan id.
+    pub project_id: Option<String>,
+}
+
+/// Most recent scan of the resolved project, or a hard exit naming what was
+/// tried when it has none.
+fn latest_scan_id(config: &Config, resolved: &utils::api::ResolvedProject) -> String {
     let scans = match utils::api::query_scan_list(
         &config.get_url(),
-        Some(&project_name),
+        Some(&resolved.query_name),
         Some(1),
         None,
     ) {
         Ok(result) => result.scans.unwrap_or_default(),
         Err(e) => {
             log::error!(
-                    "Unable to query the scan list. Please check your connection and ensure that:\n\
-                     - The server URL is reachable.\n\
-                     - Your authentication token is valid.\n\n\
-                     Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli\n\n\
-                     Error details: {}",
-                    e
-                );
+                "Unable to query the scan list. Please check your connection and ensure that:\n\
+                 - The server URL is reachable.\n\
+                 - Your authentication token is valid.\n\n\
+                 Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli\n\n\
+                 Error details: {}",
+                e
+            );
             std::process::exit(1);
         }
     };
     match scans.first() {
         Some(scan) => scan.id.clone(),
         None => {
-            log::error!("No scans found for project '{}'.", project_name);
+            if resolved.confirmed {
+                log::error!(
+                    "Project '{}' has no scans yet. Run 'corgea scan' to start one.",
+                    resolved.query_name
+                );
+            } else {
+                log::error!(
+                    "No scans found for {}. Run 'corgea scan', or pass --scan-id.",
+                    resolved.tried_label
+                );
+            }
             std::process::exit(1);
         }
     }
 }
 
-pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>) {
-    let scan_id = scan_id.unwrap_or_else(|| latest_scan_id(config));
-    // Read the scan itself: the scan list omits failed_reason and scan_errors.
+pub fn run(config: &Config, args: WaitArgs) {
+    let WaitArgs {
+        scan_id,
+        selector,
+        project_id,
+    } = args;
+
+    // A scan id alone leaves nothing to resolve: the scan and issue endpoints
+    // both fetch by scan id, so neither /projects nor the listing is dialed.
+    let (scan_id, resolved_name) = match scan_id {
+        Some(scan_id) => (scan_id, None),
+        None => {
+            let resolved = utils::api::resolve_project_or_exit(&config.get_url(), &selector);
+            let scan_id = latest_scan_id(config, &resolved);
+            (scan_id, Some(resolved.query_name))
+        }
+    };
+
+    // Read the scan itself: the listing omits failed_reason and scan_errors,
+    // which are the only record of why a scan ended badly.
     let scan = match utils::api::get_scan(&config.get_url(), &scan_id) {
         Ok(scan) => scan,
         Err(e) => {
@@ -48,19 +85,36 @@ pub fn run(config: &Config, scan_id: Option<String>, project_id: Option<String>)
             std::process::exit(1);
         }
     };
-    let project_name = scan.project.clone();
+
+    // A resolved name already drove the listing query, so keep it. Otherwise an
+    // explicit `--project-name` (or an uploaded name passed in) wins, then the
+    // canonical project the backend returned for this scan, in preference to a
+    // name recomputed from the checkout.
+    let project_name = resolved_name
+        .or_else(|| selector.name.clone())
+        .unwrap_or_else(|| {
+            let canonical = scan.project.trim();
+            if canonical.is_empty() {
+                utils::generic::determine_project_name(None)
+            } else {
+                canonical.to_string()
+            }
+        });
+
+    // Canonical names contain `/` (e.g. `bohappdev/dotnet-azure-web-tsb`), which
+    // `build_scan_url` percent-encodes into a single path segment.
+    let url_name = project_name.trim().trim_matches('/');
+    if project_id.is_none() && url_name.is_empty() {
+        log::error!(
+            "Cannot build the scan URL: no Corgea project resolved. Pass --project-name <NAME>."
+        );
+        std::process::exit(1);
+    }
+    let scan_url = build_scan_url(&config.get_url(), project_id.as_deref(), url_name, &scan_id);
+
     // The API reports lowercase statuses, so comparing against "Complete"
     // never matched and finished scans were polled again.
-    let state = blast::classify_scan_status(&scan.status);
-
-    let scan_url = build_scan_url(
-        &config.get_url(),
-        project_id.as_deref(),
-        &project_name,
-        &scan_id,
-    );
-
-    match state {
+    match blast::classify_scan_status(&scan.status) {
         blast::ScanState::Running => {
             print!(
                 "\n\nWaiting for scan with ID: {}.\n\nYou can view it populate at the link:\n{}\n\n",

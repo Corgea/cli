@@ -433,3 +433,177 @@ pub fn tree_harness(
         .vuln_statuses(statuses)
         .build()
 }
+
+// --- project-resolution e2e fixtures (shared by list_resolution.rs and
+// wait_resolution.rs) -------------------------------------------------------
+
+/// Canonical project name for the Bank-of-Hope resolution case: the dir
+/// basename (`dotnet-azure-web-tsb`) differs from the stored project name.
+#[allow(dead_code)]
+pub const CANON: &str = "bohappdev/dotnet-azure-web-tsb";
+/// Git remote whose slug resolves to `CANON`.
+#[allow(dead_code)]
+pub const REMOTE: &str = "https://github.com/bohappdev/dotnet-azure-web-tsb.git";
+
+/// `/projects` hit returning the canonical project whose `repo_url` matches
+/// the slug — the new-backend confirmed path.
+#[allow(dead_code)]
+pub fn projects_match() -> String {
+    r#"{"status":"ok","projects":[{"name":"bohappdev/dotnet-azure-web-tsb","repo_url":"https://github.com/bohappdev/dotnet-azure-web-tsb"}]}"#.to_string()
+}
+
+/// `/projects` miss (repo not onboarded / pre-COR-1426 backend filtered out).
+#[allow(dead_code)]
+pub fn projects_empty() -> String {
+    r#"{"status":"ok","projects":[]}"#.to_string()
+}
+
+/// `/scans` returning one `Complete` scan under `project`.
+#[allow(dead_code)]
+pub fn scans_one(project: &str) -> String {
+    format!(
+        r#"{{"status":"ok","page":1,"total_pages":1,"scans":[{{"id":"scan-123","project":"{project}","repo":"https://github.com/bohappdev/dotnet-azure-web-tsb","branch":"main","status":"Complete","engine":"blast","created_at":"2026-01-01T00:00:00Z"}}]}}"#
+    )
+}
+
+/// `/scans` returning an empty page.
+#[allow(dead_code)]
+pub fn scans_empty() -> String {
+    r#"{"status":"ok","page":1,"total_pages":1,"scans":[]}"#.to_string()
+}
+
+/// Temp git repo at `<tmp>/<dirname>` with `origin` set to `remote`. The dir
+/// basename is the caller's to choose so it can differ from the stored name.
+#[allow(dead_code)]
+pub fn temp_git_repo(dirname: &str, remote: &str) -> (TempDir, std::path::PathBuf) {
+    let tmp = TempDir::new().expect("temp dir");
+    let repo_dir = tmp.path().join(dirname);
+    std::fs::create_dir(&repo_dir).expect("create repo dir");
+    let repo = git2::Repository::init(&repo_dir).expect("git init");
+    repo.remote("origin", remote).expect("set origin");
+    (tmp, repo_dir)
+}
+
+/// Temp NON-git dir at `<tmp>/<dirname>` (no remote).
+#[allow(dead_code)]
+pub fn temp_plain_dir(dirname: &str) -> (TempDir, std::path::PathBuf) {
+    let tmp = TempDir::new().expect("temp dir");
+    let dir = tmp.path().join(dirname);
+    std::fs::create_dir(&dir).expect("create dir");
+    (tmp, dir)
+}
+
+/// Every request target a stub was asked for, in order.
+#[allow(dead_code)]
+pub type Hits = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// `spawn_http_stub` that also records every request target, so a test can
+/// assert which endpoints were (not) dialed and with what query.
+#[allow(dead_code)]
+pub fn spawn_recording_http_stub<F>(route: F) -> (String, Hits)
+where
+    F: Fn(&str) -> (&'static str, String) + Send + 'static,
+{
+    let hits: Hits = Default::default();
+    let recorder = hits.clone();
+    let base_url = spawn_http_stub(move |path| {
+        recorder.lock().unwrap().push(path.to_string());
+        route(path)
+    });
+    (base_url, hits)
+}
+
+/// Run `corgea <subcommand> <args...>` against `url` from `cwd`, isolated from
+/// the host (temp HOME). `CORGEA_URL`/`CORGEA_TOKEN` are layered back on after
+/// `corgea_isolated` strips them.
+#[allow(dead_code)]
+pub fn run_corgea(
+    subcommand: &str,
+    args: &[&str],
+    url: &str,
+    cwd: &std::path::Path,
+) -> std::process::Output {
+    let (mut cmd, _home) = corgea_isolated();
+    cmd.arg(subcommand);
+    cmd.args(args);
+    cmd.env("CORGEA_URL", url)
+        .env("CORGEA_TOKEN", "test-token")
+        .current_dir(cwd);
+    cmd.output().expect("spawn corgea")
+}
+
+/// The endpoints the `list`/`wait` resolution tests stub. `/verify` is always
+/// answered `ok`; a field left `None` 404s, as does any other path — so a test
+/// asserting an endpoint was never dialed simply leaves it unset.
+///
+/// Routing is on the request-target PREFIX: `/projects` carries a
+/// percent-encoded query, so the full target is not a stable key.
+#[allow(dead_code)]
+#[derive(Default, Clone)]
+pub struct Routes {
+    pub projects: Option<String>,
+    pub scans: Option<String>,
+    pub issues: Option<String>,
+    pub sca_issues: Option<String>,
+    /// `GET /scan/{id}` — `check_scan_status`.
+    pub scan: Option<String>,
+    /// `GET /scan/{id}/issues` — `report_scan_status` and the `--scan-id`
+    /// issue route.
+    pub scan_issues: Option<String>,
+}
+
+#[allow(dead_code)]
+impl Routes {
+    /// The stub answer for `path`: a served body, else 404. Tests needing an
+    /// endpoint outside this table match it first and delegate here.
+    pub fn answer(&self, path: &str) -> (&'static str, String) {
+        let body = if path.starts_with("/api/v1/verify") {
+            Some(r#"{"status":"ok"}"#.to_string())
+        } else if path.starts_with("/api/v1/projects?repo_url=") {
+            self.projects.clone()
+        } else if path.starts_with("/api/v1/scans?") {
+            self.scans.clone()
+        } else if path.starts_with("/api/v1/issues/sca") {
+            self.sca_issues.clone()
+        } else if path.starts_with("/api/v1/issues?") {
+            self.issues.clone()
+        } else if path.starts_with("/api/v1/scan/") {
+            if path.contains("/issues") {
+                self.scan_issues.clone()
+            } else {
+                self.scan.clone()
+            }
+        } else {
+            None
+        };
+        match body {
+            Some(body) => ("200 OK", body),
+            None => ("404 Not Found", NOT_FOUND_JSON.to_string()),
+        }
+    }
+}
+
+/// `Routes` behind a recording stub; returns the base URL and the hit log.
+#[allow(dead_code)]
+pub fn spawn_resolution_stub(routes: Routes) -> (String, Hits) {
+    spawn_recording_http_stub(move |path| routes.answer(path))
+}
+
+/// An empty page of SCA issues.
+#[allow(dead_code)]
+pub fn sca_issues_empty() -> String {
+    r#"{"status":"ok","page":1,"total_pages":1,"total_issues":0,"issues":[]}"#.to_string()
+}
+
+/// An empty page of scan-scoped issues.
+#[allow(dead_code)]
+pub fn scan_issues_empty() -> String {
+    r#"{"status":"ok","page":1,"total_pages":1,"total_issues":0,"issues":[]}"#.to_string()
+}
+
+/// `GET /api/v1/scan/{id}` returning a completed scan (`check_scan_status`
+/// checks the lowercase `complete`).
+#[allow(dead_code)]
+pub fn scan_complete() -> String {
+    r#"{"id":"scan-123","project":"bohappdev/dotnet-azure-web-tsb","repo":"https://github.com/bohappdev/dotnet-azure-web-tsb","branch":"main","status":"complete","engine":"blast","created_at":"2026-01-01T00:00:00Z"}"#.to_string()
+}
