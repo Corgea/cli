@@ -73,7 +73,7 @@ corgea wait SCAN_ID                            # Wait for a specific scan
 
 Waiting (`corgea scan`, `corgea wait`, `corgea upload --wait`) exits 1 if the
 scan fails, printing why. A scan missing one scanner's results exits 0 with a
-warning. Polling gives up after 4 hours; override with
+warning. Polling gives up after 10 hours; override with
 `CORGEA_SCAN_TIMEOUT_SECONDS`.
 
 ### List — `corgea list` (alias: `corgea ls`)

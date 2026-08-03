@@ -579,14 +579,13 @@ pub fn classify_scan_status(status: &str) -> ScanState {
     }
 }
 
-/// Upper bound on polling, from the raw `SCAN_TIMEOUT_ENV` value.
+/// How long to poll before giving up, parsed from `SCAN_TIMEOUT_ENV`.
 ///
-/// A scan that never reaches a terminal state (dropped worker, superseded scan)
-/// would otherwise burn a CI job's whole time budget. The default sits far
-/// above any real scan. Takes the raw value rather than reading the environment
-/// so the override can be tested without mutating the process.
+/// Backstop for a scan that never reports a terminal status. Scans that run
+/// past the default raise the override. Takes the raw value so it is testable
+/// without touching the environment.
 fn parse_poll_timeout(raw: Option<&str>) -> Duration {
-    const DEFAULT_SECONDS: u64 = 4 * 60 * 60;
+    const DEFAULT_SECONDS: u64 = 10 * 60 * 60;
     let seconds = match raw {
         Some(raw) => match raw.trim().parse::<u64>() {
             Ok(seconds) if seconds > 0 => seconds,
@@ -1089,7 +1088,7 @@ mod tests {
     fn poll_timeout_rejects_overrides_that_are_not_a_positive_number() {
         // A bad value must not shorten or disable the wait: anything that is
         // not a positive count of seconds falls back to the default.
-        let default = Duration::from_secs(4 * 60 * 60);
+        let default = Duration::from_secs(10 * 60 * 60);
         assert_eq!(parse_poll_timeout(None), default);
         assert_eq!(parse_poll_timeout(Some("")), default);
         assert_eq!(parse_poll_timeout(Some("abc")), default);
