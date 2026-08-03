@@ -13,6 +13,7 @@ Offline fixture projects for `corgea deps` unit and CLI tests per `docs/PRD_DEPS
 | `node-transitive` | npm generic transitive edges + scoped package names |
 | `node-yarn` / `node-pnpm` | unsupported npm-family lockfiles |
 | `node-monorepo` | workspace detection |
+| `mixed-monorepo` | recursive npm + requirements.txt discovery |
 | `python-poetry` | Poetry lock + transitive urllib3 |
 | `python-poetry-multi` | Poetry dependency tables for multiple parents |
 | `python-pip-nolock` | DEP001 + requirements.txt |
