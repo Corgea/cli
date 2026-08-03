@@ -6,7 +6,7 @@ mod common;
 
 use common::{
     projects_empty, projects_match, scans_empty, scans_one, temp_git_repo, temp_plain_dir, Hits,
-    CANON, NOT_FOUND_JSON, REMOTE,
+    Routes, CANON, REMOTE,
 };
 use std::path::Path;
 use std::process::Output;
@@ -25,21 +25,21 @@ fn issues_miss() -> String {
 
 // --- harness ---------------------------------------------------------------
 
-/// Stub serving verify + the three listing endpoints, and recording every
-/// request target so a test can assert what the CLI actually sent.
+/// The three listing endpoints `list` reads.
 fn spawn_stub(projects: String, scans: String, issues: String) -> (String, Hits) {
-    common::spawn_recording_http_stub(move |path| {
-        if path.starts_with("/api/v1/verify") {
-            ("200 OK", r#"{"status":"ok"}"#.to_string())
-        } else if path.starts_with("/api/v1/projects?repo_url=") {
-            ("200 OK", projects.clone())
-        } else if path.starts_with("/api/v1/scans?") {
-            ("200 OK", scans.clone())
-        } else if path.starts_with("/api/v1/issues?") {
-            ("200 OK", issues.clone())
-        } else {
-            ("404 Not Found", NOT_FOUND_JSON.to_string())
-        }
+    common::spawn_resolution_stub(Routes {
+        projects: Some(projects),
+        scans: Some(scans),
+        issues: Some(issues),
+        ..Default::default()
+    })
+}
+
+/// Stub serving verify + the SCA listing endpoint only.
+fn spawn_sca_stub() -> (String, Hits) {
+    common::spawn_resolution_stub(Routes {
+        sca_issues: Some(common::sca_issues_empty()),
+        ..Default::default()
     })
 }
 
@@ -230,6 +230,72 @@ fn list_project_name_override_skips_resolution() {
 }
 
 #[test]
+fn list_issues_percent_encodes_the_project_name() {
+    // A project name is user- and server-supplied; interpolated raw, an `&`
+    // would split the query and address the project `foo` instead.
+    let (url, hits) = spawn_stub(projects_empty(), scans_empty(), issues_one());
+    let (_tmp, dir) = temp_plain_dir("whatever");
+    let out = run_list(&["--issues", "--project-name", "foo&bar#baz"], &url, &dir);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        hits.iter().any(|h| h.contains("project=foo%26bar%23baz")),
+        "the delimiters must be encoded, not split the query; hits: {hits:?}"
+    );
+}
+
+#[test]
+fn list_sca_issues_scopes_to_an_explicit_project_name() {
+    // The flags are offered on every `list` mode, so with --sca-issues they
+    // must actually scope the request rather than silently return every
+    // project's findings. `list_sca_issues` reads `project`.
+    let (url, hits) = spawn_sca_stub();
+    let (_tmp, dir) = temp_plain_dir("whatever");
+    let out = run_list(&["--sca-issues", "--project-name", "some/name"], &url, &dir);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h.starts_with("/api/v1/issues/sca") && h.contains("project=some%2Fname")),
+        "the SCA request must carry the named project; hits: {hits:?}"
+    );
+}
+
+#[test]
+fn list_sca_issues_without_a_selector_stays_unscoped() {
+    // Unflagged --sca-issues has always returned the company-wide latest scan;
+    // adding the flags must not silently narrow it.
+    let (url, hits) = spawn_sca_stub();
+    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    let out = run_list(&["--sca-issues"], &url, &repo);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits = hits.lock().unwrap();
+    assert!(
+        !hits.iter().any(|h| h.contains("project=")),
+        "no selector means no project scope; hits: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| h.starts_with("/api/v1/projects")),
+        "and no resolution round trip; hits: {hits:?}"
+    );
+}
+
+#[test]
 fn list_project_name_and_repo_are_mutually_exclusive() {
     let (_tmp, dir) = temp_plain_dir("whatever");
     let (mut cmd, _home) = common::corgea_isolated();
@@ -277,22 +343,19 @@ fn list_json_miss_is_valid_empty_envelope() {
 fn list_issues_with_scan_id_skips_project_resolution() {
     // The scan-id issue route ignores the project, so no /projects call should
     // be made even from a real git repo where a remote IS present. (COR-1577)
-    let (url, hits) = common::spawn_recording_http_stub(|path| {
-        if path.starts_with("/api/v1/verify") {
-            ("200 OK", r#"{"status":"ok"}"#.to_string())
-        } else if path.contains("/check_blocking_rules") {
+    // `projects` stays unset: dialing it would 404 and show up in the hits.
+    let routes = Routes {
+        scan_issues: Some(common::scan_issues_empty()),
+        ..Default::default()
+    };
+    let (url, hits) = common::spawn_recording_http_stub(move |path| {
+        if path.contains("/check_blocking_rules") {
             (
                 "200 OK",
                 r#"{"block":false,"blocking_issues":[],"total_pages":1}"#.to_string(),
             )
-        } else if path.starts_with("/api/v1/scan/") && path.contains("/issues") {
-            (
-                "200 OK",
-                r#"{"status":"ok","page":1,"total_pages":1,"total_issues":0,"issues":[]}"#
-                    .to_string(),
-            )
         } else {
-            ("404 Not Found", NOT_FOUND_JSON.to_string())
+            routes.answer(path)
         }
     });
     let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);

@@ -1,19 +1,29 @@
 use crate::config::Config;
 use crate::scanners::blast;
 use crate::utils;
+use crate::utils::api::ProjectSelector;
 
-pub fn run(
-    config: &Config,
-    scan_id: Option<String>,
-    project_name_override: Option<String>,
-    repo_override: Option<String>,
-    project_id: Option<String>,
-) {
+#[derive(Default)]
+pub struct WaitArgs {
+    pub scan_id: Option<String>,
+    pub selector: ProjectSelector,
+    /// Known project id — `--project-id`, or straight from an upload response.
+    /// Clap requires it to be paired with a scan id.
+    pub project_id: Option<String>,
+}
+
+pub fn run(config: &Config, args: WaitArgs) {
+    let WaitArgs {
+        scan_id,
+        selector,
+        project_id,
+    } = args;
     // A scan id alone leaves nothing to resolve: everything below keys off
     // the scan, and `blast::check_scan_status`/`report_scan_status` fetch by
     // scan id regardless of whether the project id came along too.
     let resolved = if scan_id.is_some() {
-        let name = project_name_override
+        let name = selector
+            .name
             .clone()
             .unwrap_or_else(|| utils::generic::determine_project_name(None));
         utils::api::ResolvedProject {
@@ -23,11 +33,7 @@ pub fn run(
             confirmed: false,
         }
     } else {
-        utils::api::resolve_project_or_exit(
-            &config.get_url(),
-            project_name_override.as_deref(),
-            repo_override.as_deref(),
-        )
+        utils::api::resolve_project_or_exit(&config.get_url(), &selector)
     };
     let project_name = resolved.query_name.clone();
 
@@ -52,10 +58,10 @@ pub fn run(
             }
         }
     };
-    let (scan_id, processed) = match scan_id {
+    let (scan_id, processed, project_name) = match scan_id {
         Some(scan_id) => {
-            let processed = match blast::check_scan_status(&scan_id, &config.get_url()) {
-                Ok(processed) => processed,
+            let scan = match utils::api::get_scan(&config.get_url(), &scan_id) {
+                Ok(scan) => scan,
                 Err(_) => {
                     log::error!(
                         "\nOops! Something went wrong. Please try again later or check your setup.\n"
@@ -63,10 +69,22 @@ pub fn run(
                     std::process::exit(1);
                 }
             };
-            (scan_id.to_string(), processed)
+            let processed = scan.status == "complete";
+            // Explicit `--project-name` (or an uploaded name passed in) wins;
+            // otherwise trust the canonical project the backend just
+            // returned for this scan over the locally recomputed name.
+            let project_name = selector.name.clone().unwrap_or_else(|| {
+                let canonical = scan.project.trim();
+                if canonical.is_empty() {
+                    project_name.clone()
+                } else {
+                    canonical.to_string()
+                }
+            });
+            (scan_id.to_string(), processed, project_name)
         }
         None => match scans.first() {
-            Some(scan) => (scan.id.clone(), scan.status == "Complete"),
+            Some(scan) => (scan.id.clone(), scan.status == "Complete", project_name),
             None => {
                 if resolved.confirmed {
                     log::error!(

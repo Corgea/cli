@@ -169,6 +169,13 @@ enum Commands {
             help = "Resolve the project from this repo (org/repo slug or remote URL) instead of the git remote."
         )]
         repo: Option<String>,
+        #[arg(
+            long,
+            requires = "scan_id",
+            value_parser = clap::builder::NonEmptyStringValueParser::new(),
+            help = "Use this known Corgea project id for the result link, skipping project resolution. Requires a scan id, which is what the id then belongs to."
+        )]
+        project_id: Option<String>,
     },
     /// List something, by default it lists the scans
     #[command(alias = "ls")]
@@ -588,10 +595,14 @@ fn main() {
                 if *wait {
                     wait::run(
                         &corgea_config,
-                        Some(result.scan_id.clone()),
-                        Some(result.project_name.clone()),
-                        None,
-                        result.project_id.clone(),
+                        wait::WaitArgs {
+                            scan_id: Some(result.scan_id.clone()),
+                            selector: utils::api::ProjectSelector {
+                                name: Some(result.project_name.clone()),
+                                ..Default::default()
+                            },
+                            project_id: result.project_id.clone(),
+                        },
                     );
                 } else {
                     scan::print_scan_tracking_url(&corgea_config, &result);
@@ -741,14 +752,19 @@ fn main() {
             scan_id,
             project_name,
             repo,
+            project_id,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             wait::run(
                 &corgea_config,
-                scan_id.clone(),
-                project_name.clone(),
-                repo.clone(),
-                None,
+                wait::WaitArgs {
+                    scan_id: scan_id.clone(),
+                    selector: utils::api::ProjectSelector {
+                        name: project_name.clone(),
+                        repo: repo.clone(),
+                    },
+                    project_id: project_id.clone(),
+                },
             );
         }
         Some(Commands::List {
@@ -772,14 +788,18 @@ fn main() {
             }
             list::run(
                 &corgea_config,
-                issues,
-                sca_issues,
-                json,
-                page,
-                page_size,
-                scan_id,
-                project_name.clone(),
-                repo.clone(),
+                list::ListArgs {
+                    issues: *issues,
+                    sca_issues: *sca_issues,
+                    json: *json,
+                    page: *page,
+                    page_size: *page_size,
+                    scan_id: scan_id.clone(),
+                    selector: utils::api::ProjectSelector {
+                        name: project_name.clone(),
+                        repo: repo.clone(),
+                    },
+                },
             );
         }
         Some(Commands::Inspect {
