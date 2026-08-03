@@ -97,15 +97,19 @@ fn scan_maven_pom(ctx: &mut ScanContext<'_>, dir: &Path, pom_path: &Path) -> Res
     Ok(())
 }
 
+/// Sections whose contents are not the project's own coordinates or
+/// dependencies; stripped before any dependency or property extraction.
+const NON_DEPENDENCY_SECTIONS: &[&str] = &["profiles", "build", "reporting"];
+
 fn parse_pom_dependencies(content: &str) -> Result<Vec<MavenDep>, DepsError> {
-    let props = parse_pom_properties(content);
-    let (rest, management) = split_dependency_management(content);
+    let stripped = strip_sections(content, NON_DEPENDENCY_SECTIONS);
+    let props = parse_pom_properties(&stripped);
+    let (rest, management) = split_dependency_management(&stripped);
     let managed: std::collections::HashMap<(String, String), String> = parse_pom_regex(management)
         .into_iter()
         .filter(|d| !d.version.is_empty())
         .map(|d| ((d.group, d.artifact), d.version))
         .collect();
-    let rest = strip_sections(rest, &["profiles", "build"]);
     let mut deps = parse_pom_regex(&rest);
     for dep in &mut deps {
         if dep.version.is_empty() {
@@ -118,9 +122,12 @@ fn parse_pom_dependencies(content: &str) -> Result<Vec<MavenDep>, DepsError> {
     Ok(deps)
 }
 
-/// Remove every `<tag>...</tag>` section; their contents (plugin and
-/// profile dependency blocks) are not application dependencies.
-fn strip_sections(mut content: String, tags: &[&str]) -> String {
+/// Remove every `<tag>...</tag>` section. Their dependency blocks are not
+/// application dependencies, and a profile's `<properties>` or
+/// `<dependencyManagement>` must not affect the base dependency graph, so
+/// stripping runs before property and management extraction.
+fn strip_sections(content: &str, tags: &[&str]) -> String {
+    let mut content = content.to_string();
     for tag in tags {
         while let Some((rest, _)) = split_section(&content, tag) {
             content = rest;
@@ -219,15 +226,12 @@ fn pom_project_version(content: &str) -> String {
     // nested section that may carry unrelated <version> tags of its own
     // (plugin versions in <build>, managed versions in
     // <dependencyManagement>, etc).
-    let nested_start = [
-        "<dependencyManagement>",
-        "<build>",
-        "<reporting>",
-        "<profiles>",
-    ]
-    .iter()
-    .filter_map(|tag| head.find(tag))
-    .min();
+    let nested_start = NON_DEPENDENCY_SECTIONS
+        .iter()
+        .copied()
+        .chain(["dependencyManagement"])
+        .filter_map(|tag| head.find(&format!("<{tag}>")))
+        .min();
     let head = match nested_start {
         Some(pos) => &head[..pos],
         None => head,
