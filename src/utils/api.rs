@@ -850,7 +850,17 @@ pub fn resolve_project_by_repo(
     let mut page = 1;
     loop {
         let Some(parsed) = fetch_projects_page(url, repo_path, page)? else {
-            return Ok(None);
+            // Only page 1 can be a backend without the endpoint; a 404 once the
+            // walk is under way (a concurrent delete shrinking the filtered set)
+            // would discard the matches already found and read as a clean miss.
+            if page == 1 {
+                return Ok(None);
+            }
+            return Err(format!(
+                "/projects page {} returned 404 after pagination started",
+                page
+            )
+            .into());
         };
         let total_pages = parsed.total_pages.unwrap_or(1);
         if parsed.projects.is_empty() {
@@ -1750,6 +1760,14 @@ mod tests {
 
     // Serves `page_one` until a request carries `page=2`, then `page_two`.
     fn spawn_paged_projects_stub(page_one: &'static str, page_two: &'static str) -> String {
+        spawn_paged_projects_stub_status(page_one, "200 OK", page_two)
+    }
+
+    fn spawn_paged_projects_stub_status(
+        page_one: &'static str,
+        page_two_status: &'static str,
+        page_two: &'static str,
+    ) -> String {
         use std::io::Write;
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -1757,12 +1775,12 @@ mod tests {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 let request = corgea::vuln_api_stub::read_http_request(&mut stream);
-                let body = if String::from_utf8_lossy(&request).contains("page=2") {
-                    page_two
+                let (status, body) = if String::from_utf8_lossy(&request).contains("page=2") {
+                    (page_two_status, page_two)
                 } else {
-                    page_one
+                    ("200 OK", page_one)
                 };
-                let resp = corgea::vuln_api_stub::http_response("200 OK", "", body);
+                let resp = corgea::vuln_api_stub::http_response(status, "", body);
                 let _ = stream.write_all(resp.as_bytes());
             }
         });
@@ -1780,6 +1798,21 @@ mod tests {
         );
         let got = resolve_project_by_repo(&base, "acme/api", None).unwrap();
         assert_eq!(got.map(|p| p.name).as_deref(), Some("acme/api"));
+    }
+
+    #[test]
+    fn resolve_project_by_repo_mid_pagination_404_is_hard_err() {
+        // Django 404s a page that a concurrent delete shrank out of existence.
+        // Page 1 already held the exact match, so a soft miss here would throw
+        // it away and send the caller to the legacy-name fallback.
+        let base = spawn_paged_projects_stub_status(
+            r#"{"status":"ok","total_pages":2,"projects":[{"name":"acme/api","repo_url":"https://github.com/acme/api"}]}"#,
+            "404 Not Found",
+            r#"{"message":"Invalid page."}"#,
+        );
+        let err = resolve_project_by_repo(&base, "acme/api", None).unwrap_err();
+        assert!(err.to_string().contains("page 2"), "{err}");
+        assert!(err.to_string().contains("pagination"), "{err}");
     }
 
     #[test]
