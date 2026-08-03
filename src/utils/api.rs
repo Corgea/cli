@@ -471,9 +471,7 @@ pub fn get_scan_issues(
     page_size: Option<u16>,
     scan_id: Option<String>,
 ) -> Result<ProjectIssuesResponse, Box<dyn std::error::Error>> {
-    // Built with `query`, not `format!`: a project name is user- and
-    // server-supplied, so an `&`/`#`/`?` in it would otherwise split the query
-    // and address a different project.
+    // Project names can contain `&`/`?`/`#`, so use `query`, not `format!`.
     let (url, mut query_params) = match scan_id {
         Some(scan_id) => (
             format!("{}{}/scan/{}/issues", url, API_BASE, scan_id),
@@ -744,18 +742,13 @@ pub struct ProjectSummary {
 
 #[derive(Deserialize, Debug)]
 pub struct ProjectsResponse {
-    /// Required: doghouse's `@paginated` emits this key on every 200, empty
-    /// array included (`api/decorators.py:228,241,259`). A 200 without it is
-    /// not this endpoint answering, so it must fail the parse rather than read
-    /// as "no matches" and take the legacy-name fallback.
+    /// Deliberately no `#[serde(default)]`: a 200 missing this key must fail
+    /// the parse, not read as "no matches" and take the legacy-name fallback.
     pub projects: Vec<ProjectSummary>,
-    /// Absent on a backend that does not paginate -> treated as a single page.
     #[serde(default)]
     pub total_pages: Option<u32>,
 }
 
-/// The backend's `@paginated` `max_page_size` for /projects; a larger value is
-/// clamped server-side.
 const PROJECTS_PAGE_SIZE: u16 = 50;
 
 /// Ceiling on pages walked looking for an exact repo match, so a bogus
@@ -840,7 +833,8 @@ fn fetch_projects_page(
 /// `gitlab.com/acme/api`), but a lone path match is accepted whatever its
 /// host — an SSH-config alias origin (`corp-github:acme/api`) never matches
 /// the stored `github.com` and must still resolve. Several path matches with
-/// none on our host is genuinely ambiguous and errors rather than guessing.
+/// none on our host — or several on it — is genuinely ambiguous and errors
+/// rather than guessing.
 ///
 /// `Err` for hard failures (network/auth/5xx/unparseable body/ambiguity); a
 /// clean "no match" (or a 404 from a backend without the endpoint) is a soft
@@ -851,6 +845,7 @@ pub fn resolve_project_by_repo(
     expected_host: Option<&str>,
 ) -> Result<Option<ProjectSummary>, Box<dyn std::error::Error>> {
     let expected = repo_path.to_lowercase();
+    let mut host_matches: Vec<ProjectSummary> = Vec::new();
     let mut candidates: Vec<ProjectSummary> = Vec::new();
     let mut page = 1;
     loop {
@@ -868,11 +863,14 @@ pub fn resolve_project_by_repo(
             if !repo_url_matches_path(repo_url, &expected) {
                 continue;
             }
-            // Our own host settles it; no need to read further pages.
+            // A host match is preferred but not returned early: two projects
+            // claiming the same host+path must reach the ambiguity check
+            // below, not resolve to whichever the backend listed first.
             if expected_host.is_some_and(|h| repo_url_on_host(repo_url, h)) {
-                return Ok(Some(project));
+                host_matches.push(project);
+            } else {
+                candidates.push(project);
             }
-            candidates.push(project);
         }
         if page >= total_pages {
             break;
@@ -890,20 +888,25 @@ pub fn resolve_project_by_repo(
         page += 1;
     }
 
-    if candidates.len() > 1 {
-        let urls: Vec<&str> = candidates
+    let mut matches = if host_matches.is_empty() {
+        candidates
+    } else {
+        host_matches
+    };
+    if matches.len() > 1 {
+        let urls: Vec<&str> = matches
             .iter()
             .filter_map(|p| p.repo_url.as_deref())
             .collect();
         return Err(format!(
             "{} Corgea projects claim repo '{}' ({}); pass --project-name <NAME> to choose one",
-            candidates.len(),
+            matches.len(),
             repo_path,
             urls.join(", ")
         )
         .into());
     }
-    Ok(candidates.pop())
+    Ok(matches.pop())
 }
 
 /// What `list`/`wait` need to drive the existing name-based queries.
@@ -1842,6 +1845,18 @@ mod tests {
             r#"{"status":"ok","projects":[{"name":"gl","repo_url":"https://gitlab.com/acme/api"},{"name":"gh","repo_url":"https://github.com/acme/api"}]}"#,
         );
         let err = resolve_project_by_repo(&base, "acme/api", Some("corp-github")).unwrap_err();
+        assert!(err.to_string().contains("--project-name"), "{err}");
+    }
+
+    #[test]
+    fn resolve_project_by_repo_errors_when_two_projects_share_our_host_and_path() {
+        // A host match must not short-circuit the ambiguity check: two
+        // projects on the same host+path would resolve to whichever the
+        // backend listed first.
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","projects":[{"name":"first","repo_url":"https://github.com/acme/api"},{"name":"second","repo_url":"https://github.com/acme/api"}]}"#,
+        );
+        let err = resolve_project_by_repo(&base, "acme/api", Some("github.com")).unwrap_err();
         assert!(err.to_string().contains("--project-name"), "{err}");
     }
 
