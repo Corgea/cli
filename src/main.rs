@@ -156,7 +156,20 @@ enum Commands {
         sbom: Option<String>,
     },
     /// Wait for the latest in progress scan
-    Wait { scan_id: Option<String> },
+    Wait {
+        scan_id: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "repo",
+            help = "Query this exact Corgea project name directly (skips repo auto-resolution)."
+        )]
+        project_name: Option<String>,
+        #[arg(
+            long,
+            help = "Resolve the project from this repo (org/repo slug or remote URL) instead of the git remote."
+        )]
+        repo: Option<String>,
+    },
     /// List something, by default it lists the scans
     #[command(alias = "ls")]
     List {
@@ -181,6 +194,19 @@ enum Commands {
 
         #[arg(long, value_parser = clap::value_parser!(u16), help = "Number of items per page")]
         page_size: Option<u16>,
+
+        #[arg(
+            long,
+            conflicts_with = "repo",
+            help = "Query this exact Corgea project name directly (skips repo auto-resolution)."
+        )]
+        project_name: Option<String>,
+
+        #[arg(
+            long,
+            help = "Resolve the project from this repo (org/repo slug or remote URL) instead of the git remote."
+        )]
+        repo: Option<String>,
     },
     /// Inspect something, by default it will inspect a scan
     Inspect {
@@ -560,7 +586,13 @@ fn main() {
 
             if let Some(result) = result {
                 if *wait {
-                    wait::run(&corgea_config, Some(result.scan_id), result.project_id);
+                    wait::run(
+                        &corgea_config,
+                        Some(result.scan_id.clone()),
+                        Some(result.project_name.clone()),
+                        None,
+                        result.project_id.clone(),
+                    );
                 } else {
                     scan::print_scan_tracking_url(&corgea_config, &result);
                 }
@@ -705,9 +737,19 @@ fn main() {
                 ),
             }
         }
-        Some(Commands::Wait { scan_id }) => {
+        Some(Commands::Wait {
+            scan_id,
+            project_name,
+            repo,
+        }) => {
             verify_token_and_exit_when_fail(&corgea_config);
-            wait::run(&corgea_config, scan_id.clone(), None);
+            wait::run(
+                &corgea_config,
+                scan_id.clone(),
+                project_name.clone(),
+                repo.clone(),
+                None,
+            );
         }
         Some(Commands::List {
             issues,
@@ -716,6 +758,8 @@ fn main() {
             page_size,
             scan_id,
             sca_issues,
+            project_name,
+            repo,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             if *issues && *sca_issues {
@@ -734,6 +778,8 @@ fn main() {
                 page,
                 page_size,
                 scan_id,
+                project_name.clone(),
+                repo.clone(),
             );
         }
         Some(Commands::Inspect {

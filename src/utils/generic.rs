@@ -297,16 +297,75 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
             .map(|commit| commit.id().to_string())
     });
 
-    let repo_url = repo
-        .find_remote("origin")
-        .ok()
-        .and_then(|remote| remote.url().map(|url| url.to_string()));
-
     Ok(Some(RepoInfo {
         branch,
-        repo_url,
+        repo_url: origin_url(&repo),
         sha,
     }))
+}
+
+/// `origin`'s URL, or None when the remote is missing or carries no URL.
+fn origin_url(repo: &Repository) -> Option<String> {
+    repo.find_remote("origin")
+        .ok()
+        .and_then(|remote| remote.url().map(|url| url.to_string()))
+}
+
+/// The enclosing repository's `origin` remote URL, searched upward from the
+/// current directory so `corgea list`/`wait` also resolve from a subdirectory.
+/// `get_repo_info` deliberately returns None outside the worktree root; this
+/// does not. None outside a git repo or when `origin` carries no URL.
+pub fn discover_repo_url() -> Option<String> {
+    origin_url(&Repository::discover(Path::new(".")).ok()?)
+}
+
+/// The whole repository path after the host, lowercased (`org/repo`,
+/// `group/subgroup/repo`, Azure `org/project/_git/repo`). The host is excluded
+/// so SSH/HTTPS/port variants of one remote compare equal; None when the value
+/// carries no host at all. The full path — not a trailing `org/repo` slug — is
+/// what doghouse `normalize_repo_url` stores (`heeler/models.py:201-246`), so
+/// it is what an equality compare needs. Azure SSH remotes
+/// (`ssh.dev.azure.com/v3/org/…`, no `_git` segment) remain a known limitation.
+pub fn extract_repo_path(url: &str) -> Option<String> {
+    Some(split_remote(url)?[1..].join("/").to_lowercase())
+}
+
+/// Split a git remote into `[host, path segments…]`, dropping scheme, userinfo
+/// and port. None when fewer than two path segments follow the host, or when
+/// nothing marks the value as a network remote.
+fn split_remote(url: &str) -> Option<Vec<&str>> {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let (had_scheme, url) = match url.split_once("://") {
+        Some((_, rest)) => (true, rest),
+        None => (false, url),
+    };
+    // Drop userinfo (`git@`, `oauth2:token@`) so it is never read as the host.
+    let host_end = url.find('/').unwrap_or(url.len());
+    let (had_userinfo, url) = match url[..host_end].rfind('@') {
+        Some(at) => (true, &url[at + 1..]),
+        None => (false, url),
+    };
+    // A colon before the first '/' is the scp-style `host:org/repo` separator.
+    let first_slash = url.find('/').unwrap_or(url.len());
+    let had_scp_colon = url[..first_slash].contains(':');
+    // URL forms split host from path on '/', scp-like `git@host:org/repo` on ':'.
+    let mut segments: Vec<&str> = url.split(['/', ':']).filter(|s| !s.is_empty()).collect();
+    // segments[0] is the host; an all-digit segment right after it is a port.
+    if segments.len() >= 4 && segments[1].chars().all(|c| c.is_ascii_digit()) {
+        segments.remove(1);
+    }
+    // Need host + at least org + repo.
+    if segments.len() < 3 {
+        return None;
+    }
+    // A scheme, userinfo or scp colon is what marks a network remote. Without
+    // one this is a bare path — a GitLab `group/subgroup/repo`, whose namespace
+    // may itself contain dots — so every segment belongs to the path.
+    if !had_scheme && !had_userinfo && !had_scp_colon {
+        return None;
+    }
+    Some(segments)
 }
 
 /// True when `dir` is the repository worktree root (not a subdirectory).
@@ -440,5 +499,57 @@ mod tests {
             "node_modules file should be excluded: {:?}",
             added
         );
+    }
+
+    #[test]
+    fn extract_repo_path_handles_common_remote_forms() {
+        for url in [
+            "https://github.com/org/repo.git",
+            "https://github.com/org/repo",
+            "git@github.com:org/repo.git",
+            "git@github.com:org/repo",
+            "ssh://git@github.com/org/repo",
+            "https://github.com/org/repo/",
+            "https://github.com/Org/Repo",
+            // host:port must not leak the port into the path
+            "https://git.example.com:8443/org/repo",
+            // token userinfo must not be read as the host
+            "https://oauth2:tok@gitlab.com/org/repo",
+        ] {
+            assert_eq!(extract_repo_path(url).as_deref(), Some("org/repo"), "{url}");
+        }
+        // Bank of Hope case: the stored name is the whole org/repo path.
+        assert_eq!(
+            extract_repo_path("git@github.com:bohappdev/dotnet-azure-web-tsb.git").as_deref(),
+            Some("bohappdev/dotnet-azure-web-tsb")
+        );
+        // Whole path is kept: Azure `_git` and GitLab subgroups.
+        assert_eq!(
+            extract_repo_path("https://dev.azure.com/org/project/_git/repo").as_deref(),
+            Some("org/project/_git/repo")
+        );
+        assert_eq!(
+            extract_repo_path("git@gitlab.com:group/subgroup/repo.git").as_deref(),
+            Some("group/subgroup/repo")
+        );
+        // An SSH-config host alias carries no userinfo and no dot, but the
+        // colon before the first slash still marks it scp-style.
+        assert_eq!(
+            extract_repo_path("corp-github:bohappdev/repo.git").as_deref(),
+            Some("bohappdev/repo")
+        );
+    }
+
+    #[test]
+    fn extract_repo_path_returns_none_without_a_host() {
+        assert_eq!(extract_repo_path("not a url"), None);
+        assert_eq!(extract_repo_path(""), None);
+        assert_eq!(extract_repo_path("github.com"), None); // host only
+                                                           // Nothing marks these as a network remote, so they are bare paths the
+                                                           // caller keeps verbatim; a GitLab namespace may contain dots, so a
+                                                           // dotted leading segment is no evidence of a host.
+        assert_eq!(extract_repo_path("org/repo"), None);
+        assert_eq!(extract_repo_path("group/subgroup/repo"), None);
+        assert_eq!(extract_repo_path("my.group/sub/repo"), None);
     }
 }
