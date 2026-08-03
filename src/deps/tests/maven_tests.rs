@@ -279,12 +279,37 @@ fn maven_plugin_and_profile_deps_are_excluded() {
         *n.id(),
         PackageId("pkg:maven/com.google.guava/guava@32.1.3-jre".into())
     );
-    for name in ["ant", "maven-antrun-plugin", "commons-io"] {
+    for name in [
+        "ant",
+        "maven-antrun-plugin",
+        "commons-io",
+        "report-plugin",
+        "report-helper",
+    ] {
         assert!(
             inv.node(name).is_none(),
             "{name} must not be an application dependency"
         );
     }
+}
+
+/// An inactive profile's `<dependencyManagement>` and `<properties>` must
+/// not pin or resolve versions for base dependencies.
+#[test]
+fn maven_inactive_profile_management_and_properties_do_not_leak() {
+    let inv = scan_fixture("java-maven-profile-mgmt");
+    let lib = inv.node("lib").expect("lib node missing");
+    assert_eq!(
+        lib.version(),
+        Some(""),
+        "inactive profile's managed version must not pin the base dependency"
+    );
+    let other = inv.node("other").expect("other node missing");
+    assert_eq!(
+        other.version(),
+        Some("${profile.only}"),
+        "inactive profile's properties must not resolve base placeholders"
+    );
 }
 
 /// The property fixed-point resolution must handle chains deeper than the
