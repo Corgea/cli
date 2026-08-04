@@ -1017,3 +1017,57 @@ fn run_git(repo: &std::path::Path, args: &[&str]) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn cli_sbom_warns_on_unsupported_ecosystem_and_still_succeeds() {
+    let (mut cmd, _home) = corgea_isolated();
+    let project = TempDir::new().expect("project dir");
+    std::fs::write(
+        project.path().join("go.mod"),
+        "module example.com/foo\n\ngo 1.22\n",
+    )
+    .expect("write go.mod");
+
+    let out = cmd
+        .args(["deps", "sbom", project.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run corgea");
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("go.mod") && stderr.contains("Go") && stderr.contains("not yet included"),
+        "expected an unsupported-ecosystem warning on stderr, got: {stderr}"
+    );
+
+    let sbom: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid CycloneDX JSON");
+    assert_eq!(sbom["bomFormat"], "CycloneDX");
+    assert_eq!(
+        sbom["components"].as_array().map(|a| a.len()),
+        Some(0),
+        "Go-only tree should produce zero SBOM components"
+    );
+}
+
+#[test]
+fn cli_sbom_nonexistent_path_fails_cleanly() {
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .args(["deps", "sbom", "/does/not/exist/corgea-cli-test"])
+        .output()
+        .expect("failed to run corgea");
+
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("path does not exist"),
+        "expected a clean path-does-not-exist error, got: {stderr}"
+    );
+}
