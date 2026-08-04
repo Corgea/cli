@@ -248,6 +248,51 @@ fn cli_graph_format_json_outputs_parseable_nodes() {
 }
 
 #[test]
+fn cli_mixed_monorepo_commands_cover_npm_and_pypi() {
+    let path = fixture("mixed-monorepo");
+    let expected = ["pkg:npm/debug@4.3.4", "pkg:pypi/fastapi@0.110.0"];
+
+    for (subcommand, format) in [("scan", "json"), ("graph", "json"), ("sbom", "cyclonedx")] {
+        let (mut cmd, _home) = corgea_isolated();
+        let out = cmd
+            .args(["deps", subcommand, &path, "--format", format])
+            .output()
+            .expect("failed to run corgea");
+        assert!(
+            out.status.success(),
+            "deps {subcommand} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+        let ids: Vec<_> = if subcommand == "sbom" {
+            assert_eq!(parsed["bomFormat"], "CycloneDX");
+            parsed["components"]
+                .as_array()
+                .expect("components array")
+                .iter()
+                .filter_map(|component| component["purl"].as_str())
+                .collect()
+        } else {
+            parsed["nodes"]
+                .as_array()
+                .expect("nodes array")
+                .iter()
+                .filter_map(|node| node["id"].as_str())
+                .collect()
+        };
+
+        for id in expected {
+            assert!(
+                ids.contains(&id),
+                "deps {subcommand} omitted {id}: {parsed}"
+            );
+        }
+    }
+}
+
+#[test]
 fn cli_deps_help_includes_copy_paste_examples() {
     let cases = [
         (
