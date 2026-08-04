@@ -1,5 +1,3 @@
-mod common;
-
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
@@ -14,34 +12,35 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-const TOKEN: &str = "opaque-test-token";
-const SOURCE_BODY: &str = "print(\"cloud contract\")\n";
-const REPORT_BODY: &str = r#"{"version":"semgrep.dev/v1","results":[{"path":"src/main.py"}]}"#;
+pub(crate) const TOKEN: &str = "opaque-test-token";
+pub(crate) const SOURCE_BODY: &str = "print(\"cloud contract\")\n";
+pub(crate) const REPORT_BODY: &str =
+    r#"{"version":"semgrep.dev/v1","results":[{"path":"src/main.py"}]}"#;
 
 #[derive(Debug, Clone)]
-struct CapturedRequest {
+pub(crate) struct CapturedRequest {
     method: Method,
     target: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
-type RequestCheck = dyn Fn(&CapturedRequest) -> Result<(), String> + Send;
+pub(crate) type RequestCheck = dyn Fn(&CapturedRequest) -> Result<(), String> + Send;
 
-struct ExpectedRequest {
+pub(crate) struct ExpectedRequest {
     label: &'static str,
     check: Box<RequestCheck>,
     status: StatusCode,
     body: String,
 }
 
-struct ApiState {
+pub(crate) struct ApiState {
     expected: VecDeque<ExpectedRequest>,
     captured: Vec<CapturedRequest>,
     failures: Vec<String>,
 }
 
-struct ApiStub {
+pub(crate) struct ApiStub {
     base_url: String,
     state: Arc<Mutex<ApiState>>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
@@ -49,7 +48,7 @@ struct ApiStub {
 }
 
 impl ApiStub {
-    fn start(expected: Vec<ExpectedRequest>) -> Self {
+    pub(crate) fn start(expected: Vec<ExpectedRequest>) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind API stub");
         listener
             .set_nonblocking(true)
@@ -109,16 +108,16 @@ impl ApiStub {
         }
     }
 
-    fn base_url(&self) -> &str {
+    pub(crate) fn base_url(&self) -> &str {
         &self.base_url
     }
 
-    fn transcript(&self) -> String {
+    pub(crate) fn transcript(&self) -> String {
         let state = self.state.lock().expect("lock API transcript");
         format_transcript(&state.captured)
     }
 
-    fn assert_finished(mut self) -> String {
+    pub(crate) fn assert_finished(mut self) -> String {
         self.stop();
         let state = self.state.lock().expect("lock finished API state");
         let remaining = state
@@ -137,7 +136,7 @@ impl ApiStub {
         transcript
     }
 
-    fn stop(&mut self) {
+    pub(crate) fn stop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -158,7 +157,7 @@ impl Drop for ApiStub {
     }
 }
 
-async fn handle_request(
+pub(crate) async fn handle_request(
     request: Request<Incoming>,
     state: Arc<Mutex<ApiState>>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -224,7 +223,7 @@ async fn handle_request(
         .expect("build API response"))
 }
 
-fn expected_request<F>(
+pub(crate) fn expected_request<F>(
     label: &'static str,
     check: F,
     response: (StatusCode, String),
@@ -240,15 +239,15 @@ where
     }
 }
 
-fn json_response(body: Value) -> (StatusCode, String) {
+pub(crate) fn json_response(body: Value) -> (StatusCode, String) {
     (StatusCode::OK, body.to_string())
 }
 
-fn json_response_with_status(status: StatusCode, body: Value) -> (StatusCode, String) {
+pub(crate) fn json_response_with_status(status: StatusCode, body: Value) -> (StatusCode, String) {
     (status, body.to_string())
 }
 
-fn target_path_and_query(target: &str) -> (&str, Vec<(String, String)>) {
+pub(crate) fn target_path_and_query(target: &str) -> (&str, Vec<(String, String)>) {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let query = url::form_urlencoded::parse(query.as_bytes())
         .into_owned()
@@ -256,7 +255,7 @@ fn target_path_and_query(target: &str) -> (&str, Vec<(String, String)>) {
     (path, query)
 }
 
-fn assert_method_and_path(
+pub(crate) fn assert_method_and_path(
     request: &CapturedRequest,
     method: Method,
     path: &str,
@@ -271,7 +270,7 @@ fn assert_method_and_path(
     Ok(())
 }
 
-fn assert_opaque_auth(request: &CapturedRequest) -> Result<(), String> {
+pub(crate) fn assert_opaque_auth(request: &CapturedRequest) -> Result<(), String> {
     match header_value(request, "corgea-token") {
         Some(value) if value == TOKEN => Ok(()),
         Some(value) => Err(format!("expected CORGEA-TOKEN {TOKEN}, got {value}")),
@@ -279,7 +278,7 @@ fn assert_opaque_auth(request: &CapturedRequest) -> Result<(), String> {
     }
 }
 
-fn assert_authenticated_request(
+pub(crate) fn assert_authenticated_request(
     request: &CapturedRequest,
     method: Method,
     path: &str,
@@ -288,7 +287,11 @@ fn assert_authenticated_request(
     assert_opaque_auth(request)
 }
 
-fn assert_query(request: &CapturedRequest, key: &str, expected: &str) -> Result<(), String> {
+pub(crate) fn assert_query(
+    request: &CapturedRequest,
+    key: &str,
+    expected: &str,
+) -> Result<(), String> {
     let (_, query) = target_path_and_query(&request.target);
     match query.iter().find(|(name, _)| name == key) {
         Some((_, value)) if value == expected => Ok(()),
@@ -297,14 +300,17 @@ fn assert_query(request: &CapturedRequest, key: &str, expected: &str) -> Result<
     }
 }
 
-fn assert_scan_list_request(request: &CapturedRequest, project: &str) -> Result<(), String> {
+pub(crate) fn assert_scan_list_request(
+    request: &CapturedRequest,
+    project: &str,
+) -> Result<(), String> {
     assert_authenticated_request(request, Method::GET, "/api/v1/scans")?;
     assert_query(request, "page", "1")?;
     assert_query(request, "page_size", "30")?;
     assert_query(request, "project", project)
 }
 
-fn query_value(request: &CapturedRequest, key: &str) -> Result<String, String> {
+pub(crate) fn query_value(request: &CapturedRequest, key: &str) -> Result<String, String> {
     let (_, query) = target_path_and_query(&request.target);
     query
         .into_iter()
@@ -312,7 +318,10 @@ fn query_value(request: &CapturedRequest, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing query field {key}"))
 }
 
-fn assert_body_contains(request: &CapturedRequest, expected: &[u8]) -> Result<(), String> {
+pub(crate) fn assert_body_contains(
+    request: &CapturedRequest,
+    expected: &[u8],
+) -> Result<(), String> {
     if request
         .body
         .windows(expected.len())
@@ -327,7 +336,7 @@ fn assert_body_contains(request: &CapturedRequest, expected: &[u8]) -> Result<()
     }
 }
 
-fn header_value<'a>(request: &'a CapturedRequest, name: &str) -> Option<&'a str> {
+pub(crate) fn header_value<'a>(request: &'a CapturedRequest, name: &str) -> Option<&'a str> {
     request
         .headers
         .iter()
@@ -335,7 +344,7 @@ fn header_value<'a>(request: &'a CapturedRequest, name: &str) -> Option<&'a str>
         .map(|(_, value)| value.as_str())
 }
 
-fn assert_content_type(request: &CapturedRequest, expected: &str) -> Result<(), String> {
+pub(crate) fn assert_content_type(request: &CapturedRequest, expected: &str) -> Result<(), String> {
     match header_value(request, "content-type") {
         Some(value) if value.starts_with(expected) => Ok(()),
         Some(value) => Err(format!("expected content type {expected}, got {value}")),
@@ -343,7 +352,11 @@ fn assert_content_type(request: &CapturedRequest, expected: &str) -> Result<(), 
     }
 }
 
-fn assert_header(request: &CapturedRequest, name: &str, expected: &str) -> Result<(), String> {
+pub(crate) fn assert_header(
+    request: &CapturedRequest,
+    name: &str,
+    expected: &str,
+) -> Result<(), String> {
     match header_value(request, name) {
         Some(value) if value == expected => Ok(()),
         Some(value) => Err(format!("expected header {name}: {expected}, got {value}")),
@@ -351,7 +364,7 @@ fn assert_header(request: &CapturedRequest, name: &str, expected: &str) -> Resul
     }
 }
 
-fn assert_multipart_text_field(
+pub(crate) fn assert_multipart_text_field(
     request: &CapturedRequest,
     name: &str,
     value: &str,
@@ -368,7 +381,7 @@ fn assert_multipart_text_field(
     }
 }
 
-fn format_transcript(requests: &[CapturedRequest]) -> String {
+pub(crate) fn format_transcript(requests: &[CapturedRequest]) -> String {
     if requests.is_empty() {
         return "<no requests>".to_string();
     }
@@ -397,7 +410,7 @@ fn format_transcript(requests: &[CapturedRequest]) -> String {
         .join("\n")
 }
 
-fn run_with_timeout(mut command: Command, api: &ApiStub) -> Output {
+pub(crate) fn run_with_timeout(mut command: Command, api: &ApiStub) -> Output {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -424,7 +437,7 @@ fn run_with_timeout(mut command: Command, api: &ApiStub) -> Output {
     }
 }
 
-fn output_context(output: &Output, transcript: &str) -> String {
+pub(crate) fn output_context(output: &Output, transcript: &str) -> String {
     format!(
         "stdout:\n{}\nstderr:\n{}\nAPI transcript:\n{}",
         String::from_utf8_lossy(&output.stdout),
@@ -433,7 +446,7 @@ fn output_context(output: &Output, transcript: &str) -> String {
     )
 }
 
-fn parse_output_json(output: &Output, transcript: &str) -> Value {
+pub(crate) fn parse_output_json(output: &Output, transcript: &str) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
         panic!(
             "failed to parse CLI stdout as JSON: {error}\n{}",
@@ -442,8 +455,8 @@ fn parse_output_json(output: &Output, transcript: &str) -> Value {
     })
 }
 
-fn cloud_command(api: &ApiStub, path: &Path) -> (Command, TempDir) {
-    let (mut command, home) = common::corgea_isolated();
+pub(crate) fn cloud_command(api: &ApiStub, path: &Path) -> (Command, TempDir) {
+    let (mut command, home) = crate::repo_common::corgea_isolated();
     command
         .current_dir(path)
         .env("CORGEA_TOKEN", TOKEN)
@@ -451,33 +464,33 @@ fn cloud_command(api: &ApiStub, path: &Path) -> (Command, TempDir) {
     (command, home)
 }
 
-struct ReportProject {
+pub(crate) struct ReportProject {
     root: TempDir,
     report_path: PathBuf,
 }
 
-struct GitProject {
+pub(crate) struct GitProject {
     root: TempDir,
-    sha: String,
+    pub(crate) sha: String,
 }
 
 impl GitProject {
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         self.root.path()
     }
 }
 
 impl ReportProject {
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         self.root.path()
     }
 
-    fn report_path(&self) -> &Path {
+    pub(crate) fn report_path(&self) -> &Path {
         &self.report_path
     }
 }
 
-fn report_project() -> ReportProject {
+pub(crate) fn report_project() -> ReportProject {
     let root = TempDir::new().expect("create report project");
     let source_dir = root.path().join("src");
     std::fs::create_dir(&source_dir).expect("create source directory");
@@ -487,7 +500,7 @@ fn report_project() -> ReportProject {
     ReportProject { root, report_path }
 }
 
-fn git_project() -> GitProject {
+pub(crate) fn git_project() -> GitProject {
     let root = TempDir::new().expect("create Git project");
     for args in [
         vec!["init"],
@@ -515,7 +528,7 @@ fn git_project() -> GitProject {
     GitProject { root, sha }
 }
 
-fn run_git(path: &Path, args: &[&str]) -> Output {
+pub(crate) fn run_git(path: &Path, args: &[&str]) -> Output {
     let output = Command::new("git")
         .args(args)
         .current_dir(path)
@@ -531,14 +544,14 @@ fn run_git(path: &Path, args: &[&str]) -> Output {
     output
 }
 
-fn temp_project_name(path: &Path) -> String {
+pub(crate) fn temp_project_name(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
         .expect("UTF-8 temp project name")
         .to_string()
 }
 
-fn verify_request() -> ExpectedRequest {
+pub(crate) fn verify_request() -> ExpectedRequest {
     expected_request(
         "verify token",
         |request| assert_authenticated_request(request, Method::GET, "/api/v1/verify"),
@@ -546,7 +559,7 @@ fn verify_request() -> ExpectedRequest {
     )
 }
 
-fn scan_response(scan_id: &str, project: &str, status: &str) -> Value {
+pub(crate) fn scan_response(scan_id: &str, project: &str, status: &str) -> Value {
     json!({
         "id": scan_id,
         "project": project,
@@ -559,7 +572,7 @@ fn scan_response(scan_id: &str, project: &str, status: &str) -> Value {
     })
 }
 
-fn scans_response(scans: Vec<Value>) -> Value {
+pub(crate) fn scans_response(scans: Vec<Value>) -> Value {
     json!({
         "status": "ok",
         "page": 1,
@@ -568,7 +581,7 @@ fn scans_response(scans: Vec<Value>) -> Value {
     })
 }
 
-fn regular_issue(issue_id: &str, scan_id: &str, project: &str, urgency: &str) -> Value {
+pub(crate) fn regular_issue(issue_id: &str, scan_id: &str, project: &str, urgency: &str) -> Value {
     json!({
         "id": issue_id,
         "scan_id": scan_id,
@@ -604,7 +617,7 @@ fn regular_issue(issue_id: &str, scan_id: &str, project: &str, urgency: &str) ->
     })
 }
 
-fn regular_issue_page(scan_id: &str, project: &str) -> Value {
+pub(crate) fn regular_issue_page(scan_id: &str, project: &str) -> Value {
     let issues = vec![
         regular_issue("issue-cr", scan_id, project, "CR"),
         regular_issue("issue-hi-1", scan_id, project, "HI"),
@@ -620,7 +633,7 @@ fn regular_issue_page(scan_id: &str, project: &str) -> Value {
     })
 }
 
-fn empty_issue_page() -> Value {
+pub(crate) fn empty_issue_page() -> Value {
     json!({
         "status": "ok",
         "issues": [],
@@ -630,7 +643,7 @@ fn empty_issue_page() -> Value {
     })
 }
 
-fn malicious_sca_issue_page() -> Value {
+pub(crate) fn malicious_sca_issue_page() -> Value {
     json!({
         "status": "ok",
         "issues": [{
@@ -657,7 +670,7 @@ fn malicious_sca_issue_page() -> Value {
     })
 }
 
-fn upload_plan(scan_id: &str, project_id: i64) -> Vec<ExpectedRequest> {
+pub(crate) fn upload_plan(scan_id: &str, project_id: i64) -> Vec<ExpectedRequest> {
     let run_id = Arc::new(Mutex::new(None::<String>));
     let code_run_id = Arc::clone(&run_id);
     let scan_run_id = Arc::clone(&run_id);
@@ -712,7 +725,7 @@ fn upload_plan(scan_id: &str, project_id: i64) -> Vec<ExpectedRequest> {
     ]
 }
 
-fn append_wait_plan(
+pub(crate) fn append_wait_plan(
     expected: &mut Vec<ExpectedRequest>,
     project: &str,
     scan_id: &str,
@@ -744,7 +757,7 @@ fn append_wait_plan(
     ));
 }
 
-fn assert_issue_summary(stdout: &str, context: &str) {
+pub(crate) fn assert_issue_summary(stdout: &str, context: &str) {
     for (urgency, count) in [("CR", 1), ("HI", 2), ("ME", 1), ("LO", 0)] {
         let row = format!("{urgency:<20} | {count}");
         assert!(stdout.contains(&row), "missing {row:?}\n{context}");
@@ -753,7 +766,7 @@ fn assert_issue_summary(stdout: &str, context: &str) {
     assert!(stdout.contains(&total), "missing {total:?}\n{context}");
 }
 
-fn blast_plan(sha: &str) -> Vec<ExpectedRequest> {
+pub(crate) fn blast_plan(sha: &str) -> Vec<ExpectedRequest> {
     let patch_sha = sha.to_string();
     let patch_path = "/api/v1/start-scan/transfer-123/".to_string();
     let detail_path = "/api/v1/scan/blast-scan-123".to_string();
@@ -826,429 +839,4 @@ fn blast_plan(sha: &str) -> Vec<ExpectedRequest> {
             json_response(malicious_sca_issue_page()),
         ),
     ]
-}
-
-#[test]
-fn upload_prints_tracking_url_from_returned_ids() {
-    let project = report_project();
-    let api = ApiStub::start(upload_plan("scan-upload-123", 42));
-    let (mut command, _home) = cloud_command(&api, project.path());
-    command.args([
-        "upload",
-        project.report_path().to_str().expect("UTF-8 report path"),
-        "--project-name",
-        "upload-contract",
-    ]);
-
-    let output = run_with_timeout(command, &api);
-    let transcript = api.assert_finished();
-    let context = output_context(&output, &transcript);
-    assert_eq!(output.status.code(), Some(0), "{context}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("scan-upload-123"), "{context}");
-    assert!(
-        stdout.contains("/project/42/?scan_id=scan-upload-123"),
-        "{context}"
-    );
-    assert!(
-        stdout.contains("continue securely in the Corgea cloud"),
-        "{context}"
-    );
-}
-
-#[test]
-fn upload_wait_uses_returned_ids_and_stops_at_complete() {
-    let project = report_project();
-    let local_project = temp_project_name(project.path());
-    let mut plan = upload_plan("wait-scan-123", 73);
-    append_wait_plan(
-        &mut plan,
-        &local_project,
-        "wait-scan-123",
-        &["processing", "complete"],
-    );
-    let api = ApiStub::start(plan);
-    let (mut command, _home) = cloud_command(&api, project.path());
-    command.args([
-        "upload",
-        project.report_path().to_str().expect("UTF-8 report path"),
-        "--project-name",
-        "upload-contract",
-        "--wait",
-    ]);
-
-    let output = run_with_timeout(command, &api);
-    let transcript = api.assert_finished();
-    let context = output_context(&output, &transcript);
-    assert_eq!(output.status.code(), Some(0), "{context}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("/project/73/?scan_id=wait-scan-123"),
-        "{context}"
-    );
-    assert_issue_summary(&stdout, &context);
-}
-
-#[test]
-fn wait_reports_an_immediately_complete_scan() {
-    let project = TempDir::new().expect("create wait project");
-    let local_project = temp_project_name(project.path());
-    let mut plan = vec![verify_request()];
-    append_wait_plan(
-        &mut plan,
-        &local_project,
-        "complete-scan-123",
-        &["complete"],
-    );
-    let api = ApiStub::start(plan);
-    let (mut command, _home) = cloud_command(&api, project.path());
-    command.args(["wait", "complete-scan-123"]);
-
-    let output = run_with_timeout(command, &api);
-    let transcript = api.assert_finished();
-    let context = output_context(&output, &transcript);
-    assert_eq!(output.status.code(), Some(0), "{context}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("Scan has been processed successfully!"),
-        "{context}"
-    );
-    assert!(stdout.contains("scan_id=complete-scan-123"), "{context}");
-    assert_issue_summary(&stdout, &context);
-}
-
-#[test]
-fn wait_exits_one_when_scan_list_fails() {
-    let project = TempDir::new().expect("create wait project");
-    let local_project = temp_project_name(project.path());
-    let api = ApiStub::start(vec![
-        verify_request(),
-        expected_request(
-            "reject scan list",
-            move |request| assert_scan_list_request(request, &local_project),
-            json_response_with_status(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"status": "error"}),
-            ),
-        ),
-    ]);
-    let (mut command, _home) = cloud_command(&api, project.path());
-    command.arg("wait");
-
-    let output = run_with_timeout(command, &api);
-    let transcript = api.assert_finished();
-    let context = output_context(&output, &transcript);
-    assert_eq!(output.status.code(), Some(1), "{context}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Unable to query the scan list"),
-        "{context}"
-    );
-}
-
-#[test]
-fn wait_exits_one_when_scan_detail_fails() {
-    let project = TempDir::new().expect("create wait project");
-    let scan_id = "detail-error-scan";
-    let detail_path = format!("/api/v1/scan/{scan_id}");
-    let api = ApiStub::start(vec![
-        verify_request(),
-        expected_request(
-            "reject scan detail",
-            move |request| assert_authenticated_request(request, Method::GET, &detail_path),
-            json_response_with_status(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"status": "error"}),
-            ),
-        ),
-    ]);
-    let (mut command, _home) = cloud_command(&api, project.path());
-    command.args(["wait", scan_id]);
-
-    let output = run_with_timeout(command, &api);
-    let transcript = api.assert_finished();
-    let context = output_context(&output, &transcript);
-    assert_eq!(output.status.code(), Some(1), "{context}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Oops! Something went wrong"), "{context}");
-}
-
-#[test]
-fn scan_fail_on_malicious_sends_sha_and_list_renders_it() {
-    let project = git_project();
-    let scan_api = ApiStub::start(blast_plan(&project.sha));
-    let (mut scan_command, _scan_home) = cloud_command(&scan_api, project.path());
-    scan_command.args([
-        "scan",
-        "blast",
-        "--fail-on",
-        "malicious",
-        "--project-name",
-        "cloud-e2e",
-    ]);
-
-    let scan_output = run_with_timeout(scan_command, &scan_api);
-    let scan_transcript = scan_api.assert_finished();
-    let scan_context = output_context(&scan_output, &scan_transcript);
-    assert_eq!(scan_output.status.code(), Some(1), "{scan_context}");
-    let scan_stdout = String::from_utf8_lossy(&scan_output.stdout);
-    assert!(
-        scan_stdout.contains("matched --fail-on malicious"),
-        "{scan_context}"
-    );
-
-    let list_response_sha = project.sha.clone();
-    let list_api = ApiStub::start(vec![
-        verify_request(),
-        expected_request(
-            "resolve Git project",
-            |request| {
-                assert_authenticated_request(request, Method::GET, "/api/v1/projects")?;
-                assert_query(request, "repo_url", "corgea/cloud-e2e")?;
-                assert_query(request, "page", "1")?;
-                assert_query(request, "page_size", "50")
-            },
-            json_response(json!({
-                "status": "ok",
-                "projects": [{
-                    "name": "cloud-e2e",
-                    "repo_url": "https://github.com/corgea/cloud-e2e.git"
-                }]
-            })),
-        ),
-        expected_request(
-            "list scans for Git project",
-            move |request| assert_scan_list_request(request, "cloud-e2e"),
-            json_response(scans_response(vec![json!({
-                "id": "blast-scan-123",
-                "project": "cloud-e2e",
-                "repo": "https://github.com/corgea/cloud-e2e.git",
-                "branch": "e2e-main",
-                "status": "complete",
-                "engine": "blast",
-                "created_at": "2026-07-30T12:00:00Z",
-                "git_sha": list_response_sha
-            })])),
-        ),
-    ]);
-    let (mut list_command, _list_home) = cloud_command(&list_api, project.path());
-    list_command.arg("list");
-
-    let list_output = run_with_timeout(list_command, &list_api);
-    let list_transcript = list_api.assert_finished();
-    let list_context = output_context(&list_output, &list_transcript);
-    assert_eq!(list_output.status.code(), Some(0), "{list_context}");
-    let list_stdout = String::from_utf8_lossy(&list_output.stdout);
-    assert!(list_stdout.contains(&project.sha[..8]), "{list_context}");
-}
-
-#[test]
-fn list_json_returns_filtered_scan_contract() {
-    let project = TempDir::new().expect("create list project");
-    let local_project = temp_project_name(project.path());
-    let response_project = local_project.clone();
-    let query_project = local_project.clone();
-    let api = ApiStub::start(vec![
-        verify_request(),
-        expected_request(
-            "list filtered scans as JSON",
-            move |request| assert_scan_list_request(request, &query_project),
-            json_response(json!({
-                "status": "ok",
-                "page": 1,
-                "total_pages": 2,
-                "scans": [{
-                    "id": "list-scan-123",
-                    "project": response_project,
-                    "repo": "https://github.com/corgea/list-contract.git",
-                    "branch": "main",
-                    "status": "complete",
-                    "engine": "blast",
-                    "created_at": "2026-07-30T12:00:00Z",
-                    "git_sha": "0123456789abcdef0123456789abcdef01234567"
-                }]
-            })),
-        ),
-    ]);
-    let (mut command, _home) = cloud_command(&api, project.path());
-    command.args(["list", "--json"]);
-
-    let output = run_with_timeout(command, &api);
-    let transcript = api.assert_finished();
-    let context = output_context(&output, &transcript);
-    assert_eq!(output.status.code(), Some(0), "{context}");
-    let body = parse_output_json(&output, &transcript);
-    assert_eq!(body["page"], 1, "{context}");
-    assert_eq!(body["total_pages"], 2, "{context}");
-    let results = body["results"].as_array().expect("list JSON results");
-    assert_eq!(results.len(), 1, "{context}");
-    assert_eq!(results[0]["id"], "list-scan-123", "{context}");
-    assert_eq!(results[0]["project"], local_project, "{context}");
-    assert_eq!(results[0]["status"], "complete", "{context}");
-    assert_eq!(
-        results[0]["git_sha"], "0123456789abcdef0123456789abcdef01234567",
-        "{context}"
-    );
-}
-
-#[test]
-fn inspect_scan_json_returns_requested_scan() {
-    let project = TempDir::new().expect("create inspect project");
-    let scan_id = "inspect-scan-123";
-    let scan_path = format!("/api/v1/scan/{scan_id}");
-    let api = ApiStub::start(vec![
-        verify_request(),
-        expected_request(
-            "inspect scan as JSON",
-            move |request| assert_authenticated_request(request, Method::GET, &scan_path),
-            json_response(json!({
-                "id": scan_id,
-                "project": "inspect-project",
-                "repo": "https://github.com/corgea/inspect-project.git",
-                "branch": "main",
-                "status": "complete",
-                "engine": "blast",
-                "created_at": "2026-07-30T12:00:00Z",
-                "git_sha": "abcdef0123456789abcdef0123456789abcdef01"
-            })),
-        ),
-    ]);
-    let (mut command, _home) = cloud_command(&api, project.path());
-    command.args(["inspect", scan_id, "--json"]);
-
-    let output = run_with_timeout(command, &api);
-    let transcript = api.assert_finished();
-    let context = output_context(&output, &transcript);
-    assert_eq!(output.status.code(), Some(0), "{context}");
-    let body = parse_output_json(&output, &transcript);
-    assert_eq!(body["id"], scan_id, "{context}");
-    assert_eq!(body["project"], "inspect-project", "{context}");
-    assert_eq!(body["status"], "complete", "{context}");
-    assert_eq!(body["engine"], "blast", "{context}");
-    assert_eq!(
-        body["git_sha"], "abcdef0123456789abcdef0123456789abcdef01",
-        "{context}"
-    );
-}
-
-#[test]
-fn inspect_issue_json_returns_requested_issue() {
-    let project = TempDir::new().expect("create inspect project");
-    let issue_id = "inspect-issue-123";
-    let issue_path = format!("/api/v1/issue/{issue_id}");
-    let api = ApiStub::start(vec![
-        verify_request(),
-        expected_request(
-            "inspect issue as JSON",
-            move |request| assert_authenticated_request(request, Method::GET, &issue_path),
-            json_response(json!({
-                "status": "ok",
-                "issue": regular_issue(
-                    issue_id,
-                    "inspect-scan-123",
-                    "inspect-project",
-                    "HI"
-                )
-            })),
-        ),
-    ]);
-    let (mut command, _home) = cloud_command(&api, project.path());
-    command.args(["inspect", "--issue", "--json", issue_id]);
-
-    let output = run_with_timeout(command, &api);
-    let transcript = api.assert_finished();
-    let context = output_context(&output, &transcript);
-    assert_eq!(output.status.code(), Some(0), "{context}");
-    let body = parse_output_json(&output, &transcript);
-    assert_eq!(body["status"], "ok", "{context}");
-    assert_eq!(body["issue"]["id"], issue_id, "{context}");
-    assert_eq!(body["issue"]["scan_id"], "inspect-scan-123", "{context}");
-    assert_eq!(body["issue"]["urgency"], "HI", "{context}");
-    assert_eq!(
-        body["issue"]["classification"]["name"], "HI test issue",
-        "{context}"
-    );
-    assert_eq!(
-        body["issue"]["location"]["file"]["path"], "src/main.py",
-        "{context}"
-    );
-    assert_eq!(body["issue"]["location"]["line_number"], 7, "{context}");
-}
-
-#[test]
-fn list_exits_one_on_server_error() {
-    let project = TempDir::new().expect("create list project");
-    let local_project = temp_project_name(project.path());
-    let api = ApiStub::start(vec![
-        verify_request(),
-        expected_request(
-            "reject scan list",
-            move |request| assert_scan_list_request(request, &local_project),
-            json_response_with_status(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"status": "error"}),
-            ),
-        ),
-    ]);
-    let (mut command, _home) = cloud_command(&api, project.path());
-    command.arg("list");
-
-    let output = run_with_timeout(command, &api);
-    let transcript = api.assert_finished();
-    let context = output_context(&output, &transcript);
-    assert_eq!(output.status.code(), Some(1), "{context}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Unable to fetch scans"), "{context}");
-}
-
-#[test]
-fn inspect_scan_exits_one_on_server_error() {
-    let project = TempDir::new().expect("create inspect project");
-    let scan_id = "inspect-error-scan";
-    let scan_path = format!("/api/v1/scan/{scan_id}");
-    let api = ApiStub::start(vec![
-        verify_request(),
-        expected_request(
-            "reject scan inspection",
-            move |request| assert_authenticated_request(request, Method::GET, &scan_path),
-            json_response_with_status(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"status": "error"}),
-            ),
-        ),
-    ]);
-    let (mut command, _home) = cloud_command(&api, project.path());
-    command.args(["inspect", scan_id]);
-
-    let output = run_with_timeout(command, &api);
-    let transcript = api.assert_finished();
-    let context = output_context(&output, &transcript);
-    assert_eq!(output.status.code(), Some(1), "{context}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(scan_id), "{context}");
-}
-
-#[test]
-fn inspect_issue_exits_one_on_invalid_contract() {
-    let project = TempDir::new().expect("create inspect project");
-    let issue_id = "inspect-invalid-issue";
-    let issue_path = format!("/api/v1/issue/{issue_id}");
-    let api = ApiStub::start(vec![
-        verify_request(),
-        expected_request(
-            "return invalid issue contract",
-            move |request| assert_authenticated_request(request, Method::GET, &issue_path),
-            json_response(json!({"unexpected": true})),
-        ),
-    ]);
-    let (mut command, _home) = cloud_command(&api, project.path());
-    command.args(["inspect", "--issue", "--json", issue_id]);
-
-    let output = run_with_timeout(command, &api);
-    let transcript = api.assert_finished();
-    let context = output_context(&output, &transcript);
-    assert_eq!(output.status.code(), Some(1), "{context}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(issue_id), "{context}");
-    assert!(stderr.contains("Failed to parse response"), "{context}");
 }
