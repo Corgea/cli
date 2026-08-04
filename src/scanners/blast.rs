@@ -15,6 +15,7 @@ pub fn run(
     config: &Config,
     fail_on: Option<String>,
     fail: &bool,
+    block_on: Option<String>,
     only_uncommitted: &bool,
     metadata: Option<String>,
     scan_type: Option<String>,
@@ -304,8 +305,11 @@ pub fn run(
         }
     };
     if *fail {
+        log::warn!(
+            "\n--fail is deprecated: it evaluates every active blocking rule regardless of whether it applies to pull requests or CI. Use --block-on <slug> to name the CI blocking rules this pipeline should enforce."
+        );
         let blocking_rules =
-            match utils::api::check_blocking_rules(&config.get_url(), &scan_id, None) {
+            match utils::api::check_blocking_rules(&config.get_url(), &scan_id, None, None) {
                 Ok(rules) => rules,
                 Err(e) => {
                     log::error!("Failed to check blocking rules: {}", e);
@@ -322,6 +326,39 @@ pub fn run(
         );
             std::process::exit(1);
         }
+    }
+
+    if let Some(block_on) = &block_on {
+        let blocking_rules = match utils::api::check_blocking_rules(
+            &config.get_url(),
+            &scan_id,
+            None,
+            Some(block_on),
+        ) {
+            Ok(rules) => rules,
+            Err(e) => {
+                log::error!("{}", e);
+                std::process::exit(1);
+            }
+        };
+        if blocking_rules.block {
+            let triggered = triggered_slug_summary(&blocking_rules);
+            println!(
+                "\nExiting with error code 1: {} issue(s) violated the blocking rule(s) {}.\nFor more details, check the scan results at: {}\nAlternatively, run {} to view the issues list on your local machine.",
+                blocking_rules.blocking_issues.len(),
+                utils::terminal::set_text_color(&triggered, utils::terminal::TerminalColor::Red),
+                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green),
+                utils::terminal::set_text_color(
+                    &format!("corgea ls -i -s={}", scan_id),
+                    utils::terminal::TerminalColor::Green
+                )
+            );
+            std::process::exit(1);
+        }
+        println!(
+            "\nNo issues violated the blocking rule(s): {}.",
+            utils::terminal::set_text_color(block_on, utils::terminal::TerminalColor::Green)
+        );
     }
 
     if let Some(out_file) = out_file {
@@ -556,6 +593,55 @@ pub fn fail_on_gate_trips(
     })
 }
 
+/// Trim and de-duplicate the comma-separated `--block-on` slugs.
+///
+/// Returns the canonical comma-joined value to send to the API, or `None`
+/// when the flag was not supplied. Empty entries are rejected here so a stray
+/// comma is reported locally rather than as an opaque server error.
+pub fn normalize_block_on(block_on: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = block_on else {
+        return Ok(None);
+    };
+
+    let mut slugs: Vec<&str> = Vec::new();
+    for part in raw.split(',') {
+        let slug = part.trim();
+        if slug.is_empty() {
+            return Err(
+                "block-on contains an empty rule slug. Expected a comma-separated list of rule slugs, e.g. --block-on no-criticals,no-malicious-deps."
+                    .to_string(),
+            );
+        }
+        if !slugs.contains(&slug) {
+            slugs.push(slug);
+        }
+    }
+
+    if slugs.is_empty() {
+        return Err("block-on cannot be empty.".to_string());
+    }
+    Ok(Some(slugs.join(",")))
+}
+
+/// The distinct rule slugs that blocked the scan, for the failure message.
+///
+/// Falls back to rule ids against backends that do not send slugs yet.
+pub fn triggered_slug_summary(response: &utils::api::BlockingRuleResponse) -> String {
+    let mut names: Vec<String> = Vec::new();
+    for issue in &response.blocking_issues {
+        let identifiers = match &issue.triggered_by_slugs {
+            Some(slugs) if !slugs.is_empty() => slugs.clone(),
+            _ => issue.triggered_by_rules.clone(),
+        };
+        for identifier in identifiers {
+            if !names.contains(&identifier) {
+                names.push(identifier);
+            }
+        }
+    }
+    names.join(", ")
+}
+
 pub fn wait_for_scan(config: &Config, scan_id: &str) {
     // Create loading animation
     let stop_signal = Arc::new(Mutex::new(false));
@@ -700,7 +786,9 @@ pub fn metadata_json_from_pairs(pairs: &[String]) -> Result<Option<String>, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::api::{SCAIssue, SCALocation, SCAPackage};
+    use crate::utils::api::{
+        BlockOnError, BlockingIssue, BlockingRuleResponse, SCAIssue, SCALocation, SCAPackage,
+    };
 
     fn counts(pairs: &[(&str, usize)]) -> HashMap<String, usize> {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
@@ -864,5 +952,102 @@ mod tests {
         let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json).unwrap();
         assert_eq!(map.get("k").and_then(|v| v.as_str()), Some(""));
         assert!(metadata_json_from_pairs(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn normalize_block_on_returns_none_when_flag_absent() {
+        assert_eq!(normalize_block_on(None).unwrap(), None);
+    }
+
+    #[test]
+    fn normalize_block_on_trims_and_dedupes_slugs() {
+        assert_eq!(
+            normalize_block_on(Some("no-criticals")).unwrap(),
+            Some("no-criticals".to_string())
+        );
+        assert_eq!(
+            normalize_block_on(Some(" no-criticals , no-malicious-deps ")).unwrap(),
+            Some("no-criticals,no-malicious-deps".to_string())
+        );
+        assert_eq!(
+            normalize_block_on(Some("no-criticals,no-criticals")).unwrap(),
+            Some("no-criticals".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_block_on_rejects_empty_entries() {
+        assert!(normalize_block_on(Some("")).is_err());
+        assert!(normalize_block_on(Some("   ")).is_err());
+        assert!(normalize_block_on(Some(",")).is_err());
+        assert!(normalize_block_on(Some("no-criticals,")).is_err());
+        assert!(normalize_block_on(Some("no-criticals,,other")).is_err());
+    }
+
+    fn blocking_response(issues: Vec<BlockingIssue>) -> BlockingRuleResponse {
+        BlockingRuleResponse {
+            block: !issues.is_empty(),
+            blocking_issues: issues,
+            total_pages: 1,
+        }
+    }
+
+    #[test]
+    fn triggered_slug_summary_dedupes_across_issues() {
+        let response = blocking_response(vec![
+            BlockingIssue {
+                id: "issue-1".to_string(),
+                triggered_by_rules: vec!["1".to_string()],
+                triggered_by_slugs: Some(vec!["no-criticals".to_string()]),
+            },
+            BlockingIssue {
+                id: "issue-2".to_string(),
+                triggered_by_rules: vec!["1".to_string(), "2".to_string()],
+                triggered_by_slugs: Some(vec![
+                    "no-criticals".to_string(),
+                    "no-malicious-deps".to_string(),
+                ]),
+            },
+        ]);
+        assert_eq!(
+            triggered_slug_summary(&response),
+            "no-criticals, no-malicious-deps"
+        );
+    }
+
+    #[test]
+    fn triggered_slug_summary_falls_back_to_rule_ids() {
+        let response = blocking_response(vec![BlockingIssue {
+            id: "issue-1".to_string(),
+            triggered_by_rules: vec!["7".to_string()],
+            triggered_by_slugs: None,
+        }]);
+        assert_eq!(triggered_slug_summary(&response), "7");
+    }
+
+    #[test]
+    fn block_on_error_names_each_failure_category() {
+        let error = BlockOnError {
+            message: Some("Invalid block_on rule(s).".to_string()),
+            unknown_slugs: vec!["typo-rule".to_string()],
+            inactive_slugs: vec!["old-rule".to_string()],
+            non_ci_slugs: vec!["pr-only-rule".to_string()],
+        };
+        let described = error.describe();
+        assert!(described.contains("Unknown blocking rule(s): typo-rule"));
+        assert!(described.contains("Rule(s) not scoped to CI: pr-only-rule"));
+        assert!(described.contains("Inactive rule(s): old-rule"));
+    }
+
+    #[test]
+    fn block_on_error_falls_back_to_the_server_message() {
+        let error = BlockOnError {
+            message: Some("block_on was provided but contained no rule slugs.".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            error.describe(),
+            "block_on was provided but contained no rule slugs."
+        );
     }
 }

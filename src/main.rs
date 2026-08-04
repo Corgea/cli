@@ -97,9 +97,16 @@ enum Commands {
         #[arg(
             short,
             long,
-            help = "Fail on (exits with error code 1) based on blocking rules defined in the web app."
+            help = "Deprecated: use --block-on instead. Fail on (exits with error code 1) based on every active blocking rule defined in the web app, regardless of what it applies to."
         )]
         fail: bool,
+
+        #[arg(
+            long = "block-on",
+            value_name = "SLUG",
+            help = "Fail (exit code 1) if the scan violates the named CI blocking rules. Comma-separated rule slugs, e.g. --block-on no-criticals,no-malicious-deps. Slugs are shown next to each rule in the web app. Rules must exist, be active, and have 'Applies To' set to CI."
+        )]
+        block_on: Option<String>,
 
         #[arg(
             short,
@@ -570,6 +577,7 @@ fn main() {
             scanner,
             fail_on,
             fail,
+            block_on,
             only_uncommitted,
             metadata,
             scan_type,
@@ -595,6 +603,11 @@ fn main() {
 
             if *fail && *scanner != Scanner::Blast {
                 ::log::error!("fail is only supported with blast scanner.");
+                std::process::exit(1);
+            }
+
+            if block_on.is_some() && *scanner != Scanner::Blast {
+                ::log::error!("block-on is only supported with blast scanner.");
                 std::process::exit(1);
             }
 
@@ -645,6 +658,19 @@ fn main() {
                 std::process::exit(1);
             }
 
+            if block_on.is_some() && (*fail || fail_on.is_some()) {
+                ::log::error!("block-on cannot be used together with fail or fail_on.");
+                std::process::exit(1);
+            }
+
+            let block_on = match scanners::blast::normalize_block_on(block_on.as_deref()) {
+                Ok(slugs) => slugs,
+                Err(msg) => {
+                    ::log::error!("{}", msg);
+                    std::process::exit(1);
+                }
+            };
+
             if let Some(scan_type) = scan_type {
                 if scan_type.is_empty() {
                     ::log::error!("scan_type cannot be empty.");
@@ -692,6 +718,7 @@ fn main() {
                     &corgea_config,
                     fail_on.clone(),
                     fail,
+                    block_on,
                     only_uncommitted,
                     metadata_json,
                     scan_type.clone(),

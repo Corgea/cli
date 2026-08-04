@@ -147,6 +147,7 @@ pub fn run(
                     &config.get_url(),
                     scan_id.as_ref().unwrap(),
                     Some(page),
+                    None,
                 ) {
                     Ok(rules) => {
                         if rules.block {

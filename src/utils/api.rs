@@ -792,17 +792,26 @@ pub fn verify_token(corgea_url: &str) -> Result<bool, Box<dyn Error>> {
     }
 }
 
+/// Evaluate a scan against blocking rules.
+///
+/// `block_on` is a comma-separated list of CI rule slugs. When omitted the
+/// backend falls back to evaluating every active rule, which is the legacy
+/// `--fail` behavior.
 pub fn check_blocking_rules(
     url: &str,
     sast_scan_id: &str,
     page: Option<u32>,
+    block_on: Option<&str>,
 ) -> Result<BlockingRuleResponse, Box<dyn Error>> {
     let url = format!(
         "{}{}/scan/{}/check_blocking_rules",
         url, API_BASE, sast_scan_id
     );
     let page = page.unwrap_or(1);
-    let query_params = vec![("page", page.to_string())];
+    let mut query_params = vec![("page", page.to_string())];
+    if let Some(block_on) = block_on {
+        query_params.push(("block_on", block_on.to_string()));
+    }
 
     let client = http_client();
     debug(&format!("Sending request to URL: {}", url));
@@ -833,6 +842,11 @@ pub fn check_blocking_rules(
         let status = response.status();
         let response_text = response.text()?;
         debug(&format!("Response body: {}", response_text));
+        if status == reqwest::StatusCode::BAD_REQUEST {
+            if let Ok(block_on_error) = serde_json::from_str::<BlockOnError>(&response_text) {
+                return Err(block_on_error.describe().into());
+            }
+        }
         Err(format!("API request failed with status: {}", status).into())
     }
 }
@@ -1078,6 +1092,60 @@ pub struct BlockingRuleResponse {
 pub struct BlockingIssue {
     pub id: String,
     pub triggered_by_rules: Vec<String>,
+    // Optional so the CLI keeps working against backends predating rule slugs.
+    #[serde(default)]
+    pub triggered_by_slugs: Option<Vec<String>>,
+}
+
+/// Structured 400 body returned when `--block-on` names unusable rules.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct BlockOnError {
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub unknown_slugs: Vec<String>,
+    #[serde(default)]
+    pub inactive_slugs: Vec<String>,
+    #[serde(default)]
+    pub non_ci_slugs: Vec<String>,
+}
+
+impl BlockOnError {
+    fn is_empty(&self) -> bool {
+        self.unknown_slugs.is_empty()
+            && self.inactive_slugs.is_empty()
+            && self.non_ci_slugs.is_empty()
+    }
+
+    /// One line per failure category, naming the offending slugs.
+    pub fn describe(&self) -> String {
+        if self.is_empty() {
+            return self
+                .message
+                .clone()
+                .unwrap_or_else(|| "Invalid --block-on value.".to_string());
+        }
+        let mut lines = Vec::new();
+        if !self.unknown_slugs.is_empty() {
+            lines.push(format!(
+                "Unknown blocking rule(s): {}",
+                self.unknown_slugs.join(", ")
+            ));
+        }
+        if !self.non_ci_slugs.is_empty() {
+            lines.push(format!(
+                "Rule(s) not scoped to CI: {}. Change 'Applies To' to CI in the web app, or remove them from --block-on.",
+                self.non_ci_slugs.join(", ")
+            ));
+        }
+        if !self.inactive_slugs.is_empty() {
+            lines.push(format!(
+                "Inactive rule(s): {}. Activate them in the web app, or remove them from --block-on.",
+                self.inactive_slugs.join(", ")
+            ));
+        }
+        lines.join("\n")
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]
