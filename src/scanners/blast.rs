@@ -304,14 +304,7 @@ pub fn run(
         }
     };
     if *fail {
-        let blocking_rules =
-            match utils::api::check_blocking_rules(&config.get_url(), &scan_id, None) {
-                Ok(rules) => rules,
-                Err(e) => {
-                    log::error!("Failed to check blocking rules: {}", e);
-                    std::process::exit(1);
-                }
-            };
+        let blocking_rules = wait_for_blocking_rules(config, &scan_id);
         if blocking_rules.block {
             println!("\nExiting with error code 1 due to some issues violating some blocking rules defined for this project.\nfor more details, please check the scan results at the link: {}\nAlternatively, you can run {} to view the issues list on your local machine.",
             utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green),
@@ -608,6 +601,59 @@ pub fn wait_for_scan(config: &Config, scan_id: &str) {
              ╰────────────────────────────────────────────╯\n",
         " ", " "
     );
+}
+
+/// Match doghouse `LICENSE_DEPS_WAIT_TIMEOUT` (15 minutes).
+const BLOCKING_RULES_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const BLOCKING_RULES_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn stop_blocking_rules_spinner(stop_signal: &Arc<Mutex<bool>>, spinner: thread::JoinHandle<()>) {
+    *stop_signal.lock().unwrap() = true;
+    let _ = spinner.join();
+    print!(
+        "{}",
+        utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
+    );
+}
+
+/// Poll until blocking-rules status is no longer pending (or 15m timeout).
+/// Older backends omit status (serde defaults to complete: one-shot).
+fn wait_for_blocking_rules(config: &Config, scan_id: &str) -> utils::api::BlockingRuleResponse {
+    let stop_signal = Arc::new(Mutex::new(false));
+    let stop_signal_clone = Arc::clone(&stop_signal);
+    let spinner = thread::spawn(move || {
+        utils::terminal::show_loading_message(
+            "Checking blocking rules... ([T]s)",
+            stop_signal_clone,
+        );
+    });
+
+    let started = std::time::Instant::now();
+    loop {
+        match utils::api::check_blocking_rules(&config.get_url(), scan_id, None) {
+            Ok(rules) if !rules.is_pending() => {
+                stop_blocking_rules_spinner(&stop_signal, spinner);
+                return rules;
+            }
+            Ok(_) => {
+                if started.elapsed() >= BLOCKING_RULES_WAIT_TIMEOUT {
+                    stop_blocking_rules_spinner(&stop_signal, spinner);
+                    log::error!(
+                        "\nTimed out waiting for blocking rules for scan '{}'. \
+                         Failing closed.",
+                        scan_id
+                    );
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                stop_blocking_rules_spinner(&stop_signal, spinner);
+                log::error!("Failed to check blocking rules: {}", e);
+                std::process::exit(1);
+            }
+        }
+        std::thread::sleep(BLOCKING_RULES_POLL_INTERVAL);
+    }
 }
 
 pub fn check_scan_status(scan_id: &str, url: &str) -> Result<bool, Box<dyn Error>> {

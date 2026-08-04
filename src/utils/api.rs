@@ -1386,11 +1386,28 @@ pub struct FalsePositiveDetection {
     pub reasoning: Option<String>,
 }
 
+/// Doghouse `check_blocking_rules` readiness. Missing on older backends.
+pub const BLOCKING_RULES_STATUS_COMPLETE: &str = "complete";
+pub const BLOCKING_RULES_STATUS_PENDING: &str = "pending";
+
+fn default_blocking_rules_status() -> String {
+    BLOCKING_RULES_STATUS_COMPLETE.to_string()
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct BlockingRuleResponse {
     pub block: bool,
     pub blocking_issues: Vec<BlockingIssue>,
     pub total_pages: u32,
+    /// License-deps readiness. Omitted on older backends: treated as complete.
+    #[serde(default = "default_blocking_rules_status")]
+    pub status: String,
+}
+
+impl BlockingRuleResponse {
+    pub fn is_pending(&self) -> bool {
+        self.status == BLOCKING_RULES_STATUS_PENDING
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1438,6 +1455,24 @@ pub struct SCAIssuesResponse {
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn blocking_rule_response_defaults_status_when_missing() {
+        let legacy = r#"{"block":false,"blocking_issues":[],"total_pages":1}"#;
+        let parsed: BlockingRuleResponse = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.status, BLOCKING_RULES_STATUS_COMPLETE);
+        assert!(!parsed.is_pending());
+
+        let pending = r#"{"block":false,"blocking_issues":[],"total_pages":1,"status":"pending"}"#;
+        let parsed: BlockingRuleResponse = serde_json::from_str(pending).unwrap();
+        assert!(parsed.is_pending());
+
+        let complete = r#"{"block":true,"blocking_issues":[],"total_pages":1,"status":"complete"}"#;
+        let parsed: BlockingRuleResponse = serde_json::from_str(complete).unwrap();
+        assert_eq!(parsed.status, BLOCKING_RULES_STATUS_COMPLETE);
+        assert!(!parsed.is_pending());
+        assert!(parsed.block);
+    }
 
     #[test]
     fn scan_response_deserializes_git_sha_and_defaults_when_missing() {
