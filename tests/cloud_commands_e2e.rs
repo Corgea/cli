@@ -718,13 +718,6 @@ fn append_wait_plan(
     scan_id: &str,
     statuses: &[&str],
 ) {
-    let list_project = project.to_string();
-    expected.push(expected_request(
-        "query scan list before waiting",
-        move |request| assert_scan_list_request(request, &list_project),
-        json_response(scans_response(Vec::new())),
-    ));
-
     for (index, status) in statuses.iter().enumerate() {
         let path = format!("/api/v1/scan/{scan_id}");
         let body = scan_response(scan_id, project, status);
@@ -940,7 +933,7 @@ fn wait_exits_one_when_scan_list_fails() {
         ),
     ]);
     let (mut command, _home) = cloud_command(&api, project.path());
-    command.args(["wait", "list-error-scan"]);
+    command.arg("wait");
 
     let output = run_with_timeout(command, &api);
     let transcript = api.assert_finished();
@@ -956,16 +949,10 @@ fn wait_exits_one_when_scan_list_fails() {
 #[test]
 fn wait_exits_one_when_scan_detail_fails() {
     let project = TempDir::new().expect("create wait project");
-    let local_project = temp_project_name(project.path());
     let scan_id = "detail-error-scan";
     let detail_path = format!("/api/v1/scan/{scan_id}");
     let api = ApiStub::start(vec![
         verify_request(),
-        expected_request(
-            "query scan list before failed detail",
-            move |request| assert_scan_list_request(request, &local_project),
-            json_response(scans_response(Vec::new())),
-        ),
         expected_request(
             "reject scan detail",
             move |request| assert_authenticated_request(request, Method::GET, &detail_path),
@@ -1014,6 +1001,22 @@ fn scan_fail_on_malicious_sends_sha_and_list_renders_it() {
     let list_api = ApiStub::start(vec![
         verify_request(),
         expected_request(
+            "resolve Git project",
+            |request| {
+                assert_authenticated_request(request, Method::GET, "/api/v1/projects")?;
+                assert_query(request, "repo_url", "corgea/cloud-e2e")?;
+                assert_query(request, "page", "1")?;
+                assert_query(request, "page_size", "50")
+            },
+            json_response(json!({
+                "status": "ok",
+                "projects": [{
+                    "name": "cloud-e2e",
+                    "repo_url": "https://github.com/corgea/cloud-e2e.git"
+                }]
+            })),
+        ),
+        expected_request(
             "list scans for Git project",
             move |request| assert_scan_list_request(request, "cloud-e2e"),
             json_response(scans_response(vec![json!({
@@ -1054,28 +1057,16 @@ fn list_json_returns_filtered_scan_contract() {
                 "status": "ok",
                 "page": 1,
                 "total_pages": 2,
-                "scans": [
-                    {
-                        "id": "list-scan-123",
-                        "project": response_project,
-                        "repo": "https://github.com/corgea/list-contract.git",
-                        "branch": "main",
-                        "status": "complete",
-                        "engine": "blast",
-                        "created_at": "2026-07-30T12:00:00Z",
-                        "git_sha": "0123456789abcdef0123456789abcdef01234567"
-                    },
-                    {
-                        "id": "unrelated-scan",
-                        "project": "other-project",
-                        "repo": null,
-                        "branch": null,
-                        "status": "processing",
-                        "engine": "semgrep",
-                        "created_at": "2026-07-30T12:00:00Z",
-                        "git_sha": null
-                    }
-                ]
+                "scans": [{
+                    "id": "list-scan-123",
+                    "project": response_project,
+                    "repo": "https://github.com/corgea/list-contract.git",
+                    "branch": "main",
+                    "status": "complete",
+                    "engine": "blast",
+                    "created_at": "2026-07-30T12:00:00Z",
+                    "git_sha": "0123456789abcdef0123456789abcdef01234567"
+                }]
             })),
         ),
     ]);
