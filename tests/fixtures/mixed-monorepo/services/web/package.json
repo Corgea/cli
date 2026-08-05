@@ -1,0 +1,10 @@
+{
+  "name": "corgea-fixture-web-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "debug": "^4.3.4",
+    "ms": "*"
+  }
+}

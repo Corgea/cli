@@ -471,33 +471,116 @@ pub fn get_scan_issues(
     page_size: Option<u16>,
     scan_id: Option<String>,
 ) -> Result<ProjectIssuesResponse, Box<dyn std::error::Error>> {
-    let mut seperator = "?";
-    let mut url = match scan_id {
-        Some(scan_id) => format!("{}{}/scan/{}/issues", url, API_BASE, scan_id),
-        None => {
-            seperator = "&";
-            format!("{}{}/issues?project={}", url, API_BASE, project)
-        }
+    // Project names can contain `&`/`?`/`#`, so use `query`, not `format!`.
+    let (url, mut query_params) = match scan_id {
+        Some(scan_id) => (
+            format!("{}{}/scan/{}/issues", url, API_BASE, scan_id),
+            vec![],
+        ),
+        None => (
+            format!("{}{}/issues", url, API_BASE),
+            vec![("project", project.to_string())],
+        ),
     };
     if let Some(p) = page {
-        url.push_str(&format!("{}page={}", seperator, p));
+        query_params.push(("page", p.to_string()));
     }
-    if let Some(p_size) = page_size {
-        url.push_str(&format!("&page_size={}", p_size));
-    } else {
-        url.push_str("&page_size=30");
-    }
+    query_params.push(("page_size", page_size.unwrap_or(30).to_string()));
     let client = http_client();
 
     debug(&format!("Sending request to URL: {}", url));
+    debug(&format!("Query params: {:?}", query_params));
 
-    let response = match client.get(&url).send() {
+    let response = match client.get(&url).query(&query_params).send() {
         Ok(res) => {
             check_for_warnings(res.headers(), res.status());
             res
         }
         Err(e) => return Err(format!("Failed to send request: {}", e).into()),
     };
+    let response_text = response.text()?;
+    let project_issues_response: ProjectIssuesResponse = serde_json::from_str(&response_text)
+        .map_err(|e| {
+            debug(&format!(
+                "Failed to parse response: {}. Response body: {}",
+                e, response_text
+            ));
+            format!("Failed to parse response: {}", e)
+        })?;
+
+    if project_issues_response.status == "ok" {
+        Ok(project_issues_response)
+    } else if project_issues_response.status == "no_project_found" {
+        Err("Project not found 404".into())
+    } else {
+        Err("Server error 500".into())
+    }
+}
+
+/// Endpoint and query for a code quality listing. The backend serves code
+/// quality from paths parallel to — but not named like — the security routes:
+/// `/scan/{id}/issues/quality` for a scan, `/issues/code-quality` otherwise.
+fn quality_issues_request(
+    url: &str,
+    project: &str,
+    page: Option<u16>,
+    page_size: Option<u16>,
+    scan_id: Option<&str>,
+) -> (String, Vec<(&'static str, String)>) {
+    // Project names can contain `&`/`?`/`#`, so use `query`, not `format!`.
+    let (endpoint, mut query_params) = match scan_id {
+        Some(scan_id) => (
+            format!("{}{}/scan/{}/issues/quality", url, API_BASE, scan_id),
+            vec![],
+        ),
+        None => (
+            format!("{}{}/issues/code-quality", url, API_BASE),
+            vec![("project", project.to_string())],
+        ),
+    };
+    if let Some(p) = page {
+        query_params.push(("page", p.to_string()));
+    }
+    query_params.push(("page_size", page_size.unwrap_or(30).to_string()));
+    (endpoint, query_params)
+}
+
+pub fn get_quality_issues(
+    url: &str,
+    project: &str,
+    page: Option<u16>,
+    page_size: Option<u16>,
+    scan_id: Option<String>,
+) -> Result<ProjectIssuesResponse, Box<dyn std::error::Error>> {
+    let (endpoint, query_params) =
+        quality_issues_request(url, project, page, page_size, scan_id.as_deref());
+    let client = http_client();
+
+    debug(&format!("Sending request to URL: {}", endpoint));
+    debug(&format!("Query params: {:?}", query_params));
+
+    let response = match client.get(&endpoint).query(&query_params).send() {
+        Ok(res) => {
+            check_for_warnings(res.headers(), res.status());
+            res
+        }
+        Err(e) => return Err(format!("Failed to send request: {}", e).into()),
+    };
+    // Unlike the security routes, these endpoints answer a missing scan with a
+    // bare HTTP 404 rather than a `no_project_found` body, so the status has to
+    // be read before the parse or the miss surfaces as a parse failure.
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        debug(&format!(
+            "Code quality request failed: HTTP {}. Response body: {}",
+            status, body
+        ));
+        if status == StatusCode::NOT_FOUND {
+            return Err("Code quality issues not found 404".into());
+        }
+        return Err(format!("Request failed with status: {}", status).into());
+    }
     let response_text = response.text()?;
     let project_issues_response: ProjectIssuesResponse = serde_json::from_str(&response_text)
         .map_err(|e| {
@@ -733,6 +816,312 @@ pub fn query_scan_list(
     }
 }
 
+#[derive(Deserialize, Debug)]
+pub struct ProjectSummary {
+    pub name: String,
+    #[serde(default)]
+    pub repo_url: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ProjectsResponse {
+    /// Deliberately no `#[serde(default)]`: a 200 missing this key must fail
+    /// the parse, not read as "no matches" and take the legacy-name fallback.
+    pub projects: Vec<ProjectSummary>,
+    #[serde(default)]
+    pub total_pages: Option<u32>,
+}
+
+const PROJECTS_PAGE_SIZE: u16 = 50;
+
+/// Ceiling on pages walked looking for an exact repo match, so a bogus
+/// server-reported `total_pages` cannot drive an unbounded request loop.
+const PROJECTS_MAX_PAGES: u32 = 20;
+
+/// True when a stored `repo_url` points at exactly `expected_path` (a whole
+/// post-host path, already lowercased). Comparing whole paths keeps the
+/// backend's `repo_url__icontains` results honest: neither the sibling
+/// `acme/api-v2` nor the nested `…/mirrors/acme/api` passes for `acme/api`.
+/// Falls back to a normalized compare for a stored bare `acme/api`.
+fn repo_url_matches_path(repo_url: &str, expected_path: &str) -> bool {
+    if let Some(path) = utils::generic::extract_repo_path(repo_url) {
+        return path == expected_path;
+    }
+    let r = repo_url.trim().trim_end_matches('/');
+    let r = r.strip_suffix(".git").unwrap_or(r).to_lowercase();
+    r == expected_path
+}
+
+/// True when a candidate is stored on exactly `expected_host`.
+fn repo_url_on_host(repo_url: &str, expected_host: &str) -> bool {
+    utils::generic::extract_repo_host(repo_url).as_deref() == Some(expected_host)
+}
+
+/// One page of GET /api/v1/projects?repo_url=…
+///
+/// `Ok(None)` only for a 404 (a backend without the endpoint). A 5xx or a body
+/// that does not parse is an `Err`: both are hard failures, and treating them
+/// as a clean miss would silently fall back to the CWD-name path.
+fn fetch_projects_page(
+    url: &str,
+    repo_path: &str,
+    page: u32,
+) -> Result<Option<ProjectsResponse>, Box<dyn std::error::Error>> {
+    let request_url = format!("{}{}/projects", url, API_BASE);
+    let client = http_client();
+    debug(&format!(
+        "Resolving project via {} (repo_url={}, page={})",
+        request_url, repo_path, page
+    ));
+    let (page, page_size) = (page.to_string(), PROJECTS_PAGE_SIZE.to_string());
+    let response = client
+        .get(&request_url)
+        .query(&[
+            ("repo_url", repo_path),
+            ("page", &page),
+            ("page_size", &page_size),
+        ])
+        .send()?;
+    check_for_warnings(response.headers(), response.status());
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(format!("/projects request failed: HTTP {}", status).into());
+    }
+    let text = response.text()?;
+    match serde_json::from_str(&text) {
+        Ok(parsed) => Ok(Some(parsed)),
+        Err(e) => {
+            debug(&format!("/projects response body: {}", text));
+            Err(format!("Failed to parse the /projects response: {}", e).into())
+        }
+    }
+}
+
+/// Resolve the canonical project for a repo path via GET /api/v1/projects?repo_url=…
+///
+/// The backend filters `repo_url__icontains` over a paginated list, so the
+/// exact repo can sit behind a page of siblings (`acme/api-v2`, …) — pages are
+/// walked until it turns up or they run out.
+///
+/// Old-backend safety guard: a pre-COR-1426 backend ignores the unknown
+/// `repo_url` param and returns ALL company projects, so every candidate is
+/// re-checked against the path here — on such a backend none match, and the
+/// caller falls back to the CWD-name path.
+///
+/// The host is a tie-breaker, not a gate: it settles which of several
+/// same-path candidates is ours (`github.com/acme/api` is not
+/// `gitlab.com/acme/api`), but a lone path match is accepted whatever its
+/// host — an SSH-config alias origin (`corp-github:acme/api`) never matches
+/// the stored `github.com` and must still resolve. Several path matches with
+/// none on our host — or several on it — is genuinely ambiguous and errors
+/// rather than guessing.
+///
+/// `Err` for hard failures (network/auth/5xx/unparseable body/ambiguity); a
+/// clean "no match" (or a 404 from a backend without the endpoint) is a soft
+/// `Ok(None)`.
+pub fn resolve_project_by_repo(
+    url: &str,
+    repo_path: &str,
+    expected_host: Option<&str>,
+) -> Result<Option<ProjectSummary>, Box<dyn std::error::Error>> {
+    let expected = repo_path.to_lowercase();
+    let mut host_matches: Vec<ProjectSummary> = Vec::new();
+    let mut candidates: Vec<ProjectSummary> = Vec::new();
+    let mut page = 1;
+    loop {
+        let Some(parsed) = fetch_projects_page(url, repo_path, page)? else {
+            // Only page 1 can be a backend without the endpoint; a 404 once the
+            // walk is under way (a concurrent delete shrinking the filtered set)
+            // would discard the matches already found and read as a clean miss.
+            if page == 1 {
+                return Ok(None);
+            }
+            return Err(format!(
+                "/projects page {} returned 404 after pagination started",
+                page
+            )
+            .into());
+        };
+        let total_pages = parsed.total_pages.unwrap_or(1);
+        if parsed.projects.is_empty() {
+            break;
+        }
+        for project in parsed.projects {
+            let Some(repo_url) = project.repo_url.as_deref() else {
+                continue;
+            };
+            if !repo_url_matches_path(repo_url, &expected) {
+                continue;
+            }
+            // A host match is preferred but not returned early: two projects
+            // claiming the same host+path must reach the ambiguity check
+            // below, not resolve to whichever the backend listed first.
+            if expected_host.is_some_and(|h| repo_url_on_host(repo_url, h)) {
+                host_matches.push(project);
+            } else {
+                candidates.push(project);
+            }
+        }
+        if page >= total_pages {
+            break;
+        }
+        // Every reported page was NOT searched, so this is not a clean miss:
+        // saying so would send the caller to the legacy-name fallback, which
+        // can list a different same-basename project and exit 0.
+        if page >= PROJECTS_MAX_PAGES {
+            return Err(format!(
+                "/projects reported {} pages; refusing to guess after searching {}",
+                total_pages, PROJECTS_MAX_PAGES
+            )
+            .into());
+        }
+        page += 1;
+    }
+
+    let mut matches = if host_matches.is_empty() {
+        candidates
+    } else {
+        host_matches
+    };
+    if matches.len() > 1 {
+        let urls: Vec<&str> = matches
+            .iter()
+            .filter_map(|p| p.repo_url.as_deref())
+            .collect();
+        return Err(format!(
+            "{} Corgea projects claim repo '{}' ({}); pass --project-name <NAME> to choose one",
+            matches.len(),
+            repo_path,
+            urls.join(", ")
+        )
+        .into());
+    }
+    Ok(matches.pop())
+}
+
+/// What `list`/`wait` need to drive the existing name-based queries.
+#[derive(Debug)]
+pub struct ResolvedProject {
+    /// Sent as `?project=` to the listing endpoints.
+    pub query_name: String,
+    /// True only when /projects confirmed a backend project.
+    pub confirmed: bool,
+    /// Pre-formatted subject of the miss message ("repo 'org/repo'", …).
+    pub tried_label: String,
+}
+
+/// How the caller asked for a project: `--project-name` and `--repo` are
+/// mutually exclusive at the CLI, but both travel together to the resolver.
+/// One struct so the two same-typed options cannot be transposed at a call
+/// site.
+#[derive(Default, Clone)]
+pub struct ProjectSelector {
+    pub name: Option<String>,
+    pub repo: Option<String>,
+}
+
+impl ProjectSelector {
+    /// True when the caller named a project or repo explicitly, rather than
+    /// leaving it to auto-detection.
+    pub fn is_set(&self) -> bool {
+        self.name.is_some() || self.repo.is_some()
+    }
+}
+
+/// Resolve which project `list`/`wait` should query: `--project-name` verbatim,
+/// else the repo path from `--repo` or the discovered remote. Unconfirmed, an
+/// explicit `--repo` queries that path as a name and everything else falls back
+/// to what the pre-COR-1577 CLI queried. `Err` only for a hard resolver failure
+/// (network/auth/5xx from /projects).
+pub fn resolve_project(
+    url: &str,
+    selector: &ProjectSelector,
+) -> Result<ResolvedProject, Box<dyn std::error::Error>> {
+    let repo_override = selector.repo.as_deref();
+    if let Some(name) = selector.name.as_deref() {
+        // Normalize before it reaches `?project=`, which the backend matches
+        // exactly: `--project-name foo/` must not miss the project `foo`.
+        let name = name.trim().trim_matches('/');
+        if name.is_empty() {
+            return Err("--project-name must name a project".into());
+        }
+        return Ok(ResolvedProject {
+            query_name: name.to_string(),
+            confirmed: false,
+            tried_label: format!("project '{}'", name),
+        });
+    }
+
+    // --repo may be a bare path (`org/repo`, or a GitLab `group/subgroup/repo`)
+    // rather than a URL; `extract_repo_path` returns None for those, so the
+    // whole value is the path.
+    let (repo_path, repo_host) = match repo_override {
+        Some(r) => match utils::generic::extract_repo_path(r) {
+            Some(path) => (Some(path), utils::generic::extract_repo_host(r)),
+            None => (Some(r.trim().to_string()), None),
+        },
+        None => match utils::generic::discover_repo_url() {
+            Some(u) => (
+                utils::generic::extract_repo_path(&u),
+                utils::generic::extract_repo_host(&u),
+            ),
+            None => (None, None),
+        },
+    };
+
+    if let Some(repo_path) = repo_path {
+        if let Some(project) = resolve_project_by_repo(url, &repo_path, repo_host.as_deref())? {
+            return Ok(ResolvedProject {
+                query_name: project.name,
+                confirmed: true,
+                tried_label: format!("repo '{}'", repo_path),
+            });
+        }
+        // Unconfirmed: an explicit --repo queries that path as a name, and an
+        // auto-detected remote queries exactly what the pre-COR-1577 CLI did,
+        // so an old or not-yet-onboarded backend still resolves.
+        let query_name = match repo_override {
+            Some(_) => repo_path.clone(),
+            None => utils::generic::determine_project_name(None),
+        };
+        return Ok(ResolvedProject {
+            query_name,
+            confirmed: false,
+            tried_label: format!("repo '{}'", repo_path),
+        });
+    }
+
+    let cwd =
+        utils::generic::get_current_working_directory().unwrap_or_else(|| "unknown".to_string());
+    Ok(ResolvedProject {
+        tried_label: format!("directory '{}'", cwd),
+        query_name: utils::generic::determine_project_name(None),
+        confirmed: false,
+    })
+}
+
+/// `resolve_project`, or a hard exit with the shared failure copy. Every
+/// caller treats a resolver error as fatal.
+pub fn resolve_project_or_exit(url: &str, selector: &ProjectSelector) -> ResolvedProject {
+    match resolve_project(url, selector) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            log::error!(
+                "Unable to resolve the Corgea project. Please check your connection and ensure that:\n\
+                - The server URL is reachable.\n\
+                - Your authentication token is valid.\n\n\
+                Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli\n\n\
+                Error details: {}",
+                e
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 pub fn exchange_code_for_token(
     base_url: &str,
     code: &str,
@@ -856,6 +1245,7 @@ pub fn get_sca_issues(
     page: Option<u16>,
     page_size: Option<u16>,
     scan_id: Option<String>,
+    project: Option<&str>,
 ) -> Result<SCAIssuesResponse, Box<dyn std::error::Error>> {
     let client = http_client();
     let mut query_params = vec![];
@@ -864,6 +1254,11 @@ pub fn get_sca_issues(
     }
     if let Some(page_size) = page_size {
         query_params.push(("page_size", page_size.to_string()));
+    }
+    // Scopes the scan-less route to one project (doghouse `list_sca_issues`
+    // reads `project`); the scan route already keys off the scan.
+    if let Some(project) = project {
+        query_params.push(("project", project.to_string()));
     }
 
     let endpoint = if let Some(scan_id) = scan_id {
@@ -928,11 +1323,18 @@ pub fn get_all_sca_issues(
     let mut current_page: u32 = 1;
 
     loop {
-        let response =
-            match get_sca_issues(url, Some(current_page as u16), Some(30), scan_id.clone()) {
-                Ok(response) => response,
-                Err(e) => return Err(format!("Failed to get SCA issues: {}", e).into()),
-            };
+        // No project scope: every caller passes a scan id, which selects the
+        // scan on its own.
+        let response = match get_sca_issues(
+            url,
+            Some(current_page as u16),
+            Some(30),
+            scan_id.clone(),
+            None,
+        ) {
+            Ok(response) => response,
+            Err(e) => return Err(format!("Failed to get SCA issues: {}", e).into()),
+        };
 
         if response.issues.is_empty() {
             break;
@@ -1241,6 +1643,85 @@ mod tests {
     }
 
     #[test]
+    fn deserializes_code_quality_issue_response() {
+        // Code quality issues carry a free-form classification label (no CWE) and
+        // must deserialize into the same Issue struct used for security issues.
+        let body = r#"{
+            "status": "ok",
+            "page": 1,
+            "total_pages": 1,
+            "total_issues": 1,
+            "issues": [
+                {
+                    "id": "11111111-1111-1111-1111-111111111111",
+                    "urgency": "ME",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "status": "open",
+                    "classification": {
+                        "id": "Maintainability",
+                        "name": "Maintainability",
+                        "description": null
+                    },
+                    "location": {
+                        "file": {"name": "app.py", "language": "python", "path": "app/app.py"},
+                        "project": {"name": "proj", "branch": "main", "git_sha": "abc"},
+                        "line_number": 20
+                    },
+                    "auto_triage": {"false_positive_detection": {"status": "valid"}},
+                    "auto_fix_suggestion": {"status": "no_fix"}
+                }
+            ]
+        }"#;
+
+        let parsed: ProjectIssuesResponse =
+            serde_json::from_str(body).expect("should parse code quality response");
+        assert_eq!(parsed.status, "ok");
+        let issues = parsed.issues.expect("issues present");
+        assert_eq!(issues.len(), 1);
+        let issue = &issues[0];
+        assert_eq!(issue.classification.id, "Maintainability");
+        assert_eq!(issue.classification.name, "Maintainability");
+        assert!(issue.classification.description.is_none());
+    }
+
+    #[test]
+    fn quality_issues_request_targets_the_documented_paths() {
+        // The two code quality routes are named asymmetrically on the backend,
+        // so the paths are pinned here rather than derived from each other.
+        let (endpoint, query) =
+            quality_issues_request("https://api.example.com", "proj", Some(2), Some(10), None);
+        assert_eq!(
+            endpoint,
+            "https://api.example.com/api/v1/issues/code-quality"
+        );
+        assert_eq!(
+            query,
+            vec![
+                ("project", "proj".to_string()),
+                ("page", "2".to_string()),
+                ("page_size", "10".to_string()),
+            ]
+        );
+
+        let (endpoint, query) = quality_issues_request(
+            "https://api.example.com",
+            "proj",
+            Some(1),
+            None,
+            Some("scan-123"),
+        );
+        assert_eq!(
+            endpoint,
+            "https://api.example.com/api/v1/scan/scan-123/issues/quality"
+        );
+        // A scan selects its own project, and the page size defaults to 30.
+        assert_eq!(
+            query,
+            vec![("page", "1".to_string()), ("page_size", "30".to_string())]
+        );
+    }
+
+    #[test]
     fn should_warn_deprecated_false_when_no_warning_header() {
         let headers = HeaderMap::new();
         assert!(!should_warn_deprecated(&headers));
@@ -1393,6 +1874,277 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(attempts.get(), 1);
+    }
+
+    // Single-response-per-connection JSON stub on an ephemeral port; returns
+    // the base URL. Drains the request first: closing the socket with an
+    // unread request still in the kernel buffer triggers a TCP RST that
+    // surfaces on the client as hyper `UnexpectedMessage` (flaky).
+    fn spawn_projects_stub(body: &'static str) -> String {
+        spawn_projects_stub_status("200 OK", body)
+    }
+
+    fn spawn_projects_stub_status(status_line: &'static str, body: &'static str) -> String {
+        use std::io::Write;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = corgea::vuln_api_stub::read_http_request(&mut stream);
+                let resp = corgea::vuln_api_stub::http_response(status_line, "", body);
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn repo_url_matches_path_compares_the_whole_path() {
+        // Same repo across scheme/.git/trailing-slash/port variants.
+        for stored in [
+            "https://github.com/acme/api",
+            "https://github.com/acme/api.git",
+            "git@github.com:acme/api",
+            "acme/api",
+        ] {
+            assert!(repo_url_matches_path(stored, "acme/api"), "{stored}");
+        }
+        // Sibling / prefix repo, a different org, and — since the owner must be
+        // top-level on the host — a nested mirror or a deeper path.
+        for stored in [
+            "https://github.com/acme/api-v2",
+            "https://github.com/notacme/api",
+            "https://github.com/mirrors/acme/api",
+        ] {
+            assert!(!repo_url_matches_path(stored, "acme/api"), "{stored}");
+        }
+        // Multi-segment paths compare in full.
+        assert!(repo_url_matches_path(
+            "https://dev.azure.com/org/project/_git/repo",
+            "org/project/_git/repo"
+        ));
+        assert!(repo_url_matches_path(
+            "git@gitlab.com:group/subgroup/repo.git",
+            "group/subgroup/repo"
+        ));
+    }
+
+    #[test]
+    fn resolve_project_by_repo_keeps_only_repo_url_matches() {
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","projects":[{"name":"bohappdev/dotnet-azure-web-tsb","repo_url":"https://github.com/bohappdev/dotnet-azure-web-tsb"}]}"#,
+        );
+        let got = resolve_project_by_repo(&base, "bohappdev/dotnet-azure-web-tsb", None).unwrap();
+        assert_eq!(
+            got.map(|p| p.name).as_deref(),
+            Some("bohappdev/dotnet-azure-web-tsb")
+        );
+    }
+
+    #[test]
+    fn resolve_project_by_repo_guards_against_old_backend_returning_all() {
+        // A pre-COR-1426 backend ignores ?repo_url and returns every project.
+        // Without the path re-check we would confirm a stranger's project and
+        // list its scans.
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","projects":[{"name":"other/repo","repo_url":"https://github.com/other/repo"},{"name":"misc/thing","repo_url":"https://github.com/misc/thing"}]}"#,
+        );
+        assert!(
+            resolve_project_by_repo(&base, "bohappdev/dotnet-azure-web-tsb", None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_project_by_repo_rejects_sibling_prefix_repo() {
+        // `repo_url__icontains` returns the sibling `acme/api-v2` for `acme/api`.
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","projects":[{"name":"acme/api-v2","repo_url":"https://github.com/acme/api-v2"}]}"#,
+        );
+        assert!(resolve_project_by_repo(&base, "acme/api", None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn resolve_project_by_repo_empty_and_404_are_soft_none() {
+        let base = spawn_projects_stub(r#"{"status":"ok","projects":[]}"#);
+        assert!(resolve_project_by_repo(&base, "org/repo", None)
+            .unwrap()
+            .is_none());
+        // /projects absent on a very old backend -> soft miss, not a failure.
+        let base = spawn_projects_stub_status("404 Not Found", r#"{"message":"not found"}"#);
+        assert!(resolve_project_by_repo(&base, "org/repo", None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn resolve_project_by_repo_server_error_is_hard_err() {
+        // 5xx must surface, not silently fall back to the local-dir project.
+        let base = spawn_projects_stub_status("500 Internal Server Error", r#"{"error":"boom"}"#);
+        assert!(resolve_project_by_repo(&base, "org/repo", None).is_err());
+    }
+
+    // Serves `page_one` until a request carries `page=2`, then `page_two`.
+    fn spawn_paged_projects_stub(page_one: &'static str, page_two: &'static str) -> String {
+        spawn_paged_projects_stub_status(page_one, "200 OK", page_two)
+    }
+
+    fn spawn_paged_projects_stub_status(
+        page_one: &'static str,
+        page_two_status: &'static str,
+        page_two: &'static str,
+    ) -> String {
+        use std::io::Write;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let request = corgea::vuln_api_stub::read_http_request(&mut stream);
+                let (status, body) = if String::from_utf8_lossy(&request).contains("page=2") {
+                    (page_two_status, page_two)
+                } else {
+                    ("200 OK", page_one)
+                };
+                let resp = corgea::vuln_api_stub::http_response(status, "", body);
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn resolve_project_by_repo_walks_past_the_first_page() {
+        // `repo_url__icontains` over a 20-per-page list: enough `acme/api-*`
+        // siblings push the exact `acme/api` onto page 2, and stopping at page
+        // 1 would recreate the very miss this resolves.
+        let base = spawn_paged_projects_stub(
+            r#"{"status":"ok","total_pages":2,"projects":[{"name":"acme/api-v2","repo_url":"https://github.com/acme/api-v2"}]}"#,
+            r#"{"status":"ok","total_pages":2,"projects":[{"name":"acme/api","repo_url":"https://github.com/acme/api"}]}"#,
+        );
+        let got = resolve_project_by_repo(&base, "acme/api", None).unwrap();
+        assert_eq!(got.map(|p| p.name).as_deref(), Some("acme/api"));
+    }
+
+    #[test]
+    fn resolve_project_by_repo_mid_pagination_404_is_hard_err() {
+        // Django 404s a page that a concurrent delete shrank out of existence.
+        // Page 1 already held the exact match, so a soft miss here would throw
+        // it away and send the caller to the legacy-name fallback.
+        let base = spawn_paged_projects_stub_status(
+            r#"{"status":"ok","total_pages":2,"projects":[{"name":"acme/api","repo_url":"https://github.com/acme/api"}]}"#,
+            "404 Not Found",
+            r#"{"message":"Invalid page."}"#,
+        );
+        let err = resolve_project_by_repo(&base, "acme/api", None).unwrap_err();
+        assert!(err.to_string().contains("page 2"), "{err}");
+        assert!(err.to_string().contains("pagination"), "{err}");
+    }
+
+    #[test]
+    fn resolve_project_by_repo_truncated_search_is_hard_err() {
+        // The ceiling stops the walk before every reported page was searched,
+        // so "no match" would be a guess — and the caller acts on it by
+        // querying the legacy name, which can list a different project.
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","total_pages":999,"projects":[{"name":"acme/api-v2","repo_url":"https://github.com/acme/api-v2"}]}"#,
+        );
+        let err = resolve_project_by_repo(&base, "acme/api", None).unwrap_err();
+        assert!(err.to_string().contains("999 pages"), "{err}");
+    }
+
+    #[test]
+    fn resolve_project_by_repo_bad_envelope_is_hard_err() {
+        // `@paginated` always emits `projects`, empty array included, so a 200
+        // without it — or one that is not JSON at all — is an error envelope or
+        // a foreign responder, not a clean miss.
+        for body in [
+            r#"{"status":"error","message":"boom"}"#,
+            "<html><body>Access denied</body></html>",
+        ] {
+            let base = spawn_projects_stub(body);
+            assert!(
+                resolve_project_by_repo(&base, "org/repo", None).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_project_by_repo_picks_the_candidate_on_the_origin_host() {
+        // `?repo_url=acme/api` is hostless, so `icontains` returns both forges;
+        // the origin host is what says which one is ours.
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","projects":[{"name":"gl","repo_url":"https://gitlab.com/acme/api"},{"name":"gh","repo_url":"https://github.com/acme/api"}]}"#,
+        );
+        let got = resolve_project_by_repo(&base, "acme/api", Some("github.com")).unwrap();
+        assert_eq!(got.map(|p| p.name).as_deref(), Some("gh"));
+        let got = resolve_project_by_repo(&base, "acme/api", Some("gitlab.com")).unwrap();
+        assert_eq!(got.map(|p| p.name).as_deref(), Some("gl"));
+    }
+
+    #[test]
+    fn resolve_project_by_repo_accepts_a_lone_match_from_an_unknown_host() {
+        // An SSH-config alias origin (`corp-github:acme/api`) never equals the
+        // stored `github.com`, but there is nothing to disambiguate — holding
+        // out for a host match would leave COR-1577 unfixed for exactly the
+        // alias remotes this repo itself uses.
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","projects":[{"name":"acme/api","repo_url":"https://github.com/acme/api"}]}"#,
+        );
+        let got = resolve_project_by_repo(&base, "acme/api", Some("corp-github")).unwrap();
+        assert_eq!(got.map(|p| p.name).as_deref(), Some("acme/api"));
+    }
+
+    #[test]
+    fn resolve_project_by_repo_errors_when_the_path_is_claimed_twice() {
+        // Two forges, neither ours: picking either would be a coin flip, and
+        // reporting no match would quietly list a third project's scans.
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","projects":[{"name":"gl","repo_url":"https://gitlab.com/acme/api"},{"name":"gh","repo_url":"https://github.com/acme/api"}]}"#,
+        );
+        let err = resolve_project_by_repo(&base, "acme/api", Some("corp-github")).unwrap_err();
+        assert!(err.to_string().contains("--project-name"), "{err}");
+    }
+
+    #[test]
+    fn resolve_project_by_repo_errors_when_two_projects_share_our_host_and_path() {
+        // A host match must not short-circuit the ambiguity check: two
+        // projects on the same host+path would resolve to whichever the
+        // backend listed first.
+        let base = spawn_projects_stub(
+            r#"{"status":"ok","projects":[{"name":"first","repo_url":"https://github.com/acme/api"},{"name":"second","repo_url":"https://github.com/acme/api"}]}"#,
+        );
+        let err = resolve_project_by_repo(&base, "acme/api", Some("github.com")).unwrap_err();
+        assert!(err.to_string().contains("--project-name"), "{err}");
+    }
+
+    #[test]
+    fn resolve_project_name_override_is_normalized_and_never_empty() {
+        // The name goes straight into `?project=`, which the backend matches
+        // exactly, so a trailing slash would miss the project.
+        let r = resolve_project(
+            "http://127.0.0.1:1",
+            &ProjectSelector {
+                name: Some("foo/".into()),
+                repo: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(r.query_name, "foo");
+        assert!(!r.confirmed);
+        assert!(resolve_project(
+            "http://127.0.0.1:1",
+            &ProjectSelector {
+                name: Some("/".into()),
+                repo: None
+            }
+        )
+        .is_err());
     }
 
     #[test]

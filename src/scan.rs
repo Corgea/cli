@@ -107,8 +107,18 @@ pub fn run_semgrep(config: &Config, project_name: Option<String>) {
 
     let output = run_command(&base_command.to_string(), command);
 
-    if let Some(result) = parse_scan(config, output, true, project_name) {
-        crate::wait::run(config, Some(result.scan_id), result.project_id);
+    if let Some(result) = parse_scan(config, output, true, project_name.clone()) {
+        crate::wait::run(
+            config,
+            crate::wait::WaitArgs {
+                scan_id: Some(result.scan_id),
+                selector: crate::utils::api::ProjectSelector {
+                    name: Some(result.project_name.clone()),
+                    ..Default::default()
+                },
+                project_id: result.project_id,
+            },
+        );
     }
 }
 
@@ -122,8 +132,18 @@ pub fn run_snyk(config: &Config, project_name: Option<String>) {
 
     let output = run_command(&base_command.to_string(), command);
 
-    if let Some(result) = parse_scan(config, output, true, project_name) {
-        crate::wait::run(config, Some(result.scan_id), result.project_id);
+    if let Some(result) = parse_scan(config, output, true, project_name.clone()) {
+        crate::wait::run(
+            config,
+            crate::wait::WaitArgs {
+                scan_id: Some(result.scan_id),
+                selector: crate::utils::api::ProjectSelector {
+                    name: Some(result.project_name.clone()),
+                    ..Default::default()
+                },
+                project_id: result.project_id,
+            },
+        );
     }
 }
 
