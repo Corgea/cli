@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CxXMLResults InitiatorName="svc-corgea" Owner="security" ScanId="1043271" ProjectName="checkmarx-demo" TeamFullPathOnReportDate="CxServer" DeepLink="https://checkmarx.example.com/CxWebClient/ViewerMain.aspx?scanid=1043271&amp;projectid=42" ScanStart="Monday, July 27, 2026 9:12:03 AM" Preset="Checkmarx Default" ScanTime="00h:04m:11s" LinesOfCodeScanned="48" FilesScanned="2" ReportCreationTime="Monday, July 27, 2026 9:18:44 AM" Team="CxServer" CheckmarxVersion="9.5.0" ScanType="Full" SourceOrigin="LocalPath" Visibility="Public">
+  <Query id="594" cweId="89" name="SQL_Injection" group="Python_High_Risk" Severity="High" QueryPath="Python\Cx\Python High Risk\SQL Injection Version:0" Language="Python" LanguageHash="1806663762" LanguageChangeDate="2026-01-14T00:00:00.0000000" SeverityIndex="3">
+    <Result NodeId="10432712" FileName="/src/db.py" Status="New" Line="14" Column="24" FalsePositive="False" Severity="High" AssignToUser="" state="0" Remark="" DeepLink="https://checkmarx.example.com/CxWebClient/ViewerMain.aspx?scanid=1043271&amp;projectid=42&amp;pathid=1" SeverityIndex="3">
+      <Path ResultId="1043271" PathId="1" SimilarityId="-1729315482">
+        <PathNode>
+          <FileName>/src/login.py</FileName>
+          <Line>6</Line>
+          <Column>18</Column>
+          <NodeId>1</NodeId>
+          <Name>username</Name>
+          <Type>ParamDecl</Type>
+          <Length>8</Length>
+          <Snippet>
+            <Line>
+              <Number>6</Number>
+              <Code>def authenticate(username, password):</Code>
+            </Line>
+          </Snippet>
+        </PathNode>
+        <PathNode>
+          <FileName>/src/db.py</FileName>
+          <Line>14</Line>
+          <Column>24</Column>
+          <NodeId>2</NodeId>
+          <Name>query</Name>
+          <Type>StringLiteral</Type>
+          <Length>5</Length>
+          <Snippet>
+            <Line>
+              <Number>14</Number>
+              <Code>    query = "SELECT id, role FROM users WHERE name = '" + username + "'"</Code>
+            </Line>
+          </Snippet>
+        </PathNode>
+      </Path>
+    </Result>
+  </Query>
+  <Query id="612" cweId="798" name="Use_Of_Hardcoded_Password" group="Python_Best_Coding_Practice" Severity="Medium" QueryPath="Python\Cx\Python Best Coding Practice\Use Of Hardcoded Password Version:0" Language="Python" LanguageHash="1806663762" LanguageChangeDate="2026-01-14T00:00:00.0000000" SeverityIndex="2">
+    <Result NodeId="10432713" FileName="/src/db.py" Status="New" Line="6" Column="16" FalsePositive="False" Severity="Medium" AssignToUser="" state="0" Remark="" DeepLink="https://checkmarx.example.com/CxWebClient/ViewerMain.aspx?scanid=1043271&amp;projectid=42&amp;pathid=2" SeverityIndex="2">
+      <Path ResultId="1043271" PathId="2" SimilarityId="1180231477">
+        <PathNode>
+          <FileName>/src/db.py</FileName>
+          <Line>6</Line>
+          <Column>16</Column>
+          <NodeId>1</NodeId>
+          <Name>DB_PASSWORD</Name>
+          <Type>StringLiteral</Type>
+          <Length>11</Length>
+          <Snippet>
+            <Line>
+              <Number>6</Number>
+              <Code>DB_PASSWORD = "s3cr3t-admin-pw"</Code>
+            </Line>
+          </Snippet>
+        </PathNode>
+      </Path>
+    </Result>
+  </Query>
+</CxXMLResults>
