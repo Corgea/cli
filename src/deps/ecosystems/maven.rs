@@ -5,7 +5,7 @@ use crate::deps::ecosystems::classify_constraint;
 use crate::deps::ecosystems::evaluate::{
     constraint_to_findings, dep001, file_in_dir, parent_dir, ScanContext,
 };
-use crate::deps::model::{DependencyNode, Ecosystem, PackageId, Scope, SourceType};
+use crate::deps::model::{DependencyEdge, DependencyNode, Ecosystem, PackageId, Scope, SourceType};
 use crate::deps::DepsError;
 
 pub fn scan_maven_projects(ctx: &mut ScanContext<'_>) -> Result<(), DepsError> {
@@ -68,6 +68,14 @@ fn scan_maven_pom(ctx: &mut ScanContext<'_>, dir: &Path, pom_path: &Path) -> Res
             Some(package_id.clone()),
             false,
         ));
+        ctx.graph.edges.push(DependencyEdge {
+            from: PackageId::root(),
+            to: package_id.clone(),
+            declared_constraint: declared.clone(),
+            resolved_version: Some(dep.version.clone()),
+            scope: dep.scope,
+            source_file: rel.clone(),
+        });
         ctx.graph.nodes.push(DependencyNode {
             id: package_id,
             name,
@@ -89,8 +97,178 @@ fn scan_maven_pom(ctx: &mut ScanContext<'_>, dir: &Path, pom_path: &Path) -> Res
     Ok(())
 }
 
+/// Sections whose contents are not the project's own coordinates or
+/// dependencies; stripped before any dependency or property extraction.
+const NON_DEPENDENCY_SECTIONS: &[&str] = &["profiles", "build", "reporting"];
+
 fn parse_pom_dependencies(content: &str) -> Result<Vec<MavenDep>, DepsError> {
-    Ok(parse_pom_regex(content))
+    let stripped = strip_sections(content, NON_DEPENDENCY_SECTIONS);
+    let props = parse_pom_properties(&stripped);
+    let (rest, management) = split_dependency_management(&stripped);
+    let managed: std::collections::HashMap<(String, String), String> = parse_pom_regex(management)
+        .into_iter()
+        .filter(|d| !d.version.is_empty())
+        .map(|d| ((d.group, d.artifact), d.version))
+        .collect();
+    let mut deps = parse_pom_regex(&rest);
+    for dep in &mut deps {
+        if dep.version.is_empty() {
+            if let Some(v) = managed.get(&(dep.group.clone(), dep.artifact.clone())) {
+                dep.version = v.clone();
+            }
+        }
+        dep.version = resolve_placeholders(&dep.version, &props);
+    }
+    Ok(deps)
+}
+
+/// Remove every `<tag>...</tag>` section. Their dependency blocks are not
+/// application dependencies, and a profile's `<properties>` or
+/// `<dependencyManagement>` must not affect the base dependency graph, so
+/// stripping runs before property and management extraction.
+fn strip_sections(content: &str, tags: &[&str]) -> String {
+    let mut content = content.to_string();
+    for tag in tags {
+        while let Some((rest, _)) = split_section(&content, tag) {
+            content = rest;
+        }
+    }
+    content
+}
+
+/// Split out the `<dependencyManagement>` section: its entries pin versions
+/// for the project's dependencies but are not dependencies themselves.
+/// Returns (pom without the section, the section's inner content).
+fn split_dependency_management(content: &str) -> (String, &str) {
+    split_section(content, "dependencyManagement").unwrap_or_else(|| (content.to_string(), ""))
+}
+
+/// Locate a `<tag>...</tag>` section and split content into (content with
+/// the section removed, the section's inner content). `None` if the tag
+/// isn't present or is malformed (close before open).
+fn split_section<'a>(content: &'a str, tag: &str) -> Option<(String, &'a str)> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let s = content.find(&open)?;
+    let e = content.find(&close)?;
+    if s >= e {
+        return None;
+    }
+    let inner = &content[s + open.len()..e];
+    let rest = format!("{}{}", &content[..s], &content[e + close.len()..]);
+    Some((rest, inner))
+}
+
+/// Collect `<properties>` entries plus the built-in `project.version`.
+fn parse_pom_properties(content: &str) -> std::collections::HashMap<String, String> {
+    let mut props = std::collections::HashMap::new();
+    if let Some(start) = content.find("<properties>") {
+        let rest = &content[start + "<properties>".len()..];
+        if let Some(end) = rest.find("</properties>") {
+            let mut block = &rest[..end];
+            while let Some(open_start) = block.find('<') {
+                let after = &block[open_start + 1..];
+                let Some(open_end) = after.find('>') else {
+                    break;
+                };
+                let tag = after[..open_end].trim();
+                let body = &after[open_end + 1..];
+                if tag.starts_with('/') || tag.starts_with('!') || tag.ends_with('/') {
+                    block = body;
+                    continue;
+                }
+                let close = format!("</{tag}>");
+                match body.find(&close) {
+                    Some(close_pos) => {
+                        props.insert(tag.to_string(), body[..close_pos].trim().to_string());
+                        block = &body[close_pos + close.len()..];
+                    }
+                    None => block = body,
+                }
+            }
+        }
+    }
+    // Property values may reference other properties; resolve the map to a
+    // fixed point, bounded to guard against definition cycles.
+    resolve_props_fixed_point(&mut props);
+    let project_version = resolve_placeholders(&pom_project_version(content), &props);
+    if !project_version.is_empty() && !project_version.contains("${") {
+        props.insert("project.version".to_string(), project_version);
+    }
+    // Properties aliasing ${project.version} (e.g. `<shared.version>`) only
+    // resolve now that project.version itself is in the map.
+    resolve_props_fixed_point(&mut props);
+    props
+}
+
+/// Resolve `${...}` references among property values to a fixed point. A
+/// resolution chain can't be longer than the number of properties without
+/// a cycle, so bound the iteration count by the map size.
+fn resolve_props_fixed_point(props: &mut std::collections::HashMap<String, String>) {
+    for _ in 0..=props.len() {
+        let resolved: std::collections::HashMap<String, String> = props
+            .iter()
+            .map(|(k, v)| (k.clone(), resolve_placeholders(v, props)))
+            .collect();
+        if resolved == *props {
+            break;
+        }
+        *props = resolved;
+    }
+}
+
+/// The pom's own `<version>`: first `<version>` before `<dependencies>`,
+/// excluding the `<parent>` block. A child that inherits its version has
+/// none of its own, so fall back to the parent's (Maven's inheritance rule).
+fn pom_project_version(content: &str) -> String {
+    let head = content.split("<dependencies>").next().unwrap_or(content);
+    // The project's own <version> lives among its coordinates, before any
+    // nested section that may carry unrelated <version> tags of its own
+    // (plugin versions in <build>, managed versions in
+    // <dependencyManagement>, etc).
+    let nested_start = NON_DEPENDENCY_SECTIONS
+        .iter()
+        .copied()
+        .chain(["dependencyManagement"])
+        .filter_map(|tag| head.find(&format!("<{tag}>")))
+        .min();
+    let head = match nested_start {
+        Some(pos) => &head[..pos],
+        None => head,
+    };
+    if let Some((cleaned, parent)) = split_section(head, "parent") {
+        let own = extract_xml_tag(&cleaned, "version");
+        if !own.is_empty() {
+            return own;
+        }
+        return extract_xml_tag(parent, "version");
+    }
+    extract_xml_tag(head, "version")
+}
+
+/// Substitute `${name}` placeholders; unresolved ones pass through unchanged.
+fn resolve_placeholders(raw: &str, props: &std::collections::HashMap<String, String>) -> String {
+    if !raw.contains("${") {
+        return raw.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let key = &after[..end];
+        match props.get(key) {
+            Some(v) => out.push_str(v),
+            None => out.push_str(&rest[start..start + 2 + end + 1]),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn parse_pom_regex(content: &str) -> Vec<MavenDep> {

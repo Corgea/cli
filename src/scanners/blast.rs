@@ -16,6 +16,7 @@ pub fn run(
     fail_on: Option<String>,
     fail: &bool,
     only_uncommitted: &bool,
+    metadata: Option<String>,
     scan_type: Option<String>,
     policy: Option<String>,
     out_format: Option<String>,
@@ -23,6 +24,7 @@ pub fn run(
     target: Option<String>,
     exclude: Option<String>,
     project_name: Option<String>,
+    sbom: Option<String>,
 ) {
     // Validate that only_uncommitted and target are not used together
     if *only_uncommitted && target.is_some() {
@@ -212,6 +214,7 @@ pub fn run(
         repo_info,
         scan_type,
         policy,
+        metadata,
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -411,6 +414,23 @@ pub fn run(
                 fs::write(out_file.clone(), report).expect("\n\nFailed to write Markdown file, check if the file path is valid and you have the necessary permissions to write to it.");
                 utils::terminal::clear_previous_line();
                 println!("\n\nScan report written to: {}\n\n", out_file.clone());
+            }
+        }
+    }
+
+    if let Some(sbom_file) = sbom {
+        match corgea::deps::report::sbom(std::path::Path::new(".")) {
+            Ok(doc) => {
+                let json = serde_json::to_string_pretty(&doc).expect("serialize SBOM");
+                if let Err(e) = fs::write(&sbom_file, json) {
+                    log::error!("\n\nFailed to write SBOM to '{}': {}\n\n", sbom_file, e);
+                    std::process::exit(1);
+                }
+                println!("CycloneDX SBOM written to: {}\n", sbom_file);
+            }
+            Err(e) => {
+                log::error!("\n\nFailed to generate SBOM: {}\n\n", e);
+                std::process::exit(1);
             }
         }
     }
@@ -651,6 +671,32 @@ pub fn report_scan_status(
     Ok(classification_counts)
 }
 
+/// Parse `--metadata KEY=VALUE` flags into a JSON object string.
+/// Splits on the first `=`; duplicate keys last-wins. Empty input -> `Ok(None)`.
+pub fn metadata_json_from_pairs(pairs: &[String]) -> Result<Option<String>, String> {
+    let mut map = serde_json::Map::new();
+    for entry in pairs {
+        match entry.split_once('=') {
+            Some((key, value)) if !key.is_empty() => {
+                map.insert(
+                    key.to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
+            }
+            _ => {
+                return Err(
+                    "Invalid --metadata value. Use KEY=VALUE with a non-empty key, e.g. --metadata pipeline_url=https://...".to_string(),
+                );
+            }
+        }
+    }
+    if map.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(serde_json::Value::Object(map).to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,5 +818,51 @@ mod tests {
             &counts(&[("LO", 1)]),
             &[sca_issue(Some("malicious"))]
         ));
+    }
+
+    #[test]
+    fn parse_metadata_valid_pairs() {
+        let pairs = vec![
+            "pipeline_url=https://ci.example/run/1".to_string(),
+            "artifact_version=1.2.3".to_string(),
+            "note=a=b=c".to_string(),
+        ];
+        let json = metadata_json_from_pairs(&pairs).unwrap().unwrap();
+        let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(map.len(), 3);
+        assert_eq!(
+            map.get("pipeline_url").and_then(|v| v.as_str()),
+            Some("https://ci.example/run/1")
+        );
+        assert_eq!(
+            map.get("artifact_version").and_then(|v| v.as_str()),
+            Some("1.2.3")
+        );
+        assert_eq!(map.get("note").and_then(|v| v.as_str()), Some("a=b=c"));
+    }
+
+    #[test]
+    fn parse_metadata_rejects_missing_eq_or_empty_key() {
+        assert!(metadata_json_from_pairs(&["novalue".to_string()]).is_err());
+        assert!(metadata_json_from_pairs(&["=value".to_string()]).is_err());
+        assert!(metadata_json_from_pairs(&["".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parse_metadata_duplicate_keys_last_wins() {
+        let pairs = vec!["k=first".to_string(), "k=second".to_string()];
+        let json = metadata_json_from_pairs(&pairs).unwrap().unwrap();
+        let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(map.get("k").and_then(|v| v.as_str()), Some("second"));
+    }
+
+    #[test]
+    fn parse_metadata_empty_value_and_empty_list_ok() {
+        let json = metadata_json_from_pairs(&["k=".to_string()])
+            .unwrap()
+            .unwrap();
+        let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(map.get("k").and_then(|v| v.as_str()), Some(""));
+        assert!(metadata_json_from_pairs(&[]).unwrap().is_none());
     }
 }

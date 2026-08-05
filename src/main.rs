@@ -65,6 +65,12 @@ enum Commands {
             help = "The name of the Corgea project. Defaults to git repository name if found, otherwise to the current directory name."
         )]
         project_name: Option<String>,
+
+        #[arg(
+            long,
+            help = "Wait for the uploaded scan to complete and print the results. Without this flag, the command prints the scan page URL so you can track the results."
+        )]
+        wait: bool,
     },
     /// Scan the current directory. Supports blast, semgrep and snyk.
     Scan {
@@ -80,6 +86,13 @@ enum Commands {
 
         #[arg(long, help = "Only scan uncommitted changes.")]
         only_uncommitted: bool,
+
+        #[arg(
+            long = "metadata",
+            value_name = "KEY=VALUE",
+            help = "Attach scan-level metadata (repeatable), e.g. --metadata pipeline_url=... --metadata artifact_version=1.2.3"
+        )]
+        metadata: Vec<String>,
 
         #[arg(
             short,
@@ -132,9 +145,38 @@ enum Commands {
             help = "The name of the Corgea project. Defaults to git repository name if found, otherwise to the current directory name."
         )]
         project_name: Option<String>,
+
+        #[arg(
+            long,
+            value_name = "FILE",
+            num_args = 0..=1,
+            default_missing_value = "bom.json",
+            help = "Generate a CycloneDX SBOM of the project after the scan completes, alongside any report. Optionally specify the output file. Defaults to bom.json."
+        )]
+        sbom: Option<String>,
     },
     /// Wait for the latest in progress scan
-    Wait { scan_id: Option<String> },
+    Wait {
+        scan_id: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "repo",
+            help = "Query this exact Corgea project name directly (skips repo auto-resolution)."
+        )]
+        project_name: Option<String>,
+        #[arg(
+            long,
+            help = "Resolve the project from this repo (org/repo slug or remote URL) instead of the git remote."
+        )]
+        repo: Option<String>,
+        #[arg(
+            long,
+            requires = "scan_id",
+            value_parser = clap::builder::NonEmptyStringValueParser::new(),
+            help = "Use this known Corgea project id for the result link, skipping project resolution. Requires a scan id, which is what the id then belongs to."
+        )]
+        project_id: Option<String>,
+    },
     /// List something, by default it lists the scans
     #[command(alias = "ls")]
     List {
@@ -170,9 +212,16 @@ enum Commands {
 
         #[arg(
             long,
-            help = "The name of the Corgea project. Defaults to git repository name if found, otherwise to the current directory name."
+            conflicts_with = "repo",
+            help = "Query this exact Corgea project name directly (skips repo auto-resolution)."
         )]
         project_name: Option<String>,
+
+        #[arg(
+            long,
+            help = "Resolve the project from this repo (org/repo slug or remote URL) instead of the git remote."
+        )]
+        repo: Option<String>,
     },
     /// Inspect something, by default it will inspect a scan
     Inspect {
@@ -225,6 +274,11 @@ enum Commands {
         #[command(subcommand)]
         command: corgea::deps::run::DepsSubcommand,
     },
+    /// Look up a package's known advisories before choosing or installing it
+    Advisories {
+        #[command(subcommand)]
+        command: corgea::advisories::AdvisoriesSubcommand,
+    },
     /// Wrap `npm` commands: gate install targets on Corgea's vuln verdicts, then run npm.
     Npm(InstallWrapArgs),
     /// Wrap `yarn` commands: gate install targets on Corgea's vuln verdicts, then run yarn.
@@ -245,7 +299,7 @@ enum Commands {
 struct InstallWrapArgs {
     #[arg(
         long,
-        help = "Proceed with the install despite vulnerable findings. Findings are still printed."
+        help = "Proceed with the install despite vulnerable or malicious findings. Findings are still printed."
     )]
     force: bool,
 
@@ -260,10 +314,20 @@ struct InstallWrapArgs {
     cmd: Vec<String>,
 }
 
-fn install_wrap_options(
-    args: &InstallWrapArgs,
-    config: &Config,
-) -> corgea::precheck::PrecheckOptions {
+/// The vuln-api access policy shared by the install gate and `advisories`:
+/// which base URL to hit and whether the Corgea token travels with the
+/// request. `has_token` reports whether the user is logged in, independent
+/// of the isolation decision that may keep the token off a custom URL.
+struct VulnApiAccess {
+    base_url: String,
+    mode: corgea::precheck::VerdictMode,
+    has_token: bool,
+}
+
+/// Resolve the shared vuln-api access policy once so both surfaces apply the
+/// same base-URL/token-isolation rule (never send a token to an endpoint it
+/// does not belong to without explicit opt-in).
+fn resolve_vuln_api_access(config: &Config) -> VulnApiAccess {
     let token = config.get_token();
     let token = token.trim();
     let base_url = config::vuln_api_url();
@@ -271,14 +335,25 @@ fn install_wrap_options(
     let send_token_to_custom =
         utils::generic::get_env_var_if_exists("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL")
             .is_some_and(|v| v.trim() == "1");
-    let mode = select_verdict_mode(token, custom_vuln_api_url, send_token_to_custom);
+    VulnApiAccess {
+        mode: select_verdict_mode(token, custom_vuln_api_url, send_token_to_custom),
+        base_url,
+        has_token: !token.is_empty(),
+    }
+}
+
+fn install_wrap_options(
+    args: &InstallWrapArgs,
+    config: &Config,
+) -> corgea::precheck::PrecheckOptions {
+    let access = resolve_vuln_api_access(config);
     corgea::precheck::PrecheckOptions {
         force: args.force,
         json: args.json,
         verdict: Some(corgea::precheck::VerdictConfig {
-            base_url,
-            mode,
-            public_login_hint: token.is_empty(),
+            base_url: access.base_url,
+            mode: access.mode,
+            public_hint: Some(public_hint_for(access.has_token)),
         }),
         npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
         pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
@@ -290,15 +365,42 @@ fn install_wrap_options(
     }
 }
 
-/// A token enables authenticated (fail-closed) verdicts — but never against
-/// a custom vuln-api URL unless the user explicitly opts in to sending the
-/// token there.
+/// Advisories connection options. No token gate — tokenless (public) mode
+/// must work — but the same isolation policy as the install wrap.
+fn advisories_options(config: &Config) -> corgea::advisories::AdvisoriesOptions {
+    let access = resolve_vuln_api_access(config);
+    let token = match access.mode {
+        corgea::precheck::VerdictMode::Authenticated { token } => Some(token),
+        corgea::precheck::VerdictMode::Public => None,
+    };
+    corgea::advisories::AdvisoriesOptions {
+        base_url: access.base_url,
+        token,
+    }
+}
+
+/// Which public-mode disclosure to print. A withheld token is not the same
+/// situation as no token, and telling a logged-in user to log in is useless.
+/// Only consulted in public mode — authenticated runs print no hint.
+fn public_hint_for(has_token: bool) -> corgea::precheck::PublicHint {
+    if has_token {
+        corgea::precheck::PublicHint::TokenWithheld
+    } else {
+        corgea::precheck::PublicHint::NoToken
+    }
+}
+
+/// A token enables authenticated (fail-closed) verdicts — but only against a
+/// vuln-api the token belongs to. That means neither a custom URL nor a
+/// non-production built-in default, unless the user explicitly opts in to
+/// sending the token there.
 fn select_verdict_mode(
     token: &str,
     custom_vuln_api_url: bool,
     send_token_to_custom: bool,
 ) -> corgea::precheck::VerdictMode {
-    if !token.is_empty() && (!custom_vuln_api_url || send_token_to_custom) {
+    let trusted_default = !custom_vuln_api_url && config::DEFAULT_VULN_API_URL_IS_PRODUCTION;
+    if !token.is_empty() && (trusted_default || send_token_to_custom) {
         corgea::precheck::VerdictMode::Authenticated {
             token: token.to_string(),
         }
@@ -483,18 +585,35 @@ fn main() {
         Some(Commands::Upload {
             report,
             project_name,
+            wait,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
-            match report {
+            let result = match report {
                 Some(report) => {
                     if report.ends_with(".fpr") {
-                        fortify_parse(&corgea_config, report, project_name.clone());
+                        fortify_parse(&corgea_config, report, project_name.clone())
                     } else {
-                        scan::read_file_report(&corgea_config, report, project_name.clone());
+                        scan::read_file_report(&corgea_config, report, project_name.clone())
                     }
                 }
-                None => {
-                    scan::read_stdin_report(&corgea_config, project_name.clone());
+                None => scan::read_stdin_report(&corgea_config, project_name.clone()),
+            };
+
+            if let Some(result) = result {
+                if *wait {
+                    wait::run(
+                        &corgea_config,
+                        wait::WaitArgs {
+                            scan_id: Some(result.scan_id.clone()),
+                            selector: utils::api::ProjectSelector {
+                                name: Some(result.project_name.clone()),
+                                ..Default::default()
+                            },
+                            project_id: result.project_id.clone(),
+                        },
+                    );
+                } else {
+                    scan::print_scan_tracking_url(&corgea_config, &result);
                 }
             }
         }
@@ -503,6 +622,7 @@ fn main() {
             fail_on,
             fail,
             only_uncommitted,
+            metadata,
             scan_type,
             policy,
             out_format,
@@ -510,6 +630,7 @@ fn main() {
             target,
             exclude,
             project_name,
+            sbom,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             if let Some(level) = fail_on {
@@ -532,6 +653,19 @@ fn main() {
                 ::log::error!("only_uncommitted is only supported with blast scanner.");
                 std::process::exit(1);
             }
+
+            if !metadata.is_empty() && *scanner != Scanner::Blast {
+                ::log::error!("--metadata is only supported with the blast scanner.");
+                std::process::exit(1);
+            }
+
+            let metadata_json = match scanners::blast::metadata_json_from_pairs(metadata) {
+                Ok(json) => json,
+                Err(e) => {
+                    ::log::error!("{}", e);
+                    std::process::exit(1);
+                }
+            };
 
             if out_file.is_some() && *scanner != Scanner::Blast {
                 ::log::error!("out_file is only supported with blast scanner.");
@@ -597,6 +731,11 @@ fn main() {
                 std::process::exit(1);
             }
 
+            if sbom.is_some() && *scanner != Scanner::Blast {
+                ::log::error!("sbom is only supported with blast scanner.");
+                std::process::exit(1);
+            }
+
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config, project_name.clone()),
                 Scanner::Semgrep => scan::run_semgrep(&corgea_config, project_name.clone()),
@@ -605,6 +744,7 @@ fn main() {
                     fail_on.clone(),
                     fail,
                     only_uncommitted,
+                    metadata_json,
                     scan_type.clone(),
                     policy.clone(),
                     out_format.clone(),
@@ -612,12 +752,28 @@ fn main() {
                     target.clone(),
                     exclude.clone(),
                     project_name.clone(),
+                    sbom.clone(),
                 ),
             }
         }
-        Some(Commands::Wait { scan_id }) => {
+        Some(Commands::Wait {
+            scan_id,
+            project_name,
+            repo,
+            project_id,
+        }) => {
             verify_token_and_exit_when_fail(&corgea_config);
-            wait::run(&corgea_config, scan_id.clone(), None);
+            wait::run(
+                &corgea_config,
+                wait::WaitArgs {
+                    scan_id: scan_id.clone(),
+                    selector: utils::api::ProjectSelector {
+                        name: project_name.clone(),
+                        repo: repo.clone(),
+                    },
+                    project_id: project_id.clone(),
+                },
+            );
         }
         Some(Commands::List {
             issues,
@@ -628,6 +784,7 @@ fn main() {
             sca_issues,
             code_quality,
             project_name,
+            repo,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             if [*issues, *sca_issues, *code_quality]
@@ -647,14 +804,19 @@ fn main() {
             }
             list::run(
                 &corgea_config,
-                issues,
-                sca_issues,
-                code_quality,
-                json,
-                page,
-                page_size,
-                scan_id,
-                project_name,
+                list::ListArgs {
+                    issues: *issues,
+                    sca_issues: *sca_issues,
+                    code_quality: *code_quality,
+                    json: *json,
+                    page: *page,
+                    page_size: *page_size,
+                    scan_id: scan_id.clone(),
+                    selector: utils::api::ProjectSelector {
+                        name: project_name.clone(),
+                        repo: repo.clone(),
+                    },
+                },
             );
         }
         Some(Commands::Inspect {
@@ -696,6 +858,12 @@ fn main() {
         Some(Commands::Deps { command }) => {
             // Offline: no token / network. Exit code propagates fail-on policy.
             std::process::exit(i32::from(corgea::deps::run::run(command.clone())));
+        }
+        Some(Commands::Advisories { command }) => {
+            std::process::exit(corgea::advisories::run(
+                command.clone(),
+                advisories_options(&corgea_config),
+            ));
         }
         // Install wrappers: no auth gate. Public CVE checks run without a
         // token and fail open on lookup outages.
@@ -742,12 +910,18 @@ mod tests {
     fn verdict_mode_selection_matrix() {
         use corgea::precheck::VerdictMode;
 
-        assert_eq!(
-            select_verdict_mode("token", false, false),
-            VerdictMode::Authenticated {
-                token: "token".to_string()
-            }
-        );
+        // Built-in default: authenticated only when that default is production.
+        let default_mode = select_verdict_mode("token", false, false);
+        if config::DEFAULT_VULN_API_URL_IS_PRODUCTION {
+            assert_eq!(
+                default_mode,
+                VerdictMode::Authenticated {
+                    token: "token".to_string()
+                }
+            );
+        } else {
+            assert_eq!(default_mode, VerdictMode::Public);
+        }
         assert_eq!(select_verdict_mode("", false, false), VerdictMode::Public);
         assert_eq!(
             select_verdict_mode("token", true, false),
@@ -759,5 +933,37 @@ mod tests {
                 token: "token".to_string()
             }
         );
+    }
+
+    /// A token reaches only an endpoint it belongs to. A custom vuln-api is
+    /// not one, so it stays public and says so — the withheld hint exists for
+    /// exactly that cohort. See COR-1549.
+    #[test]
+    fn withheld_token_selects_public_mode_and_withheld_hint() {
+        use corgea::precheck::{PublicHint, VerdictMode};
+
+        // token + custom URL + no opt-in
+        assert_eq!(
+            select_verdict_mode("token", true, false),
+            VerdictMode::Public
+        );
+        assert_eq!(public_hint_for(true), PublicHint::TokenWithheld);
+        // No token is a different situation with different advice.
+        assert_eq!(public_hint_for(false), PublicHint::NoToken);
+    }
+
+    /// The opt-in is what makes an otherwise untrusted endpoint eligible for
+    /// the token — and it never manufactures a token that does not exist.
+    #[test]
+    fn opt_in_enables_authenticated_for_untrusted_endpoints() {
+        use corgea::precheck::VerdictMode;
+
+        assert_eq!(
+            select_verdict_mode("token", true, true),
+            VerdictMode::Authenticated {
+                token: "token".to_string()
+            }
+        );
+        assert_eq!(select_verdict_mode("", true, true), VerdictMode::Public);
     }
 }

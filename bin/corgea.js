@@ -10,7 +10,7 @@ function resolveTargetTriple() {
     case "linux":
     case "android":
       if (process.arch === "x64") return "x86_64-unknown-linux-musl";
-      if (process.arch === "arm64") return "aarch64-unknown-linux-gnu";
+      if (process.arch === "arm64") return "aarch64-unknown-linux-musl";
       return null;
     case "darwin":
       if (process.arch === "x64") return "x86_64-apple-darwin";

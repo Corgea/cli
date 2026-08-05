@@ -69,8 +69,29 @@ Pushing an annotated `vX.Y.Z` tag to `main` fans out to three GitHub Actions wor
 ## What gets built
 
 - **PyPI wheels** (`release.yml`): Linux (x86_64, x86), Windows (x64, x86), macOS (x86_64, aarch64), plus an sdist. Asserts `manylinux2014` tags for broad Linux compatibility.
-- **Native binaries** (`release-binaries.yml`): `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`.
-- **npm binary bundling** (`npm-publish.yml` → `scripts/npm/bundle-binaries.js`): downloads the GitHub Release zips and lays them out as `vendor/<target>/corgea/corgea`. At runtime `bin/corgea.js` selects the binary for the host OS/arch. npm ships 5 of the 6 targets (Linux x64 uses the musl build).
+- **Native binaries** (`release-binaries.yml`): `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`.
+- **npm binary bundling** (`npm-publish.yml` → `scripts/npm/bundle-binaries.js`): downloads the GitHub Release zips and lays them out as `vendor/<target>/corgea/corgea`. At runtime `bin/corgea.js` selects the binary for the host OS/arch. npm ships 5 of the 7 targets (both Linux arches use the musl build).
+
+### Linux glibc floor
+
+Building a `*-gnu` target natively stamps the *runner's* glibc into the binary's
+ELF version-need table, and the loader then refuses to start it on any host with
+an older glibc. Every release from `v1.7.2` through `v1.9.2` shipped Linux gnu
+binaries that required `GLIBC_2.39`, so they failed on Ubuntu 22.04 (glibc 2.35)
+and older with `version 'GLIBC_2.38' not found`.
+
+All four Linux targets are therefore cross-built on `ubuntu-latest` with
+[`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild), pinning the gnu
+targets to the `GLIBC_FLOOR` declared in `release-binaries.yml` (currently
+`2.17`, i.e. RHEL 7 / Ubuntu 14.04 and newer). `scripts/check-linux-binary.sh`
+then re-reads each artifact and fails the build if a gnu binary exceeds the
+floor, or if a musl binary is not fully static. Run it locally with:
+
+```bash
+scripts/check-linux-binary.sh target/aarch64-unknown-linux-gnu/release/corgea aarch64-unknown-linux-gnu
+```
+
+Raising `GLIBC_FLOOR` drops support for older distros — change it deliberately.
 
 ## Release notes
 

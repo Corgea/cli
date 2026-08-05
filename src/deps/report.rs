@@ -1,8 +1,60 @@
 use serde_json::{json, Value};
 use std::fmt::Write as _;
 
-use crate::deps::model::DependencyGraph;
+use crate::deps::detect::DetectedFile;
+use crate::deps::model::{DependencyGraph, Ecosystem, PackageId};
 use crate::deps::Inventory;
+
+/// Load the policy at `root`, scan the tree, and emit a CycloneDX SBOM.
+pub fn sbom(root: &std::path::Path) -> Result<Value, crate::deps::DepsError> {
+    let policy = crate::deps::run::load_policy(root)?;
+    let inv = crate::deps::scan(root, &policy)?;
+    warn_unsupported_ecosystems(&inv.detected_files);
+    Ok(to_cyclonedx(&inv))
+}
+
+/// Print one deduplicated stderr warning per detected ecosystem that
+/// `to_cyclonedx` does not emit components for (currently Go and Cargo),
+/// so `deps sbom` / `scan --sbom` don't silently produce an empty-looking
+/// SBOM for those trees.
+pub fn warn_unsupported_ecosystems(detected: &[DetectedFile]) {
+    let mut by_ecosystem: std::collections::BTreeMap<
+        &'static str,
+        std::collections::BTreeSet<String>,
+    > = std::collections::BTreeMap::new();
+
+    for f in detected {
+        let Some(label) = unsupported_ecosystem_label(f.ecosystem) else {
+            continue;
+        };
+        let file_name = f
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        by_ecosystem.entry(label).or_default().insert(file_name);
+    }
+
+    for (label, files) in by_ecosystem {
+        let files: Vec<String> = files.into_iter().collect();
+        eprintln!(
+            "Warning: detected {} but {} is not yet included in SBOMs",
+            files.join(", "),
+            label
+        );
+    }
+}
+
+fn unsupported_ecosystem_label(ecosystem: Ecosystem) -> Option<&'static str> {
+    if crate::deps::ecosystems::is_graphed(ecosystem) {
+        return None;
+    }
+    Some(match ecosystem {
+        Ecosystem::Go => "Go",
+        Ecosystem::Cargo => "Cargo",
+        _ => "this ecosystem",
+    })
+}
 
 pub fn to_json(inv: &Inventory) -> Value {
     inventory_to_json(inv)
@@ -56,36 +108,73 @@ fn severity_to_sarif(sev: crate::deps::model::Severity) -> &'static str {
     }
 }
 
-pub fn to_cyclonedx(graph: &DependencyGraph) -> Value {
-    let components: Vec<Value> = graph
-        .nodes
+/// A version is resolved when it names a concrete release — not empty, not
+/// the `?` placeholder for lockfile-less manifests, not an unsubstituted
+/// `${...}` Maven property. Unresolved versions (and the purls fabricated
+/// from them) must be omitted, or the document fails CycloneDX 1.7 validation.
+fn is_resolved_version(version: &str) -> bool {
+    !version.is_empty() && version != "?" && !version.contains("${")
+}
+
+pub fn to_cyclonedx(inv: &Inventory) -> Value {
+    let graph = &inv.graph;
+    // Deduplicate by bom-ref: multi-module trees list the same package once
+    // per manifest, but the schema sets uniqueItems on components.
+    let mut components: std::collections::BTreeMap<&str, Value> = std::collections::BTreeMap::new();
+    for n in graph.nodes.iter().filter(|n| *n.id() != PackageId::root()) {
+        let mut c = json!({
+            "type": "library",
+            "bom-ref": n.id().0,
+            "name": n.name(),
+        });
+        if let Some(v) = n.version().filter(|v| is_resolved_version(v)) {
+            c["version"] = json!(v);
+            c["purl"] = json!(n.id().0);
+        }
+        components.entry(&n.id().0).or_insert(c);
+    }
+    let components: Vec<Value> = components.into_values().collect();
+
+    let mut depends_on: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
+        std::collections::BTreeMap::new();
+    for e in &graph.edges {
+        depends_on.entry(&e.from.0).or_default().insert(&e.to.0);
+    }
+    let deps: Vec<Value> = depends_on
         .iter()
-        .filter(|n| n.name() != "root")
-        .map(|n| {
+        .map(|(from, tos)| {
             json!({
-                "type": "library",
-                "name": n.name(),
-                "version": n.version(),
-                "purl": n.id().0,
+                "ref": from,
+                "dependsOn": tos,
             })
         })
         .collect();
 
-    let deps: Vec<Value> = graph
-        .edges
-        .iter()
-        .map(|e| {
-            json!({
-                "ref": e.from.0,
-                "dependsOn": [e.to.0],
-            })
-        })
-        .collect();
+    let root_name = std::fs::canonicalize(&inv.root)
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "project".to_string());
 
     json!({
         "bomFormat": "CycloneDX",
-        "specVersion": "1.4",
+        "specVersion": "1.7",
+        "serialNumber": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
         "version": 1,
+        "metadata": {
+            "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "tools": {
+                "components": [{
+                    "type": "application",
+                    "name": "corgea",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }]
+            },
+            "component": {
+                "type": "application",
+                "bom-ref": "root",
+                "name": root_name,
+            },
+        },
         "components": components,
         "dependencies": deps,
     })

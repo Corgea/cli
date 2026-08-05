@@ -1,0 +1,47 @@
+{
+  "package": {
+    "ecosystem": "npm",
+    "name": "axios",
+    "purl": "pkg:npm/axios",
+    "registry_url": "https://www.npmjs.com/package/axios",
+    "metadata_url": "https://registry.npmjs.org/axios",
+    "downloads_30d": 1234567890,
+    "downloads_total": 98765432100,
+    "popularity_rank": 12,
+    "last_metadata_sync_at": "2026-07-16T00:00:00Z"
+  },
+  "advisories": [
+    {
+      "id": "GHSA-xxxx-yyyy-zzzz",
+      "alias": "CVE-2023-45857",
+      "ecosystem": "npm",
+      "summary": "axios is vulnerable to Server-Side Request Forgery when following a redirect to a crafted URL, leaking sensitive data.",
+      "severity": "high",
+      "severity_badge": "High",
+      "cvss_score": 7.5,
+      "tier": 1,
+      "tier_score": 92,
+      "kev": false,
+      "malware": false,
+      "published_at": "2023-01-12T00:00:00Z",
+      "modified_at": "2023-06-01T00:00:00Z",
+      "llm_summary": "SSRF via redirect; upgrade to a patched release."
+    },
+    {
+      "id": "MAL-2024-0001",
+      "alias": null,
+      "ecosystem": "npm",
+      "summary": "Malicious code detected in this package version; exfiltrates environment variables on install.",
+      "severity": "critical",
+      "severity_badge": "Critical",
+      "cvss_score": null,
+      "tier": 0,
+      "tier_score": null,
+      "kev": false,
+      "malware": true,
+      "published_at": "2024-03-01T00:00:00Z",
+      "modified_at": "2024-03-02T00:00:00Z",
+      "llm_summary": null
+    }
+  ]
+}

@@ -2,6 +2,7 @@ use std::path::Path;
 
 use clap::{Command, CommandFactory, Parser};
 
+use crate::deps::catalog::FINDING_DEFINITIONS;
 use crate::deps::run::DepsSubcommand;
 
 pub const BEGIN_MARKER: &str = "<!-- BEGIN GENERATED CORGEA DEPS SKILL -->";
@@ -120,6 +121,20 @@ pub fn generated_deps_skill_section() -> String {
     out.push_str(
         "\nNotes: `deps scan --out-format table|json|sarif` is the report/export selector; do not combine it with `deps scan --format`.\n",
     );
+    out.push_str("\n### Dependency finding catalog\n\n");
+    out.push_str("| ID | Status | Severity | Title | Description | Remediation |\n");
+    out.push_str("| --- | --- | --- | --- | --- | --- |\n");
+    for definition in FINDING_DEFINITIONS {
+        out.push_str(&format!(
+            "| `{}` | {} | {:?} | {} | {} | {} |\n",
+            definition.id,
+            definition.status.as_str(),
+            definition.severity,
+            definition.title,
+            definition.description,
+            definition.remediation,
+        ));
+    }
     out
 }
 

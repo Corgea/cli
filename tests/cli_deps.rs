@@ -97,7 +97,9 @@ fn cli_scan_agent_env_defaults_to_agent_format() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.starts_with("record\troot\t"), "stdout: {stdout}");
     assert!(
-        stdout.contains("\nfinding\tDEP004\tHigh\tpkg:npm/lodash@4.17.21\t"),
+        stdout.contains(
+            "\nfinding\tDEP004\tHigh\tpkg:npm/lodash@4.17.21\tWildcard or latest dependency\tPin to an exact version instead of using wildcard, latest, or unbounded ranges."
+        ),
         "stdout: {stdout}"
     );
 }
@@ -120,6 +122,17 @@ fn cli_scan_format_human_overrides_agent_env() {
         stdout.contains("Corgea dependency inventory"),
         "stdout: {stdout}"
     );
+    assert!(
+        stdout.contains("DEP004  High  Wildcard or latest dependency"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("package: lodash"), "stdout: {stdout}");
+    assert!(
+        stdout.contains(
+            "Pin to an exact version instead of using wildcard, latest, or unbounded ranges."
+        ),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -138,6 +151,20 @@ fn cli_scan_format_json_outputs_parseable_inventory() {
         serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
     assert!(parsed.get("nodes").is_some());
     assert!(parsed.get("findings").is_some());
+    let findings = parsed["findings"]
+        .as_array()
+        .expect("findings must be an array");
+    let dep004 = findings
+        .iter()
+        .find(|finding| finding["id"] == "DEP004" && finding["package"] == "pkg:npm/lodash@4.17.21")
+        .expect("node-app emits DEP004 for lodash");
+    assert_eq!(dep004["severity"], "High");
+    assert_eq!(dep004["title"], "Wildcard or latest dependency");
+    assert_eq!(
+        dep004["recommendation"],
+        "Pin to an exact version instead of using wildcard, latest, or unbounded ranges."
+    );
+    assert!(findings.iter().all(|finding| finding["id"] != "DEP010"));
     assert!(
         !String::from_utf8_lossy(&out.stdout).contains("Hint:"),
         "stdout: {}",
@@ -218,6 +245,51 @@ fn cli_graph_format_json_outputs_parseable_nodes() {
     assert!(nodes
         .iter()
         .any(|node| node["id"] == "pkg:npm/left-pad@1.3.0"));
+}
+
+#[test]
+fn cli_mixed_monorepo_commands_cover_npm_and_pypi() {
+    let path = fixture("mixed-monorepo");
+    let expected = ["pkg:npm/debug@4.3.4", "pkg:pypi/fastapi@0.110.0"];
+
+    for (subcommand, format) in [("scan", "json"), ("graph", "json"), ("sbom", "cyclonedx")] {
+        let (mut cmd, _home) = corgea_isolated();
+        let out = cmd
+            .args(["deps", subcommand, &path, "--format", format])
+            .output()
+            .expect("failed to run corgea");
+        assert!(
+            out.status.success(),
+            "deps {subcommand} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+        let ids: Vec<_> = if subcommand == "sbom" {
+            assert_eq!(parsed["bomFormat"], "CycloneDX");
+            parsed["components"]
+                .as_array()
+                .expect("components array")
+                .iter()
+                .filter_map(|component| component["purl"].as_str())
+                .collect()
+        } else {
+            parsed["nodes"]
+                .as_array()
+                .expect("nodes array")
+                .iter()
+                .filter_map(|node| node["id"].as_str())
+                .collect()
+        };
+
+        for id in expected {
+            assert!(
+                ids.contains(&id),
+                "deps {subcommand} omitted {id}: {parsed}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -943,5 +1015,59 @@ fn run_git(repo: &std::path::Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn cli_sbom_warns_on_unsupported_ecosystem_and_still_succeeds() {
+    let (mut cmd, _home) = corgea_isolated();
+    let project = TempDir::new().expect("project dir");
+    std::fs::write(
+        project.path().join("go.mod"),
+        "module example.com/foo\n\ngo 1.22\n",
+    )
+    .expect("write go.mod");
+
+    let out = cmd
+        .args(["deps", "sbom", project.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run corgea");
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("go.mod") && stderr.contains("Go") && stderr.contains("not yet included"),
+        "expected an unsupported-ecosystem warning on stderr, got: {stderr}"
+    );
+
+    let sbom: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid CycloneDX JSON");
+    assert_eq!(sbom["bomFormat"], "CycloneDX");
+    assert_eq!(
+        sbom["components"].as_array().map(|a| a.len()),
+        Some(0),
+        "Go-only tree should produce zero SBOM components"
+    );
+}
+
+#[test]
+fn cli_sbom_nonexistent_path_fails_cleanly() {
+    let (mut cmd, _home) = corgea_isolated();
+    let out = cmd
+        .args(["deps", "sbom", "/does/not/exist/corgea-cli-test"])
+        .output()
+        .expect("failed to run corgea");
+
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("path does not exist"),
+        "expected a clean path-does-not-exist error, got: {stderr}"
     );
 }

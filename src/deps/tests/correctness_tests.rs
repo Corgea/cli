@@ -22,6 +22,11 @@ fn node_direct_locked_range_is_medium_not_high() {
         .expect("expected DEP003 for express");
     assert_eq!(dep003.severity, Severity::Medium);
     assert!(dep003.reproducible);
+    assert_eq!(dep003.resolved_version.as_deref(), Some("4.18.2"));
+    assert_eq!(
+        dep003.recommendation,
+        "Pin to the resolved version or allow by policy because the lockfile resolves it."
+    );
 }
 
 #[test]

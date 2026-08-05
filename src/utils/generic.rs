@@ -268,10 +268,20 @@ pub fn get_env_var_if_exists(var_name: &str) -> Option<String> {
 }
 
 pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
-    let repo = match Repository::open(Path::new(dir)) {
+    // discover (not open) so worktrees / .git-as-file roots still resolve.
+    let repo = match Repository::discover(Path::new(dir)) {
         Ok(repo) => repo,
-        Err(_) => return Ok(None),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+        Err(e) => return Err(e),
     };
+
+    // Default BLAST packaging walks `dir` (usually "."). Only attach
+    // sha/branch/repo_url when that path is the worktree root — otherwise a
+    // nested CWD would upload a partial zip labeled with the parent HEAD, and
+    // determine_project_name would switch from CWD basename to the remote name.
+    if !is_at_repo_root(dir) {
+        return Ok(None);
+    }
 
     let branch = repo.head().ok().and_then(|head| {
         if head.is_branch() {
@@ -281,24 +291,105 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
         }
     });
 
-    // Get the latest commit SHA
     let sha = repo.head().ok().and_then(|head| {
         head.peel_to_commit()
             .ok()
             .map(|commit| commit.id().to_string())
     });
 
-    // Get the remote URL (assuming "origin")
-    let repo_url = repo
-        .find_remote("origin")
-        .ok()
-        .and_then(|remote| remote.url().map(|url| url.to_string()));
-
     Ok(Some(RepoInfo {
         branch,
-        repo_url,
+        repo_url: origin_url(&repo),
         sha,
     }))
+}
+
+/// `origin`'s URL, or None when the remote is missing or carries no URL.
+fn origin_url(repo: &Repository) -> Option<String> {
+    repo.find_remote("origin")
+        .ok()
+        .and_then(|remote| remote.url().map(|url| url.to_string()))
+}
+
+/// The enclosing repository's `origin` remote URL, searched upward from the
+/// current directory so `corgea list`/`wait` also resolve from a subdirectory.
+/// `get_repo_info` deliberately returns None outside the worktree root; this
+/// does not. None outside a git repo or when `origin` carries no URL.
+pub fn discover_repo_url() -> Option<String> {
+    origin_url(&Repository::discover(Path::new(".")).ok()?)
+}
+
+/// The whole repository path after the host, lowercased (`org/repo`,
+/// `group/subgroup/repo`, Azure `org/project/_git/repo`). The host is excluded
+/// so SSH/HTTPS/port variants of one remote compare equal; None when the value
+/// carries no host at all. The full path — not a trailing `org/repo` slug — is
+/// what doghouse `normalize_repo_url` stores (`heeler/models.py:201-246`), so
+/// it is what an equality compare needs. Azure SSH remotes
+/// (`ssh.dev.azure.com/v3/org/…`, no `_git` segment) remain a known limitation.
+pub fn extract_repo_path(url: &str) -> Option<String> {
+    Some(split_remote(url)?[1..].join("/").to_lowercase())
+}
+
+/// The host of a git remote (`github.com`), lowercased and without userinfo or
+/// port. None for a hostless value such as a bare `org/repo` — the same inputs
+/// `extract_repo_path` rejects.
+pub fn extract_repo_host(url: &str) -> Option<String> {
+    Some(split_remote(url)?[0].to_lowercase())
+}
+
+/// Split a git remote into `[host, path segments…]`, dropping scheme, userinfo
+/// and port. None when fewer than two path segments follow the host, or when
+/// nothing marks the value as a network remote.
+fn split_remote(url: &str) -> Option<Vec<&str>> {
+    let url = url.trim().trim_end_matches('/');
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let (had_scheme, url) = match url.split_once("://") {
+        Some((_, rest)) => (true, rest),
+        None => (false, url),
+    };
+    // Drop userinfo (`git@`, `oauth2:token@`) so it is never read as the host.
+    let host_end = url.find('/').unwrap_or(url.len());
+    let (had_userinfo, url) = match url[..host_end].rfind('@') {
+        Some(at) => (true, &url[at + 1..]),
+        None => (false, url),
+    };
+    // A colon before the first '/' is the scp-style `host:org/repo` separator.
+    let first_slash = url.find('/').unwrap_or(url.len());
+    let had_scp_colon = url[..first_slash].contains(':');
+    // URL forms split host from path on '/', scp-like `git@host:org/repo` on ':'.
+    let mut segments: Vec<&str> = url.split(['/', ':']).filter(|s| !s.is_empty()).collect();
+    // segments[0] is the host; an all-digit segment right after it is a port.
+    if segments.len() >= 4 && segments[1].chars().all(|c| c.is_ascii_digit()) {
+        segments.remove(1);
+    }
+    // Need host + at least org + repo.
+    if segments.len() < 3 {
+        return None;
+    }
+    // A scheme, userinfo or scp colon is what marks a network remote. Without
+    // one this is a bare path — a GitLab `group/subgroup/repo`, whose namespace
+    // may itself contain dots — so every segment belongs to the path.
+    if !had_scheme && !had_userinfo && !had_scp_colon {
+        return None;
+    }
+    Some(segments)
+}
+
+/// True when `dir` is the repository worktree root (not a subdirectory).
+fn is_at_repo_root(dir: &str) -> bool {
+    let Ok(repo) = Repository::discover(Path::new(dir)) else {
+        return false;
+    };
+    let Some(workdir) = repo.workdir() else {
+        return false;
+    };
+    let Ok(workdir) = workdir.canonicalize() else {
+        return false;
+    };
+    let Ok(cwd) = Path::new(dir).canonicalize() else {
+        return false;
+    };
+    workdir == cwd
 }
 
 pub fn get_status(status: &str) -> &str {
@@ -327,6 +418,52 @@ pub struct RepoInfo {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
+
+    // Git exports GIT_DIR/GIT_INDEX_FILE/etc. to hooks; scrub them so the
+    // test's git subprocesses operate on the temp repo even when the test
+    // suite itself runs inside a pre-commit hook.
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let mut cmd = Command::new("git");
+        for (name, _) in std::env::vars() {
+            if name.starts_with("GIT_") {
+                cmd.env_remove(name);
+            }
+        }
+        assert!(
+            cmd.args(args).current_dir(root).status().unwrap().success(),
+            "git {args:?} failed"
+        );
+    }
+
+    #[test]
+    fn get_repo_info_at_root_only_not_nested_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init"]);
+        git(root, &["config", "user.email", "test@example.com"]);
+        git(root, &["config", "user.name", "Test"]);
+        fs::write(root.join("README"), "hi").unwrap();
+        git(root, &["add", "README"]);
+        git(root, &["commit", "-m", "init"]);
+
+        let root_s = root.to_str().unwrap();
+        let nested = root.join("pkg").join("inner");
+        fs::create_dir_all(&nested).unwrap();
+        let nested_s = nested.to_str().unwrap();
+
+        let info = get_repo_info(root_s)
+            .unwrap()
+            .expect("repo root should yield SHA metadata");
+        assert!(info.sha.is_some());
+        assert!(is_at_repo_root(root_s));
+
+        assert!(
+            get_repo_info(nested_s).unwrap().is_none(),
+            "nested CWD must not attach parent HEAD SHA / remote project name"
+        );
+        assert!(!is_at_repo_root(nested_s));
+    }
 
     #[test]
     fn create_zip_from_target_excludes_default_globs() {
@@ -369,5 +506,57 @@ mod tests {
             "node_modules file should be excluded: {:?}",
             added
         );
+    }
+
+    #[test]
+    fn extract_repo_path_handles_common_remote_forms() {
+        for url in [
+            "https://github.com/org/repo.git",
+            "https://github.com/org/repo",
+            "git@github.com:org/repo.git",
+            "git@github.com:org/repo",
+            "ssh://git@github.com/org/repo",
+            "https://github.com/org/repo/",
+            "https://github.com/Org/Repo",
+            // host:port must not leak the port into the path
+            "https://git.example.com:8443/org/repo",
+            // token userinfo must not be read as the host
+            "https://oauth2:tok@gitlab.com/org/repo",
+        ] {
+            assert_eq!(extract_repo_path(url).as_deref(), Some("org/repo"), "{url}");
+        }
+        // Bank of Hope case: the stored name is the whole org/repo path.
+        assert_eq!(
+            extract_repo_path("git@github.com:bohappdev/dotnet-azure-web-tsb.git").as_deref(),
+            Some("bohappdev/dotnet-azure-web-tsb")
+        );
+        // Whole path is kept: Azure `_git` and GitLab subgroups.
+        assert_eq!(
+            extract_repo_path("https://dev.azure.com/org/project/_git/repo").as_deref(),
+            Some("org/project/_git/repo")
+        );
+        assert_eq!(
+            extract_repo_path("git@gitlab.com:group/subgroup/repo.git").as_deref(),
+            Some("group/subgroup/repo")
+        );
+        // An SSH-config host alias carries no userinfo and no dot, but the
+        // colon before the first slash still marks it scp-style.
+        assert_eq!(
+            extract_repo_path("corp-github:bohappdev/repo.git").as_deref(),
+            Some("bohappdev/repo")
+        );
+    }
+
+    #[test]
+    fn extract_repo_path_returns_none_without_a_host() {
+        assert_eq!(extract_repo_path("not a url"), None);
+        assert_eq!(extract_repo_path(""), None);
+        assert_eq!(extract_repo_path("github.com"), None); // host only
+                                                           // Nothing marks these as a network remote, so they are bare paths the
+                                                           // caller keeps verbatim; a GitLab namespace may contain dots, so a
+                                                           // dotted leading segment is no evidence of a host.
+        assert_eq!(extract_repo_path("org/repo"), None);
+        assert_eq!(extract_repo_path("group/subgroup/repo"), None);
+        assert_eq!(extract_repo_path("my.group/sub/repo"), None);
     }
 }

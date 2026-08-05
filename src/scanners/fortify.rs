@@ -1,4 +1,4 @@
-use crate::scan::upload_scan;
+use crate::scan::{upload_scan, ScanUploadResult};
 use crate::Config;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
@@ -10,12 +10,16 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 use zip::ZipArchive;
 
-pub fn parse(config: &Config, file_path: &str, project_name: Option<String>) {
+pub fn parse(
+    config: &Config,
+    file_path: &str,
+    project_name: Option<String>,
+) -> Option<ScanUploadResult> {
     let temp_dir = match TempDir::new() {
         Ok(dir) => dir,
         Err(e) => {
             println!("Error creating temporary directory: {}", e);
-            return;
+            return None;
         }
     };
 
@@ -23,7 +27,7 @@ pub fn parse(config: &Config, file_path: &str, project_name: Option<String>) {
         Ok(file) => file,
         Err(e) => {
             println!("Error opening file: {}", e);
-            return;
+            return None;
         }
     };
 
@@ -31,17 +35,17 @@ pub fn parse(config: &Config, file_path: &str, project_name: Option<String>) {
         Ok(archive) => archive,
         Err(e) => {
             println!("Error reading zip archive: {}", e);
-            return;
+            return None;
         }
     };
 
-    if let Ok(mut file) = archive.by_name("audit.fvdl") {
+    let result = if let Ok(mut file) = archive.by_name("audit.fvdl") {
         let outpath = temp_dir.path().join("audit.fvdl");
         let mut outfile = match File::create(&outpath) {
             Ok(f) => f,
             Err(e) => {
                 println!("Error creating output file: {}", e);
-                return;
+                return None;
             }
         };
         if let Err(e) = io::copy(&mut file, &mut outfile) {
@@ -49,17 +53,19 @@ pub fn parse(config: &Config, file_path: &str, project_name: Option<String>) {
         }
 
         let (scan_data, paths) = extract_file_path(outpath);
-        let _scan_id = upload_scan(
+        upload_scan(
             config,
             paths,
             "fortify".to_string(),
             scan_data,
             false,
             project_name,
-        );
+        )
     } else {
         println!("File 'audit.fvdl' not found in the archive");
+        None
     };
+    result
 }
 
 fn extract_file_path(scan_file: PathBuf) -> (String, Vec<String>) {

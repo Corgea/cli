@@ -1,3 +1,4 @@
+pub mod advisories;
 pub mod deps;
 pub mod precheck;
 pub mod verify_deps;
