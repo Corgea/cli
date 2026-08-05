@@ -1617,6 +1617,43 @@ mod tests {
     }
 
     #[test]
+    fn quality_issues_request_targets_the_documented_paths() {
+        // The two code quality routes are named asymmetrically on the backend,
+        // so the paths are pinned here rather than derived from each other.
+        let (endpoint, query) =
+            quality_issues_request("https://api.example.com", "proj", Some(2), Some(10), None);
+        assert_eq!(
+            endpoint,
+            "https://api.example.com/api/v1/issues/code-quality"
+        );
+        assert_eq!(
+            query,
+            vec![
+                ("project", "proj".to_string()),
+                ("page", "2".to_string()),
+                ("page_size", "10".to_string()),
+            ]
+        );
+
+        let (endpoint, query) = quality_issues_request(
+            "https://api.example.com",
+            "proj",
+            Some(1),
+            None,
+            Some("scan-123"),
+        );
+        assert_eq!(
+            endpoint,
+            "https://api.example.com/api/v1/scan/scan-123/issues/quality"
+        );
+        // A scan selects its own project, and the page size defaults to 30.
+        assert_eq!(
+            query,
+            vec![("page", "1".to_string()), ("page_size", "30".to_string())]
+        );
+    }
+
+    #[test]
     fn should_warn_deprecated_false_when_no_warning_header() {
         let headers = HeaderMap::new();
         assert!(!should_warn_deprecated(&headers));
