@@ -517,6 +517,89 @@ pub fn get_scan_issues(
     }
 }
 
+/// Endpoint and query for a code quality listing. The backend serves code
+/// quality from paths parallel to — but not named like — the security routes:
+/// `/scan/{id}/issues/quality` for a scan, `/issues/code-quality` otherwise.
+fn quality_issues_request(
+    url: &str,
+    project: &str,
+    page: Option<u16>,
+    page_size: Option<u16>,
+    scan_id: Option<&str>,
+) -> (String, Vec<(&'static str, String)>) {
+    // Project names can contain `&`/`?`/`#`, so use `query`, not `format!`.
+    let (endpoint, mut query_params) = match scan_id {
+        Some(scan_id) => (
+            format!("{}{}/scan/{}/issues/quality", url, API_BASE, scan_id),
+            vec![],
+        ),
+        None => (
+            format!("{}{}/issues/code-quality", url, API_BASE),
+            vec![("project", project.to_string())],
+        ),
+    };
+    if let Some(p) = page {
+        query_params.push(("page", p.to_string()));
+    }
+    query_params.push(("page_size", page_size.unwrap_or(30).to_string()));
+    (endpoint, query_params)
+}
+
+pub fn get_quality_issues(
+    url: &str,
+    project: &str,
+    page: Option<u16>,
+    page_size: Option<u16>,
+    scan_id: Option<String>,
+) -> Result<ProjectIssuesResponse, Box<dyn std::error::Error>> {
+    let (endpoint, query_params) =
+        quality_issues_request(url, project, page, page_size, scan_id.as_deref());
+    let client = http_client();
+
+    debug(&format!("Sending request to URL: {}", endpoint));
+    debug(&format!("Query params: {:?}", query_params));
+
+    let response = match client.get(&endpoint).query(&query_params).send() {
+        Ok(res) => {
+            check_for_warnings(res.headers(), res.status());
+            res
+        }
+        Err(e) => return Err(format!("Failed to send request: {}", e).into()),
+    };
+    // Unlike the security routes, these endpoints answer a missing scan with a
+    // bare HTTP 404 rather than a `no_project_found` body, so the status has to
+    // be read before the parse or the miss surfaces as a parse failure.
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        debug(&format!(
+            "Code quality request failed: HTTP {}. Response body: {}",
+            status, body
+        ));
+        if status == StatusCode::NOT_FOUND {
+            return Err("Code quality issues not found 404".into());
+        }
+        return Err(format!("Request failed with status: {}", status).into());
+    }
+    let response_text = response.text()?;
+    let project_issues_response: ProjectIssuesResponse = serde_json::from_str(&response_text)
+        .map_err(|e| {
+            debug(&format!(
+                "Failed to parse response: {}. Response body: {}",
+                e, response_text
+            ));
+            format!("Failed to parse response: {}", e)
+        })?;
+
+    if project_issues_response.status == "ok" {
+        Ok(project_issues_response)
+    } else if project_issues_response.status == "no_project_found" {
+        Err("Project not found 404".into())
+    } else {
+        Err("Server error 500".into())
+    }
+}
+
 pub fn get_scan(url: &str, scan_id: &str) -> Result<ScanResponse, Box<dyn std::error::Error>> {
     let url = format!("{}{}/scan/{}", url, API_BASE, scan_id);
 
@@ -1489,6 +1572,85 @@ mod tests {
         );
         assert!(headers.get("Authorization").is_none());
         assert!(headers.get("CORGEA-SOURCE").is_some());
+    }
+
+    #[test]
+    fn deserializes_code_quality_issue_response() {
+        // Code quality issues carry a free-form classification label (no CWE) and
+        // must deserialize into the same Issue struct used for security issues.
+        let body = r#"{
+            "status": "ok",
+            "page": 1,
+            "total_pages": 1,
+            "total_issues": 1,
+            "issues": [
+                {
+                    "id": "11111111-1111-1111-1111-111111111111",
+                    "urgency": "ME",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "status": "open",
+                    "classification": {
+                        "id": "Maintainability",
+                        "name": "Maintainability",
+                        "description": null
+                    },
+                    "location": {
+                        "file": {"name": "app.py", "language": "python", "path": "app/app.py"},
+                        "project": {"name": "proj", "branch": "main", "git_sha": "abc"},
+                        "line_number": 20
+                    },
+                    "auto_triage": {"false_positive_detection": {"status": "valid"}},
+                    "auto_fix_suggestion": {"status": "no_fix"}
+                }
+            ]
+        }"#;
+
+        let parsed: ProjectIssuesResponse =
+            serde_json::from_str(body).expect("should parse code quality response");
+        assert_eq!(parsed.status, "ok");
+        let issues = parsed.issues.expect("issues present");
+        assert_eq!(issues.len(), 1);
+        let issue = &issues[0];
+        assert_eq!(issue.classification.id, "Maintainability");
+        assert_eq!(issue.classification.name, "Maintainability");
+        assert!(issue.classification.description.is_none());
+    }
+
+    #[test]
+    fn quality_issues_request_targets_the_documented_paths() {
+        // The two code quality routes are named asymmetrically on the backend,
+        // so the paths are pinned here rather than derived from each other.
+        let (endpoint, query) =
+            quality_issues_request("https://api.example.com", "proj", Some(2), Some(10), None);
+        assert_eq!(
+            endpoint,
+            "https://api.example.com/api/v1/issues/code-quality"
+        );
+        assert_eq!(
+            query,
+            vec![
+                ("project", "proj".to_string()),
+                ("page", "2".to_string()),
+                ("page_size", "10".to_string()),
+            ]
+        );
+
+        let (endpoint, query) = quality_issues_request(
+            "https://api.example.com",
+            "proj",
+            Some(1),
+            None,
+            Some("scan-123"),
+        );
+        assert_eq!(
+            endpoint,
+            "https://api.example.com/api/v1/scan/scan-123/issues/quality"
+        );
+        // A scan selects its own project, and the page size defaults to 30.
+        assert_eq!(
+            query,
+            vec![("page", "1".to_string()), ("page_size", "30".to_string())]
+        );
     }
 
     #[test]

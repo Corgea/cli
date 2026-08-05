@@ -190,6 +190,14 @@ enum Commands {
         )]
         sca_issues: bool,
 
+        #[arg(
+            long,
+            short = 'q',
+            visible_alias = "quality",
+            help = "List code quality issues instead of scans"
+        )]
+        code_quality: bool,
+
         #[arg(short, long, help = "Specify the scan id to list issues for.")]
         scan_id: Option<String>,
 
@@ -774,15 +782,23 @@ fn main() {
             page_size,
             scan_id,
             sca_issues,
+            code_quality,
             project_name,
             repo,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
-            if *issues && *sca_issues {
-                ::log::error!("Cannot use both --issues and --sca-issues at the same time.");
+            if [*issues, *sca_issues, *code_quality]
+                .iter()
+                .filter(|flag| **flag)
+                .count()
+                > 1
+            {
+                ::log::error!(
+                    "Cannot use more than one of --issues, --sca-issues, and --code-quality at the same time."
+                );
                 std::process::exit(1);
             }
-            if scan_id.is_some() && !*issues && !*sca_issues {
+            if scan_id.is_some() && !*issues && !*sca_issues && !*code_quality {
                 println!("scan_id option is only supported for issues list command.");
                 std::process::exit(1);
             }
@@ -791,6 +807,7 @@ fn main() {
                 list::ListArgs {
                     issues: *issues,
                     sca_issues: *sca_issues,
+                    code_quality: *code_quality,
                     json: *json,
                     page: *page,
                     page_size: *page_size,

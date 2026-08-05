@@ -9,6 +9,7 @@ use std::path::Path;
 pub struct ListArgs {
     pub issues: bool,
     pub sca_issues: bool,
+    pub code_quality: bool,
     pub json: bool,
     pub page: Option<u16>,
     pub page_size: Option<u16>,
@@ -20,6 +21,7 @@ pub fn run(config: &Config, args: ListArgs) {
     let ListArgs {
         issues,
         sca_issues,
+        code_quality,
         json,
         page,
         page_size,
@@ -131,8 +133,9 @@ pub fn run(config: &Config, args: ListArgs) {
             Some(sca_issues_response.page),
             Some(sca_issues_response.total_pages),
         );
-    } else if issues {
-        // The --scan-id route hits /scan/{id}/issues and ignores the project.
+    } else if issues || code_quality {
+        // The --scan-id route hits /scan/{id}/issues[/quality] and ignores the
+        // project.
         let resolved = scan_id
             .is_none()
             .then(|| utils::api::resolve_project_or_exit(&config.get_url(), &selector));
@@ -140,13 +143,29 @@ pub fn run(config: &Config, args: ListArgs) {
             .as_ref()
             .map(|r| r.query_name.clone())
             .unwrap_or_default();
-        let issues_response = match utils::api::get_scan_issues(
-            &config.get_url(),
-            &project_name,
-            Some(page.unwrap_or(1)),
-            page_size,
-            scan_id.clone(),
-        ) {
+        let issue_kind = if code_quality {
+            "code quality issues"
+        } else {
+            "scan issues"
+        };
+        let fetch_result = if code_quality {
+            utils::api::get_quality_issues(
+                &config.get_url(),
+                &project_name,
+                Some(page.unwrap_or(1)),
+                page_size,
+                scan_id.clone(),
+            )
+        } else {
+            utils::api::get_scan_issues(
+                &config.get_url(),
+                &project_name,
+                Some(page.unwrap_or(1)),
+                page_size,
+                scan_id.clone(),
+            )
+        };
+        let issues_response = match fetch_result {
             Ok(response) => response,
             Err(e) => {
                 debug(&format!("Error Sending Request: {}", e));
@@ -162,7 +181,7 @@ pub fn run(config: &Config, args: ListArgs) {
                     }
                 } else {
                     log::error!(
-                        "Unable to fetch scan issues. Please check your connection and ensure that:\n\
+                        "Unable to fetch {issue_kind}. Please check your connection and ensure that:\n\
                         - The server URL is reachable.\n\
                         - Your authentication token is valid.\n\n\
                         Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli {}",
@@ -176,7 +195,10 @@ pub fn run(config: &Config, args: ListArgs) {
         let mut blocking_rules: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
 
-        if let Some(id) = &scan_id {
+        // Blocking rules are a security-listing concern. Skip the enrichment for
+        // code quality so a blocking-rules API failure can't take down the CQ
+        // listing and so Blocking columns aren't driven by non-CQ findings.
+        if let Some(id) = scan_id.as_ref().filter(|_| !code_quality) {
             let mut page: u32 = 1;
             loop {
                 match utils::api::check_blocking_rules(&config.get_url(), id, Some(page)) {
