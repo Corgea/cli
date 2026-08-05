@@ -1,13 +1,13 @@
 # Examples
 
-## `upload_checkmarx.sh` — upload a Checkmarx report
+## `upload_checkmarx.py` — upload a Checkmarx report
 
 Creates a Corgea scan from a Checkmarx report. Same API flow as
 `corgea upload`, without waiting for the scan to finish.
 
 ```bash
 export CORGEA_TOKEN=<your token>
-./upload_checkmarx.sh <code_path> <report_path>
+./upload_checkmarx.py <code_path> <report_path>
 ```
 
 | Arg | Meaning |
@@ -22,7 +22,7 @@ Optional env vars: `CORGEA_URL` (default `https://www.corgea.app`), `PROJECT`
 
 ```bash
 export CORGEA_TOKEN=<your token>
-./upload_checkmarx.sh ./checkmarx ./checkmarx/report.xml
+./upload_checkmarx.py ./checkmarx ./checkmarx/report.xml
 ```
 
 ```
@@ -34,7 +34,7 @@ Scan scan-abc-123 created.
 https://www.corgea.app/project/42/?scan_id=scan-abc-123
 ```
 
-Requires `curl` and `python3` (stdlib only — used to parse the report).
+Stdlib only — no `pip install`.
 
 ## `deps_skill.rs`
 
