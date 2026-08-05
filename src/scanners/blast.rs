@@ -616,7 +616,58 @@ fn stop_blocking_rules_spinner(stop_signal: &Arc<Mutex<bool>>, spinner: thread::
     );
 }
 
-/// Poll until blocking-rules status is no longer pending (or 15m timeout).
+#[derive(Debug)]
+enum BlockingRulesPollDecision {
+    Complete(utils::api::BlockingRuleResponse),
+    KeepWaiting,
+    FailClosed { message: String },
+}
+
+const BLOCKING_RULES_TIMEOUT_MESSAGE: &str =
+    "Timed out waiting for blocking rules to finish. Failing closed.";
+
+/// Only explicit `complete` is terminal. Pending/unknown wait; transient errors
+/// retry until timeout; permanent errors fail immediately.
+fn decide_blocking_rules_poll(
+    result: Result<utils::api::BlockingRuleResponse, String>,
+    elapsed: std::time::Duration,
+    timeout: std::time::Duration,
+) -> BlockingRulesPollDecision {
+    match result {
+        Ok(rules) if rules.is_complete() => BlockingRulesPollDecision::Complete(rules),
+        Ok(rules) => {
+            if elapsed >= timeout {
+                log::debug!(
+                    "Blocking-rules wait timed out; last status was '{}'.",
+                    rules.status
+                );
+                BlockingRulesPollDecision::FailClosed {
+                    message: BLOCKING_RULES_TIMEOUT_MESSAGE.to_string(),
+                }
+            } else {
+                if rules.status == utils::api::BLOCKING_RULES_STATUS_PENDING {
+                    log::debug!("Blocking rules still pending; waiting.");
+                } else {
+                    log::debug!(
+                        "Unexpected blocking-rules status '{}'; waiting for complete.",
+                        rules.status
+                    );
+                }
+                BlockingRulesPollDecision::KeepWaiting
+            }
+        }
+        Err(e) => {
+            if !utils::api::is_retryable_blocking_rules_error_message(&e) || elapsed >= timeout {
+                BlockingRulesPollDecision::FailClosed { message: e }
+            } else {
+                log::debug!("Transient blocking-rules error; will retry: {}", e);
+                BlockingRulesPollDecision::KeepWaiting
+            }
+        }
+    }
+}
+
+/// Poll until blocking-rules status is `complete` (or 15m timeout).
 /// Older backends omit status (serde defaults to complete: one-shot).
 fn wait_for_blocking_rules(config: &Config, scan_id: &str) -> utils::api::BlockingRuleResponse {
     let stop_signal = Arc::new(Mutex::new(false));
@@ -630,25 +681,28 @@ fn wait_for_blocking_rules(config: &Config, scan_id: &str) -> utils::api::Blocki
 
     let started = std::time::Instant::now();
     loop {
-        match utils::api::check_blocking_rules(&config.get_url(), scan_id, None) {
-            Ok(rules) if !rules.is_pending() => {
+        // Do not start another request after the deadline.
+        if started.elapsed() >= BLOCKING_RULES_WAIT_TIMEOUT {
+            stop_blocking_rules_spinner(&stop_signal, spinner);
+            log::error!("\n{} (scan '{}')", BLOCKING_RULES_TIMEOUT_MESSAGE, scan_id);
+            std::process::exit(1);
+        }
+
+        let result = utils::api::check_blocking_rules(&config.get_url(), scan_id, None)
+            .map_err(|e| e.to_string());
+        match decide_blocking_rules_poll(result, started.elapsed(), BLOCKING_RULES_WAIT_TIMEOUT) {
+            BlockingRulesPollDecision::Complete(rules) => {
                 stop_blocking_rules_spinner(&stop_signal, spinner);
                 return rules;
             }
-            Ok(_) => {
-                if started.elapsed() >= BLOCKING_RULES_WAIT_TIMEOUT {
-                    stop_blocking_rules_spinner(&stop_signal, spinner);
-                    log::error!(
-                        "\nTimed out waiting for blocking rules for scan '{}'. \
-                         Failing closed.",
-                        scan_id
-                    );
-                    std::process::exit(1);
-                }
-            }
-            Err(e) => {
+            BlockingRulesPollDecision::KeepWaiting => {}
+            BlockingRulesPollDecision::FailClosed { message } => {
                 stop_blocking_rules_spinner(&stop_signal, spinner);
-                log::error!("Failed to check blocking rules: {}", e);
+                if message == BLOCKING_RULES_TIMEOUT_MESSAGE {
+                    log::error!("\n{} (scan '{}')", message, scan_id);
+                } else {
+                    log::error!("Failed to check blocking rules: {}", message);
+                }
                 std::process::exit(1);
             }
         }
@@ -746,10 +800,115 @@ pub fn metadata_json_from_pairs(pairs: &[String]) -> Result<Option<String>, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::api::{SCAIssue, SCALocation, SCAPackage};
+    use crate::utils::api::{
+        BlockingRuleResponse, SCAIssue, SCALocation, SCAPackage, BLOCKING_RULES_STATUS_COMPLETE,
+        BLOCKING_RULES_STATUS_PENDING,
+    };
+    use std::time::Duration;
 
     fn counts(pairs: &[(&str, usize)]) -> HashMap<String, usize> {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    fn sample_rules(status: &str, block: bool) -> BlockingRuleResponse {
+        BlockingRuleResponse {
+            block,
+            blocking_issues: vec![],
+            total_pages: 1,
+            status: status.to_string(),
+        }
+    }
+
+    #[test]
+    fn poll_only_complete_is_terminal_unknown_keeps_waiting() {
+        let timeout = Duration::from_secs(60);
+        match decide_blocking_rules_poll(
+            Ok(sample_rules(BLOCKING_RULES_STATUS_COMPLETE, true)),
+            Duration::ZERO,
+            timeout,
+        ) {
+            BlockingRulesPollDecision::Complete(r) => assert!(r.block),
+            other => panic!("expected Complete, got {other:?}"),
+        }
+        assert!(matches!(
+            decide_blocking_rules_poll(
+                Ok(sample_rules(BLOCKING_RULES_STATUS_PENDING, false)),
+                Duration::ZERO,
+                timeout
+            ),
+            BlockingRulesPollDecision::KeepWaiting
+        ));
+        assert!(matches!(
+            decide_blocking_rules_poll(
+                Ok(sample_rules("processing", false)),
+                Duration::ZERO,
+                timeout
+            ),
+            BlockingRulesPollDecision::KeepWaiting
+        ));
+        assert!(matches!(
+            decide_blocking_rules_poll(Ok(sample_rules("", false)), Duration::ZERO, timeout),
+            BlockingRulesPollDecision::KeepWaiting
+        ));
+        assert!(matches!(
+            decide_blocking_rules_poll(Ok(sample_rules("processing", false)), timeout, timeout),
+            BlockingRulesPollDecision::FailClosed { .. }
+        ));
+    }
+
+    #[test]
+    fn poll_retries_transient_error_then_accepts_complete() {
+        let timeout = Duration::from_secs(60);
+        assert!(matches!(
+            decide_blocking_rules_poll(
+                Err("API request failed with status: 503 Service Unavailable".into()),
+                Duration::from_secs(1),
+                timeout,
+            ),
+            BlockingRulesPollDecision::KeepWaiting
+        ));
+        // Still fail closed once the overall deadline is hit.
+        assert!(matches!(
+            decide_blocking_rules_poll(
+                Err("API request failed with status: 503 Service Unavailable".into()),
+                timeout,
+                timeout,
+            ),
+            BlockingRulesPollDecision::FailClosed { .. }
+        ));
+        match decide_blocking_rules_poll(
+            Ok(sample_rules(BLOCKING_RULES_STATUS_COMPLETE, false)),
+            Duration::from_secs(2),
+            timeout,
+        ) {
+            BlockingRulesPollDecision::Complete(r) => assert!(!r.block),
+            other => panic!("expected Complete after retry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_fails_fast_on_permanent_auth_error() {
+        assert!(matches!(
+            decide_blocking_rules_poll(
+                Err("API request failed with status: 401 Unauthorized".into()),
+                Duration::ZERO,
+                Duration::from_secs(60),
+            ),
+            BlockingRulesPollDecision::FailClosed { .. }
+        ));
+    }
+
+    #[test]
+    fn poll_accepts_complete_even_after_deadline_overrun() {
+        // Request started under budget; late response still honored.
+        match decide_blocking_rules_poll(
+            Ok(sample_rules(BLOCKING_RULES_STATUS_COMPLETE, true)),
+            Duration::from_secs(16 * 60),
+            Duration::from_secs(15 * 60),
+        ) {
+            BlockingRulesPollDecision::Complete(r) => assert!(r.block),
+            other => panic!("expected late Complete to be accepted, got {other:?}"),
+        }
     }
 
     fn sca_issue(classification: Option<&str>) -> SCAIssue {
