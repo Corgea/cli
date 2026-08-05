@@ -1488,6 +1488,30 @@ pub struct BlockingRuleResponse {
     pub block: bool,
     pub blocking_issues: Vec<BlockingIssue>,
     pub total_pages: u32,
+    // Totals the server computes over the whole result set before paginating.
+    // Optional so the CLI keeps working against backends predating the field.
+    #[serde(default)]
+    pub stats: Option<BlockingRuleStats>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct BlockingRuleStats {
+    #[serde(default)]
+    pub blocked_issues: u32,
+}
+
+impl BlockingRuleResponse {
+    /// How many issues violated the evaluated rules, across every page.
+    ///
+    /// The server counts this before paginating, so one request is enough.
+    /// `blocking_issues` only holds the requested page, so it is the fallback
+    /// for backends that do not send `stats` and can under-report.
+    pub fn blocked_count(&self) -> usize {
+        self.stats
+            .as_ref()
+            .map(|stats| stats.blocked_issues as usize)
+            .unwrap_or_else(|| self.blocking_issues.len())
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]

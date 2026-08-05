@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::targets;
 use crate::utils;
 use crate::utils::api::SCAIssue;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -342,11 +342,13 @@ pub fn run(
             }
         };
         if blocking_rules.block {
-            let issues = collect_blocking_issues(config, &scan_id, block_on, blocking_rules);
-            let triggered = triggered_slug_summary(&issues);
+            // The count comes from the server's pre-pagination total; the slug
+            // list is drawn from the returned page, which is all the gate needs
+            // to name the rules at fault.
+            let triggered = triggered_slug_summary(&blocking_rules.blocking_issues);
             println!(
                 "\nExiting with error code 1: {} issue(s) violated the blocking rule(s) {}.\nFor more details, check the scan results at: {}\nAlternatively, run {} to view the issues list on your local machine.",
-                issues.len(),
+                blocking_rules.blocked_count(),
                 utils::terminal::set_text_color(&triggered, utils::terminal::TerminalColor::Red),
                 utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green),
                 utils::terminal::set_text_color(
@@ -624,57 +626,6 @@ pub fn normalize_block_on(block_on: Option<&str>) -> Result<Option<String>, Stri
     Ok(Some(slugs.join(",")))
 }
 
-/// Every distinct blocking issue across all pages of the response.
-///
-/// The endpoint pages at 20 issues by default, so page 1 alone under-reports
-/// the count and can omit a rule that only trips on a later page. `first` is
-/// the already-fetched page 1.
-///
-/// A later page that fails to load is warned about and skipped rather than
-/// aborting: the scan is already known to be blocked, so turning a transient
-/// pagination failure into a lost exit code would be worse than an incomplete
-/// summary.
-fn collect_blocking_issues(
-    config: &Config,
-    scan_id: &str,
-    block_on: &str,
-    first: utils::api::BlockingRuleResponse,
-) -> Vec<utils::api::BlockingIssue> {
-    let total_pages = first.total_pages;
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut issues: Vec<utils::api::BlockingIssue> = Vec::new();
-    let mut push_unique = |issues: &mut Vec<utils::api::BlockingIssue>,
-                           incoming: Vec<utils::api::BlockingIssue>| {
-        for issue in incoming {
-            if seen.insert(issue.id.clone()) {
-                issues.push(issue);
-            }
-        }
-    };
-
-    push_unique(&mut issues, first.blocking_issues);
-    for page in 2..=total_pages {
-        match utils::api::check_blocking_rules(
-            &config.get_url(),
-            scan_id,
-            Some(page),
-            Some(block_on),
-        ) {
-            Ok(rules) => push_unique(&mut issues, rules.blocking_issues),
-            Err(e) => {
-                log::warn!(
-                    "Could not load page {} of {} of the blocking issues, so the summary below may be incomplete: {}",
-                    page,
-                    total_pages,
-                    e
-                );
-                break;
-            }
-        }
-    }
-    issues
-}
-
 /// The distinct rule slugs that blocked the scan, for the failure message.
 ///
 /// Falls back to rule ids against backends that do not send slugs yet.
@@ -838,7 +789,10 @@ pub fn metadata_json_from_pairs(pairs: &[String]) -> Result<Option<String>, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::api::{BlockOnError, BlockingIssue, SCAIssue, SCALocation, SCAPackage};
+    use crate::utils::api::{
+        BlockOnError, BlockingIssue, BlockingRuleResponse, BlockingRuleStats, SCAIssue,
+        SCALocation, SCAPackage,
+    };
 
     fn counts(pairs: &[(&str, usize)]) -> HashMap<String, usize> {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
@@ -1066,20 +1020,34 @@ mod tests {
         assert_eq!(triggered_slug_summary(&[]), "");
     }
 
-    /// A rule that only trips on a later page must still be named, which is the
-    /// whole reason the gate aggregates pages before building its message.
+    /// The gate reports the server's pre-pagination total, not the page length,
+    /// so a blocked scan with more issues than fit on one page still reports the
+    /// real count from a single request.
     #[test]
-    fn triggered_slug_summary_names_rules_from_every_page() {
-        let aggregated = vec![
-            issue("issue-1", &["1"], Some(&["criticals"])),
-            issue("issue-2", &["2"], Some(&["malicious-deps"])),
-        ];
-        assert_eq!(
-            triggered_slug_summary(&aggregated),
-            "criticals, malicious-deps"
-        );
-        // Page 1 in isolation would have blamed only the first rule.
-        assert_eq!(triggered_slug_summary(&aggregated[..1]), "criticals");
+    fn blocked_count_prefers_the_server_total_over_the_page_length() {
+        let response = BlockingRuleResponse {
+            block: true,
+            blocking_issues: vec![issue("issue-1", &["1"], Some(&["criticals"]))],
+            total_pages: 7,
+            stats: Some(BlockingRuleStats {
+                blocked_issues: 133,
+            }),
+        };
+        assert_eq!(response.blocked_count(), 133);
+    }
+
+    #[test]
+    fn blocked_count_falls_back_to_the_page_length_without_stats() {
+        let response = BlockingRuleResponse {
+            block: true,
+            blocking_issues: vec![
+                issue("issue-1", &["1"], Some(&["criticals"])),
+                issue("issue-2", &["2"], Some(&["malicious-deps"])),
+            ],
+            total_pages: 1,
+            stats: None,
+        };
+        assert_eq!(response.blocked_count(), 2);
     }
 
     #[test]
