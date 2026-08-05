@@ -104,7 +104,7 @@ enum Commands {
         #[arg(
             long = "block-on",
             value_name = "SLUG",
-            help = "Fail (exit code 1) if the scan violates the named CI blocking rules. Comma-separated rule slugs, e.g. --block-on no-criticals,no-malicious-deps. Slugs are shown next to each rule in the web app. Rules must exist, be active, and have 'Applies To' set to CI."
+            help = "Fail (exit code 1) if the scan violates the named CI blocking rules. Comma-separated rule slugs, e.g. --block-on criticals,malicious-deps. Slugs are shown next to each rule in the web app. Rules must exist, be active, and have 'Applies To' set to CI."
         )]
         block_on: Option<String>,
 

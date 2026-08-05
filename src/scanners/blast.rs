@@ -609,7 +609,7 @@ pub fn normalize_block_on(block_on: Option<&str>) -> Result<Option<String>, Stri
         let slug = part.trim();
         if slug.is_empty() {
             return Err(
-                "block-on contains an empty rule slug. Expected a comma-separated list of rule slugs, e.g. --block-on no-criticals,no-malicious-deps."
+                "block-on contains an empty rule slug. Expected a comma-separated list of rule slugs, e.g. --block-on criticals,malicious-deps."
                     .to_string(),
             );
         }
@@ -1012,16 +1012,16 @@ mod tests {
     #[test]
     fn normalize_block_on_trims_and_dedupes_slugs() {
         assert_eq!(
-            normalize_block_on(Some("no-criticals")).unwrap(),
-            Some("no-criticals".to_string())
+            normalize_block_on(Some("criticals")).unwrap(),
+            Some("criticals".to_string())
         );
         assert_eq!(
-            normalize_block_on(Some(" no-criticals , no-malicious-deps ")).unwrap(),
-            Some("no-criticals,no-malicious-deps".to_string())
+            normalize_block_on(Some(" criticals , malicious-deps ")).unwrap(),
+            Some("criticals,malicious-deps".to_string())
         );
         assert_eq!(
-            normalize_block_on(Some("no-criticals,no-criticals")).unwrap(),
-            Some("no-criticals".to_string())
+            normalize_block_on(Some("criticals,criticals")).unwrap(),
+            Some("criticals".to_string())
         );
     }
 
@@ -1030,8 +1030,8 @@ mod tests {
         assert!(normalize_block_on(Some("")).is_err());
         assert!(normalize_block_on(Some("   ")).is_err());
         assert!(normalize_block_on(Some(",")).is_err());
-        assert!(normalize_block_on(Some("no-criticals,")).is_err());
-        assert!(normalize_block_on(Some("no-criticals,,other")).is_err());
+        assert!(normalize_block_on(Some("criticals,")).is_err());
+        assert!(normalize_block_on(Some("criticals,,other")).is_err());
     }
 
     fn issue(id: &str, rules: &[&str], slugs: Option<&[&str]>) -> BlockingIssue {
@@ -1045,17 +1045,14 @@ mod tests {
     #[test]
     fn triggered_slug_summary_dedupes_across_issues() {
         let issues = vec![
-            issue("issue-1", &["1"], Some(&["no-criticals"])),
+            issue("issue-1", &["1"], Some(&["criticals"])),
             issue(
                 "issue-2",
                 &["1", "2"],
-                Some(&["no-criticals", "no-malicious-deps"]),
+                Some(&["criticals", "malicious-deps"]),
             ),
         ];
-        assert_eq!(
-            triggered_slug_summary(&issues),
-            "no-criticals, no-malicious-deps"
-        );
+        assert_eq!(triggered_slug_summary(&issues), "criticals, malicious-deps");
     }
 
     #[test]
@@ -1074,15 +1071,15 @@ mod tests {
     #[test]
     fn triggered_slug_summary_names_rules_from_every_page() {
         let aggregated = vec![
-            issue("issue-1", &["1"], Some(&["no-criticals"])),
-            issue("issue-2", &["2"], Some(&["no-malicious-deps"])),
+            issue("issue-1", &["1"], Some(&["criticals"])),
+            issue("issue-2", &["2"], Some(&["malicious-deps"])),
         ];
         assert_eq!(
             triggered_slug_summary(&aggregated),
-            "no-criticals, no-malicious-deps"
+            "criticals, malicious-deps"
         );
         // Page 1 in isolation would have blamed only the first rule.
-        assert_eq!(triggered_slug_summary(&aggregated[..1]), "no-criticals");
+        assert_eq!(triggered_slug_summary(&aggregated[..1]), "criticals");
     }
 
     #[test]
