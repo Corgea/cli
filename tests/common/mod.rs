@@ -44,7 +44,21 @@ pub fn corgea_isolated() -> (Command, TempDir) {
         .env_remove("CURSOR_AGENT")
         .env_remove("CURSOR_TRACE_ID")
         .env_remove("GEMINI_CLI")
-        .env_remove("PI_AGENT");
+        .env_remove("PI_AGENT")
+        .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("GITHUB_REPOSITORY")
+        .env_remove("GITHUB_PR")
+        .env_remove("REPO_DATA")
+        .env_remove("DEBUG_CORGEA_OVERRIDE_REPORT_CHUNK_SIZE")
+        .env_remove("RUST_LOG")
+        .env_remove("CORGEA_DEBUG")
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("ALL_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("all_proxy");
     (cmd, home)
 }
 
@@ -545,11 +559,15 @@ pub struct Routes {
     pub scans: Option<String>,
     pub issues: Option<String>,
     pub sca_issues: Option<String>,
+    /// `GET /issues/code-quality` — the project-scoped `--code-quality` route.
+    pub code_quality_issues: Option<String>,
     /// `GET /scan/{id}` — `check_scan_status`.
     pub scan: Option<String>,
     /// `GET /scan/{id}/issues` — `report_scan_status` and the `--scan-id`
     /// issue route.
     pub scan_issues: Option<String>,
+    /// `GET /scan/{id}/issues/quality` — the `--code-quality --scan-id` route.
+    pub scan_quality_issues: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -565,10 +583,14 @@ impl Routes {
             self.scans.clone()
         } else if path.starts_with("/api/v1/issues/sca") {
             self.sca_issues.clone()
+        } else if path.starts_with("/api/v1/issues/code-quality") {
+            self.code_quality_issues.clone()
         } else if path.starts_with("/api/v1/issues?") {
             self.issues.clone()
         } else if path.starts_with("/api/v1/scan/") {
-            if path.contains("/issues") {
+            if path.contains("/issues/quality") {
+                self.scan_quality_issues.clone()
+            } else if path.contains("/issues") {
                 self.scan_issues.clone()
             } else {
                 self.scan.clone()

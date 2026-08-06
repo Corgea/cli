@@ -517,6 +517,89 @@ pub fn get_scan_issues(
     }
 }
 
+/// Endpoint and query for a code quality listing. The backend serves code
+/// quality from paths parallel to — but not named like — the security routes:
+/// `/scan/{id}/issues/quality` for a scan, `/issues/code-quality` otherwise.
+fn quality_issues_request(
+    url: &str,
+    project: &str,
+    page: Option<u16>,
+    page_size: Option<u16>,
+    scan_id: Option<&str>,
+) -> (String, Vec<(&'static str, String)>) {
+    // Project names can contain `&`/`?`/`#`, so use `query`, not `format!`.
+    let (endpoint, mut query_params) = match scan_id {
+        Some(scan_id) => (
+            format!("{}{}/scan/{}/issues/quality", url, API_BASE, scan_id),
+            vec![],
+        ),
+        None => (
+            format!("{}{}/issues/code-quality", url, API_BASE),
+            vec![("project", project.to_string())],
+        ),
+    };
+    if let Some(p) = page {
+        query_params.push(("page", p.to_string()));
+    }
+    query_params.push(("page_size", page_size.unwrap_or(30).to_string()));
+    (endpoint, query_params)
+}
+
+pub fn get_quality_issues(
+    url: &str,
+    project: &str,
+    page: Option<u16>,
+    page_size: Option<u16>,
+    scan_id: Option<String>,
+) -> Result<ProjectIssuesResponse, Box<dyn std::error::Error>> {
+    let (endpoint, query_params) =
+        quality_issues_request(url, project, page, page_size, scan_id.as_deref());
+    let client = http_client();
+
+    debug(&format!("Sending request to URL: {}", endpoint));
+    debug(&format!("Query params: {:?}", query_params));
+
+    let response = match client.get(&endpoint).query(&query_params).send() {
+        Ok(res) => {
+            check_for_warnings(res.headers(), res.status());
+            res
+        }
+        Err(e) => return Err(format!("Failed to send request: {}", e).into()),
+    };
+    // Unlike the security routes, these endpoints answer a missing scan with a
+    // bare HTTP 404 rather than a `no_project_found` body, so the status has to
+    // be read before the parse or the miss surfaces as a parse failure.
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        debug(&format!(
+            "Code quality request failed: HTTP {}. Response body: {}",
+            status, body
+        ));
+        if status == StatusCode::NOT_FOUND {
+            return Err("Code quality issues not found 404".into());
+        }
+        return Err(format!("Request failed with status: {}", status).into());
+    }
+    let response_text = response.text()?;
+    let project_issues_response: ProjectIssuesResponse = serde_json::from_str(&response_text)
+        .map_err(|e| {
+            debug(&format!(
+                "Failed to parse response: {}. Response body: {}",
+                e, response_text
+            ));
+            format!("Failed to parse response: {}", e)
+        })?;
+
+    if project_issues_response.status == "ok" {
+        Ok(project_issues_response)
+    } else if project_issues_response.status == "no_project_found" {
+        Err("Project not found 404".into())
+    } else {
+        Err("Server error 500".into())
+    }
+}
+
 pub fn get_scan(url: &str, scan_id: &str) -> Result<ScanResponse, Box<dyn std::error::Error>> {
     let url = format!("{}{}/scan/{}", url, API_BASE, scan_id);
 
@@ -850,7 +933,17 @@ pub fn resolve_project_by_repo(
     let mut page = 1;
     loop {
         let Some(parsed) = fetch_projects_page(url, repo_path, page)? else {
-            return Ok(None);
+            // Only page 1 can be a backend without the endpoint; a 404 once the
+            // walk is under way (a concurrent delete shrinking the filtered set)
+            // would discard the matches already found and read as a clean miss.
+            if page == 1 {
+                return Ok(None);
+            }
+            return Err(format!(
+                "/projects page {} returned 404 after pagination started",
+                page
+            )
+            .into());
         };
         let total_pages = parsed.total_pages.unwrap_or(1);
         if parsed.projects.is_empty() {
@@ -1088,17 +1181,26 @@ pub fn verify_token(corgea_url: &str) -> Result<bool, Box<dyn Error>> {
     }
 }
 
+/// Evaluate a scan against blocking rules.
+///
+/// `block_on` is a comma-separated list of CI rule slugs. When omitted the
+/// backend falls back to evaluating every active rule, which is the legacy
+/// `--fail` behavior.
 pub fn check_blocking_rules(
     url: &str,
     sast_scan_id: &str,
     page: Option<u32>,
+    block_on: Option<&str>,
 ) -> Result<BlockingRuleResponse, Box<dyn Error>> {
     let url = format!(
         "{}{}/scan/{}/check_blocking_rules",
         url, API_BASE, sast_scan_id
     );
     let page = page.unwrap_or(1);
-    let query_params = vec![("page", page.to_string())];
+    let mut query_params = vec![("page", page.to_string())];
+    if let Some(block_on) = block_on {
+        query_params.push(("block_on", block_on.to_string()));
+    }
 
     let client = http_client();
     debug(&format!("Sending request to URL: {}", url));
@@ -1129,6 +1231,11 @@ pub fn check_blocking_rules(
         let status = response.status();
         let response_text = response.text()?;
         debug(&format!("Response body: {}", response_text));
+        if status == reqwest::StatusCode::BAD_REQUEST {
+            if let Ok(block_on_error) = serde_json::from_str::<BlockOnError>(&response_text) {
+                return Err(block_on_error.describe().into());
+            }
+        }
         Err(format!("API request failed with status: {}", status).into())
     }
 }
@@ -1432,12 +1539,90 @@ pub struct BlockingRuleResponse {
     pub block: bool,
     pub blocking_issues: Vec<BlockingIssue>,
     pub total_pages: u32,
+    // Totals the server computes over the whole result set before paginating.
+    // Optional so the CLI keeps working against backends predating the field.
+    #[serde(default)]
+    pub stats: Option<BlockingRuleStats>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct BlockingRuleStats {
+    #[serde(default)]
+    pub blocked_issues: u32,
+}
+
+impl BlockingRuleResponse {
+    /// How many issues violated the evaluated rules, across every page.
+    ///
+    /// The server counts this before paginating, so one request is enough.
+    /// `blocking_issues` only holds the requested page, so it is the fallback
+    /// for backends that do not send `stats` and can under-report.
+    pub fn blocked_count(&self) -> usize {
+        self.stats
+            .as_ref()
+            .map(|stats| stats.blocked_issues as usize)
+            .unwrap_or_else(|| self.blocking_issues.len())
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct BlockingIssue {
     pub id: String,
     pub triggered_by_rules: Vec<String>,
+    // Optional so the CLI keeps working against backends predating rule slugs.
+    #[serde(default)]
+    pub triggered_by_slugs: Option<Vec<String>>,
+}
+
+/// Structured 400 body returned when `--block-on` names unusable rules.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct BlockOnError {
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub unknown_slugs: Vec<String>,
+    #[serde(default)]
+    pub inactive_slugs: Vec<String>,
+    #[serde(default)]
+    pub non_ci_slugs: Vec<String>,
+}
+
+impl BlockOnError {
+    fn is_empty(&self) -> bool {
+        self.unknown_slugs.is_empty()
+            && self.inactive_slugs.is_empty()
+            && self.non_ci_slugs.is_empty()
+    }
+
+    /// One line per failure category, naming the offending slugs.
+    pub fn describe(&self) -> String {
+        if self.is_empty() {
+            return self
+                .message
+                .clone()
+                .unwrap_or_else(|| "Invalid --block-on value.".to_string());
+        }
+        let mut lines = Vec::new();
+        if !self.unknown_slugs.is_empty() {
+            lines.push(format!(
+                "Unknown blocking rule(s): {}",
+                self.unknown_slugs.join(", ")
+            ));
+        }
+        if !self.non_ci_slugs.is_empty() {
+            lines.push(format!(
+                "Rule(s) not scoped to CI: {}. Change 'Applies To' to CI in the web app, or remove them from --block-on.",
+                self.non_ci_slugs.join(", ")
+            ));
+        }
+        if !self.inactive_slugs.is_empty() {
+            lines.push(format!(
+                "Inactive rule(s): {}. Activate them in the web app, or remove them from --block-on.",
+                self.inactive_slugs.join(", ")
+            ));
+        }
+        lines.join("\n")
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -1530,6 +1715,85 @@ mod tests {
         );
         assert!(headers.get("Authorization").is_none());
         assert!(headers.get("CORGEA-SOURCE").is_some());
+    }
+
+    #[test]
+    fn deserializes_code_quality_issue_response() {
+        // Code quality issues carry a free-form classification label (no CWE) and
+        // must deserialize into the same Issue struct used for security issues.
+        let body = r#"{
+            "status": "ok",
+            "page": 1,
+            "total_pages": 1,
+            "total_issues": 1,
+            "issues": [
+                {
+                    "id": "11111111-1111-1111-1111-111111111111",
+                    "urgency": "ME",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "status": "open",
+                    "classification": {
+                        "id": "Maintainability",
+                        "name": "Maintainability",
+                        "description": null
+                    },
+                    "location": {
+                        "file": {"name": "app.py", "language": "python", "path": "app/app.py"},
+                        "project": {"name": "proj", "branch": "main", "git_sha": "abc"},
+                        "line_number": 20
+                    },
+                    "auto_triage": {"false_positive_detection": {"status": "valid"}},
+                    "auto_fix_suggestion": {"status": "no_fix"}
+                }
+            ]
+        }"#;
+
+        let parsed: ProjectIssuesResponse =
+            serde_json::from_str(body).expect("should parse code quality response");
+        assert_eq!(parsed.status, "ok");
+        let issues = parsed.issues.expect("issues present");
+        assert_eq!(issues.len(), 1);
+        let issue = &issues[0];
+        assert_eq!(issue.classification.id, "Maintainability");
+        assert_eq!(issue.classification.name, "Maintainability");
+        assert!(issue.classification.description.is_none());
+    }
+
+    #[test]
+    fn quality_issues_request_targets_the_documented_paths() {
+        // The two code quality routes are named asymmetrically on the backend,
+        // so the paths are pinned here rather than derived from each other.
+        let (endpoint, query) =
+            quality_issues_request("https://api.example.com", "proj", Some(2), Some(10), None);
+        assert_eq!(
+            endpoint,
+            "https://api.example.com/api/v1/issues/code-quality"
+        );
+        assert_eq!(
+            query,
+            vec![
+                ("project", "proj".to_string()),
+                ("page", "2".to_string()),
+                ("page_size", "10".to_string()),
+            ]
+        );
+
+        let (endpoint, query) = quality_issues_request(
+            "https://api.example.com",
+            "proj",
+            Some(1),
+            None,
+            Some("scan-123"),
+        );
+        assert_eq!(
+            endpoint,
+            "https://api.example.com/api/v1/scan/scan-123/issues/quality"
+        );
+        // A scan selects its own project, and the page size defaults to 30.
+        assert_eq!(
+            query,
+            vec![("page", "1".to_string()), ("page_size", "30".to_string())]
+        );
     }
 
     #[test]
@@ -1801,6 +2065,14 @@ mod tests {
 
     // Serves `page_one` until a request carries `page=2`, then `page_two`.
     fn spawn_paged_projects_stub(page_one: &'static str, page_two: &'static str) -> String {
+        spawn_paged_projects_stub_status(page_one, "200 OK", page_two)
+    }
+
+    fn spawn_paged_projects_stub_status(
+        page_one: &'static str,
+        page_two_status: &'static str,
+        page_two: &'static str,
+    ) -> String {
         use std::io::Write;
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -1808,12 +2080,12 @@ mod tests {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 let request = corgea::vuln_api_stub::read_http_request(&mut stream);
-                let body = if String::from_utf8_lossy(&request).contains("page=2") {
-                    page_two
+                let (status, body) = if String::from_utf8_lossy(&request).contains("page=2") {
+                    (page_two_status, page_two)
                 } else {
-                    page_one
+                    ("200 OK", page_one)
                 };
-                let resp = corgea::vuln_api_stub::http_response("200 OK", "", body);
+                let resp = corgea::vuln_api_stub::http_response(status, "", body);
                 let _ = stream.write_all(resp.as_bytes());
             }
         });
@@ -1831,6 +2103,21 @@ mod tests {
         );
         let got = resolve_project_by_repo(&base, "acme/api", None).unwrap();
         assert_eq!(got.map(|p| p.name).as_deref(), Some("acme/api"));
+    }
+
+    #[test]
+    fn resolve_project_by_repo_mid_pagination_404_is_hard_err() {
+        // Django 404s a page that a concurrent delete shrank out of existence.
+        // Page 1 already held the exact match, so a soft miss here would throw
+        // it away and send the caller to the legacy-name fallback.
+        let base = spawn_paged_projects_stub_status(
+            r#"{"status":"ok","total_pages":2,"projects":[{"name":"acme/api","repo_url":"https://github.com/acme/api"}]}"#,
+            "404 Not Found",
+            r#"{"message":"Invalid page."}"#,
+        );
+        let err = resolve_project_by_repo(&base, "acme/api", None).unwrap_err();
+        assert!(err.to_string().contains("page 2"), "{err}");
+        assert!(err.to_string().contains("pagination"), "{err}");
     }
 
     #[test]
