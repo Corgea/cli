@@ -1206,7 +1206,7 @@ pub fn check_blocking_rules(
     debug(&format!("Sending request to URL: {}", url));
     debug(&format!("Query params: {:?}", query_params));
 
-    let response = match client.get(url).query(&query_params).send() {
+    let response = match client.get(&url).query(&query_params).send() {
         Ok(res) => {
             check_for_warnings(res.headers(), res.status());
             debug(&format!("Response status: {}", res.status()));
@@ -1483,6 +1483,14 @@ pub struct FalsePositiveDetection {
     pub reasoning: Option<String>,
 }
 
+/// Doghouse `check_blocking_rules` readiness. Missing on older backends.
+pub const BLOCKING_RULES_STATUS_COMPLETE: &str = "complete";
+pub const BLOCKING_RULES_STATUS_PENDING: &str = "pending";
+
+fn default_blocking_rules_status() -> String {
+    BLOCKING_RULES_STATUS_COMPLETE.to_string()
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct BlockingRuleResponse {
     pub block: bool,
@@ -1492,6 +1500,9 @@ pub struct BlockingRuleResponse {
     // Optional so the CLI keeps working against backends predating the field.
     #[serde(default)]
     pub stats: Option<BlockingRuleStats>,
+    /// License-deps readiness. Omitted on older backends: treated as complete.
+    #[serde(default = "default_blocking_rules_status")]
+    pub status: String,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -1501,6 +1512,10 @@ pub struct BlockingRuleStats {
 }
 
 impl BlockingRuleResponse {
+    pub fn is_complete(&self) -> bool {
+        self.status == BLOCKING_RULES_STATUS_COMPLETE
+    }
+
     /// How many issues violated the evaluated rules, across every page.
     ///
     /// The server counts this before paginating, so one request is enough.
@@ -1512,6 +1527,19 @@ impl BlockingRuleResponse {
             .map(|stats| stats.blocked_issues as usize)
             .unwrap_or_else(|| self.blocking_issues.len())
     }
+}
+
+/// Retryable during blocking-rules wait: transport errors and HTTP 429/5xx.
+/// Permanent 4xx (auth, not found, bad request) stay fail-fast.
+pub fn is_retryable_blocking_rules_error_message(message: &str) -> bool {
+    if let Some(rest) = message.strip_prefix("API request failed with status: ") {
+        return rest
+            .split_whitespace()
+            .next()
+            .and_then(|code| code.parse::<u16>().ok())
+            .is_some_and(|code| code == 429 || (500..600).contains(&code));
+    }
+    message.starts_with("API request failed:")
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1613,6 +1641,51 @@ pub struct SCAIssuesResponse {
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn blocking_rule_response_defaults_status_when_missing() {
+        let legacy = r#"{"block":false,"blocking_issues":[],"total_pages":1}"#;
+        let parsed: BlockingRuleResponse = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.status, BLOCKING_RULES_STATUS_COMPLETE);
+        assert!(parsed.is_complete());
+
+        let pending = r#"{"block":false,"blocking_issues":[],"total_pages":1,"status":"pending"}"#;
+        let parsed: BlockingRuleResponse = serde_json::from_str(pending).unwrap();
+        assert_eq!(parsed.status, BLOCKING_RULES_STATUS_PENDING);
+        assert!(!parsed.is_complete());
+
+        let complete = r#"{"block":true,"blocking_issues":[],"total_pages":1,"status":"complete"}"#;
+        let parsed: BlockingRuleResponse = serde_json::from_str(complete).unwrap();
+        assert!(parsed.is_complete());
+        assert!(parsed.block);
+
+        let unexpected =
+            r#"{"block":false,"blocking_issues":[],"total_pages":1,"status":"processing"}"#;
+        let parsed: BlockingRuleResponse = serde_json::from_str(unexpected).unwrap();
+        assert!(!parsed.is_complete());
+    }
+
+    #[test]
+    fn retryable_blocking_rules_errors_cover_transport_429_and_5xx() {
+        assert!(is_retryable_blocking_rules_error_message(
+            "API request failed: connection reset"
+        ));
+        assert!(is_retryable_blocking_rules_error_message(
+            "API request failed with status: 429 Too Many Requests"
+        ));
+        assert!(is_retryable_blocking_rules_error_message(
+            "API request failed with status: 503 Service Unavailable"
+        ));
+        assert!(!is_retryable_blocking_rules_error_message(
+            "API request failed with status: 401 Unauthorized"
+        ));
+        assert!(!is_retryable_blocking_rules_error_message(
+            "API request failed with status: 404 Not Found"
+        ));
+        assert!(!is_retryable_blocking_rules_error_message(
+            "Failed to parse response: expected value"
+        ));
+    }
 
     #[test]
     fn scan_response_deserializes_git_sha_and_defaults_when_missing() {
