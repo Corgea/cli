@@ -1,5 +1,5 @@
 use crate::utils::terminal::{set_text_color, TerminalColor};
-use git2::Repository;
+use git2::{Repository, StatusOptions};
 use globset::{Glob, GlobSetBuilder};
 use ignore::WalkBuilder;
 use std::env;
@@ -297,11 +297,31 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
             .map(|commit| commit.id().to_string())
     });
 
+    let dirty = is_worktree_dirty(&repo);
+
     Ok(Some(RepoInfo {
         branch,
         repo_url: origin_url(&repo),
         sha,
+        dirty,
     }))
+}
+
+/// True when the worktree has modified, staged, or untracked files.
+/// Gitignored paths alone do not count; submodules are excluded.
+///
+/// Untracked paths that packaging would later drop via `DEFAULT_EXCLUDE_GLOBS`
+/// still count as dirty (false-positive dirty costs a full scan, not a miss).
+/// Status errors also treat the tree as dirty so we never claim clean HEAD.
+fn is_worktree_dirty(repo: &Repository) -> bool {
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false)
+        .exclude_submodules(true);
+    repo.statuses(Some(&mut opts))
+        .map(|s| !s.is_empty())
+        .unwrap_or(true)
 }
 
 /// `origin`'s URL, or None when the remote is missing or carries no URL.
@@ -412,6 +432,7 @@ pub struct RepoInfo {
     pub branch: Option<String>,
     pub repo_url: Option<String>,
     pub sha: Option<String>,
+    pub dirty: bool,
 }
 
 #[cfg(test)]
@@ -440,12 +461,7 @@ mod tests {
     fn get_repo_info_at_root_only_not_nested_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        git(root, &["init"]);
-        git(root, &["config", "user.email", "test@example.com"]);
-        git(root, &["config", "user.name", "Test"]);
-        fs::write(root.join("README"), "hi").unwrap();
-        git(root, &["add", "README"]);
-        git(root, &["commit", "-m", "init"]);
+        init_committed_repo(root);
 
         let root_s = root.to_str().unwrap();
         let nested = root.join("pkg").join("inner");
@@ -456,6 +472,7 @@ mod tests {
             .unwrap()
             .expect("repo root should yield SHA metadata");
         assert!(info.sha.is_some());
+        assert!(!info.dirty, "clean commit should report dirty=false");
         assert!(is_at_repo_root(root_s));
 
         assert!(
@@ -463,6 +480,67 @@ mod tests {
             "nested CWD must not attach parent HEAD SHA / remote project name"
         );
         assert!(!is_at_repo_root(nested_s));
+    }
+
+    fn init_committed_repo(root: &std::path::Path) {
+        git(root, &["init"]);
+        git(root, &["config", "user.email", "test@example.com"]);
+        git(root, &["config", "user.name", "Test"]);
+        fs::write(root.join("README"), "hi").unwrap();
+        git(root, &["add", "README"]);
+        git(root, &["commit", "-m", "init"]);
+    }
+
+    #[test]
+    fn get_repo_info_dirty_true_when_tracked_file_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_committed_repo(root);
+        fs::write(root.join("README"), "changed").unwrap();
+        let info = get_repo_info(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(info.dirty);
+    }
+
+    #[test]
+    fn get_repo_info_dirty_true_when_change_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_committed_repo(root);
+        fs::write(root.join("README"), "staged").unwrap();
+        git(root, &["add", "README"]);
+        let info = get_repo_info(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(info.dirty);
+    }
+
+    #[test]
+    fn get_repo_info_dirty_true_when_untracked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_committed_repo(root);
+        fs::write(root.join("new.py"), "print(1)").unwrap();
+        let info = get_repo_info(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(info.dirty);
+    }
+
+    #[test]
+    fn get_repo_info_dirty_false_when_only_gitignored_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_committed_repo(root);
+        fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        git(root, &["add", ".gitignore"]);
+        git(root, &["commit", "-m", "ignore"]);
+        fs::write(root.join("ignored.txt"), "secret").unwrap();
+        let info = get_repo_info(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(!info.dirty);
     }
 
     #[test]
