@@ -18,6 +18,8 @@ use std::path::Path;
 
 const CHUNK_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 const API_BASE: &str = "/api/v1";
+const DIRTY_TRUE: &str = "true";
+const DIRTY_FALSE: &str = "false";
 
 fn auth_headers(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -336,6 +338,11 @@ pub fn upload_zip(
             if let Some(sha) = &info.sha {
                 form = form.part("sha", multipart::Part::text(sha.to_string()));
             }
+            // Always send dirty: omitted field = old CLI; "false" = clean tree.
+            form = form.part(
+                "dirty",
+                multipart::Part::text(if info.dirty { DIRTY_TRUE } else { DIRTY_FALSE }),
+            );
         }
         if let Some(scan_type) = scan_type.clone() {
             let scan_type = if scan_type.contains("blast") {

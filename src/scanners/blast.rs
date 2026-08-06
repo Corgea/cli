@@ -64,7 +64,6 @@ pub fn run(
     fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
     let project_name = utils::generic::determine_project_name(project_name.as_deref());
     let zip_path = format!("{}/{}.zip", temp_dir.display(), project_name);
-    let repo_info = utils::generic::get_repo_info("./").unwrap_or_default();
     match utils::generic::create_path_if_not_exists(&temp_dir) {
         Ok(_) => (),
         Err(e) => {
@@ -207,6 +206,23 @@ pub fn run(
         "\r{}Project packaged successfully.\n",
         utils::terminal::set_text_color("", utils::terminal::TerminalColor::Green)
     );
+    // Read dirty/sha after packaging so the flag matches the uploaded archive.
+    let repo_info = utils::generic::get_repo_info("./").unwrap_or_default();
+    if let Some(ref info) = repo_info {
+        if info.dirty {
+            match info.sha.as_deref() {
+                Some(sha) => {
+                    let short_sha = &sha[..sha.len().min(7)];
+                    println!(
+                        "Working tree has uncommitted changes - scanning your local files, not commit {short_sha}."
+                    );
+                }
+                None => {
+                    println!("Working tree has uncommitted changes - scanning your local files.")
+                }
+            }
+        }
+    }
     println!("\n\nSubmitting scan to Corgea:");
     let upload_result = match utils::api::upload_zip(
         &zip_path,

@@ -767,12 +767,17 @@ pub(crate) fn assert_issue_summary(stdout: &str, context: &str) {
 }
 
 pub(crate) fn blast_plan(sha: &str) -> Vec<ExpectedRequest> {
+    blast_upload_plan(sha, false, true)
+}
+
+/// BLAST upload contract. `include_sca` covers `--fail-on malicious` (SCA fetch).
+pub(crate) fn blast_upload_plan(sha: &str, dirty: bool, include_sca: bool) -> Vec<ExpectedRequest> {
     let patch_sha = sha.to_string();
+    let dirty_value = if dirty { "true" } else { "false" }.to_string();
     let patch_path = "/api/v1/start-scan/transfer-123/".to_string();
     let detail_path = "/api/v1/scan/blast-scan-123".to_string();
     let issue_path = "/api/v1/scan/blast-scan-123/issues".to_string();
-    let sca_path = "/api/v1/scan/blast-scan-123/issues/sca".to_string();
-    vec![
+    let mut plan = vec![
         verify_request(),
         expected_request(
             "start BLAST upload",
@@ -808,6 +813,7 @@ pub(crate) fn blast_plan(sha: &str) -> Vec<ExpectedRequest> {
                     "https://github.com/corgea/cloud-e2e.git",
                 )?;
                 assert_multipart_text_field(request, "sha", &patch_sha)?;
+                assert_multipart_text_field(request, "dirty", &dirty_value)?;
                 assert_body_contains(request, b"name=\"chunk_data\"")
             },
             json_response(json!({
@@ -829,7 +835,10 @@ pub(crate) fn blast_plan(sha: &str) -> Vec<ExpectedRequest> {
             },
             json_response(empty_issue_page()),
         ),
-        expected_request(
+    ];
+    if include_sca {
+        let sca_path = "/api/v1/scan/blast-scan-123/issues/sca".to_string();
+        plan.push(expected_request(
             "read malicious SCA issues",
             move |request| {
                 assert_authenticated_request(request, Method::GET, &sca_path)?;
@@ -837,6 +846,7 @@ pub(crate) fn blast_plan(sha: &str) -> Vec<ExpectedRequest> {
                 assert_query(request, "page_size", "30")
             },
             json_response(malicious_sca_issue_page()),
-        ),
-    ]
+        ));
+    }
+    plan
 }
