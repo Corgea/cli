@@ -35,7 +35,9 @@ corgea scan --scan-type policy --policy 1      # Specific policy ID
 corgea scan --fail-on CR                       # Exit 1 on critical issues (CR, HI, ME, LO)
 corgea scan --fail-on malicious                # Exit 1 if any dependency is classified malicious
 corgea scan --fail-on HI,malicious             # Comma-separated conditions combine
-corgea scan --fail                             # Exit 1 based on project blocking rules
+corgea scan --block-on criticals               # Exit 1 if the scan violates the named CI blocking rules
+corgea scan --block-on criticals,malicious-deps  # Comma-separated rule slugs
+corgea scan --fail                             # Deprecated: exit 1 based on every active blocking rule
 corgea scan --out-format json --out-file r.json   # Export (json, html, sarif, markdown)
 corgea scan --sbom                             # Also write a CycloneDX SBOM to bom.json
 corgea scan --sbom sbom.cdx.json               # SBOM to a custom file
@@ -46,7 +48,11 @@ Scan types: `blast` (base AI), `policy` (PolicyIQ), `malicious`, `secrets`, `pii
 
 `--fail-on` takes comma-separated conditions: severity thresholds `CR`, `HI`, `ME`, `LO` (trip at or above the level) and/or `malicious` (trips when any dependency in the scan is classified malicious). Use `malicious` to block supply-chain findings in CI across every ecosystem the scan covers, including those the `corgea npm`/`corgea pip` install gate does not.
 
-`--only-uncommitted` and `--target` are mutually exclusive. `--fail-on` and `--fail` are mutually exclusive.
+`--block-on` takes comma-separated blocking-rule slugs. Blocking rules are configured in the web app and each one applies either to pull requests or to CI. Only CI rules can be named by `--block-on`; a slug that is unknown, inactive, or scoped to pull requests is a hard error (exit 1) rather than a silently skipped gate. The slug is shown next to each rule in the web app and is derived from the rule name, so renaming a rule changes its slug. Name rules for the condition that trips them — `criticals`, not `no-criticals` — so that `--block-on` reads as a direct assertion rather than a double negative.
+
+`--fail` is deprecated. It evaluates every active blocking rule regardless of what it applies to; use `--block-on` to name the CI rules a pipeline should enforce.
+
+`--only-uncommitted` and `--target` are mutually exclusive. `--fail-on`, `--fail`, and `--block-on` are mutually exclusive.
 
 ### Upload — `corgea upload [report]`
 
@@ -358,6 +364,7 @@ corgea inspect --issue --diff ISSUE_ID
 ```bash
 corgea scan --fail-on CR --out-format sarif --out-file results.sarif
 corgea scan --fail-on CR,malicious --out-format sarif --out-file results.sarif  # also block malicious dependencies
+corgea scan --block-on criticals --out-format sarif --out-file results.sarif  # gate on a CI blocking rule from the web app
 ```
 
 ### Upload third-party reports
