@@ -235,20 +235,65 @@ pub fn header_value(request: &str, name: &str) -> Option<String> {
         .map(|(_, value)| value.trim().to_string())
 }
 
-/// Read one HTTP request's bytes (through the header terminator) off `stream`.
+/// Read one HTTP request off `stream`: the headers, then whatever body they
+/// declare.
+///
+/// The body is drained even though no stub inspects it. Responses carry
+/// `Connection: close`, so answering while the client is still writing its
+/// body resets the connection, and the client reports a request-body error
+/// instead of reading the reply. Small bodies survive on socket buffering
+/// alone; the streamed multipart uploads (`POST /start-scan` and the chunk
+/// `PATCH`) do not, which made the scan e2e tests fail intermittently.
+///
+/// The read timeout keeps a client that never finishes its body from parking
+/// the single-threaded stub thread forever; on expiry the request is served
+/// with whatever arrived.
 pub fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 1024];
-    while let Ok(n) = stream.read(&mut chunk) {
-        if n == 0 {
-            break;
+    let mut searched = 0;
+
+    let header_end = loop {
+        // Rescan only the seam plus what just arrived, so a multi-megabyte
+        // upload is not re-walked on every read.
+        if let Some(offset) = buf[searched..].windows(4).position(|w| w == b"\r\n\r\n") {
+            break searched + offset + 4;
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+        searched = buf.len().saturating_sub(3);
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return buf,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    };
+
+    let headers = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+    let chunked = header_value(&headers, "transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
+    // A chunked body ends with a zero-length chunk rather than at a known
+    // offset. Anything else is bounded by Content-Length, absent for bodyless
+    // requests and therefore zero.
+    let body_end = (!chunked).then(|| {
+        header_end
+            + header_value(&headers, "content-length")
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0)
+    });
+
+    loop {
+        let complete = match body_end {
+            Some(end) => buf.len() >= end,
+            None => buf[header_end..].ends_with(b"0\r\n\r\n"),
+        };
+        if complete {
+            return buf;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return buf,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
     }
-    buf
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -379,6 +424,88 @@ mod tests {
         let mut resp = String::new();
         stream.read_to_string(&mut resp).unwrap();
         resp
+    }
+
+    /// Accept one connection, hand it to `read_http_request`, and return what
+    /// that pulled off the wire while `send` writes the request.
+    fn read_one_request(send: impl FnOnce(&mut TcpStream) + Send + 'static) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            send(&mut stream);
+        });
+        let (mut stream, _) = listener.accept().expect("accept");
+        let buf = read_http_request(&mut stream);
+        client.join().expect("client thread");
+        buf
+    }
+
+    /// A body that lands after the headers is still drained. Stopping at the
+    /// header terminator would let the stub answer and close mid-upload,
+    /// which the client sees as a request-body error rather than a response.
+    #[test]
+    fn reads_content_length_body_arriving_after_the_headers() {
+        let body = "x".repeat(5000);
+        let expected = body.clone();
+        let buf = read_one_request(move |stream| {
+            let headers = format!(
+                "POST /upload HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).unwrap();
+            thread::sleep(std::time::Duration::from_millis(50));
+            stream.write_all(body.as_bytes()).unwrap();
+        });
+
+        let request = String::from_utf8_lossy(&buf);
+        assert!(
+            request.ends_with(&expected),
+            "body truncated at {} bytes",
+            buf.len()
+        );
+    }
+
+    /// Streamed multipart uploads send no Content-Length, so the drain has to
+    /// run to the zero-length chunk instead.
+    #[test]
+    fn reads_chunked_body_to_its_terminator() {
+        let buf = read_one_request(|stream| {
+            stream
+                .write_all(b"POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .unwrap();
+            thread::sleep(std::time::Duration::from_millis(50));
+            stream.write_all(b"5\r\nhello\r\n").unwrap();
+            thread::sleep(std::time::Duration::from_millis(50));
+            stream.write_all(b"0\r\n\r\n").unwrap();
+        });
+
+        let request = String::from_utf8_lossy(&buf);
+        assert!(request.contains("hello"), "chunk missing from: {request}");
+        assert!(
+            request.ends_with("0\r\n\r\n"),
+            "did not stop at the terminator: {request}"
+        );
+    }
+
+    /// A bodyless request returns as soon as the headers are in, rather than
+    /// blocking on EOF or the read timeout.
+    #[test]
+    fn returns_on_the_headers_when_there_is_no_body() {
+        let started = std::time::Instant::now();
+        let buf = read_one_request(|stream| {
+            stream
+                .write_all(b"GET /thing HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            // Held open so a read that waits for EOF would stall here.
+            thread::sleep(std::time::Duration::from_millis(200));
+        });
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "waited on the timeout instead of returning at the headers"
+        );
+        assert!(String::from_utf8_lossy(&buf).starts_with("GET /thing"));
     }
 
     #[test]
