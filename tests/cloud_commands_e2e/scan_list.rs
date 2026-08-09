@@ -100,6 +100,72 @@ fn scan_dirty_worktree_sends_dirty_true_and_prints_notice() {
 }
 
 #[test]
+fn scan_clean_target_upload_sends_dirty_true_without_worktree_notice() {
+    let project = git_project();
+    std::fs::write(project.path().join("other.py"), "print('other')\n").expect("write other");
+    run_git(project.path(), &["add", "other.py"]);
+    run_git(project.path(), &["commit", "-m", "add other"]);
+    let sha = String::from_utf8(run_git(project.path(), &["rev-parse", "HEAD"]).stdout)
+        .expect("UTF-8 SHA")
+        .trim()
+        .to_string();
+
+    let scan_api = ApiStub::start(blast_upload_plan(&sha, true, false));
+    let (mut scan_command, _scan_home) = cloud_command(&scan_api, project.path());
+    scan_command.args([
+        "scan",
+        "blast",
+        "--target",
+        "main.py",
+        "--project-name",
+        "cloud-e2e",
+    ]);
+
+    let scan_output = run_with_timeout(scan_command, &scan_api);
+    let scan_transcript = scan_api.assert_finished();
+    let scan_context = output_context(&scan_output, &scan_transcript);
+    assert_eq!(scan_output.status.code(), Some(0), "{scan_context}");
+    let scan_stdout = String::from_utf8_lossy(&scan_output.stdout);
+    assert!(
+        !scan_stdout.contains("Working tree has uncommitted changes"),
+        "clean partial target must not print dirty worktree notice\n{scan_context}"
+    );
+}
+
+#[test]
+fn scan_clean_exclude_upload_sends_dirty_true_without_worktree_notice() {
+    let project = git_project();
+    std::fs::write(project.path().join("other.py"), "print('other')\n").expect("write other");
+    run_git(project.path(), &["add", "other.py"]);
+    run_git(project.path(), &["commit", "-m", "add other"]);
+    let sha = String::from_utf8(run_git(project.path(), &["rev-parse", "HEAD"]).stdout)
+        .expect("UTF-8 SHA")
+        .trim()
+        .to_string();
+
+    let scan_api = ApiStub::start(blast_upload_plan(&sha, true, false));
+    let (mut scan_command, _scan_home) = cloud_command(&scan_api, project.path());
+    scan_command.args([
+        "scan",
+        "blast",
+        "--exclude",
+        "other.py",
+        "--project-name",
+        "cloud-e2e",
+    ]);
+
+    let scan_output = run_with_timeout(scan_command, &scan_api);
+    let scan_transcript = scan_api.assert_finished();
+    let scan_context = output_context(&scan_output, &scan_transcript);
+    assert_eq!(scan_output.status.code(), Some(0), "{scan_context}");
+    let scan_stdout = String::from_utf8_lossy(&scan_output.stdout);
+    assert!(
+        !scan_stdout.contains("Working tree has uncommitted changes"),
+        "clean exclude scan must not print dirty worktree notice\n{scan_context}"
+    );
+}
+
+#[test]
 fn list_json_returns_filtered_scan_contract() {
     let project = TempDir::new().expect("create list project");
     let local_project = temp_project_name(project.path());

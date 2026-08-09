@@ -307,21 +307,50 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
     }))
 }
 
-/// True when the worktree has modified, staged, or untracked files.
-/// Gitignored paths alone do not count; submodules are excluded.
+/// True when the worktree has modified, staged, or untracked files (including
+/// dirty submodules). Gitignored paths alone do not count.
 ///
 /// Untracked paths that packaging would later drop via `DEFAULT_EXCLUDE_GLOBS`
 /// still count as dirty (false-positive dirty costs a full scan, not a miss).
 /// Status errors also treat the tree as dirty so we never claim clean HEAD.
 fn is_worktree_dirty(repo: &Repository) -> bool {
     let mut opts = StatusOptions::new();
+    // Include submodule status: packaging walks into submodule dirs, so a
+    // modified checkout must not be advertised as clean parent HEAD.
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
-        .include_ignored(false)
-        .exclude_submodules(true);
+        .include_ignored(false);
     repo.statuses(Some(&mut opts))
         .map(|s| !s.is_empty())
         .unwrap_or(true)
+}
+
+/// Merge before/after packaging samples into upload metadata.
+///
+/// Only `dirty=false` when both samples exist, are clean, and share the same
+/// SHA. Any missing sample, dirty sample, or SHA drift fails safe to dirty.
+/// Prefer the post-packaging sample for branch/url/sha display.
+pub fn reconcile_repo_info_for_upload(
+    before: Option<RepoInfo>,
+    after: Option<RepoInfo>,
+) -> Option<RepoInfo> {
+    match (before, after) {
+        (None, None) => None,
+        (Some(sample), None) | (None, Some(sample)) => Some(RepoInfo {
+            dirty: true,
+            ..sample
+        }),
+        (Some(before), Some(after)) => {
+            let stable_clean =
+                !before.dirty && !after.dirty && before.sha.is_some() && before.sha == after.sha;
+            Some(RepoInfo {
+                branch: after.branch.or(before.branch),
+                repo_url: after.repo_url.or(before.repo_url),
+                sha: after.sha.or(before.sha),
+                dirty: !stable_clean,
+            })
+        }
+    }
 }
 
 /// `origin`'s URL, or None when the remote is missing or carries no URL.
@@ -427,11 +456,12 @@ pub fn get_status(status: &str) -> &str {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RepoInfo {
     pub branch: Option<String>,
     pub repo_url: Option<String>,
     pub sha: Option<String>,
+    /// True when the upload must not be treated as an exact clean HEAD snapshot.
     pub dirty: bool,
 }
 
@@ -541,6 +571,108 @@ mod tests {
             .unwrap()
             .expect("repo info");
         assert!(!info.dirty);
+    }
+
+    fn sample_info(sha: &str, dirty: bool) -> RepoInfo {
+        RepoInfo {
+            branch: Some("main".into()),
+            repo_url: Some("https://github.com/org/repo.git".into()),
+            sha: Some(sha.into()),
+            dirty,
+        }
+    }
+
+    #[test]
+    fn reconcile_clean_same_sha_stays_clean() {
+        let before = sample_info("aaa", false);
+        let after = sample_info("aaa", false);
+        let out = reconcile_repo_info_for_upload(Some(before), Some(after)).unwrap();
+        assert!(!out.dirty);
+        assert_eq!(out.sha.as_deref(), Some("aaa"));
+    }
+
+    #[test]
+    fn reconcile_sha_drift_marks_dirty() {
+        let before = sample_info("aaa", false);
+        let after = sample_info("bbb", false);
+        let out = reconcile_repo_info_for_upload(Some(before), Some(after)).unwrap();
+        assert!(out.dirty);
+        assert_eq!(out.sha.as_deref(), Some("bbb"));
+    }
+
+    #[test]
+    fn reconcile_either_dirty_marks_dirty() {
+        let before = sample_info("aaa", true);
+        let after = sample_info("aaa", false);
+        let out = reconcile_repo_info_for_upload(Some(before), Some(after)).unwrap();
+        assert!(out.dirty);
+
+        let before = sample_info("aaa", false);
+        let after = sample_info("aaa", true);
+        let out = reconcile_repo_info_for_upload(Some(before), Some(after)).unwrap();
+        assert!(out.dirty);
+    }
+
+    #[test]
+    fn reconcile_missing_sample_marks_dirty() {
+        let only = sample_info("aaa", false);
+        assert!(
+            reconcile_repo_info_for_upload(Some(only.clone()), None)
+                .unwrap()
+                .dirty
+        );
+        assert!(
+            reconcile_repo_info_for_upload(None, Some(only))
+                .unwrap()
+                .dirty
+        );
+        assert!(reconcile_repo_info_for_upload(None, None).is_none());
+    }
+
+    #[test]
+    fn get_repo_info_dirty_when_submodule_content_modified() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let parent = parent_dir.path();
+        init_committed_repo(parent);
+
+        // Keep the submodule source outside the parent so it is not an
+        // untracked sibling that would itself mark the tree dirty.
+        let sub_dir = tempfile::tempdir().unwrap();
+        let sub_src = sub_dir.path();
+        git(sub_src, &["init"]);
+        git(sub_src, &["config", "user.email", "test@example.com"]);
+        git(sub_src, &["config", "user.name", "Test"]);
+        fs::write(sub_src.join("lib.py"), "v1\n").unwrap();
+        git(sub_src, &["add", "lib.py"]);
+        git(sub_src, &["commit", "-m", "sub init"]);
+
+        // Modern git blocks file:// clones unless explicitly allowed.
+        git(
+            parent,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub_src.to_str().unwrap(),
+                "vendor",
+            ],
+        );
+        git(parent, &["commit", "-m", "add submodule"]);
+
+        let clean = get_repo_info(parent.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(!clean.dirty, "committed submodule should be clean");
+
+        fs::write(parent.join("vendor").join("lib.py"), "v2\n").unwrap();
+        let dirty = get_repo_info(parent.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(
+            dirty.dirty,
+            "modified submodule checkout must mark parent dirty"
+        );
     }
 
     #[test]

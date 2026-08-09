@@ -90,6 +90,10 @@ pub fn run(
         target.as_deref()
     };
 
+    // Sample before packaging so a mid-pack commit cannot advertise a new clean HEAD
+    // against an archive built from the previous (or mixed) tree.
+    let repo_before = utils::generic::get_repo_info("./").unwrap_or_default();
+
     if target_str.is_none() && exclude.is_some() {
         println!("Excluding files matching: {}", exclude.as_deref().unwrap());
     }
@@ -206,21 +210,33 @@ pub fn run(
         "\r{}Project packaged successfully.\n",
         utils::terminal::set_text_color("", utils::terminal::TerminalColor::Green)
     );
-    // Read dirty/sha after packaging so the flag matches the uploaded archive.
-    let repo_info = utils::generic::get_repo_info("./").unwrap_or_default();
-    if let Some(ref info) = repo_info {
-        if info.dirty {
-            match info.sha.as_deref() {
-                Some(sha) => {
-                    let short_sha = &sha[..sha.len().min(7)];
-                    println!(
-                        "Working tree has uncommitted changes - scanning your local files, not commit {short_sha}."
-                    );
-                }
-                None => {
-                    println!("Working tree has uncommitted changes - scanning your local files.")
-                }
+    let repo_after = utils::generic::get_repo_info("./").unwrap_or_default();
+    // User notice reflects actual worktree dirtiness, not upload fail-safes
+    // (--target/--exclude or before/after SHA drift).
+    let worktree_dirty = repo_before.as_ref().is_some_and(|i| i.dirty)
+        || repo_after.as_ref().is_some_and(|i| i.dirty);
+    if worktree_dirty {
+        let notice_sha = repo_after
+            .as_ref()
+            .and_then(|i| i.sha.as_deref())
+            .or_else(|| repo_before.as_ref().and_then(|i| i.sha.as_deref()));
+        match notice_sha {
+            Some(sha) => {
+                let short_sha = &sha[..sha.len().min(7)];
+                println!(
+                    "Working tree has uncommitted changes - scanning your local files, not commit {short_sha}."
+                );
             }
+            None => {
+                println!("Working tree has uncommitted changes - scanning your local files.")
+            }
+        }
+    }
+    let mut repo_info = utils::generic::reconcile_repo_info_for_upload(repo_before, repo_after);
+    // Partial archives are not an exact HEAD snapshot even on a clean tree.
+    if target_str.is_some() || exclude.is_some() {
+        if let Some(ref mut info) = repo_info {
+            info.dirty = true;
         }
     }
     println!("\n\nSubmitting scan to Corgea:");
