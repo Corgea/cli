@@ -193,12 +193,15 @@ fn wait_on_completed_scan_succeeds() {
     );
 }
 
+const DEGRADED: &str = r#"{"scan_type":"sca","level":"error","location":"Project-wide",
+    "message":"Dependency Analysis did not finish, so those results are missing."}"#;
+
+/// The warning is the only place the user learns coverage dropped, and it is
+/// raised from two places: whichever of the two reads sees `complete` first.
 #[test]
 fn completed_scan_reports_missing_scanner_results() {
-    // This warning is the only place the user learns coverage dropped.
-    let degraded = r#"{"scan_type":"sca","level":"error","location":"Project-wide",
-        "message":"Dependency Analysis did not finish, so those results are missing."}"#;
-    let url = spawn_scan_api(&["processing", "complete"], "", degraded);
+    // Complete on the second read, so the poll loop raises it.
+    let url = spawn_scan_api(&["processing", "complete"], "", DEGRADED);
 
     let (code, output) = run_wait(&url, &[]);
 
@@ -206,6 +209,20 @@ fn completed_scan_reports_missing_scanner_results() {
     assert!(
         output.contains("Dependency Analysis did not finish, so those results are missing."),
         "degraded coverage must be reported: {output}"
+    );
+}
+
+#[test]
+fn already_completed_scan_reports_missing_scanner_results() {
+    // Complete on the first read, so the wait returns without ever polling.
+    let url = spawn_scan_api(&["complete"], "", DEGRADED);
+
+    let (code, output) = run_wait(&url, &[]);
+
+    assert_eq!(code, Some(0), "a degraded scan still succeeds: {output}");
+    assert!(
+        output.contains("Dependency Analysis did not finish, so those results are missing."),
+        "degraded coverage must be reported without polling: {output}"
     );
 }
 
@@ -221,5 +238,65 @@ fn wait_stops_polling_a_scan_that_never_finishes() {
     assert!(
         output.contains("Stopped waiting"),
         "timeout must explain itself: {output}"
+    );
+}
+
+#[test]
+fn wait_budget_covers_the_first_status_read() {
+    // `corgea wait` reads the scan once before it starts polling. That read
+    // shares the same budget, so a server that accepts the connection and never
+    // answers cannot spend the client's 150s timeout on top of the wait.
+    let url = common::spawn_http_stub(|path| {
+        if path.starts_with("/api/v1/scan/") {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+        ("200 OK", String::from(r#"{"status":"ok"}"#))
+    });
+
+    let started = Instant::now();
+    let (code, output) = run_wait(&url, &[("CORGEA_SCAN_TIMEOUT_SECONDS", "3")]);
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        code,
+        Some(1),
+        "an unanswered read must fail the command: {output}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "waited {elapsed:?} on a 3s budget: {output}"
+    );
+}
+
+#[test]
+fn wait_honors_the_timeout_when_a_status_read_stalls() {
+    // The budget has to bound the whole wait, not just the gaps between reads.
+    // Each read carries the client's 150s timeout, so a server that accepts the
+    // connection and never answers used to hold the CLI far past the budget.
+    let reads = Arc::new(AtomicUsize::new(0));
+    let url = common::spawn_http_stub(move |path| {
+        if path.starts_with("/api/v1/scan/") {
+            if reads.fetch_add(1, Ordering::SeqCst) > 0 {
+                // Outlasts MAX_RUNTIME: reaching this read must not mean waiting
+                // for it.
+                std::thread::sleep(Duration::from_secs(60));
+            }
+            return ("200 OK", scan_json("processing", "", ""));
+        }
+        ("200 OK", String::from(r#"{"status":"ok"}"#))
+    });
+
+    let started = Instant::now();
+    let (code, output) = run_wait(&url, &[("CORGEA_SCAN_TIMEOUT_SECONDS", "3")]);
+    let elapsed = started.elapsed();
+
+    assert_eq!(code, Some(1), "a timeout must fail the command: {output}");
+    assert!(
+        output.contains("Stopped waiting"),
+        "a stalled read must be reported as a timeout, not a broken connection: {output}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "waited {elapsed:?} on a 3s budget: {output}"
     );
 }

@@ -40,6 +40,8 @@ third-party report.
 All three exit 1 if the scan fails, printing the reason and the scanners that hit
 problems. A scan that completes with a scanner missing exits 0 with a warning.
 Waiting gives up after 10 hours; override with `CORGEA_SCAN_TIMEOUT_SECONDS`.
+`--fail`/`--block-on` then wait up to 15 minutes for blocking rules to be
+evaluated; override with `CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS`.
 
 ## Dependency Inventory (offline)
 

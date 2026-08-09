@@ -72,9 +72,13 @@ pub fn run(config: &Config, args: WaitArgs) {
         }
     };
 
+    // One budget covers this read and the polling that may follow it, so a
+    // stalled first read cannot spend the wait on top of it.
+    let budget = blast::WaitBudget::start();
+
     // Read the scan itself: the listing omits failed_reason and scan_errors,
     // which are the only record of why a scan ended badly.
-    let scan = match utils::api::get_scan(&config.get_url(), &scan_id) {
+    let scan = match utils::api::get_scan(&config.get_url(), &scan_id, budget.remaining()) {
         Ok(scan) => scan,
         Err(e) => {
             log::error!(
@@ -125,7 +129,7 @@ pub fn run(config: &Config, args: WaitArgs) {
                "{}",
                utils::terminal::set_text_color("Your scan will continue securely in the Corgea cloud.\nYou can safely exit the process now if you prefer not to wait for it to complete.\n\n", utils::terminal::TerminalColor::Blue)
             );
-            blast::wait_for_scan(config, &scan_id);
+            blast::wait_for_scan(config, &scan_id, budget);
         }
         blast::ScanState::Completed => {
             println!("Scan has been processed successfully!");

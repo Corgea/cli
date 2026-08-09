@@ -15,9 +15,12 @@ use std::error::Error;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::time::Duration;
 
 const CHUNK_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 const API_BASE: &str = "/api/v1";
+/// How long any one request may take before the client gives up.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
 
 fn auth_headers(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -40,7 +43,7 @@ static COOKIE_JAR: std::sync::LazyLock<std::sync::Arc<reqwest::cookie::Jar>> =
 static SHARED_CLIENT: std::sync::LazyLock<reqwest::blocking::Client> =
     std::sync::LazyLock::new(|| {
         let mut builder = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(5 * 30))
+            .timeout(REQUEST_TIMEOUT)
             .cookie_provider(COOKIE_JAR.clone());
 
         if let Ok(https_proxy) = std::env::var("https_proxy") {
@@ -118,6 +121,15 @@ impl DebugRequestBuilder {
     pub fn body<T: Into<reqwest::blocking::Body>>(self, body: T) -> Self {
         Self {
             inner: self.inner.body(body),
+            client: self.client,
+        }
+    }
+
+    /// Shorten this one request's timeout, never lengthen it past
+    /// `REQUEST_TIMEOUT`.
+    pub fn timeout(self, timeout: Duration) -> Self {
+        Self {
+            inner: self.inner.timeout(timeout.min(REQUEST_TIMEOUT)),
             client: self.client,
         }
     }
@@ -600,13 +612,22 @@ pub fn get_quality_issues(
     }
 }
 
-pub fn get_scan(url: &str, scan_id: &str) -> Result<ScanResponse, Box<dyn std::error::Error>> {
+/// `deadline` caps this single read, so a caller polling against a budget is
+/// not held past it by a stalled request. `None` uses `REQUEST_TIMEOUT`.
+pub fn get_scan(
+    url: &str,
+    scan_id: &str,
+    deadline: Option<Duration>,
+) -> Result<ScanResponse, Box<dyn std::error::Error>> {
     let url = format!("{}{}/scan/{}", url, API_BASE, scan_id);
 
     let client = http_client();
     debug(&format!("Sending request to URL: {}", url));
-    let response = client
-        .get(&url)
+    let mut request = client.get(&url);
+    if let Some(deadline) = deadline {
+        request = request.timeout(deadline);
+    }
+    let response = request
         .send()
         .map_err(|e| format!("Failed to send request: {}", e))?;
 
@@ -1353,16 +1374,12 @@ pub fn get_all_sca_issues(
 
 /// One scanner problem reported against a scan, already sanitized server-side.
 ///
-/// Fields are optional so older servers still deserialize.
+/// Every field is optional so a server that omits any of them still parses.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ScanErrorSummary {
-    #[serde(default)]
     pub scan_type: Option<String>,
-    #[serde(default)]
     pub level: Option<String>,
-    #[serde(default)]
     pub location: Option<String>,
-    #[serde(default)]
     pub message: Option<String>,
 }
 

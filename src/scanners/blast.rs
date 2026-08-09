@@ -13,6 +13,10 @@ use uuid::Uuid;
 
 /// Overrides how long `wait_for_scan` polls before giving up.
 const SCAN_TIMEOUT_ENV: &str = "CORGEA_SCAN_TIMEOUT_SECONDS";
+const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(10 * 60 * 60);
+
+/// Overrides how long the CI gate waits for blocking rules to be evaluated.
+const BLOCKING_RULES_TIMEOUT_ENV: &str = "CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS";
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -260,7 +264,7 @@ pub fn run(
        utils::terminal::set_text_color("Your scan will continue securely in the Corgea cloud.\nYou can safely exit the process now if you prefer not to wait for it to complete.\n\n", utils::terminal::TerminalColor::Blue)
     );
 
-    wait_for_scan(config, &scan_id);
+    wait_for_scan(config, &scan_id, WaitBudget::start());
     let stop_signal = Arc::new(Mutex::new(false));
     let stop_signal_clone = Arc::clone(&stop_signal);
     let results_thread = thread::spawn(move || {
@@ -650,29 +654,68 @@ pub fn classify_scan_status(status: &str) -> ScanState {
     }
 }
 
-/// How long to poll before giving up, parsed from `SCAN_TIMEOUT_ENV`.
-///
-/// Backstop for a scan that never reports a terminal status. Scans that run
-/// past the default raise the override. Takes the raw value so it is testable
-/// without touching the environment.
-fn parse_poll_timeout(raw: Option<&str>) -> Duration {
-    const DEFAULT_SECONDS: u64 = 10 * 60 * 60;
-    let seconds = match raw {
+/// Compact duration for a message: `10h`, `15m`, or `90s`.
+fn format_timeout(timeout: Duration) -> String {
+    match timeout.as_secs() {
+        secs if secs > 0 && secs % 3600 == 0 => format!("{}h", secs / 3600),
+        secs if secs > 0 && secs % 60 == 0 => format!("{}m", secs / 60),
+        secs => format!("{}s", secs),
+    }
+}
+
+/// How long to wait, from `var`, falling back to `default` when it is unset or
+/// unusable. Takes the raw value so it is testable without touching the
+/// environment.
+fn parse_timeout(var: &str, raw: Option<&str>, default: Duration) -> Duration {
+    match raw {
         Some(raw) => match raw.trim().parse::<u64>() {
-            Ok(seconds) if seconds > 0 => seconds,
+            Ok(seconds) if seconds > 0 => Duration::from_secs(seconds),
             _ => {
                 log::warn!(
-                    "Ignoring {}='{}': expected a positive whole number of seconds. Waiting up to {} hours instead.",
-                    SCAN_TIMEOUT_ENV,
+                    "Ignoring {}='{}': expected a positive whole number of seconds. Waiting up to {} instead.",
+                    var,
                     raw,
-                    DEFAULT_SECONDS / 3600
+                    format_timeout(default)
                 );
-                DEFAULT_SECONDS
+                default
             }
         },
-        None => DEFAULT_SECONDS,
-    };
-    Duration::from_secs(seconds)
+        None => default,
+    }
+}
+
+fn env_timeout(var: &str, default: Duration) -> Duration {
+    parse_timeout(var, env::var(var).ok().as_deref(), default)
+}
+
+/// The wall-clock budget for one wait, shared by every read it makes so that a
+/// stalled read cannot push the total past what the user asked for.
+pub struct WaitBudget {
+    started_at: Instant,
+    timeout: Duration,
+}
+
+impl WaitBudget {
+    /// Starts the clock, spending up to `SCAN_TIMEOUT_ENV`.
+    ///
+    /// Backstop for a scan that never reports a terminal status. Scans that run
+    /// past the default raise the override.
+    pub fn start() -> Self {
+        Self::with_timeout(env_timeout(SCAN_TIMEOUT_ENV, DEFAULT_SCAN_TIMEOUT))
+    }
+
+    fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            started_at: Instant::now(),
+            timeout,
+        }
+    }
+
+    /// What is left to spend, or `None` once the budget is gone.
+    pub fn remaining(&self) -> Option<Duration> {
+        let remaining = self.timeout.saturating_sub(self.started_at.elapsed());
+        (!remaining.is_zero()).then_some(remaining)
+    }
 }
 
 /// Human-readable explanation of why a scan failed, for the terminal.
@@ -761,11 +804,24 @@ fn format_scan_error_line(error: &utils::api::ScanErrorSummary) -> String {
     }
 }
 
+/// Why the wait stopped before the scan reached a terminal state.
+fn poll_timed_out(scan_id: &str, budget: &WaitBudget, last_status: &str) -> String {
+    format!(
+        "Stopped waiting for scan {} after {}s; it was last reported as '{}'.\n\
+         The scan may still finish in the Corgea cloud — check the scan page, \
+         or set {} to wait longer.",
+        scan_id,
+        budget.timeout.as_secs(),
+        last_status,
+        SCAN_TIMEOUT_ENV
+    )
+}
+
 /// Block until the scan reaches a terminal state, then report it.
 ///
 /// Exits non-zero on failure or poll timeout, so CI cannot mistake a broken
 /// scan for a clean one.
-pub fn wait_for_scan(config: &Config, scan_id: &str) {
+pub fn wait_for_scan(config: &Config, scan_id: &str, budget: WaitBudget) {
     let stop_signal = Arc::new(Mutex::new(false));
     let stop_signal_clone = Arc::clone(&stop_signal);
     let spinner = thread::spawn(move || {
@@ -775,28 +831,26 @@ pub fn wait_for_scan(config: &Config, scan_id: &str) {
         );
     });
 
-    let timeout = parse_poll_timeout(env::var(SCAN_TIMEOUT_ENV).ok().as_deref());
-    let started_at = Instant::now();
+    let mut last_status = String::from("unknown");
 
     let result = loop {
         thread::sleep(Duration::from_secs(1));
-        match utils::api::get_scan(&config.get_url(), scan_id) {
+        // Every read is capped to what is left of the budget: on the client's
+        // own timeout a stalled read would otherwise keep us going long past
+        // the wait the user asked for.
+        let Some(remaining) = budget.remaining() else {
+            break Err(poll_timed_out(scan_id, &budget, &last_status));
+        };
+        match utils::api::get_scan(&config.get_url(), scan_id, Some(remaining)) {
             Ok(scan) => match classify_scan_status(&scan.status) {
                 ScanState::Completed => break Ok(scan),
                 ScanState::Failed => break Err(format_scan_failure(&scan)),
-                ScanState::Running if started_at.elapsed() >= timeout => {
-                    break Err(format!(
-                        "Stopped waiting for scan {} after {}s; it is still reported as '{}'.\n\
-                         The scan may still finish in the Corgea cloud — check the scan page, \
-                         or set {} to wait longer.",
-                        scan_id,
-                        timeout.as_secs(),
-                        scan.status,
-                        SCAN_TIMEOUT_ENV
-                    ))
-                }
-                ScanState::Running => {}
+                ScanState::Running => last_status = scan.status,
             },
+            // A read cut short by the deadline is a timeout, not a broken link.
+            Err(_) if budget.remaining().is_none() => {
+                break Err(poll_timed_out(scan_id, &budget, &last_status))
+            }
             Err(e) => {
                 break Err(format!(
                     "Unable to check the status of scan '{}'.\n\
@@ -843,7 +897,7 @@ pub fn wait_for_scan(config: &Config, scan_id: &str) {
 }
 
 /// Match doghouse `LICENSE_DEPS_WAIT_TIMEOUT` (15 minutes).
-const BLOCKING_RULES_WAIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_BLOCKING_RULES_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const BLOCKING_RULES_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 fn stop_blocking_rules_spinner(stop_signal: &Arc<Mutex<bool>>, spinner: thread::JoinHandle<()>) {
@@ -906,7 +960,8 @@ fn decide_blocking_rules_poll(
     }
 }
 
-/// Poll until blocking-rules status is `complete` (or 15m timeout).
+/// Poll until blocking-rules status is `complete`, or `BLOCKING_RULES_TIMEOUT_ENV`
+/// (15m by default) runs out.
 /// Older backends omit status (serde defaults to complete: one-shot).
 /// `block_on` is forwarded as the CI rule-slug filter (`--block-on`); `None`
 /// keeps legacy `--fail` "all active rules" behavior.
@@ -924,10 +979,11 @@ fn wait_for_blocking_rules(
         );
     });
 
+    let timeout = env_timeout(BLOCKING_RULES_TIMEOUT_ENV, DEFAULT_BLOCKING_RULES_TIMEOUT);
     let started = Instant::now();
     loop {
         // Do not start another request after the deadline.
-        if started.elapsed() >= BLOCKING_RULES_WAIT_TIMEOUT {
+        if started.elapsed() >= timeout {
             stop_blocking_rules_spinner(&stop_signal, spinner);
             log::error!("\n{} (scan '{}')", BLOCKING_RULES_TIMEOUT_MESSAGE, scan_id);
             std::process::exit(1);
@@ -935,7 +991,7 @@ fn wait_for_blocking_rules(
 
         let result = utils::api::check_blocking_rules(&config.get_url(), scan_id, None, block_on)
             .map_err(|e| e.to_string());
-        match decide_blocking_rules_poll(result, started.elapsed(), BLOCKING_RULES_WAIT_TIMEOUT) {
+        match decide_blocking_rules_poll(result, started.elapsed(), timeout) {
             BlockingRulesPollDecision::Complete(rules) => {
                 stop_blocking_rules_spinner(&stop_signal, spinner);
                 return rules;
@@ -1494,17 +1550,42 @@ mod tests {
     }
 
     #[test]
-    fn poll_timeout_rejects_overrides_that_are_not_a_positive_number() {
+    fn timeout_rejects_overrides_that_are_not_a_positive_number() {
         // A bad value must not shorten or disable the wait: anything that is
         // not a positive count of seconds falls back to the default.
-        let default = Duration::from_secs(10 * 60 * 60);
-        assert_eq!(parse_poll_timeout(None), default);
-        assert_eq!(parse_poll_timeout(Some("")), default);
-        assert_eq!(parse_poll_timeout(Some("abc")), default);
-        assert_eq!(parse_poll_timeout(Some("0")), default);
-        assert_eq!(parse_poll_timeout(Some("-30")), default);
-        assert_eq!(parse_poll_timeout(Some("1.5")), default);
-        assert_eq!(parse_poll_timeout(Some(" 90 ")), Duration::from_secs(90));
+        let default = DEFAULT_SCAN_TIMEOUT;
+        let parse = |raw| parse_timeout(SCAN_TIMEOUT_ENV, raw, default);
+        assert_eq!(parse(None), default);
+        assert_eq!(parse(Some("")), default);
+        assert_eq!(parse(Some("abc")), default);
+        assert_eq!(parse(Some("0")), default);
+        assert_eq!(parse(Some("-30")), default);
+        assert_eq!(parse(Some("1.5")), default);
+        assert_eq!(parse(Some(" 90 ")), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn timeout_defaults_are_the_documented_ones() {
+        // The docs promise these two numbers; drifting from them silently is
+        // the failure mode worth catching.
+        assert_eq!(DEFAULT_SCAN_TIMEOUT, Duration::from_secs(10 * 60 * 60));
+        assert_eq!(DEFAULT_BLOCKING_RULES_TIMEOUT, Duration::from_secs(15 * 60));
+        assert_eq!(format_timeout(DEFAULT_SCAN_TIMEOUT), "10h");
+        assert_eq!(format_timeout(DEFAULT_BLOCKING_RULES_TIMEOUT), "15m");
+        assert_eq!(format_timeout(Duration::from_secs(90)), "90s");
+    }
+
+    #[test]
+    fn budget_reports_what_is_left_and_then_nothing() {
+        let spent = WaitBudget::with_timeout(Duration::ZERO);
+        assert_eq!(spent.remaining(), None, "a spent budget buys no more reads");
+
+        let budget = WaitBudget::with_timeout(Duration::from_secs(60));
+        let remaining = budget.remaining().expect("fresh budget has time left");
+        assert!(
+            remaining <= Duration::from_secs(60),
+            "remaining must count down from the timeout, got {remaining:?}"
+        );
     }
 
     #[test]
@@ -1691,5 +1772,28 @@ mod tests {
         assert_eq!(classify_scan_status(&scan.status), ScanState::Failed);
         assert!(scan.scan_errors.is_empty());
         assert!(format_scan_failure(&scan).contains("the scanner ran out of memory"));
+    }
+
+    #[test]
+    fn scan_errors_deserialize_with_fields_missing() {
+        // A server that omits any of these must still parse, since an entry we
+        // cannot read is an entry whose missing results go unreported.
+        let json = r#"{
+            "id": "abc",
+            "project": "p",
+            "repo": null,
+            "branch": "main",
+            "status": "complete",
+            "engine": "corgea-blast",
+            "created_at": "2026-01-01T00:00:00Z",
+            "scan_errors": [{"message": "pom.xml could not be resolved"}, {}]
+        }"#;
+
+        let scan: utils::api::ScanResponse = serde_json::from_str(json).unwrap();
+
+        // No level means the entry counts as a problem, so both are reported.
+        let warnings = format_scan_warnings(&scan).unwrap();
+        assert!(warnings.contains("  - pom.xml could not be resolved"));
+        assert!(warnings.contains("  - No details provided."));
     }
 }
