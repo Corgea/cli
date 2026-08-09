@@ -29,13 +29,20 @@ const SKIP_ENV_VAR: &str = "CORGEA_SKIP_WEBAPP_VERSION_CHECK";
 /// `v1.71.3-client-a`). Only the leading numeric part is comparable, so a
 /// suffixed build counts as the release it was cut from rather than sorting
 /// below it the way semver pre-release ordering would.
-static NUMERIC_VERSION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(\d+)\.(\d+)(?:\.(\d+))?").expect("valid version regex"));
+///
+/// Anchored, and the numbers must end the string or start a suffix. Matching a
+/// dotted number anywhere would read something like `build-2026.08-v1.70.0` as
+/// `2026.8.0` and call an outdated webapp current; a shape we do not recognize
+/// has to be unknown instead.
+static NUMERIC_VERSION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^v?(\d+)\.(\d+)(?:\.(\d+))?(?:$|[-+])").expect("valid version regex")
+});
 
-/// The `major.minor.patch` numbers in `raw`, or `None` when it carries none.
-/// A missing patch reads as `0`, so `v1.71` and `v1.71.0` compare equal.
+/// The `major.minor.patch` numbers leading `raw`, or `None` when it is not a
+/// shape we recognize. A missing patch reads as `0`, so `v1.71` and `v1.71.0`
+/// compare equal.
 pub fn extract_version(raw: &str) -> Option<Version> {
-    let captures = NUMERIC_VERSION.captures(raw)?;
+    let captures = NUMERIC_VERSION.captures(raw.trim())?;
     let number = |group: usize| match captures.get(group) {
         Some(digits) => digits.as_str().parse::<u64>().ok(),
         None => Some(0),
@@ -87,6 +94,9 @@ pub fn warn_if_webapp_outdated(corgea_url: &str) {
 
     let webapp_version = match api::get_webapp_version(corgea_url) {
         Ok(Some(version)) => version,
+        // Includes a 404 from a webapp predating the endpoint. Warning on that
+        // would flag every deployment sitting exactly at the floor, since the
+        // endpoint ships above it -- see `api::get_webapp_version`.
         Ok(None) => {
             debug("Webapp did not report a version; skipping compatibility check");
             return;
@@ -137,6 +147,20 @@ mod tests {
         assert_eq!(extract_version(""), None);
         assert_eq!(extract_version("unknown"), None);
         assert_eq!(extract_version("main"), None);
+    }
+
+    #[test]
+    fn a_version_buried_in_another_string_is_unknown() {
+        // Matching a dotted number anywhere would read the date here as
+        // 2026.8.0 and call this outdated webapp current.
+        assert_eq!(extract_version("build-2026.08-v1.70.0"), None);
+        assert_eq!(extract_version("corgea 1.70.0"), None);
+        assert_eq!(extract_version("1.71.3.4"), None);
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_tolerated() {
+        assert_eq!(extract_version("  v1.71.3\n"), Some(Version::new(1, 71, 3)));
     }
 
     #[test]
