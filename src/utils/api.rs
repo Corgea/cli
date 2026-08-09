@@ -18,6 +18,14 @@ use std::path::Path;
 
 const CHUNK_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 const API_BASE: &str = "/api/v1";
+/// Unversioned on purpose: the webapp serves its own version outside the
+/// versioned API so clients can read it before agreeing on an API version.
+const WEBAPP_VERSION_PATH: &str = "/api/version";
+
+/// Far below the shared client's timeout, because this request is advisory and
+/// runs ahead of every authenticated command: a deployment that stalls this one
+/// route must not hold the command the user actually asked for.
+const WEBAPP_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn auth_headers(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -118,6 +126,14 @@ impl DebugRequestBuilder {
     pub fn body<T: Into<reqwest::blocking::Body>>(self, body: T) -> Self {
         Self {
             inner: self.inner.body(body),
+            client: self.client,
+        }
+    }
+
+    /// Override the shared client's timeout for this request alone.
+    pub fn timeout(self, timeout: std::time::Duration) -> Self {
+        Self {
+            inner: self.inner.timeout(timeout),
             client: self.client,
         }
     }
@@ -1181,6 +1197,55 @@ pub fn verify_token(corgea_url: &str) -> Result<bool, Box<dyn Error>> {
     }
 }
 
+/// The version the webapp at `corgea_url` reports for itself.
+///
+/// `Ok(None)` means the deployment did not tell us: either it predates
+/// `/api/version` (404) or it could not determine its own version (null).
+///
+/// A 404 is not evidence of an outdated webapp and callers must not treat it as
+/// one. The endpoint ships in a release *above* `MIN_WEBAPP_VERSION`, so every
+/// deployment sitting exactly at the floor answers 404 while being perfectly
+/// compatible. A 404 only narrows the version to "older than the release that
+/// added this route", which spans both sides of the floor.
+///
+/// Deliberately skips `check_for_warnings`: this runs as a pre-flight before
+/// the command the user asked for, and it must not be what terminates the
+/// process. The command's own requests still surface deprecation signals.
+pub fn get_webapp_version(corgea_url: &str) -> Result<Option<String>, Box<dyn Error>> {
+    let url = format!("{}{}", corgea_url, WEBAPP_VERSION_PATH);
+    let client = http_client();
+    debug(&format!("Sending request to URL: {}", url));
+
+    let response = client.get(&url).timeout(WEBAPP_VERSION_TIMEOUT).send()?;
+    let status = response.status();
+
+    if status == StatusCode::NOT_FOUND {
+        debug("Webapp does not serve /api/version");
+        return Ok(None);
+    }
+
+    if !status.is_success() {
+        return Err(format!("Request failed with status: {}", status).into());
+    }
+
+    let body_text = response.text()?;
+    let body: WebappVersionResponse = match serde_json::from_str(&body_text) {
+        Ok(json) => json,
+        Err(e) => {
+            debug(&format!(
+                "Failed to parse response as JSON: {}. Response body: {}",
+                e, body_text
+            ));
+            return Err("Failed to parse response".to_string().into());
+        }
+    };
+
+    Ok(body
+        .version
+        .map(|version| version.trim().to_string())
+        .filter(|version| !version.is_empty()))
+}
+
 /// Evaluate a scan against blocking rules.
 ///
 /// `block_on` is a comma-separated list of CI rule slugs. When omitted the
@@ -1349,6 +1414,13 @@ pub fn get_all_sca_issues(
     }
 
     Ok(all_issues)
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct WebappVersionResponse {
+    /// Null on deployments that cannot determine their own version.
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]

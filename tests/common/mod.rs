@@ -37,6 +37,8 @@ pub fn corgea_isolated() -> (Command, TempDir) {
         .env_remove("CORGEA_PYPI_REGISTRY")
         .env_remove("CORGEA_VULN_API_URL")
         .env_remove("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL")
+        .env_remove("CORGEA_MIN_WEBAPP_VERSION")
+        .env_remove("CORGEA_SKIP_WEBAPP_VERSION_CHECK")
         .env_remove("AI_AGENT")
         .env_remove("CODEX_SANDBOX")
         .env_remove("CLAUDECODE")
@@ -568,6 +570,9 @@ pub struct Routes {
     pub scan_issues: Option<String>,
     /// `GET /scan/{id}/issues/quality` — the `--code-quality --scan-id` route.
     pub scan_quality_issues: Option<String>,
+    /// `GET /api/version` — the webapp compatibility pre-flight. Left unset it
+    /// 404s, which is how a webapp predating the endpoint answers.
+    pub version: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -577,6 +582,8 @@ impl Routes {
     pub fn answer(&self, path: &str) -> (&'static str, String) {
         let body = if path.starts_with("/api/v1/verify") {
             Some(r#"{"status":"ok"}"#.to_string())
+        } else if path == "/api/version" {
+            self.version.clone()
         } else if path.starts_with("/api/v1/projects?repo_url=") {
             self.projects.clone()
         } else if path.starts_with("/api/v1/scans?") {
@@ -621,6 +628,12 @@ pub fn sca_issues_empty() -> String {
 #[allow(dead_code)]
 pub fn scan_issues_empty() -> String {
     r#"{"status":"ok","page":1,"total_pages":1,"total_issues":0,"issues":[]}"#.to_string()
+}
+
+/// `GET /api/version` reporting `version`.
+#[allow(dead_code)]
+pub fn webapp_version(version: &str) -> String {
+    format!(r#"{{"status":"ok","version":"{version}"}}"#)
 }
 
 /// `GET /api/v1/scan/{id}` returning a completed scan (`check_scan_status`

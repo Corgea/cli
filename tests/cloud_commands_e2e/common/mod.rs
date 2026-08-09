@@ -559,6 +559,18 @@ pub(crate) fn verify_request() -> ExpectedRequest {
     )
 }
 
+/// The compatibility pre-flight every authenticated command makes right after
+/// verifying the token. It answers with a null version — "this deployment does
+/// not know" — so these contracts stay independent of the CLI's minimum-version
+/// floor. `cli_webapp_version.rs` covers the comparison itself.
+pub(crate) fn webapp_version_request() -> ExpectedRequest {
+    expected_request(
+        "read webapp version",
+        |request| assert_authenticated_request(request, Method::GET, "/api/version"),
+        json_response(json!({"status": "ok", "version": null})),
+    )
+}
+
 pub(crate) fn scan_response(scan_id: &str, project: &str, status: &str) -> Value {
     json!({
         "id": scan_id,
@@ -676,6 +688,7 @@ pub(crate) fn upload_plan(scan_id: &str, project_id: i64) -> Vec<ExpectedRequest
     let scan_run_id = Arc::clone(&run_id);
     vec![
         verify_request(),
+        webapp_version_request(),
         expected_request(
             "upload referenced source",
             move |request| {
@@ -774,6 +787,7 @@ pub(crate) fn blast_plan(sha: &str) -> Vec<ExpectedRequest> {
     let sca_path = "/api/v1/scan/blast-scan-123/issues/sca".to_string();
     vec![
         verify_request(),
+        webapp_version_request(),
         expected_request(
             "start BLAST upload",
             |request| {
