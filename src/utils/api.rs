@@ -22,6 +22,11 @@ const API_BASE: &str = "/api/v1";
 /// versioned API so clients can read it before agreeing on an API version.
 const WEBAPP_VERSION_PATH: &str = "/api/version";
 
+/// Far below the shared client's timeout, because this request is advisory and
+/// runs ahead of every authenticated command: a deployment that stalls this one
+/// route must not hold the command the user actually asked for.
+const WEBAPP_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn auth_headers(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     let (name, value) = auth_header(token);
@@ -121,6 +126,14 @@ impl DebugRequestBuilder {
     pub fn body<T: Into<reqwest::blocking::Body>>(self, body: T) -> Self {
         Self {
             inner: self.inner.body(body),
+            client: self.client,
+        }
+    }
+
+    /// Override the shared client's timeout for this request alone.
+    pub fn timeout(self, timeout: std::time::Duration) -> Self {
+        Self {
+            inner: self.inner.timeout(timeout),
             client: self.client,
         }
     }
@@ -1188,7 +1201,12 @@ pub fn verify_token(corgea_url: &str) -> Result<bool, Box<dyn Error>> {
 ///
 /// `Ok(None)` means the deployment did not tell us: either it predates
 /// `/api/version` (404) or it could not determine its own version (null).
-/// Callers treat both the same way.
+///
+/// A 404 is not evidence of an outdated webapp and callers must not treat it as
+/// one. The endpoint ships in a release *above* `MIN_WEBAPP_VERSION`, so every
+/// deployment sitting exactly at the floor answers 404 while being perfectly
+/// compatible. A 404 only narrows the version to "older than the release that
+/// added this route", which spans both sides of the floor.
 ///
 /// Deliberately skips `check_for_warnings`: this runs as a pre-flight before
 /// the command the user asked for, and it must not be what terminates the
@@ -1198,7 +1216,7 @@ pub fn get_webapp_version(corgea_url: &str) -> Result<Option<String>, Box<dyn Er
     let client = http_client();
     debug(&format!("Sending request to URL: {}", url));
 
-    let response = client.get(&url).send()?;
+    let response = client.get(&url).timeout(WEBAPP_VERSION_TIMEOUT).send()?;
     let status = response.status();
 
     if status == StatusCode::NOT_FOUND {

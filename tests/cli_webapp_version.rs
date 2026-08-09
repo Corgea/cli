@@ -6,6 +6,7 @@ mod common;
 
 use common::{corgea_isolated, scans_empty, temp_plain_dir, webapp_version, Hits, Routes};
 use std::process::Output;
+use std::time::{Duration, Instant};
 
 const MINIMUM: &str = "v1.71.3";
 
@@ -126,6 +127,73 @@ fn a_webapp_reporting_a_null_version_is_silent() {
     assert!(
         !stderr.contains("requires Corgea webapp"),
         "an unknown version must not warn; stderr: {stderr}"
+    );
+}
+
+/// Answers every route except `/api/version`, which it accepts and then never
+/// replies to. Threads per connection so the hung request cannot block the ones
+/// that follow it.
+fn spawn_stalling_version_stub() -> String {
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    let routes = Routes {
+        scans: Some(scans_empty()),
+        ..Default::default()
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+    let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let routes = routes.clone();
+            std::thread::spawn(move || {
+                let buf = corgea::vuln_api_stub::read_http_request(&mut stream);
+                let request = String::from_utf8_lossy(&buf);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                if path == "/api/version" {
+                    // Long enough that answering at all would fail the elapsed
+                    // assertion, so only the per-request timeout can save it.
+                    std::thread::sleep(Duration::from_secs(600));
+                    return;
+                }
+                let (status, body) = routes.answer(&path);
+                let response = corgea::vuln_api_stub::http_response(status, "", &body);
+                let _ = stream.write_all(response.as_bytes());
+            });
+        }
+    });
+    base_url
+}
+
+#[test]
+fn a_stalled_version_endpoint_does_not_hold_up_the_command() {
+    // Without a timeout of its own the pre-flight inherits the shared client's
+    // 150s, delaying a command that was ready to run.
+    let url = spawn_stalling_version_stub();
+
+    let started = Instant::now();
+    let out = run_list(&url, &[]);
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "the advisory pre-flight held the command for {elapsed:?}"
+    );
+    assert!(
+        out.status.success(),
+        "the command must still run; stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("requires Corgea webapp"),
+        "an unreachable endpoint must not warn; stderr: {}",
+        stderr(&out)
     );
 }
 
