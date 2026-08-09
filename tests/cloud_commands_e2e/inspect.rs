@@ -10,6 +10,7 @@ fn inspect_scan_json_returns_requested_scan() {
     let scan_path = format!("/api/v1/scan/{scan_id}");
     let api = ApiStub::start(vec![
         verify_request(),
+        webapp_version_request(),
         expected_request(
             "inspect scan as JSON",
             move |request| assert_authenticated_request(request, Method::GET, &scan_path),
@@ -50,6 +51,7 @@ fn inspect_issue_json_returns_requested_issue() {
     let issue_path = format!("/api/v1/issue/{issue_id}");
     let api = ApiStub::start(vec![
         verify_request(),
+        webapp_version_request(),
         expected_request(
             "inspect issue as JSON",
             move |request| assert_authenticated_request(request, Method::GET, &issue_path),
@@ -94,6 +96,7 @@ fn inspect_scan_exits_one_on_server_error() {
     let scan_path = format!("/api/v1/scan/{scan_id}");
     let api = ApiStub::start(vec![
         verify_request(),
+        webapp_version_request(),
         expected_request(
             "reject scan inspection",
             move |request| assert_authenticated_request(request, Method::GET, &scan_path),
@@ -121,6 +124,7 @@ fn inspect_issue_exits_one_on_invalid_contract() {
     let issue_path = format!("/api/v1/issue/{issue_id}");
     let api = ApiStub::start(vec![
         verify_request(),
+        webapp_version_request(),
         expected_request(
             "return invalid issue contract",
             move |request| assert_authenticated_request(request, Method::GET, &issue_path),

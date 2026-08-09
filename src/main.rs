@@ -19,6 +19,7 @@ mod utils {
     pub mod terminal;
 }
 mod targets;
+mod version_check;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use config::Config;
@@ -520,7 +521,7 @@ fn main() {
         }
         utils::api::set_auth_token(&config.get_token());
         match utils::api::verify_token(config.get_url().as_str()) {
-            Ok(true) => {}
+            Ok(true) => version_check::warn_if_webapp_outdated(config.get_url().as_str()),
             Ok(false) => {
                 println!("Invalid token provided.\nPlease run 'corgea login' to authenticate.\nFor more info checkout our docs at Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli");
                 std::process::exit(1);

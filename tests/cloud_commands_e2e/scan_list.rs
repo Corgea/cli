@@ -30,6 +30,7 @@ fn scan_fail_on_malicious_sends_sha_and_list_renders_it() {
     let list_response_sha = project.sha.clone();
     let list_api = ApiStub::start(vec![
         verify_request(),
+        webapp_version_request(),
         expected_request(
             "resolve Git project",
             |request| {
@@ -80,6 +81,7 @@ fn list_json_returns_filtered_scan_contract() {
     let query_project = local_project.clone();
     let api = ApiStub::start(vec![
         verify_request(),
+        webapp_version_request(),
         expected_request(
             "list filtered scans as JSON",
             move |request| assert_scan_list_request(request, &query_project),
@@ -127,6 +129,7 @@ fn list_exits_one_on_server_error() {
     let local_project = temp_project_name(project.path());
     let api = ApiStub::start(vec![
         verify_request(),
+        webapp_version_request(),
         expected_request(
             "reject scan list",
             move |request| assert_scan_list_request(request, &local_project),
