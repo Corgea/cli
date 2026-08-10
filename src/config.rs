@@ -54,6 +54,14 @@ impl Config {
         Ok(file_path)
     }
 
+    /// Where the config lives, creating nothing on the way to it.
+    fn config_path_readonly() -> Option<PathBuf> {
+        let mut path = dirs::home_dir()?;
+        path.push(".corgea");
+        path.push("config.toml");
+        Some(path)
+    }
+
     /// The settings a fresh install starts from, before anything is persisted.
     fn defaults() -> Self {
         Self {
@@ -66,15 +74,29 @@ impl Config {
         }
     }
 
-    /// Load without requiring a usable home directory.
+    fn apply_env_overrides(&mut self) {
+        if let Ok(corgea_debug) = env::var("CORGEA_DEBUG") {
+            self.debug = corgea_debug.parse::<i8>().unwrap_or(0);
+        }
+    }
+
+    /// Read the persisted settings, touching nothing.
     ///
     /// `load` creates `~/.corgea/config.toml` and fails when it cannot, which is
     /// right for commands that authenticate or persist something. Commands that
-    /// only read a compiled-in string, or write to a path given explicitly, need
-    /// neither, and must still work in a sandbox with a read-only home. The
-    /// environment overrides in the getters apply to the defaults unchanged.
+    /// only serve the skill compiled into the binary need neither: they have to
+    /// run against a read-only home, and must not leave state behind on a
+    /// writable one. A home that is absent, unreadable or malformed therefore
+    /// yields the defaults rather than an error or a newly written file.
     pub fn load_or_defaults() -> Self {
-        Self::load().unwrap_or_else(|_| Self::defaults())
+        let mut config = Self::config_path_readonly()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|contents| toml::from_str(&contents).ok())
+            .unwrap_or_else(Self::defaults);
+
+        config.apply_env_overrides();
+
+        config
     }
 
     pub fn load() -> io::Result<Self> {
@@ -88,11 +110,17 @@ impl Config {
 
         let contents = fs::read_to_string(&file_path)?;
 
-        let mut config: Self = toml::from_str(&contents).expect("Failed to deserialize config");
+        // An unparseable config is a normal error, not a bug: it is a file the
+        // user can edit. Returning it lets callers that tolerate a bad config
+        // fall back, and gives the rest a message naming the file.
+        let mut config: Self = toml::from_str(&contents).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse {}: {}", file_path.display(), e),
+            )
+        })?;
 
-        if let Ok(corgea_debug) = env::var("CORGEA_DEBUG") {
-            config.debug = corgea_debug.parse::<i8>().unwrap_or(0);
-        }
+        config.apply_env_overrides();
 
         Ok(config)
     }

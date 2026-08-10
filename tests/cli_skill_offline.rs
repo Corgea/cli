@@ -160,6 +160,113 @@ fn local_install_with_set_default_still_succeeds_without_a_home() {
     );
 }
 
+/// Serving the embedded skill is a read, so it must not leave `~/.corgea`
+/// behind on a home it *could* have written to.
+#[test]
+fn skill_show_creates_no_config() {
+    let (mut cmd, home) = common::corgea_isolated();
+    let out = cmd.args(["skill", "show"]).output().expect("run corgea");
+
+    assert!(out.status.success());
+    assert!(
+        !home.path().join(".corgea").exists(),
+        "skill show must not create ~/.corgea"
+    );
+}
+
+#[test]
+fn local_install_creates_no_config() {
+    let dest = TempDir::new().expect("temp dest");
+    let (mut cmd, home) = common::corgea_isolated();
+    let out = cmd
+        .args(["skill", "install", "corgea", "--local", "--dir"])
+        .arg(dest.path())
+        .output()
+        .expect("run corgea");
+
+    assert!(out.status.success());
+    assert!(
+        !home.path().join(".corgea").exists(),
+        "--local must not create ~/.corgea"
+    );
+}
+
+/// `config.toml` is a file the user can edit, so a broken one must not take the
+/// offline commands down with it.
+#[test]
+fn offline_commands_survive_a_malformed_config() {
+    let dest = TempDir::new().expect("temp dest");
+    let (mut show, home) = common::corgea_isolated();
+    let config_dir = home.path().join(".corgea");
+    fs::create_dir_all(&config_dir).expect("create config dir");
+    fs::write(
+        config_dir.join("config.toml"),
+        "this is not = valid = toml\n",
+    )
+    .expect("write malformed config");
+
+    let shown = show.args(["skill", "show"]).output().expect("run corgea");
+    assert!(
+        shown.status.success(),
+        "skill show must survive a malformed config: {}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert_eq!(shown.stdout, skill_bytes());
+
+    let (mut install, _unused_home) = common::corgea_isolated();
+    let installed = install
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .args(["skill", "install", "corgea", "--local", "--dir"])
+        .arg(dest.path())
+        .output()
+        .expect("run corgea");
+    assert!(
+        installed.status.success(),
+        "--local must survive a malformed config: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert_eq!(
+        fs::read(installed_skill(dest.path())).expect("skill should have been written"),
+        skill_bytes()
+    );
+}
+
+/// The tolerance above is scoped to the embedded path. A command that needs the
+/// config must still refuse to run on one it cannot parse.
+#[test]
+fn a_malformed_config_still_stops_commands_that_need_it() {
+    let dest = TempDir::new().expect("temp dest");
+    let (mut cmd, home) = common::corgea_isolated();
+    let config_dir = home.path().join(".corgea");
+    fs::create_dir_all(&config_dir).expect("create config dir");
+    fs::write(
+        config_dir.join("config.toml"),
+        "this is not = valid = toml\n",
+    )
+    .expect("write malformed config");
+
+    let out = cmd
+        .args(["skill", "install", "corgea", "--dir"])
+        .arg(dest.path())
+        .output()
+        .expect("run corgea");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a registry install must not silently ignore a broken config"
+    );
+    assert!(
+        stderr.contains("config.toml"),
+        "the error should name the file to fix: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "an editable file being wrong is not a crash: {stderr}"
+    );
+}
+
 #[test]
 fn registry_install_without_a_token_stops_at_the_auth_gate() {
     let dest = TempDir::new().expect("temp dest");

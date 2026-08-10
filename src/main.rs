@@ -539,7 +539,15 @@ fn main() {
     let mut corgea_config = if tolerates_unusable_home(&cli.command) {
         Config::load_or_defaults()
     } else {
-        Config::load().expect("Failed to load config")
+        match Config::load() {
+            Ok(config) => config,
+            // `config.toml` is a file the user can edit, so a bad one is their
+            // problem to fix, not a Rust panic with a backtrace note.
+            Err(e) => {
+                eprintln!("Failed to load config: {}", e);
+                std::process::exit(1);
+            }
+        }
     };
     init_logging(&corgea_config);
     fn verify_token_and_exit_when_fail(config: &Config) {
