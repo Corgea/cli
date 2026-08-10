@@ -54,20 +54,34 @@ impl Config {
         Ok(file_path)
     }
 
+    /// The settings a fresh install starts from, before anything is persisted.
+    fn defaults() -> Self {
+        Self {
+            url: "https://www.corgea.app".to_string(),
+            debug: 0,
+            token: "".to_string(),
+            default_agent: None,
+            recency_gate: default_recency_gate(),
+            recency_threshold_days: default_recency_threshold_days(),
+        }
+    }
+
+    /// Load without requiring a usable home directory.
+    ///
+    /// `load` creates `~/.corgea/config.toml` and fails when it cannot, which is
+    /// right for commands that authenticate or persist something. Commands that
+    /// only read a compiled-in string, or write to a path given explicitly, need
+    /// neither, and must still work in a sandbox with a read-only home. The
+    /// environment overrides in the getters apply to the defaults unchanged.
+    pub fn load_or_defaults() -> Self {
+        Self::load().unwrap_or_else(|_| Self::defaults())
+    }
+
     pub fn load() -> io::Result<Self> {
         let file_path = Self::config_path()?;
 
         if !file_path.exists() {
-            let config = Self {
-                url: "https://www.corgea.app".to_string(),
-                debug: 0,
-                token: "".to_string(),
-                default_agent: None,
-                recency_gate: default_recency_gate(),
-                recency_threshold_days: default_recency_threshold_days(),
-            };
-
-            let toml = toml::to_string(&config).expect("Failed to serialize config");
+            let toml = toml::to_string(&Self::defaults()).expect("Failed to serialize config");
 
             fs::write(&file_path, toml)?;
         }

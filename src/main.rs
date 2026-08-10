@@ -517,22 +517,30 @@ fn default_log_level(debug_flag: i8) -> &'static str {
     }
 }
 
+/// Whether this command has to keep working when `~/.corgea` cannot be created.
+///
+/// Both of these serve the skill compiled into the binary: one prints it, the
+/// other writes it where the caller asked. Neither authenticates nor persists
+/// anything, so a read-only home — the sandbox an agent is most likely to run
+/// in — must not stop them. Every other command still fails loudly, because it
+/// needs a token or somewhere to save one.
+fn tolerates_unusable_home(command: &Option<Commands>) -> bool {
+    matches!(
+        command,
+        Some(Commands::Skill {
+            command: SkillCommands::Show | SkillCommands::Install { local: true, .. }
+        })
+    )
+}
+
 fn main() {
     let cli = Cli::parse();
 
-    // Dispatched before the config loads because that call creates
-    // ~/.corgea/config.toml and panics when it cannot. Printing a string
-    // compiled into the binary has no business failing in a read-only sandbox,
-    // which is exactly where an agent is most likely to run it.
-    if let Some(Commands::Skill {
-        command: SkillCommands::Show,
-    }) = &cli.command
-    {
-        skill::run_show();
-        return;
-    }
-
-    let mut corgea_config = Config::load().expect("Failed to load config");
+    let mut corgea_config = if tolerates_unusable_home(&cli.command) {
+        Config::load_or_defaults()
+    } else {
+        Config::load().expect("Failed to load config")
+    };
     init_logging(&corgea_config);
     fn verify_token_and_exit_when_fail(config: &Config) {
         if config.get_token().is_empty() {
@@ -905,7 +913,6 @@ fn main() {
                     *local,
                 );
             }
-            // Normally handled before the config loads, above.
             SkillCommands::Show => {
                 skill::run_show();
             }
