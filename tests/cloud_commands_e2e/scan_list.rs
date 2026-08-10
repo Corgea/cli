@@ -122,9 +122,10 @@ fn scan_clean_target_upload_sends_dirty_true_without_worktree_notice() {
     ]);
 
     let scan_output = run_with_timeout(scan_command, &scan_api);
+    let scan_context_early = output_context(&scan_output, &scan_api.transcript());
+    assert_eq!(scan_output.status.code(), Some(0), "{scan_context_early}");
     let scan_transcript = scan_api.assert_finished();
     let scan_context = output_context(&scan_output, &scan_transcript);
-    assert_eq!(scan_output.status.code(), Some(0), "{scan_context}");
     let scan_stdout = String::from_utf8_lossy(&scan_output.stdout);
     assert!(
         !scan_stdout.contains("Working tree has uncommitted changes"),
@@ -155,9 +156,10 @@ fn scan_clean_exclude_upload_sends_dirty_true_without_worktree_notice() {
     ]);
 
     let scan_output = run_with_timeout(scan_command, &scan_api);
+    let scan_context_early = output_context(&scan_output, &scan_api.transcript());
+    assert_eq!(scan_output.status.code(), Some(0), "{scan_context_early}");
     let scan_transcript = scan_api.assert_finished();
     let scan_context = output_context(&scan_output, &scan_transcript);
-    assert_eq!(scan_output.status.code(), Some(0), "{scan_context}");
     let scan_stdout = String::from_utf8_lossy(&scan_output.stdout);
     assert!(
         !scan_stdout.contains("Working tree has uncommitted changes"),

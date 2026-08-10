@@ -109,7 +109,9 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     let mut excluded_files = Vec::new();
 
     for (path, relative_path) in files_to_zip {
-        let is_excluded = glob_set.is_match(&path);
+        // Match against the repo-relative path. Absolute paths (target mode)
+        // can live under `/tmp/...` on Linux and would falsely hit `**/tmp/**`.
+        let is_excluded = glob_set.is_match(&relative_path);
 
         if (path.is_file() || path.is_dir()) && !is_excluded {
             if path.is_file() {
@@ -716,6 +718,26 @@ mod tests {
             "node_modules file should be excluded: {:?}",
             added
         );
+    }
+
+    #[test]
+    fn default_exclude_globs_match_abs_tmp_but_not_repo_relative_paths() {
+        // Linux CI tempdirs are `/tmp/...`. Matching DEFAULT_EXCLUDE_GLOBS on the
+        // absolute path made `--target` drop every file via `**/tmp/**`.
+        let mut builder = GlobSetBuilder::new();
+        for &pattern in DEFAULT_EXCLUDE_GLOBS {
+            builder.add(Glob::new(pattern).unwrap());
+        }
+        let set = builder.build().unwrap();
+        assert!(
+            set.is_match(Path::new("/tmp/proj/app.py")),
+            "absolute /tmp paths hit **/tmp/** (the CI failure mode)"
+        );
+        assert!(
+            !set.is_match(Path::new("app.py")),
+            "repo-relative paths must stay scannable"
+        );
+        assert!(!set.is_match(Path::new("src/app.py")));
     }
 
     #[test]
