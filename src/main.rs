@@ -457,7 +457,15 @@ enum SkillCommands {
             help = "Persist the provided --agent as the default for future installs."
         )]
         set_default: bool,
+
+        #[arg(
+            long,
+            help = "Install the 'corgea' skill built into this binary instead of fetching it from the registry. Works offline and without a token."
+        )]
+        local: bool,
     },
+    /// Print the 'corgea' skill built into this binary, pinned to its version
+    Show,
     /// Configure the default agent used when --agent is not provided
     SetDefaultAgent {
         #[arg(help = "Agent id (e.g. cursor, claude-code, codex).")]
@@ -867,8 +875,13 @@ fn main() {
                 scope,
                 dir,
                 set_default,
+                local,
             } => {
-                verify_token_and_exit_when_fail(&corgea_config);
+                // --local reads a string compiled into this binary, so it must
+                // not require a login the way the registry path does.
+                if !*local {
+                    verify_token_and_exit_when_fail(&corgea_config);
+                }
                 skill::run_install(
                     &mut corgea_config,
                     name,
@@ -876,7 +889,11 @@ fn main() {
                     scope,
                     dir.clone(),
                     *set_default,
+                    *local,
                 );
+            }
+            SkillCommands::Show => {
+                skill::run_show();
             }
             SkillCommands::SetDefaultAgent { agent } => {
                 skill::run_set_default_agent(&mut corgea_config, agent);
