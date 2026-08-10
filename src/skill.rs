@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::utils;
 use crate::utils::terminal::{set_text_color, TerminalColor};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// The skill this binary was built from, so the reference an agent reads always
@@ -135,7 +136,16 @@ pub fn run_set_default_agent(config: &mut Config, agent: &str) {
 /// Writes the embedded skill to stdout verbatim so it can be piped or read by
 /// an agent. No token, no network, no formatting.
 pub fn run_show() {
-    print!("{}", EMBEDDED_SKILL);
+    // Rust ignores SIGPIPE, so `corgea skill show | head` would otherwise panic
+    // once the skill outgrows the pipe buffer. A closed reader is a normal exit.
+    match std::io::stdout().write_all(EMBEDDED_SKILL.as_bytes()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => {
+            eprintln!("Failed to write skill: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Fetch an approved skill from the Corgea registry, exiting on any failure.
@@ -441,12 +451,17 @@ mod tests {
 
     #[test]
     fn test_embedded_skill_has_frontmatter_naming_itself() {
-        assert!(
-            EMBEDDED_SKILL.starts_with("---\n"),
+        let mut lines = EMBEDDED_SKILL.lines();
+        assert_eq!(
+            lines.next().map(str::trim),
+            Some("---"),
             "embedded skill must open with YAML frontmatter"
         );
+        let frontmatter: Vec<&str> = lines.take_while(|l| l.trim() != "---").collect();
         assert!(
-            EMBEDDED_SKILL.contains(&format!("name: {}", EMBEDDED_SKILL_NAME)),
+            frontmatter
+                .iter()
+                .any(|l| l.trim() == format!("name: {}", EMBEDDED_SKILL_NAME)),
             "frontmatter name must stay '{}', which is what --local installs under",
             EMBEDDED_SKILL_NAME
         );
