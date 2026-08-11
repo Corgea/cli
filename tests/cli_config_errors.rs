@@ -30,6 +30,9 @@ fn a_malformed_config_fails_cleanly_instead_of_panicking() {
     );
 }
 
+/// Uses the same command as the test above, so the two differ only in whether
+/// the config parses. `--help` would not do: clap exits during parsing, before
+/// `Config::load` is ever reached.
 #[test]
 fn a_valid_config_is_still_read() {
     let (mut cmd, home) = common::corgea_isolated();
@@ -41,11 +44,17 @@ fn a_valid_config_is_still_read() {
     )
     .expect("write config");
 
-    let out = cmd.args(["--help"]).output().expect("run corgea");
+    let out = cmd.args(["ls"]).output().expect("run corgea");
+    let stderr = String::from_utf8_lossy(&out.stderr);
 
     assert!(
-        out.status.success(),
-        "a parseable config must not stop the run: {}",
-        String::from_utf8_lossy(&out.stderr)
+        !stderr.contains("Failed to load config"),
+        "a parseable config must load: {stderr}"
+    );
+    // Reaching the auth gate is what proves the config was read: the token it
+    // found was the empty one written above.
+    assert!(
+        stderr.contains("No token set"),
+        "expected the run to get as far as the auth gate: {stderr}"
     );
 }
