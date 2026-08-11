@@ -53,24 +53,23 @@ pub struct ScanUploadResult {
 }
 
 /// Build the URL to the Corgea scan page so users can track results.
-pub fn build_scan_url(config: &Config, result: &ScanUploadResult) -> String {
-    build_scan_url_from_base(&config.get_url(), result)
-}
-
-/// Build the scan page URL from an explicit base URL. Split out from
-/// `build_scan_url` so the project-segment encoding contract can be unit
-/// tested without constructing a `Config`.
-fn build_scan_url_from_base(base_url: &str, result: &ScanUploadResult) -> String {
-    match &result.project_id {
-        Some(pid) => format!("{}/project/{}/?scan_id={}", base_url, pid, result.scan_id),
-        // The project name is a free-form path segment. In CI it is
-        // `{owner/repo}-{pr}`, so it must be percent-encoded or the `/`
-        // would route the tracking link to the wrong project.
+///
+/// The project-name fallback is a free-form path segment — uploads from CI name
+/// the project `{owner/repo}-{pr}` — so it must be percent-encoded or the `/`
+/// would route the link to the wrong project.
+pub fn build_scan_url(
+    base_url: &str,
+    project_id: Option<&str>,
+    project_name: &str,
+    scan_id: &str,
+) -> String {
+    match project_id {
+        Some(pid) => format!("{}/project/{}/?scan_id={}", base_url, pid, scan_id),
         None => format!(
             "{}/project/{}?scan_id={}",
             base_url,
-            urlencoding::encode(&result.project_name),
-            result.scan_id
+            urlencoding::encode(project_name),
+            scan_id
         ),
     }
 }
@@ -78,7 +77,12 @@ fn build_scan_url_from_base(base_url: &str, result: &ScanUploadResult) -> String
 /// Print the scan page URL so the user can track the scan results without
 /// waiting for it to complete.
 pub fn print_scan_tracking_url(config: &Config, result: &ScanUploadResult) {
-    let scan_url = build_scan_url(config, result);
+    let scan_url = build_scan_url(
+        &config.get_url(),
+        result.project_id.as_deref(),
+        &result.project_name,
+        &result.scan_id,
+    );
     print!(
         "\n\nScan has started with ID: {}.\n\nYou can view it populate at the link:\n{}\n\n",
         result.scan_id,
@@ -594,18 +598,14 @@ pub fn upload_scan(
 mod tests {
     use super::*;
 
-    fn result(project_id: Option<&str>, project_name: &str) -> ScanUploadResult {
-        ScanUploadResult {
-            scan_id: "scan-123".to_string(),
-            project_id: project_id.map(|p| p.to_string()),
-            project_name: project_name.to_string(),
-        }
-    }
-
     #[test]
     fn scan_url_prefers_project_id_when_present() {
-        let url =
-            build_scan_url_from_base("https://www.corgea.app", &result(Some("42"), "some/name"));
+        let url = build_scan_url(
+            "https://www.corgea.app",
+            Some("42"),
+            "some/name",
+            "scan-123",
+        );
         assert_eq!(url, "https://www.corgea.app/project/42/?scan_id=scan-123");
     }
 
@@ -613,11 +613,22 @@ mod tests {
     fn scan_url_percent_encodes_project_name_fallback() {
         // CI project names are `{owner/repo}-{pr}`; the `/` must be encoded so
         // the link resolves to the intended project rather than a nested path.
-        let url =
-            build_scan_url_from_base("https://www.corgea.app", &result(None, "corgea/cli-15"));
+        let url = build_scan_url("https://www.corgea.app", None, "corgea/cli-15", "scan-123");
         assert_eq!(
             url,
             "https://www.corgea.app/project/corgea%2Fcli-15?scan_id=scan-123"
+        );
+    }
+
+    #[test]
+    fn scan_url_leaves_locally_derived_project_names_untouched() {
+        // `determine_project_name` already reduces names to `[alphanumeric-_.]`,
+        // which encoding leaves alone, so sharing this builder with the upload
+        // paths cannot change the links they were printing before.
+        let url = build_scan_url("https://www.corgea.app", None, "corgea_cli-1.0", "scan-123");
+        assert_eq!(
+            url,
+            "https://www.corgea.app/project/corgea_cli-1.0?scan_id=scan-123"
         );
     }
 }

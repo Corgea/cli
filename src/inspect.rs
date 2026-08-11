@@ -84,7 +84,7 @@ pub fn run(
             }
         }
     } else {
-        let scan_details = match utils::api::get_scan(&config.get_url(), id) {
+        let scan_details = match utils::api::get_scan(&config.get_url(), id, None) {
             Ok(details) => details,
             Err(e) => {
                 log::error!("Failed to fetch scan details for scan ID {}: {}", id, e);
