@@ -145,5 +145,8 @@ fn wait_exits_one_when_scan_detail_fails() {
     let context = output_context(&output, &transcript);
     assert_eq!(output.status.code(), Some(1), "{context}");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Oops! Something went wrong"), "{context}");
+    assert!(
+        stderr.contains(&format!("Unable to read scan '{scan_id}'")),
+        "{context}"
+    );
 }

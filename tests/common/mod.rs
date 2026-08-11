@@ -561,7 +561,7 @@ pub struct Routes {
     pub sca_issues: Option<String>,
     /// `GET /issues/code-quality` — the project-scoped `--code-quality` route.
     pub code_quality_issues: Option<String>,
-    /// `GET /scan/{id}` — `check_scan_status`.
+    /// `GET /scan/{id}` — the scan read behind `wait` and its polling loop.
     pub scan: Option<String>,
     /// `GET /scan/{id}/issues` — `report_scan_status` and the `--scan-id`
     /// issue route.
@@ -623,8 +623,8 @@ pub fn scan_issues_empty() -> String {
     r#"{"status":"ok","page":1,"total_pages":1,"total_issues":0,"issues":[]}"#.to_string()
 }
 
-/// `GET /api/v1/scan/{id}` returning a completed scan (`check_scan_status`
-/// checks the lowercase `complete`).
+/// `GET /api/v1/scan/{id}` returning a completed scan. Statuses are lowercase,
+/// as `classify_scan_status` expects.
 #[allow(dead_code)]
 pub fn scan_complete() -> String {
     r#"{"id":"scan-123","project":"bohappdev/dotnet-azure-web-tsb","repo":"https://github.com/bohappdev/dotnet-azure-web-tsb","branch":"main","status":"complete","engine":"blast","created_at":"2026-01-01T00:00:00Z"}"#.to_string()

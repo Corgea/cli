@@ -1,6 +1,6 @@
 //! End-to-end tests for `corgea wait` repo-URL project resolution (COR-1577).
-//! The `/api/v1/scan/` arm serves both `GET /scan/{id}` (`check_scan_status`)
-//! and `/scan/{id}/issues` (`report_scan_status`), branching on `/issues`.
+//! The `/api/v1/scan/` arm serves both `GET /scan/{id}` (the scan read) and
+//! `/scan/{id}/issues` (`report_scan_status`), branching on `/issues`.
 
 mod common;
 
