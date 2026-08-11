@@ -457,15 +457,7 @@ enum SkillCommands {
             help = "Persist the provided --agent as the default for future installs."
         )]
         set_default: bool,
-
-        #[arg(
-            long,
-            help = "Install the 'corgea' skill built into this binary instead of fetching it from the registry. Works offline and without a token."
-        )]
-        local: bool,
     },
-    /// Print the 'corgea' skill built into this binary
-    Show,
     /// Configure the default agent used when --agent is not provided
     SetDefaultAgent {
         #[arg(help = "Agent id (e.g. cursor, claude-code, codex).")]
@@ -517,36 +509,15 @@ fn default_log_level(debug_flag: i8) -> &'static str {
     }
 }
 
-/// Whether this command has to keep working when `~/.corgea` cannot be created.
-///
-/// Both of these serve the skill compiled into the binary: one prints it, the
-/// other writes it where the caller asked. Neither authenticates nor persists
-/// anything, so a read-only home — the sandbox an agent is most likely to run
-/// in — must not stop them. Every other command still fails loudly, because it
-/// needs a token or somewhere to save one.
-fn tolerates_unusable_home(command: &Option<Commands>) -> bool {
-    matches!(
-        command,
-        Some(Commands::Skill {
-            command: SkillCommands::Show | SkillCommands::Install { local: true, .. }
-        })
-    )
-}
-
 fn main() {
     let cli = Cli::parse();
-
-    let mut corgea_config = if tolerates_unusable_home(&cli.command) {
-        Config::load_or_defaults()
-    } else {
-        match Config::load() {
-            Ok(config) => config,
-            // `config.toml` is a file the user can edit, so a bad one is their
-            // problem to fix, not a Rust panic with a backtrace note.
-            Err(e) => {
-                eprintln!("Failed to load config: {}", e);
-                std::process::exit(1);
-            }
+    let mut corgea_config = match Config::load() {
+        Ok(config) => config,
+        // `config.toml` is a file the user can edit, so a bad one is theirs to
+        // fix, not a Rust panic with a backtrace note.
+        Err(e) => {
+            eprintln!("Failed to load config: {}", e);
+            std::process::exit(1);
         }
     };
     init_logging(&corgea_config);
@@ -904,13 +875,8 @@ fn main() {
                 scope,
                 dir,
                 set_default,
-                local,
             } => {
-                // --local reads a string compiled into this binary, so it must
-                // not require a login the way the registry path does.
-                if !*local {
-                    verify_token_and_exit_when_fail(&corgea_config);
-                }
+                verify_token_and_exit_when_fail(&corgea_config);
                 skill::run_install(
                     &mut corgea_config,
                     name,
@@ -918,11 +884,7 @@ fn main() {
                     scope,
                     dir.clone(),
                     *set_default,
-                    *local,
                 );
-            }
-            SkillCommands::Show => {
-                skill::run_show();
             }
             SkillCommands::SetDefaultAgent { agent } => {
                 skill::run_set_default_agent(&mut corgea_config, agent);

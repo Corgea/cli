@@ -8,6 +8,25 @@ allowed-tools: Shell, Read, Grep, Glob, StrReplace
 
 Find and fix security vulnerabilities using AI-powered scanning (BLAST), third-party scanners, and AI-generated fixes.
 
+## Check the installed version first
+
+This file describes a CLI version, not the one on the machine. Run `corgea --version` before relying on anything below.
+
+```bash
+corgea --version
+```
+
+`corgea --help` and `corgea <command> --help` come from the installed binary, so they are authoritative about which commands and flags exist. **Where this file and `--help` disagree, `--help` is right.** Confirm any command from here that you have not seen in `--help` before running it.
+
+If a command or flag is missing, the CLI is likely older than this reference. Report that to the user with the upgrade for how it was installed, rather than upgrading unprompted — CI runners and self-hosted installs are often pinned deliberately.
+
+```bash
+pip install --upgrade corgea-cli      # installed with pip
+npm install -g @corgea/cli            # installed with npm
+```
+
+A missing flag is the visible case. A flag whose default or output shape changed will not error, so treat a surprising result on an older CLI as a version difference before treating it as a bug.
+
 ## Commands
 
 ### Scan — `corgea scan [scanner]`

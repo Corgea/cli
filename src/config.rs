@@ -54,14 +54,6 @@ impl Config {
         Ok(file_path)
     }
 
-    /// Where the config lives, creating nothing on the way to it.
-    fn config_path_readonly() -> Option<PathBuf> {
-        let mut path = dirs::home_dir()?;
-        path.push(".corgea");
-        path.push("config.toml");
-        Some(path)
-    }
-
     /// The settings a fresh install starts from, before anything is persisted.
     fn defaults() -> Self {
         Self {
@@ -80,25 +72,6 @@ impl Config {
         }
     }
 
-    /// Read the persisted settings, touching nothing.
-    ///
-    /// `load` creates `~/.corgea/config.toml` and fails when it cannot, which is
-    /// right for commands that authenticate or persist something. Commands that
-    /// only serve the skill compiled into the binary need neither: they have to
-    /// run against a read-only home, and must not leave state behind on a
-    /// writable one. A home that is absent, unreadable or malformed therefore
-    /// yields the defaults rather than an error or a newly written file.
-    pub fn load_or_defaults() -> Self {
-        let mut config = Self::config_path_readonly()
-            .and_then(|path| fs::read_to_string(path).ok())
-            .and_then(|contents| toml::from_str(&contents).ok())
-            .unwrap_or_else(Self::defaults);
-
-        config.apply_env_overrides();
-
-        config
-    }
-
     pub fn load() -> io::Result<Self> {
         let file_path = Self::config_path()?;
 
@@ -111,8 +84,8 @@ impl Config {
         let contents = fs::read_to_string(&file_path)?;
 
         // An unparseable config is a normal error, not a bug: it is a file the
-        // user can edit. Returning it lets callers that tolerate a bad config
-        // fall back, and gives the rest a message naming the file.
+        // user can edit. Returning it rather than panicking lets the caller
+        // report it as what it is, naming the file to fix.
         let mut config: Self = toml::from_str(&contents).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,

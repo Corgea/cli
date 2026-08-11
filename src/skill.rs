@@ -1,19 +1,7 @@
 use crate::config::Config;
 use crate::utils;
 use crate::utils::terminal::{set_text_color, TerminalColor};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-
-/// The skill this binary was built from, so the reference an agent reads always
-/// matches the CLI it is driving. Kept out of the registry path deliberately:
-/// reading it must work offline and without a token.
-pub const EMBEDDED_SKILL: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/skills/corgea/SKILL.md"
-));
-
-/// The name `--local` installs under, and the only name it accepts.
-pub const EMBEDDED_SKILL_NAME: &str = "corgea";
 
 /// Supported agents and where their skills are installed.
 ///
@@ -131,32 +119,46 @@ pub fn run_set_default_agent(config: &mut Config, agent: &str) {
     }
 }
 
-/// `corgea skill show`
-///
-/// Writes the embedded skill to stdout verbatim so it can be piped or read by
-/// an agent. No token, no network, no formatting.
-pub fn run_show() {
-    // Rust ignores SIGPIPE, so `corgea skill show | head` would otherwise panic
-    // once the skill outgrows the pipe buffer. A closed reader is a normal exit.
-    match std::io::stdout().write_all(EMBEDDED_SKILL.as_bytes()) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-        Err(e) => {
-            eprintln!("Failed to write skill: {}", e);
-            std::process::exit(1);
+/// `corgea skill install <name[@version]>`
+pub fn run_install(
+    config: &mut Config,
+    name_arg: &str,
+    agent: Option<String>,
+    scope: &str,
+    dir: Option<String>,
+    set_default: bool,
+) {
+    let (skill_name, version) = parse_skill_arg(name_arg);
+
+    if !["project", "user"].contains(&scope) {
+        eprintln!("Invalid scope '{}'. Expected 'project' or 'user'.", scope);
+        std::process::exit(1);
+    }
+
+    // Resolve the agent (flag > configured default) unless a custom dir is set.
+    let resolved_agent = agent.clone().or_else(|| config.get_default_agent());
+    if dir.is_none() && resolved_agent.is_none() {
+        eprintln!(
+            "No agent specified. Pass --agent <name>, set a default with \
+             'corgea skill set-default-agent <name>', or use --dir.\nSupported agents: {}",
+            supported_agent_ids()
+        );
+        std::process::exit(1);
+    }
+    if dir.is_none() {
+        if let Some(ref a) = resolved_agent {
+            if !is_supported_agent(a) {
+                eprintln!(
+                    "Unsupported agent '{}'. Supported agents: {}",
+                    a,
+                    supported_agent_ids()
+                );
+                std::process::exit(1);
+            }
         }
     }
-}
 
-/// Fetch an approved skill from the Corgea registry, exiting on any failure.
-///
-/// Returns the skill body and a display label for the resolved version.
-fn fetch_registry_skill(
-    config: &Config,
-    skill_name: &str,
-    version: Option<&str>,
-) -> (String, String) {
-    let result = utils::api::get_skill(config.get_url().as_str(), skill_name, version);
+    let result = utils::api::get_skill(config.get_url().as_str(), &skill_name, version.as_deref());
 
     let response = match result {
         Ok(Some(resp)) => resp,
@@ -229,88 +231,7 @@ fn fetch_registry_skill(
         std::process::exit(1);
     }
 
-    let label = format!("v{}", version_info.version);
-    (version_info.content.unwrap_or_default(), label)
-}
-
-/// Resolve the embedded skill for `--local`, exiting if the request does not
-/// match what this binary carries.
-fn embedded_skill_or_exit(skill_name: &str, version: Option<&str>) -> (String, String) {
-    if skill_name != EMBEDDED_SKILL_NAME {
-        eprintln!(
-            "{}",
-            set_text_color(
-                &format!(
-                    "--local can only install '{}', the skill built into this binary. \
-                     Drop --local to fetch '{}' from the registry.",
-                    EMBEDDED_SKILL_NAME, skill_name
-                ),
-                TerminalColor::Red
-            )
-        );
-        std::process::exit(1);
-    }
-    if version.is_some() {
-        eprintln!(
-            "{}",
-            set_text_color(
-                "--local installs the skill pinned to this binary, so a version cannot be \
-                 requested. Drop the version, or drop --local to pick one from the registry.",
-                TerminalColor::Red
-            )
-        );
-        std::process::exit(1);
-    }
-
-    let label = format!("v{}, embedded", env!("CARGO_PKG_VERSION"));
-    (EMBEDDED_SKILL.to_string(), label)
-}
-
-/// `corgea skill install <name[@version]>`
-pub fn run_install(
-    config: &mut Config,
-    name_arg: &str,
-    agent: Option<String>,
-    scope: &str,
-    dir: Option<String>,
-    set_default: bool,
-    local: bool,
-) {
-    let (skill_name, version) = parse_skill_arg(name_arg);
-
-    if !["project", "user"].contains(&scope) {
-        eprintln!("Invalid scope '{}'. Expected 'project' or 'user'.", scope);
-        std::process::exit(1);
-    }
-
-    // Resolve the agent (flag > configured default) unless a custom dir is set.
-    let resolved_agent = agent.clone().or_else(|| config.get_default_agent());
-    if dir.is_none() && resolved_agent.is_none() {
-        eprintln!(
-            "No agent specified. Pass --agent <name>, set a default with \
-             'corgea skill set-default-agent <name>', or use --dir.\nSupported agents: {}",
-            supported_agent_ids()
-        );
-        std::process::exit(1);
-    }
-    if dir.is_none() {
-        if let Some(ref a) = resolved_agent {
-            if !is_supported_agent(a) {
-                eprintln!(
-                    "Unsupported agent '{}'. Supported agents: {}",
-                    a,
-                    supported_agent_ids()
-                );
-                std::process::exit(1);
-            }
-        }
-    }
-
-    let (content, version_label) = if local {
-        embedded_skill_or_exit(&skill_name, version.as_deref())
-    } else {
-        fetch_registry_skill(config, &skill_name, version.as_deref())
-    };
+    let content = version_info.content.unwrap_or_default();
 
     let cwd = match std::env::current_dir() {
         Ok(p) => p,
@@ -351,9 +272,9 @@ pub fn run_install(
         "{}",
         set_text_color(
             &format!(
-                "Installed skill '{}' ({}) to {}",
+                "Installed skill '{}' (v{}) to {}",
                 skill_name,
-                version_label,
+                version_info.version,
                 skill_file.display()
             ),
             TerminalColor::Green
@@ -442,28 +363,5 @@ mod tests {
         let home = PathBuf::from("/home/user");
         let result = resolve_skill_dir("foo", None, "project", None, &cwd, &home);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_embedded_skill_is_present() {
-        assert!(!EMBEDDED_SKILL.trim().is_empty());
-    }
-
-    #[test]
-    fn test_embedded_skill_has_frontmatter_naming_itself() {
-        let mut lines = EMBEDDED_SKILL.lines();
-        assert_eq!(
-            lines.next().map(str::trim),
-            Some("---"),
-            "embedded skill must open with YAML frontmatter"
-        );
-        let frontmatter: Vec<&str> = lines.take_while(|l| l.trim() != "---").collect();
-        assert!(
-            frontmatter
-                .iter()
-                .any(|l| l.trim() == format!("name: {}", EMBEDDED_SKILL_NAME)),
-            "frontmatter name must stay '{}', which is what --local installs under",
-            EMBEDDED_SKILL_NAME
-        );
     }
 }
