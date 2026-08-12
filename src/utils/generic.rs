@@ -37,11 +37,15 @@ const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
 /// - If `target` is `Some(target_str)`, resolves the target using the targets module and creates zip from those files.
 ///   The target string can be a comma-separated list of files, directories, globs, or git selectors.
 /// - `user_exclude` is an optional comma-separated list of glob patterns from `--exclude`.
+/// - `extra_files` are staged files added to the root of the zip as
+///   `(source path, zip entry name)`. They come from explicit flags such as
+///   `--include-image`, so exclude rules don't apply to them.
 pub fn create_zip_from_target<P: AsRef<Path>>(
     target: Option<&str>,
     output_zip: P,
     exclude_globs: Option<&[&str]>,
     user_exclude: Option<&str>,
+    extra_files: &[(PathBuf, String)],
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let exclude_globs = exclude_globs.unwrap_or(DEFAULT_EXCLUDE_GLOBS);
 
@@ -123,6 +127,13 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
         } else if is_excluded && path.is_file() && target.is_some() {
             excluded_files.push(relative_path);
         }
+    }
+
+    for (path, entry_name) in extra_files {
+        zip.start_file(entry_name.as_str(), options)?;
+        let mut file = File::open(path)?;
+        io::copy(&mut file, &mut zip)?;
+        added_files.push(path.clone());
     }
 
     // Print warnings for excluded files
@@ -493,7 +504,7 @@ mod tests {
         // which would exclude *everything*. The filter + warn path under test
         // is identical either way.
         let excludes: &[&str] = &["**/node_modules/**"];
-        let added = create_zip_from_target(Some(&target), &output_zip, Some(excludes), None)
+        let added = create_zip_from_target(Some(&target), &output_zip, Some(excludes), None, &[])
             .expect("zip creation should succeed");
 
         assert!(
@@ -506,6 +517,39 @@ mod tests {
             "node_modules file should be excluded: {:?}",
             added
         );
+    }
+
+    #[test]
+    fn create_zip_from_target_adds_extra_files_at_the_zip_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let source = root.join("main.py");
+        fs::write(&source, "print(1)").unwrap();
+
+        let staged = root.join("staged").join("image.tar");
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::write(&staged, "image archive").unwrap();
+
+        let output_zip = root.join("out.zip");
+        let entry_name = "corgea-image-scanning-myapp-1.0.tar".to_string();
+        let extra_files = vec![(staged.clone(), entry_name.clone())];
+        let added = create_zip_from_target(
+            Some(&source.display().to_string()),
+            &output_zip,
+            Some(&[]),
+            None,
+            &extra_files,
+        )
+        .expect("zip creation should succeed");
+
+        assert!(added.contains(&staged), "staged archive should be added");
+
+        let mut archive = zip::ZipArchive::new(File::open(&output_zip).unwrap()).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(names.contains(&entry_name), "zip entries: {:?}", names);
     }
 
     #[test]

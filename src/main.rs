@@ -1,6 +1,7 @@
 mod authorize;
 mod cicd;
 mod config;
+mod images;
 mod inspect;
 mod list;
 mod log;
@@ -161,6 +162,13 @@ enum Commands {
             help = "Generate a CycloneDX SBOM of the project after the scan completes, alongside any report. Optionally specify the output file. Defaults to bom.json."
         )]
         sbom: Option<String>,
+
+        #[arg(
+            long = "include-image",
+            value_name = "IMAGE:TAG",
+            help = "Scan a fully built container image (repeatable), e.g. --include-image myapp:1.2.3 --include-image ghcr.io/acme/api:latest. Each image is exported with docker (or podman), pulled first if it isn't available locally, and uploaded with your project. Corgea scans the images you pass instead of searching your code for base images. Requires container scanning to be enabled for your account."
+        )]
+        include_image: Vec<String>,
     },
     /// Wait for the latest in progress scan
     Wait {
@@ -639,6 +647,7 @@ fn main() {
             exclude,
             project_name,
             sbom,
+            include_image,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             if let Some(level) = fail_on {
@@ -762,6 +771,19 @@ fn main() {
                 std::process::exit(1);
             }
 
+            if !include_image.is_empty() && *scanner != Scanner::Blast {
+                ::log::error!("--include-image is only supported with the blast scanner.");
+                std::process::exit(1);
+            }
+
+            let include_images = match images::normalize_image_refs(include_image) {
+                Ok(refs) => refs,
+                Err(e) => {
+                    ::log::error!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config, project_name.clone()),
                 Scanner::Semgrep => scan::run_semgrep(&corgea_config, project_name.clone()),
@@ -780,6 +802,7 @@ fn main() {
                     exclude.clone(),
                     project_name.clone(),
                     sbom.clone(),
+                    include_images,
                 ),
             }
         }

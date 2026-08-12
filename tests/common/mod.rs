@@ -37,6 +37,7 @@ pub fn corgea_isolated() -> (Command, TempDir) {
         .env_remove("CORGEA_PYPI_REGISTRY")
         .env_remove("CORGEA_VULN_API_URL")
         .env_remove("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL")
+        .env_remove("CORGEA_CONTAINER_ENGINE")
         .env_remove("AI_AGENT")
         .env_remove("CODEX_SANDBOX")
         .env_remove("CLAUDECODE")

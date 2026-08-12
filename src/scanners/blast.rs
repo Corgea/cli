@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::images;
 use crate::scan::build_scan_url;
 use crate::targets;
 use crate::utils;
@@ -6,6 +7,7 @@ use crate::utils::api::SCAIssue;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,6 +19,33 @@ const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(10 * 60 * 60);
 
 /// Overrides how long the CI gate waits for blocking rules to be evaluated.
 const BLOCKING_RULES_TIMEOUT_ENV: &str = "CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS";
+
+/// Export every `--include-image` reference into the scan bundle. Corgea scans
+/// the archives it finds there instead of resolving base images from the source
+/// tree, so a fully built image is scanned as it ships.
+fn export_included_images(
+    images: &[String],
+    temp_dir: &Path,
+) -> Result<Vec<images::SavedImage>, String> {
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    println!(
+        "Including {} container image(s) in this scan. Corgea will scan them instead of the base images referenced in your code.\n",
+        images.len()
+    );
+
+    let archives = images::save_images(images, &temp_dir.join("images"))?;
+
+    println!("\nContainer images bundled with this scan:");
+    for archive in &archives {
+        println!("  {}", archive.description());
+    }
+    println!();
+
+    Ok(archives)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -34,6 +63,7 @@ pub fn run(
     exclude: Option<String>,
     project_name: Option<String>,
     sbom: Option<String>,
+    include_images: Vec<String>,
 ) {
     // Validate that only_uncommitted and target are not used together
     if *only_uncommitted && target.is_some() {
@@ -83,6 +113,19 @@ pub fn run(
             std::process::exit(1);
         }
     }
+
+    let image_archives = match export_included_images(&include_images, &temp_dir) {
+        Ok(archives) => archives,
+        Err(message) => {
+            log::error!("\n\n{}\n", message);
+            let _ = utils::generic::delete_directory(&temp_dir);
+            std::process::exit(1);
+        }
+    };
+    let extra_zip_files: Vec<(PathBuf, String)> = image_archives
+        .iter()
+        .map(|archive| (archive.path.clone(), archive.archive_name.clone()))
+        .collect();
 
     let stop_signal = Arc::new(Mutex::new(false));
     let stop_signal_clone = Arc::clone(&stop_signal);
@@ -176,7 +219,13 @@ pub fn run(
         }
     }
 
-    match utils::generic::create_zip_from_target(target_str, &zip_path, None, exclude.as_deref()) {
+    match utils::generic::create_zip_from_target(
+        target_str,
+        &zip_path,
+        None,
+        exclude.as_deref(),
+        &extra_zip_files,
+    ) {
         Ok(added_files) => {
             if added_files.is_empty() {
                 *stop_signal.lock().unwrap() = true;
@@ -240,6 +289,8 @@ pub fn run(
                 config.get_url(),
                 e
             );
+            // Exported image archives can be gigabytes; don't leave them behind.
+            let _ = utils::generic::delete_directory(&temp_dir);
             std::process::exit(1);
         }
     };

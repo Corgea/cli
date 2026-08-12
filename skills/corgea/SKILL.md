@@ -41,6 +41,8 @@ corgea scan --fail                             # Deprecated: exit 1 based on eve
 corgea scan --out-format json --out-file r.json   # Export (json, html, sarif, markdown)
 corgea scan --sbom                             # Also write a CycloneDX SBOM to bom.json
 corgea scan --sbom sbom.cdx.json               # SBOM to a custom file
+corgea scan --include-image myapp:1.2.3        # Also scan a fully built container image
+corgea scan --include-image myapp:1.2.3 --include-image ghcr.io/acme/api:latest  # Repeatable
 corgea scan --project-name my-service          # Override project name
 ```
 
@@ -51,6 +53,8 @@ Scan types: `blast` (base AI), `policy` (PolicyIQ), `malicious`, `secrets`, `pii
 `--block-on` takes comma-separated blocking-rule slugs. Blocking rules are configured in the web app and each one applies either to pull requests or to CI. Only CI rules can be named by `--block-on`; a slug that is unknown, inactive, or scoped to pull requests is a hard error (exit 1) rather than a silently skipped gate. The slug is shown next to each rule in the web app and is derived from the rule name, so renaming a rule changes its slug. Name rules for the condition that trips them — `criticals`, not `no-criticals` — so that `--block-on` reads as a direct assertion rather than a double negative.
 
 `--fail` is deprecated. It evaluates every active blocking rule regardless of what it applies to; use `--block-on` to name the CI rules a pipeline should enforce.
+
+`--include-image` scans the image you actually ship. Without it, container scanning discovers the base images referenced by Dockerfiles and Compose files in the repo and scans those. With it, each image is exported to a tar archive with `docker save` (or `podman save`), bundled with the project, and scanned as a whole — base-image discovery is skipped for that scan. Images that aren't available locally are pulled first, so build (or pull) the image before the scan and stay logged in to its registry. Set `CORGEA_CONTAINER_ENGINE` to choose a specific container CLI. Container scanning must be enabled for your account.
 
 `--only-uncommitted` and `--target` are mutually exclusive. `--fail-on`, `--fail`, and `--block-on` are mutually exclusive.
 
@@ -351,6 +355,13 @@ corgea scan
 
 ```bash
 corgea scan --only-uncommitted --fail-on HI
+```
+
+### Scan the container image a build produced
+
+```bash
+docker build -t myapp:1.2.3 .
+corgea scan --include-image myapp:1.2.3
 ```
 
 ### Scan a PR diff
