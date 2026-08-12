@@ -1,5 +1,5 @@
 use crate::utils::terminal::{set_text_color, TerminalColor};
-use git2::{Repository, StatusOptions};
+use git2::{IndexEntryExtendedFlag, IndexEntryFlag, Repository, StatusOptions};
 use globset::{Glob, GlobSetBuilder};
 use ignore::WalkBuilder;
 use std::env;
@@ -109,8 +109,7 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     let mut excluded_files = Vec::new();
 
     for (path, relative_path) in files_to_zip {
-        // Match against the repo-relative path. Absolute paths (target mode)
-        // can live under `/tmp/...` on Linux and would falsely hit `**/tmp/**`.
+        // Match repo-relative paths so abs `/tmp/...` targets don't hit `**/tmp/**`.
         let is_excluded = glob_set.is_match(&relative_path);
 
         if (path.is_file() || path.is_dir()) && !is_excluded {
@@ -269,14 +268,13 @@ pub fn get_env_var_if_exists(var_name: &str) -> Option<String> {
     }
 }
 
-/// Worktree identity (branch / url / sha) at the repo root.
-/// Does not walk git status — `dirty` is always false. Use
-/// [`get_repo_info_for_scan`] when building BLAST upload metadata.
+/// Repo identity at the worktree root. Does not sample dirty state — use
+/// [`get_repo_info_for_scan`] for BLAST uploads.
 pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
     get_repo_info_inner(dir, false)
 }
 
-/// Like [`get_repo_info`], plus a worktree dirty sample for scan uploads.
+/// [`get_repo_info`] plus dirty sampling for scan uploads.
 pub fn get_repo_info_for_scan(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
     get_repo_info_inner(dir, true)
 }
@@ -311,24 +309,34 @@ fn get_repo_info_inner(dir: &str, sample_dirty: bool) -> Result<Option<RepoInfo>
             .map(|commit| commit.id().to_string())
     });
 
+    let (dirty, status_dirty) = if sample_dirty {
+        worktree_dirty_flags(&repo)
+    } else {
+        (false, false)
+    };
+
     Ok(Some(RepoInfo {
         branch,
         repo_url: origin_url(&repo),
         sha,
-        dirty: sample_dirty && is_worktree_dirty(&repo),
+        dirty,
+        status_dirty,
     }))
 }
 
-/// True when the worktree has modified, staged, or untracked files (including
-/// dirty submodules). Gitignored paths alone do not count.
-///
-/// Untracked paths that packaging would later drop via `DEFAULT_EXCLUDE_GLOBS`
-/// still count as dirty (false-positive dirty costs a full scan, not a miss).
-/// Status errors also treat the tree as dirty so we never claim clean HEAD.
-fn is_worktree_dirty(repo: &Repository) -> bool {
+/// `(upload_dirty, status_dirty)`.
+/// `upload_dirty`: status changes, dirty submodules, or assume-unchanged /
+/// skip-worktree (status hides those). Errors fail closed to dirty.
+/// `status_dirty`: non-empty `statuses()` only (user notice).
+fn worktree_dirty_flags(repo: &Repository) -> (bool, bool) {
+    let status_dirty = status_has_changes(repo);
+    let upload_dirty = index_hides_worktree(repo) || status_dirty;
+    (upload_dirty, status_dirty)
+}
+
+fn status_has_changes(repo: &Repository) -> bool {
     let mut opts = StatusOptions::new();
-    // Include submodule status: packaging walks into submodule dirs, so a
-    // modified checkout must not be advertised as clean parent HEAD.
+    // Submodules: packaging walks into them, so dirty checkouts must count.
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
         .include_ignored(false);
@@ -337,11 +345,21 @@ fn is_worktree_dirty(repo: &Repository) -> bool {
         .unwrap_or(true)
 }
 
-/// Merge before/after packaging samples into upload metadata.
-///
-/// Only `dirty=false` when both samples exist, are clean, and share the same
-/// SHA. Any missing sample, dirty sample, or SHA drift fails safe to dirty.
-/// Prefer the post-packaging sample for branch/url/sha display.
+/// assume-unchanged / skip-worktree are omitted from `statuses()`.
+fn index_hides_worktree(repo: &Repository) -> bool {
+    repo.index()
+        .map(|index| {
+            index.iter().any(|entry| {
+                IndexEntryFlag::from_bits_truncate(entry.flags).is_valid()
+                    || IndexEntryExtendedFlag::from_bits_truncate(entry.flags_extended)
+                        .is_skip_worktree()
+            })
+        })
+        .unwrap_or(true)
+}
+
+/// Merge before/after packaging samples. Clean only if both exist, both clean,
+/// same SHA; otherwise dirty. Prefer post-packaging branch/url/sha.
 pub fn reconcile_repo_info_for_upload(
     before: Option<RepoInfo>,
     after: Option<RepoInfo>,
@@ -360,6 +378,7 @@ pub fn reconcile_repo_info_for_upload(
                 repo_url: after.repo_url.or(before.repo_url),
                 sha: after.sha.or(before.sha),
                 dirty: !stable_clean,
+                status_dirty: before.status_dirty || after.status_dirty,
             })
         }
     }
@@ -473,9 +492,10 @@ pub struct RepoInfo {
     pub branch: Option<String>,
     pub repo_url: Option<String>,
     pub sha: Option<String>,
-    /// Upload must not be treated as an exact clean HEAD snapshot.
-    /// Always false from [`get_repo_info`] (unsampled); set by [`get_repo_info_for_scan`].
+    /// Not an exact clean HEAD snapshot. Always false from [`get_repo_info`].
     pub dirty: bool,
+    /// Non-empty git status (excludes index hide-bits). Drives user notice.
+    pub status_dirty: bool,
 }
 
 #[cfg(test)]
@@ -543,6 +563,7 @@ mod tests {
             .unwrap()
             .expect("repo info");
         assert!(info.dirty);
+        assert!(info.status_dirty);
     }
 
     #[test]
@@ -556,6 +577,7 @@ mod tests {
             .unwrap()
             .expect("repo info");
         assert!(info.dirty);
+        assert!(info.status_dirty);
     }
 
     #[test]
@@ -568,6 +590,7 @@ mod tests {
             .unwrap()
             .expect("repo info");
         assert!(info.dirty);
+        assert!(info.status_dirty);
     }
 
     #[test]
@@ -583,6 +606,35 @@ mod tests {
             .unwrap()
             .expect("repo info");
         assert!(!info.dirty);
+        assert!(!info.status_dirty);
+    }
+
+    #[test]
+    fn get_repo_info_for_scan_dirty_when_assume_unchanged_hides_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_committed_repo(root);
+        fs::write(root.join("README"), "changed").unwrap();
+        git(root, &["update-index", "--assume-unchanged", "README"]);
+        // status clean; zip would still include the edit
+        let info = get_repo_info_for_scan(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(info.dirty);
+        assert!(!info.status_dirty);
+    }
+
+    #[test]
+    fn get_repo_info_for_scan_dirty_when_skip_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_committed_repo(root);
+        git(root, &["update-index", "--skip-worktree", "README"]);
+        let info = get_repo_info_for_scan(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(info.dirty);
+        assert!(!info.status_dirty);
     }
 
     #[test]
@@ -595,16 +647,19 @@ mod tests {
             .unwrap()
             .expect("repo info");
         assert!(!clean.dirty);
+        assert!(!clean.status_dirty);
 
         fs::write(root.join("README"), "changed").unwrap();
         let identity = get_repo_info(root.to_str().unwrap())
             .unwrap()
             .expect("repo info");
         assert!(!identity.dirty);
+        assert!(!identity.status_dirty);
         let scan = get_repo_info_for_scan(root.to_str().unwrap())
             .unwrap()
             .expect("repo info");
         assert!(scan.dirty);
+        assert!(scan.status_dirty);
     }
 
     fn sample_info(sha: &str, dirty: bool) -> RepoInfo {
@@ -613,6 +668,7 @@ mod tests {
             repo_url: Some("https://github.com/org/repo.git".into()),
             sha: Some(sha.into()),
             dirty,
+            status_dirty: false,
         }
     }
 
@@ -669,8 +725,7 @@ mod tests {
         let parent = parent_dir.path();
         init_committed_repo(parent);
 
-        // Keep the submodule source outside the parent so it is not an
-        // untracked sibling that would itself mark the tree dirty.
+        // Submodule source outside parent so it isn't an untracked sibling.
         let sub_dir = tempfile::tempdir().unwrap();
         let sub_src = sub_dir.path();
         git(sub_src, &["init"]);
@@ -680,7 +735,6 @@ mod tests {
         git(sub_src, &["add", "lib.py"]);
         git(sub_src, &["commit", "-m", "sub init"]);
 
-        // Modern git blocks file:// clones unless explicitly allowed.
         git(
             parent,
             &[
@@ -754,21 +808,14 @@ mod tests {
 
     #[test]
     fn default_exclude_globs_match_abs_tmp_but_not_repo_relative_paths() {
-        // Linux CI tempdirs are `/tmp/...`. Matching DEFAULT_EXCLUDE_GLOBS on the
-        // absolute path made `--target` drop every file via `**/tmp/**`.
+        // Abs `/tmp/...` hits `**/tmp/**`; repo-relative paths must not.
         let mut builder = GlobSetBuilder::new();
         for &pattern in DEFAULT_EXCLUDE_GLOBS {
             builder.add(Glob::new(pattern).unwrap());
         }
         let set = builder.build().unwrap();
-        assert!(
-            set.is_match(Path::new("/tmp/proj/app.py")),
-            "absolute /tmp paths hit **/tmp/** (the CI failure mode)"
-        );
-        assert!(
-            !set.is_match(Path::new("app.py")),
-            "repo-relative paths must stay scannable"
-        );
+        assert!(set.is_match(Path::new("/tmp/proj/app.py")));
+        assert!(!set.is_match(Path::new("app.py")));
         assert!(!set.is_match(Path::new("src/app.py")));
     }
 

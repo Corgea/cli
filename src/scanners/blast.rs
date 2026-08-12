@@ -98,8 +98,7 @@ pub fn run(
         target.as_deref()
     };
 
-    // Sample before packaging so a mid-pack commit cannot advertise a new clean HEAD
-    // against an archive built from the previous (or mixed) tree.
+    // Before packaging: mid-pack HEAD move must not look like a clean new SHA.
     let repo_before = utils::generic::get_repo_info_for_scan("./").unwrap_or_default();
 
     if target_str.is_none() && exclude.is_some() {
@@ -219,10 +218,9 @@ pub fn run(
         utils::terminal::set_text_color("", utils::terminal::TerminalColor::Green)
     );
     let repo_after = utils::generic::get_repo_info_for_scan("./").unwrap_or_default();
-    // User notice reflects actual worktree dirtiness, not upload fail-safes
-    // (--target/--exclude or before/after SHA drift).
-    let worktree_dirty = repo_before.as_ref().is_some_and(|i| i.dirty)
-        || repo_after.as_ref().is_some_and(|i| i.dirty);
+    // Notice = visible status only (not index hide-bits / --target / SHA drift).
+    let worktree_dirty = repo_before.as_ref().is_some_and(|i| i.status_dirty)
+        || repo_after.as_ref().is_some_and(|i| i.status_dirty);
     if worktree_dirty {
         let notice_sha = repo_after
             .as_ref()
@@ -241,7 +239,7 @@ pub fn run(
         }
     }
     let mut repo_info = utils::generic::reconcile_repo_info_for_upload(repo_before, repo_after);
-    // Partial archives are not an exact HEAD snapshot even on a clean tree.
+    // --target/--exclude archives are never an exact HEAD snapshot.
     if target_str.is_some() || exclude.is_some() {
         if let Some(ref mut info) = repo_info {
             info.dirty = true;

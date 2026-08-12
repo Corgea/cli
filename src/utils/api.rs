@@ -350,7 +350,7 @@ pub fn upload_zip(
             if let Some(sha) = &info.sha {
                 form = form.part("sha", multipart::Part::text(sha.to_string()));
             }
-            // Always send dirty: omitted = old CLI; false = exact clean HEAD snapshot.
+            // Always send: omitted = old CLI; false = clean HEAD snapshot.
             form = form.part(
                 "dirty",
                 multipart::Part::text(if info.dirty { DIRTY_TRUE } else { DIRTY_FALSE }),
