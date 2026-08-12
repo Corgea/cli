@@ -72,7 +72,6 @@ pub fn run(
     fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
     let project_name = utils::generic::determine_project_name(project_name.as_deref());
     let zip_path = format!("{}/{}.zip", temp_dir.display(), project_name);
-    let repo_info = utils::generic::get_repo_info("./").unwrap_or_default();
     match utils::generic::create_path_if_not_exists(&temp_dir) {
         Ok(_) => (),
         Err(e) => {
@@ -98,6 +97,9 @@ pub fn run(
     } else {
         target.as_deref()
     };
+
+    // Before packaging: mid-pack HEAD move must not look like a clean new SHA.
+    let repo_before = utils::generic::get_repo_info_for_scan("./").unwrap_or_default();
 
     if target_str.is_none() && exclude.is_some() {
         println!("Excluding files matching: {}", exclude.as_deref().unwrap());
@@ -215,6 +217,34 @@ pub fn run(
         "\r{}Project packaged successfully.\n",
         utils::terminal::set_text_color("", utils::terminal::TerminalColor::Green)
     );
+    let repo_after = utils::generic::get_repo_info_for_scan("./").unwrap_or_default();
+    // Notice = visible status only (not index hide-bits / --target / SHA drift).
+    let worktree_dirty = repo_before.as_ref().is_some_and(|i| i.status_dirty)
+        || repo_after.as_ref().is_some_and(|i| i.status_dirty);
+    if worktree_dirty {
+        let notice_sha = repo_after
+            .as_ref()
+            .and_then(|i| i.sha.as_deref())
+            .or_else(|| repo_before.as_ref().and_then(|i| i.sha.as_deref()));
+        match notice_sha {
+            Some(sha) => {
+                let short_sha = &sha[..sha.len().min(7)];
+                println!(
+                    "Working tree has uncommitted changes - scanning your local files, not commit {short_sha}."
+                );
+            }
+            None => {
+                println!("Working tree has uncommitted changes - scanning your local files.")
+            }
+        }
+    }
+    let mut repo_info = utils::generic::reconcile_repo_info_for_upload(repo_before, repo_after);
+    // --target/--exclude archives are never an exact HEAD snapshot.
+    if target_str.is_some() || exclude.is_some() {
+        if let Some(ref mut info) = repo_info {
+            info.dirty = true;
+        }
+    }
     println!("\n\nSubmitting scan to Corgea:");
     let upload_result = match utils::api::upload_zip(
         &zip_path,
