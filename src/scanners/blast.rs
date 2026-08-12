@@ -100,7 +100,7 @@ pub fn run(
 
     // Sample before packaging so a mid-pack commit cannot advertise a new clean HEAD
     // against an archive built from the previous (or mixed) tree.
-    let repo_before = utils::generic::get_repo_info("./").unwrap_or_default();
+    let repo_before = utils::generic::get_repo_info_for_scan("./").unwrap_or_default();
 
     if target_str.is_none() && exclude.is_some() {
         println!("Excluding files matching: {}", exclude.as_deref().unwrap());
@@ -218,7 +218,7 @@ pub fn run(
         "\r{}Project packaged successfully.\n",
         utils::terminal::set_text_color("", utils::terminal::TerminalColor::Green)
     );
-    let repo_after = utils::generic::get_repo_info("./").unwrap_or_default();
+    let repo_after = utils::generic::get_repo_info_for_scan("./").unwrap_or_default();
     // User notice reflects actual worktree dirtiness, not upload fail-safes
     // (--target/--exclude or before/after SHA drift).
     let worktree_dirty = repo_before.as_ref().is_some_and(|i| i.dirty)

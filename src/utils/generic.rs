@@ -269,7 +269,19 @@ pub fn get_env_var_if_exists(var_name: &str) -> Option<String> {
     }
 }
 
+/// Worktree identity (branch / url / sha) at the repo root.
+/// Does not walk git status — `dirty` is always false. Use
+/// [`get_repo_info_for_scan`] when building BLAST upload metadata.
 pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
+    get_repo_info_inner(dir, false)
+}
+
+/// Like [`get_repo_info`], plus a worktree dirty sample for scan uploads.
+pub fn get_repo_info_for_scan(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
+    get_repo_info_inner(dir, true)
+}
+
+fn get_repo_info_inner(dir: &str, sample_dirty: bool) -> Result<Option<RepoInfo>, git2::Error> {
     // discover (not open) so worktrees / .git-as-file roots still resolve.
     let repo = match Repository::discover(Path::new(dir)) {
         Ok(repo) => repo,
@@ -299,13 +311,11 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
             .map(|commit| commit.id().to_string())
     });
 
-    let dirty = is_worktree_dirty(&repo);
-
     Ok(Some(RepoInfo {
         branch,
         repo_url: origin_url(&repo),
         sha,
-        dirty,
+        dirty: sample_dirty && is_worktree_dirty(&repo),
     }))
 }
 
@@ -463,7 +473,8 @@ pub struct RepoInfo {
     pub branch: Option<String>,
     pub repo_url: Option<String>,
     pub sha: Option<String>,
-    /// True when the upload must not be treated as an exact clean HEAD snapshot.
+    /// Upload must not be treated as an exact clean HEAD snapshot.
+    /// Always false from [`get_repo_info`] (unsampled); set by [`get_repo_info_for_scan`].
     pub dirty: bool,
 }
 
@@ -504,7 +515,6 @@ mod tests {
             .unwrap()
             .expect("repo root should yield SHA metadata");
         assert!(info.sha.is_some());
-        assert!(!info.dirty, "clean commit should report dirty=false");
         assert!(is_at_repo_root(root_s));
 
         assert!(
@@ -524,44 +534,44 @@ mod tests {
     }
 
     #[test]
-    fn get_repo_info_dirty_true_when_tracked_file_modified() {
+    fn get_repo_info_for_scan_dirty_true_when_tracked_file_modified() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_committed_repo(root);
         fs::write(root.join("README"), "changed").unwrap();
-        let info = get_repo_info(root.to_str().unwrap())
+        let info = get_repo_info_for_scan(root.to_str().unwrap())
             .unwrap()
             .expect("repo info");
         assert!(info.dirty);
     }
 
     #[test]
-    fn get_repo_info_dirty_true_when_change_staged() {
+    fn get_repo_info_for_scan_dirty_true_when_change_staged() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_committed_repo(root);
         fs::write(root.join("README"), "staged").unwrap();
         git(root, &["add", "README"]);
-        let info = get_repo_info(root.to_str().unwrap())
+        let info = get_repo_info_for_scan(root.to_str().unwrap())
             .unwrap()
             .expect("repo info");
         assert!(info.dirty);
     }
 
     #[test]
-    fn get_repo_info_dirty_true_when_untracked_file() {
+    fn get_repo_info_for_scan_dirty_true_when_untracked_file() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_committed_repo(root);
         fs::write(root.join("new.py"), "print(1)").unwrap();
-        let info = get_repo_info(root.to_str().unwrap())
+        let info = get_repo_info_for_scan(root.to_str().unwrap())
             .unwrap()
             .expect("repo info");
         assert!(info.dirty);
     }
 
     #[test]
-    fn get_repo_info_dirty_false_when_only_gitignored_file() {
+    fn get_repo_info_for_scan_dirty_false_when_only_gitignored_file() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_committed_repo(root);
@@ -569,10 +579,32 @@ mod tests {
         git(root, &["add", ".gitignore"]);
         git(root, &["commit", "-m", "ignore"]);
         fs::write(root.join("ignored.txt"), "secret").unwrap();
-        let info = get_repo_info(root.to_str().unwrap())
+        let info = get_repo_info_for_scan(root.to_str().unwrap())
             .unwrap()
             .expect("repo info");
         assert!(!info.dirty);
+    }
+
+    #[test]
+    fn get_repo_info_skips_dirty_sampling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_committed_repo(root);
+
+        let clean = get_repo_info_for_scan(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(!clean.dirty);
+
+        fs::write(root.join("README"), "changed").unwrap();
+        let identity = get_repo_info(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(!identity.dirty);
+        let scan = get_repo_info_for_scan(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(scan.dirty);
     }
 
     fn sample_info(sha: &str, dirty: bool) -> RepoInfo {
@@ -662,13 +694,13 @@ mod tests {
         );
         git(parent, &["commit", "-m", "add submodule"]);
 
-        let clean = get_repo_info(parent.to_str().unwrap())
+        let clean = get_repo_info_for_scan(parent.to_str().unwrap())
             .unwrap()
             .expect("repo info");
         assert!(!clean.dirty, "committed submodule should be clean");
 
         fs::write(parent.join("vendor").join("lib.py"), "v2\n").unwrap();
-        let dirty = get_repo_info(parent.to_str().unwrap())
+        let dirty = get_repo_info_for_scan(parent.to_str().unwrap())
             .unwrap()
             .expect("repo info");
         assert!(
