@@ -340,6 +340,31 @@ fn list_json_miss_is_valid_empty_envelope() {
 }
 
 #[test]
+fn list_sha_with_no_matching_scan_is_an_empty_result_not_a_project_miss() {
+    // An unconfirmed project (old or not-yet-onboarded backend) plus --sha: an
+    // empty page means "this commit has not been scanned", which is what a
+    // duplicate-skip path acts on by scanning. Reporting a project miss would
+    // send it looking for the wrong problem.
+    let (url, _hits) = spawn_stub(projects_empty(), scans_empty(), issues_miss());
+    let (_tmp, repo) = temp_git_repo("dotnet-azure-web-tsb", REMOTE);
+    let out = run_list(&["--json", "--sha", &"a".repeat(40)], &url, &repo);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout not JSON ({e}): {stdout}"));
+    assert_eq!(
+        v["results"].as_array().map(|a| a.len()),
+        Some(0),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
 fn list_issues_with_scan_id_skips_project_resolution() {
     // The scan-id issue route ignores the project, so no /projects call should
     // be made even from a real git repo where a remote IS present. (COR-1577)

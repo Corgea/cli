@@ -394,8 +394,10 @@ pub fn run(config: &Config, args: ListArgs) {
         // An unresolved project is a miss (exit 1, as --issues and `wait`); a
         // confirmed project with no scans is a valid empty result. So is an
         // explicit --project-name: /scans answers 200-empty either way, so the
-        // caller's own exact name is the better authority.
-        if scans.is_empty() && !resolved.confirmed && selector.name.is_none() {
+        // caller's own exact name is the better authority. So is --sha, whose
+        // empty page means "this commit has not been scanned" — the answer a
+        // duplicate-skip path acts on by scanning.
+        if scans.is_empty() && !resolved.confirmed && selector.name.is_none() && sha.is_none() {
             log::error!(
                 "No Corgea project found for {}. Run 'corgea scan' to create one, or pass --project-name <NAME>.",
                 resolved.tried_label
@@ -406,10 +408,13 @@ pub fn run(config: &Config, args: ListArgs) {
             return;
         }
         if scans.is_empty() {
-            println!(
-                "Project '{}' has no scans yet. Run 'corgea scan' to create one.",
-                project_name
-            );
+            match sha.as_deref() {
+                Some(sha) => println!("No scan of commit {} in project '{}'.", sha, project_name),
+                None => println!(
+                    "Project '{}' has no scans yet. Run 'corgea scan' to create one.",
+                    project_name
+                ),
+            }
             return;
         }
         let mut header = vec![
