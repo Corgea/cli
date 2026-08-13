@@ -173,9 +173,19 @@ fn sanitize(value: &str) -> String {
 
 /// Sanitizing and truncating can map two different references onto one name, so
 /// suffix duplicates instead of overwriting an archive that was already written.
+///
+/// Names are compared case-insensitively: image tags may carry uppercase, and on
+/// a case-insensitive filesystem `myapp:V1` and `myapp:v1` would otherwise be
+/// exported over each other and scanned as the same image.
 fn unique_archive_name(image: &str, saved: &[SavedImage]) -> String {
+    let is_taken = |candidate: &str| {
+        saved
+            .iter()
+            .any(|entry| entry.archive_name.eq_ignore_ascii_case(candidate))
+    };
+
     let candidate = archive_name(image);
-    if !saved.iter().any(|entry| entry.archive_name == candidate) {
+    if !is_taken(&candidate) {
         return candidate;
     }
 
@@ -184,7 +194,7 @@ fn unique_archive_name(image: &str, saved: &[SavedImage]) -> String {
         .unwrap_or(&candidate);
     for suffix in 2.. {
         let candidate = format!("{}-{}{}", stem, suffix, IMAGE_ARCHIVE_EXTENSION);
-        if !saved.iter().any(|entry| entry.archive_name == candidate) {
+        if !is_taken(&candidate) {
             return candidate;
         }
     }
@@ -364,8 +374,12 @@ mod tests {
     }
 
     /// Stub container CLI: reports every image as present locally and writes the
-    /// archive `save -o <path>` asks for.
+    /// archive `save -o <path>` asks for. POSIX shell, so every test that runs it
+    /// is Unix-only — Windows can't execute the script through `Command::new`.
+    #[cfg(unix)]
     fn stub_engine(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
         let path = dir.join("stub-engine.sh");
         let mut file = fs::File::create(&path).unwrap();
         writeln!(
@@ -385,16 +399,13 @@ exit 1
         drop(file);
 
         let mut permissions = fs::metadata(&path).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            permissions.set_mode(0o755);
-        }
+        permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).unwrap();
 
         path
     }
 
+    #[cfg(unix)]
     #[test]
     fn save_images_writes_one_archive_per_image() {
         let temp_dir = env_temp_dir("save-images");
@@ -419,6 +430,7 @@ exit 1
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn save_images_suffixes_colliding_archive_names() {
         let temp_dir = env_temp_dir("colliding-images");
@@ -441,6 +453,32 @@ exit 1
             saved[1].archive_name,
             "corgea-image-scanning-acme-app-1.0-2.tar"
         );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Tags may carry uppercase, and a case-insensitive filesystem would export
+    /// `myapp:V1` over `myapp:v1` — both images would then scan as one.
+    #[cfg(unix)]
+    #[test]
+    fn save_images_separates_references_differing_only_in_case() {
+        let temp_dir = env_temp_dir("case-collision");
+        let engine = stub_engine(&temp_dir);
+        let out_dir = temp_dir.join("images");
+
+        let saved = save_images_with_engine(
+            engine.to_str().unwrap(),
+            &["myapp:v1".to_string(), "myapp:V1".to_string()],
+            &out_dir,
+        )
+        .unwrap();
+
+        assert_eq!(saved[0].archive_name, "corgea-image-scanning-myapp-v1.tar");
+        assert_eq!(
+            saved[1].archive_name,
+            "corgea-image-scanning-myapp-V1-2.tar"
+        );
+        assert_ne!(saved[0].path, saved[1].path);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
