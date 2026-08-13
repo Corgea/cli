@@ -56,6 +56,8 @@ Scan types: `blast` (base AI), `policy` (PolicyIQ), `malicious`, `secrets`, `pii
 
 `--include-image` scans the image you actually ship. Without it, container scanning discovers the base images referenced by Dockerfiles and Compose files in the repo and scans those. With it, each image is exported to a tar archive with `docker save` (or `podman save`), bundled with the project, and scanned as a whole — base-image discovery is skipped for that scan. Images that aren't available locally are pulled first, so build (or pull) the image before the scan and stay logged in to its registry. Set `CORGEA_CONTAINER_ENGINE` to choose a specific container CLI. Container scanning must be enabled for your account.
 
+An included image is enough on its own: when it is combined with `--only-uncommitted` or `--target` and no source files match (a clean working tree, for example), the scan warns and covers just the image rather than failing. An archive named `corgea-image-scanning-*.tar` that is committed to the repository is ignored — only images passed on the command line are scanned.
+
 `--only-uncommitted` and `--target` are mutually exclusive. `--fail-on`, `--fail`, and `--block-on` are mutually exclusive.
 
 ### Upload — `corgea upload [report]`
