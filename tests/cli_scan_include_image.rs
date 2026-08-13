@@ -106,6 +106,23 @@ fn stub_project() -> TempDir {
     project
 }
 
+/// Commit everything in `dir` so the working tree is clean, which is what makes
+/// `--only-uncommitted` resolve to zero files.
+fn commit_everything(dir: &std::path::Path) {
+    let repo = git2::Repository::init(dir).expect("git init");
+    let mut index = repo.index().expect("index");
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+        .expect("stage files");
+    index.write().expect("write index");
+    let tree = repo
+        .find_tree(index.write_tree().expect("write tree"))
+        .expect("find tree");
+    let signature = git2::Signature::now("Corgea Test", "test@corgea.app").expect("signature");
+    repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+        .expect("commit");
+}
+
 #[cfg(unix)]
 #[test]
 fn scan_include_image_bundles_every_exported_archive() {
@@ -151,6 +168,73 @@ fn scan_include_image_bundles_every_exported_archive() {
             "uploaded zip should contain {archive}"
         );
     }
+}
+
+/// An explicit image is a complete scan payload: a clean working tree makes
+/// `--only-uncommitted` resolve to zero files, and the scan must still upload the
+/// exported archive instead of failing on the empty target.
+#[cfg(unix)]
+#[test]
+fn scan_only_uncommitted_with_include_image_uploads_the_archive() {
+    let (base_url, uploads) = spawn_recording_scan_stub("scan-clean-tree");
+    let project = stub_project();
+    commit_everything(project.path());
+    let bin = TempDir::new().expect("engine dir");
+    write_script(bin.path(), "stub-engine", STUB_ENGINE);
+
+    let (mut cmd, _home) = corgea_isolated();
+    cmd.current_dir(project.path())
+        .env("CORGEA_URL", &base_url)
+        .env("CORGEA_TOKEN", "test-token")
+        .env("CORGEA_CONTAINER_ENGINE", bin.path().join("stub-engine"))
+        .args(["scan", "--only-uncommitted", "--include-image", "myapp:1.0"]);
+
+    let output = cmd.output().expect("run corgea scan --only-uncommitted");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "image-only scan should succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("only the included container image"),
+        "should say the scan covers only the image, got:\n{stderr}"
+    );
+    assert!(uploaded_text(&uploads).contains("corgea-image-scanning-myapp-1.0.tar"));
+}
+
+/// A copy of an archive living in the repository must not ride along: it would put
+/// the backend into image-scanning mode on scans that never asked for it.
+#[test]
+fn scan_excludes_an_archive_checked_into_the_project() {
+    let (base_url, uploads) = spawn_recording_scan_stub("scan-stale-archive");
+    let project = stub_project();
+    fs::write(
+        project.path().join("corgea-image-scanning-stale-1.0.tar"),
+        "a stale export somebody committed",
+    )
+    .expect("write stale archive");
+
+    let (mut cmd, _home) = corgea_isolated();
+    cmd.current_dir(project.path())
+        .env("CORGEA_URL", &base_url)
+        .env("CORGEA_TOKEN", "test-token")
+        .args(["scan"]);
+
+    let output = cmd.output().expect("run corgea scan");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let uploaded = uploaded_text(&uploads);
+    assert!(
+        !uploaded.contains("corgea-image-scanning-stale-1.0.tar"),
+        "a checked-in archive should not be bundled"
+    );
+    assert!(uploaded.contains("main.py"), "source files still upload");
 }
 
 #[cfg(unix)]
