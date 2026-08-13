@@ -654,10 +654,10 @@ pub fn normalize_block_on(block_on: Option<&str>) -> Result<Option<String>, Stri
     Ok(Some(slugs.join(",")))
 }
 
-/// The distinct rule slugs that blocked the scan, for the failure message.
+/// The distinct rule slugs that blocked the scan.
 ///
 /// Falls back to rule ids against backends that do not send slugs yet.
-pub fn triggered_slug_summary(issues: &[utils::api::BlockingIssue]) -> String {
+pub fn triggered_slugs(issues: &[utils::api::BlockingIssue]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for issue in issues {
         let identifiers = match &issue.triggered_by_slugs {
@@ -670,7 +670,12 @@ pub fn triggered_slug_summary(issues: &[utils::api::BlockingIssue]) -> String {
             }
         }
     }
-    names.join(", ")
+    names
+}
+
+/// The distinct rule slugs that blocked the scan, for the failure message.
+pub fn triggered_slug_summary(issues: &[utils::api::BlockingIssue]) -> String {
+    triggered_slugs(issues).join(", ")
 }
 
 /// Whether a scan status means the scan has stopped, and if so, how it ended.

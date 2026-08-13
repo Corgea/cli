@@ -802,11 +802,17 @@ pub fn get_skill(
     Ok(Some(skill_response))
 }
 
+/// One page of a project's scans.
+///
+/// `sha` asks the server for the scans of one commit. A backend that does not
+/// support the filter answers the unfiltered page, so callers that rely on the
+/// narrowing must re-check `git_sha` on the results.
 pub fn query_scan_list(
     url: &str,
     project: Option<&str>,
     page: Option<u16>,
     page_size: Option<u16>,
+    sha: Option<&str>,
 ) -> Result<ScansResponse, Box<dyn Error>> {
     let url = format!("{}{}/scans", url, API_BASE);
     let page = page.unwrap_or(1);
@@ -818,6 +824,9 @@ pub fn query_scan_list(
     }
     if let Some(project) = project {
         query_params.push(("project", project.to_string()));
+    }
+    if let Some(sha) = sha {
+        query_params.push(("sha", sha.to_string()));
     }
 
     let client = http_client();
