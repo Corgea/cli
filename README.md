@@ -47,6 +47,36 @@ evaluated; override with `CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS`.
 trips: both are written before `--fail`/`--block-on` are evaluated, so a scan
 that exits 1 on a blocking rule still leaves its report behind to ingest.
 
+### Skipping a re-scan of the same commit
+
+A pipeline that re-runs on an unchanged commit can reuse the scan it already
+has instead of paying for a duplicate:
+
+```bash
+corgea scan --skip-if-commit-scanned-recently --block-on criticals
+corgea scan --skip-if-commit-scanned-recently --scanned-within 4h   # 90s, 30m, 4h, 7d
+```
+
+When the project already has a completed scan of the current commit inside the
+window (24h by default), that scan takes the new scan's place: the results
+table, the `--block-on` gate and its exit code, and any `--out-file` report all
+come from it, so the pipeline behaves the same whether or not a scan ran. The
+window exists because unchanged code is still exposed to advisories published
+since it was last scanned.
+
+Two lines make the outcome scriptable — `CORGEA_SCAN_SKIPPED=true` plus
+`CORGEA_SCAN_ID=<id>` when a scan was reused, `CORGEA_SCAN_SKIPPED=false` when
+one ran — so a later step (an ingest, say) can branch on it.
+
+A new scan runs anyway when nothing is reusable: no scan of the commit inside
+the window, only a failed or still-running one, a scan of a worktree that had
+uncommitted changes, or a lookup the platform could not answer. The one hard
+failure is an unresolvable commit (not a git repository, or no commits yet),
+which exits 1 rather than silently scanning.
+
+What gets reused is a scan of the whole commit, so the flag is not accepted
+alongside `--only-uncommitted`, `--target`, or `--exclude`.
+
 ## Dependency Inventory (offline)
 
 `corgea deps` builds a dependency inventory from npm, Python, and Java manifests

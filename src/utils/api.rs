@@ -808,18 +808,44 @@ pub fn query_scan_list(
     page: Option<u16>,
     page_size: Option<u16>,
 ) -> Result<ScansResponse, Box<dyn Error>> {
-    let url = format!("{}{}/scans", url, API_BASE);
     let page = page.unwrap_or(1);
-    let mut query_params = vec![("page", page.to_string())];
-    if let Some(p_size) = page_size {
-        query_params.push(("page_size", p_size.to_string()));
-    } else {
-        query_params.push(("page_size", "30".to_string()));
-    }
+    let mut query_params = vec![
+        ("page", page.to_string()),
+        ("page_size", page_size.unwrap_or(30).to_string()),
+    ];
     if let Some(project) = project {
         query_params.push(("project", project.to_string()));
     }
+    request_scan_list(url, query_params)
+}
 
+/// The project's scans at exactly `sha`, newest first.
+///
+/// The `sha` filter is server-side, but a backend that predates it ignores the
+/// unknown parameter and answers with the project's scans at any commit, so
+/// callers must re-check `git_sha` on every scan they act on.
+pub fn query_scans_for_commit(
+    url: &str,
+    project: &str,
+    sha: &str,
+    page_size: u16,
+) -> Result<ScansResponse, Box<dyn Error>> {
+    request_scan_list(
+        url,
+        vec![
+            ("page", "1".to_string()),
+            ("page_size", page_size.to_string()),
+            ("project", project.to_string()),
+            ("sha", sha.to_string()),
+        ],
+    )
+}
+
+fn request_scan_list(
+    url: &str,
+    query_params: Vec<(&str, String)>,
+) -> Result<ScansResponse, Box<dyn Error>> {
+    let url = format!("{}{}/scans", url, API_BASE);
     let client = http_client();
     debug(&format!("Sending request to URL: {}", url));
     let response = match client.get(url).query(&query_params).send() {
@@ -1425,6 +1451,11 @@ pub struct ScanResponse {
     pub created_at: String,
     #[serde(default)]
     pub git_sha: Option<String>,
+    /// Whether the scanned tree carried uncommitted changes. `None` when the
+    /// scan predates the flag or came from a client that never sent it, which
+    /// is not the same as a known-clean tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_dirty: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
     /// Why a scan ended without finishing. Only set for failed scans.
