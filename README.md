@@ -43,6 +43,42 @@ Waiting gives up after 10 hours; override with `CORGEA_SCAN_TIMEOUT_SECONDS`.
 `--fail`/`--block-on` then wait up to 15 minutes for blocking rules to be
 evaluated; override with `CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS`.
 
+## CI Blocking Rules
+
+`corgea scan --block-on <slugs>` fails a pipeline on the CI blocking rules
+configured in the web app, named by their comma-separated slugs.
+
+`corgea list --block-on <slugs>` answers the same question for a scan that
+already ran, which is what a pipeline needs when it skips a duplicate scan for a
+commit it has already scanned:
+
+```bash
+corgea ls --sha "$(git rev-parse HEAD)" --block-on criticals,malicious-deps --json
+```
+
+Each listed scan gains a `blocking_verdict` (`--json`) or a Blocking column:
+
+```json
+"blocking_verdict": {
+  "block_on": ["criticals", "malicious-deps"],
+  "status": "complete",
+  "block": true,
+  "blocked_issues": 3,
+  "triggered_rules": ["criticals"]
+}
+```
+
+Only `status: "complete"` is a final answer. `pending` means the server is still
+resolving the scan's dependencies, and `unavailable` means no verdict was
+produced — for a scan that never completed, or one past the per-page evaluation
+cap, with the cause in `reason`. Both leave `block` null, so read `status` first
+and fail closed on anything else. An evaluation that errors exits 1.
+
+A verdict costs one request per scan, and the server re-evaluates every finding
+in that scan, so at most the first 10 scans of a page are evaluated and
+`--block-on` shrinks the default page to 10. `--sha` narrows to one commit and
+takes the full SHA, since the server matches exactly.
+
 ## Dependency Inventory (offline)
 
 `corgea deps` builds a dependency inventory from npm, Python, and Java manifests
