@@ -54,6 +54,8 @@ Scan types: `blast` (base AI), `policy` (PolicyIQ), `malicious`, `secrets`, `pii
 
 `--only-uncommitted` and `--target` are mutually exclusive. `--fail-on`, `--fail`, and `--block-on` are mutually exclusive.
 
+`--out-format`/`--out-file` and `--sbom` are honored regardless of the gate: the report and the SBOM are written before `--fail`/`--block-on` are evaluated, so a scan that exits 1 on a blocking rule still leaves the report file behind for the pipeline to ingest.
+
 ### Upload — `corgea upload [report]`
 
 Upload an existing scan report to Corgea.
@@ -93,6 +95,8 @@ corgea ls --sca-issues                         # SCA (dependency) issues
 corgea ls --code-quality                       # Code quality issues
 corgea ls --issues --page 2 --page-size 10     # Pagination
 corgea ls --issues --scan-id SCAN_ID --json    # JSON output
+corgea ls --sha $(git rev-parse HEAD)          # Scans of one commit
+corgea ls --sha $(git rev-parse HEAD) --block-on criticals --json  # ...and their CI blocking-rule verdict
 ```
 
 | Flag | Short | Description |
@@ -101,9 +105,54 @@ corgea ls --issues --scan-id SCAN_ID --json    # JSON output
 | `--sca-issues` | `-c` | List SCA issues |
 | `--code-quality` | `-q` | List code quality issues (alias `--quality`) |
 | `--scan-id` | `-s` | Filter to a scan |
+| `--sha` | | List only the scans of one commit (scan listing only) |
+| `--block-on` | | Report each scan's verdict against the named CI blocking rules (scan listing only) |
 | `--page` | `-p` | Page number |
 | `--page-size` | | Items per page |
 | `--json` | | JSON output |
+
+#### Blocking-rule verdicts on a listed scan
+
+`corgea ls --block-on <slugs>` answers, for a scan that already ran, the same
+question `corgea scan --block-on <slugs>` gates on. It takes the same
+comma-separated CI rule slugs and adds a `blocking_verdict` to each scan in
+`--json` output (a Blocking column otherwise):
+
+```json
+{
+  "id": "…",
+  "git_sha": "…",
+  "blocking_verdict": {
+    "block_on": ["criticals", "malicious-deps"],
+    "status": "complete",
+    "block": true,
+    "blocked_issues": 3,
+    "triggered_rules": ["criticals"]
+  }
+}
+```
+
+`status` says whether the verdict can be trusted, and **only `complete` is a
+final answer**:
+
+| `status` | Meaning | `block` |
+|----------|---------|---------|
+| `complete` | Verdict is final | `true`/`false` |
+| `pending` | The server is still resolving the scan's dependencies; retry | `false`, not yet final |
+| `unavailable` | No verdict: the scan never completed, or it was past the per-page evaluation cap (see `reason`) | `null` |
+
+Read `status` before `block`, and treat anything other than `complete` as
+fail-closed. An evaluation that errors — including an unknown, inactive, or
+pull-request-scoped slug — exits 1 rather than reporting a verdict.
+
+A verdict costs one request per scan and the server re-evaluates every finding
+in that scan, so the pass covers at most the first 10 scans of a page and
+`--block-on` shrinks the default page to 10. Narrow with `--sha` (one commit) or
+`--page-size`.
+
+`--sha` takes the **full** commit SHA (`git rev-parse HEAD`); a prefix is
+rejected rather than sent, since the server matches exactly and an empty answer
+reads as "never scanned".
 
 ### Inspect — `corgea inspect <id>`
 
@@ -373,6 +422,26 @@ corgea scan --fail-on CR --out-format sarif --out-file results.sarif
 corgea scan --fail-on CR,malicious --out-format sarif --out-file results.sarif  # also block malicious dependencies
 corgea scan --block-on criticals --out-format sarif --out-file results.sarif  # gate on a CI blocking rule from the web app
 ```
+
+The report is written whether or not the gate trips, so a pipeline can both fail
+on policy and ingest the results file.
+
+### Skip a duplicate scan but keep the gate
+
+When a pipeline skips scanning a commit it has already scanned, read the
+previous scan's verdict against the same CI rules instead of re-deriving one
+from vulnerability counts:
+
+```bash
+verdict=$(corgea ls --sha "$(git rev-parse HEAD)" --block-on criticals,malicious-deps --json)
+echo "$verdict" | jq -e '.results[0].blocking_verdict.status == "complete"' > /dev/null \
+  || { echo "no final verdict for this commit; run a scan"; exit 1; }
+echo "$verdict" | jq -e '.results[0].blocking_verdict.block == false' > /dev/null \
+  || { echo "blocked by $(echo "$verdict" | jq -r '.results[0].blocking_verdict.triggered_rules | join(", ")')"; exit 1; }
+```
+
+An empty `.results` means the commit has never been scanned: scan it rather than
+treating the absent verdict as a pass.
 
 ### Upload third-party reports
 

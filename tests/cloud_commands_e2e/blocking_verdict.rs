@@ -156,7 +156,11 @@ fn list_block_on_attaches_a_verdict_to_every_scan() {
     assert_eq!(blocked["status"], "complete", "{context}");
     assert_eq!(blocked["block"], true, "{context}");
     assert_eq!(blocked["blocked_issues"], 3, "{context}");
-    assert_eq!(blocked["triggered_rules"], json!(["criticals"]), "{context}");
+    assert_eq!(
+        blocked["triggered_rules"],
+        json!(["criticals"]),
+        "{context}"
+    );
     assert_eq!(
         blocked["block_on"],
         json!(["criticals", "malicious-deps"]),
@@ -188,7 +192,11 @@ fn list_sha_asks_the_server_for_one_commit_and_re_checks_it() {
             // this one's.
             json_response(scans_response(vec![
                 scan_at("scan-at-head", "complete", sha),
-                scan_at("scan-earlier", "complete", "f00dcafef00dcafef00dcafef00dcafef00dcafe"),
+                scan_at(
+                    "scan-earlier",
+                    "complete",
+                    "f00dcafef00dcafef00dcafef00dcafef00dcafe",
+                ),
             ])),
         ),
     ]);

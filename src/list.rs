@@ -688,7 +688,12 @@ mod tests {
     fn normalize_sha_rejects_a_prefix_or_a_non_sha() {
         // The server matches the commit exactly, so a prefix would answer "no
         // scans" — a miss a duplicate-scan check reads as "never scanned".
-        for raw in ["", "0123456", "main", "0123456789abcdef0123456789abcdef0123456z"] {
+        for raw in [
+            "",
+            "0123456",
+            "main",
+            "0123456789abcdef0123456789abcdef0123456z",
+        ] {
             assert!(normalize_sha(raw).is_err(), "{raw} should be rejected");
         }
     }
