@@ -54,6 +54,8 @@ Scan types: `blast` (base AI), `policy` (PolicyIQ), `malicious`, `secrets`, `pii
 
 `--only-uncommitted` and `--target` are mutually exclusive. `--fail-on`, `--fail`, and `--block-on` are mutually exclusive.
 
+`--out-format`/`--out-file` and `--sbom` are honored regardless of the gate: the report and the SBOM are written before `--fail`/`--block-on` are evaluated, so a scan that exits 1 on a blocking rule still leaves the report file behind for the pipeline to ingest.
+
 ### Upload — `corgea upload [report]`
 
 Upload an existing scan report to Corgea.
@@ -373,6 +375,9 @@ corgea scan --fail-on CR --out-format sarif --out-file results.sarif
 corgea scan --fail-on CR,malicious --out-format sarif --out-file results.sarif  # also block malicious dependencies
 corgea scan --block-on criticals --out-format sarif --out-file results.sarif  # gate on a CI blocking rule from the web app
 ```
+
+The report is written whether or not the gate trips, so a pipeline can both fail
+on policy and ingest the results file.
 
 ### Upload third-party reports
 

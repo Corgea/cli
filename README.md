@@ -43,6 +43,10 @@ Waiting gives up after 10 hours; override with `CORGEA_SCAN_TIMEOUT_SECONDS`.
 `--fail`/`--block-on` then wait up to 15 minutes for blocking rules to be
 evaluated; override with `CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS`.
 
+`--out-format`/`--out-file` and `--sbom` are honored whether or not a gate
+trips: both are written before `--fail`/`--block-on` are evaluated, so a scan
+that exits 1 on a blocking rule still leaves its report behind to ingest.
+
 ## Dependency Inventory (offline)
 
 `corgea deps` builds a dependency inventory from npm, Python, and Java manifests
