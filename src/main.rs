@@ -208,6 +208,20 @@ enum Commands {
         #[arg(short, long, help = "Specify the scan id to list issues for.")]
         scan_id: Option<String>,
 
+        #[arg(
+            long = "block-on",
+            value_name = "SLUG",
+            help = "Report each listed scan's verdict against the named CI blocking rules, as 'blocking_verdict' in --json output and a Blocking column otherwise. Comma-separated rule slugs, e.g. --block-on criticals,malicious-deps. Only 'complete' verdicts are final. Only for the scan listing; not for issue listings."
+        )]
+        block_on: Option<String>,
+
+        #[arg(
+            long,
+            value_name = "SHA",
+            help = "List only the scans of one commit. Takes the full commit SHA, as printed by `git rev-parse HEAD`. Only for the scan listing; not for issue listings."
+        )]
+        sha: Option<String>,
+
         #[arg(short, long, value_parser = clap::value_parser!(u16))]
         page: Option<u16>,
 
@@ -812,6 +826,8 @@ fn main() {
             code_quality,
             project_name,
             repo,
+            block_on,
+            sha,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             if [*issues, *sca_issues, *code_quality]
@@ -829,6 +845,35 @@ fn main() {
                 println!("scan_id option is only supported for issues list command.");
                 std::process::exit(1);
             }
+            let lists_issues = *issues || *sca_issues || *code_quality;
+            // Both narrow the scan listing itself. On an issue listing they
+            // would silently do nothing, and a pipeline reading a missing
+            // verdict as a pass is exactly what --block-on is there to prevent.
+            for (flag, value) in [("block-on", block_on), ("sha", sha)] {
+                if value.is_some() && lists_issues {
+                    ::log::error!(
+                        "{} is only supported for the scan listing, not with --issues, --sca-issues, or --code-quality.",
+                        flag
+                    );
+                    std::process::exit(1);
+                }
+            }
+
+            let block_on = match scanners::blast::normalize_block_on(block_on.as_deref()) {
+                Ok(slugs) => slugs,
+                Err(msg) => {
+                    ::log::error!("{}", msg);
+                    std::process::exit(1);
+                }
+            };
+            let sha = match sha.as_deref().map(list::normalize_sha).transpose() {
+                Ok(sha) => sha,
+                Err(msg) => {
+                    ::log::error!("{}", msg);
+                    std::process::exit(1);
+                }
+            };
+
             list::run(
                 &corgea_config,
                 list::ListArgs {
@@ -843,6 +888,8 @@ fn main() {
                         name: project_name.clone(),
                         repo: repo.clone(),
                     },
+                    block_on,
+                    sha,
                 },
             );
         }

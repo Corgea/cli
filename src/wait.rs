@@ -21,6 +21,7 @@ fn latest_scan_id(config: &Config, resolved: &utils::api::ResolvedProject) -> St
         Some(&resolved.query_name),
         Some(1),
         None,
+        None,
     ) {
         Ok(result) => result.scans.unwrap_or_default(),
         Err(e) => {
