@@ -339,6 +339,22 @@ pub fn run(
             std::process::exit(1);
         }
     };
+    // The report and the SBOM are produced before the blocking-rule gates: a
+    // tripped gate exits 1, and a pipeline that fails on policy still needs the
+    // report it asked for to ingest the findings it failed on.
+    write_scan_report(
+        config,
+        &project_name,
+        &scan_id,
+        &classifications,
+        out_format.as_deref(),
+        out_file.as_deref(),
+    );
+
+    if let Some(sbom_file) = sbom {
+        write_sbom(&sbom_file);
+    }
+
     if *fail {
         log::warn!(
             "\n--fail is deprecated: it evaluates every active blocking rule regardless of whether it applies to pull requests or CI. Use --block-on <slug> to name the CI blocking rules this pipeline should enforce."
@@ -379,117 +395,6 @@ pub fn run(
             "\nNo issues violated the blocking rule(s): {}.",
             utils::terminal::set_text_color(block_on, utils::terminal::TerminalColor::Green)
         );
-    }
-
-    if let Some(out_file) = out_file {
-        if let Some(out_format) = out_format {
-            let stop_signal = Arc::new(Mutex::new(false));
-            let stop_signal_clone = Arc::clone(&stop_signal);
-            let results_thread = thread::spawn(move || {
-                utils::terminal::show_loading_message(
-                    "Generating scan report... ([T]s)",
-                    stop_signal_clone,
-                );
-            });
-
-            if out_format == "json" {
-                let issues = match utils::api::get_all_issues(
-                    &config.get_url(),
-                    &project_name,
-                    Some(scan_id.clone()),
-                ) {
-                    Ok(issues) => issues,
-                    Err(e) => {
-                        log::error!("\n\nFailed to fetch issues: {}\n\n", e);
-                        std::process::exit(1);
-                    }
-                };
-                let sca_issues = match utils::api::get_all_sca_issues(
-                    &config.get_url(),
-                    &project_name,
-                    Some(scan_id.clone()),
-                ) {
-                    Ok(issues) => issues,
-                    Err(e) => {
-                        log::error!("\n\nFailed to fetch SCA issues: {}\n\n", e);
-                        std::process::exit(1);
-                    }
-                };
-                let json = serde_json::to_string_pretty(&issues).unwrap();
-                let sca_json = serde_json::to_string_pretty(&sca_issues).unwrap();
-                let report_json = serde_json::to_string_pretty(&classifications).unwrap();
-                let results_json = format!(
-                    "{{\"issues\": {}, \"sca_issues\": {}, \"report\": {}}}",
-                    json, sca_json, report_json
-                );
-                *stop_signal.lock().unwrap() = true;
-                let _ = results_thread.join();
-                fs::write(out_file.clone(), results_json).expect("Failed to write JSON file, check if the file path is valid and you have the necessary permissions to write to it.");
-                utils::terminal::clear_previous_line();
-                println!("\n\nScan results written to: {}\n\n", out_file.clone());
-            } else if out_format == "html" {
-                let report = match utils::api::get_scan_report(&config.get_url(), &scan_id, None) {
-                    Ok(html) => html,
-                    Err(e) => {
-                        log::error!("\n\nFailed to fetch scan report: {}\n\n", e);
-                        std::process::exit(1);
-                    }
-                };
-                *stop_signal.lock().unwrap() = true;
-                let _ = results_thread.join();
-                fs::write(out_file.clone(), report).expect("\n\nFailed to write HTML file, check if the file path is valid and you have the necessary permissions to write to it.");
-                utils::terminal::clear_previous_line();
-                println!("\n\nScan report written to: {}\n\n", out_file.clone());
-            } else if out_format == "sarif" {
-                let report =
-                    match utils::api::get_scan_report(&config.get_url(), &scan_id, Some("sarif")) {
-                        Ok(sarif) => sarif,
-                        Err(e) => {
-                            log::error!("\n\nFailed to fetch SARIF report: {}\n\n", e);
-                            std::process::exit(1);
-                        }
-                    };
-                *stop_signal.lock().unwrap() = true;
-                let _ = results_thread.join();
-                fs::write(out_file.clone(), report).expect("\n\nFailed to write SARIF file, check if the file path is valid and you have the necessary permissions to write to it.");
-                utils::terminal::clear_previous_line();
-                println!("\n\nScan report written to: {}\n\n", out_file.clone());
-            } else if out_format == "markdown" {
-                let report = match utils::api::get_scan_report(
-                    &config.get_url(),
-                    &scan_id,
-                    Some("markdown"),
-                ) {
-                    Ok(markdown) => markdown,
-                    Err(e) => {
-                        log::error!("\n\nFailed to fetch Markdown report: {}\n\n", e);
-                        std::process::exit(1);
-                    }
-                };
-                *stop_signal.lock().unwrap() = true;
-                let _ = results_thread.join();
-                fs::write(out_file.clone(), report).expect("\n\nFailed to write Markdown file, check if the file path is valid and you have the necessary permissions to write to it.");
-                utils::terminal::clear_previous_line();
-                println!("\n\nScan report written to: {}\n\n", out_file.clone());
-            }
-        }
-    }
-
-    if let Some(sbom_file) = sbom {
-        match corgea::deps::report::sbom(std::path::Path::new(".")) {
-            Ok(doc) => {
-                let json = serde_json::to_string_pretty(&doc).expect("serialize SBOM");
-                if let Err(e) = fs::write(&sbom_file, json) {
-                    log::error!("\n\nFailed to write SBOM to '{}': {}\n\n", sbom_file, e);
-                    std::process::exit(1);
-                }
-                println!("CycloneDX SBOM written to: {}\n", sbom_file);
-            }
-            Err(e) => {
-                log::error!("\n\nFailed to generate SBOM: {}\n\n", e);
-                std::process::exit(1);
-            }
-        }
     }
 
     print!("\n\nThank you for using Corgea! 🐕\n\n");
@@ -533,6 +438,112 @@ pub fn run(
                 "\nExiting with error code 1: scan results matched --fail-on {}.",
                 fail_on
             );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Write the `--out-format` report for a completed scan to `--out-file`.
+///
+/// Does nothing unless both are set; `main` rejects one without the other.
+fn write_scan_report(
+    config: &Config,
+    project_name: &str,
+    scan_id: &str,
+    classifications: &HashMap<String, usize>,
+    out_format: Option<&str>,
+    out_file: Option<&str>,
+) {
+    let (Some(out_format), Some(out_file)) = (out_format, out_file) else {
+        return;
+    };
+
+    let stop_signal = Arc::new(Mutex::new(false));
+    let stop_signal_clone = Arc::clone(&stop_signal);
+    let results_thread = thread::spawn(move || {
+        utils::terminal::show_loading_message(
+            "Generating scan report... ([T]s)",
+            stop_signal_clone,
+        );
+    });
+    let stop_spinner = move || {
+        *stop_signal.lock().unwrap() = true;
+        let _ = results_thread.join();
+    };
+
+    if out_format == "json" {
+        let issues =
+            match utils::api::get_all_issues(&config.get_url(), project_name, Some(scan_id.into()))
+            {
+                Ok(issues) => issues,
+                Err(e) => {
+                    log::error!("\n\nFailed to fetch issues: {}\n\n", e);
+                    std::process::exit(1);
+                }
+            };
+        let sca_issues = match utils::api::get_all_sca_issues(
+            &config.get_url(),
+            project_name,
+            Some(scan_id.into()),
+        ) {
+            Ok(issues) => issues,
+            Err(e) => {
+                log::error!("\n\nFailed to fetch SCA issues: {}\n\n", e);
+                std::process::exit(1);
+            }
+        };
+        let json = serde_json::to_string_pretty(&issues).unwrap();
+        let sca_json = serde_json::to_string_pretty(&sca_issues).unwrap();
+        let report_json = serde_json::to_string_pretty(classifications).unwrap();
+        let results_json = format!(
+            "{{\"issues\": {}, \"sca_issues\": {}, \"report\": {}}}",
+            json, sca_json, report_json
+        );
+        stop_spinner();
+        fs::write(out_file, results_json).expect("Failed to write JSON file, check if the file path is valid and you have the necessary permissions to write to it.");
+        utils::terminal::clear_previous_line();
+        println!("\n\nScan results written to: {}\n\n", out_file);
+        return;
+    }
+
+    // The server renders these; `None` is its HTML default.
+    let (report_format, label) = match out_format {
+        "html" => (None, "HTML"),
+        "sarif" => (Some("sarif"), "SARIF"),
+        "markdown" => (Some("markdown"), "Markdown"),
+        _ => {
+            stop_spinner();
+            log::error!("\n\nUnsupported out_format: {}\n\n", out_format);
+            std::process::exit(1);
+        }
+    };
+    let report = match utils::api::get_scan_report(&config.get_url(), scan_id, report_format) {
+        Ok(report) => report,
+        Err(e) => {
+            stop_spinner();
+            log::error!("\n\nFailed to fetch {} report: {}\n\n", label, e);
+            std::process::exit(1);
+        }
+    };
+    stop_spinner();
+    fs::write(out_file, report).unwrap_or_else(|_| panic!("\n\nFailed to write {label} file, check if the file path is valid and you have the necessary permissions to write to it."));
+    utils::terminal::clear_previous_line();
+    println!("\n\nScan report written to: {}\n\n", out_file);
+}
+
+/// Write a CycloneDX SBOM of the working directory to `sbom_file`.
+fn write_sbom(sbom_file: &str) {
+    match corgea::deps::report::sbom(std::path::Path::new(".")) {
+        Ok(doc) => {
+            let json = serde_json::to_string_pretty(&doc).expect("serialize SBOM");
+            if let Err(e) = fs::write(sbom_file, json) {
+                log::error!("\n\nFailed to write SBOM to '{}': {}\n\n", sbom_file, e);
+                std::process::exit(1);
+            }
+            println!("CycloneDX SBOM written to: {}\n", sbom_file);
+        }
+        Err(e) => {
+            log::error!("\n\nFailed to generate SBOM: {}\n\n", e);
             std::process::exit(1);
         }
     }
