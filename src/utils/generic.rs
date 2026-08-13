@@ -1,5 +1,5 @@
 use crate::utils::terminal::{set_text_color, TerminalColor};
-use git2::Repository;
+use git2::{IndexEntryExtendedFlag, IndexEntryFlag, Repository, StatusOptions};
 use globset::{Glob, GlobSetBuilder};
 use ignore::WalkBuilder;
 use std::env;
@@ -118,7 +118,8 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     let mut excluded_files = Vec::new();
 
     for (path, relative_path) in files_to_zip {
-        let is_excluded = glob_set.is_match(&path);
+        // Match repo-relative paths so abs `/tmp/...` targets don't hit `**/tmp/**`.
+        let is_excluded = glob_set.is_match(&relative_path);
 
         if (path.is_file() || path.is_dir()) && !is_excluded {
             if path.is_file() {
@@ -311,7 +312,18 @@ pub fn get_env_var_if_exists(var_name: &str) -> Option<String> {
     }
 }
 
+/// Repo identity at the worktree root. Does not sample dirty state — use
+/// [`get_repo_info_for_scan`] for BLAST uploads.
 pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
+    get_repo_info_inner(dir, false)
+}
+
+/// [`get_repo_info`] plus dirty sampling for scan uploads.
+pub fn get_repo_info_for_scan(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
+    get_repo_info_inner(dir, true)
+}
+
+fn get_repo_info_inner(dir: &str, sample_dirty: bool) -> Result<Option<RepoInfo>, git2::Error> {
     // discover (not open) so worktrees / .git-as-file roots still resolve.
     let repo = match Repository::discover(Path::new(dir)) {
         Ok(repo) => repo,
@@ -341,11 +353,79 @@ pub fn get_repo_info(dir: &str) -> Result<Option<RepoInfo>, git2::Error> {
             .map(|commit| commit.id().to_string())
     });
 
+    let (dirty, status_dirty) = if sample_dirty {
+        worktree_dirty_flags(&repo)
+    } else {
+        (false, false)
+    };
+
     Ok(Some(RepoInfo {
         branch,
         repo_url: origin_url(&repo),
         sha,
+        dirty,
+        status_dirty,
     }))
+}
+
+/// `(upload_dirty, status_dirty)`.
+/// `upload_dirty`: status changes, dirty submodules, or assume-unchanged /
+/// skip-worktree (status hides those). Errors fail closed to dirty.
+/// `status_dirty`: non-empty `statuses()` only (user notice).
+fn worktree_dirty_flags(repo: &Repository) -> (bool, bool) {
+    let status_dirty = status_has_changes(repo);
+    let upload_dirty = index_hides_worktree(repo) || status_dirty;
+    (upload_dirty, status_dirty)
+}
+
+fn status_has_changes(repo: &Repository) -> bool {
+    let mut opts = StatusOptions::new();
+    // Submodules: packaging walks into them, so dirty checkouts must count.
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false);
+    repo.statuses(Some(&mut opts))
+        .map(|s| !s.is_empty())
+        .unwrap_or(true)
+}
+
+/// assume-unchanged / skip-worktree are omitted from `statuses()`.
+fn index_hides_worktree(repo: &Repository) -> bool {
+    repo.index()
+        .map(|index| {
+            index.iter().any(|entry| {
+                IndexEntryFlag::from_bits_truncate(entry.flags).is_valid()
+                    || IndexEntryExtendedFlag::from_bits_truncate(entry.flags_extended)
+                        .is_skip_worktree()
+            })
+        })
+        .unwrap_or(true)
+}
+
+/// Merge before/after packaging samples. Clean only if both exist, both clean,
+/// same SHA; otherwise dirty. Prefer post-packaging branch/url/sha.
+pub fn reconcile_repo_info_for_upload(
+    before: Option<RepoInfo>,
+    after: Option<RepoInfo>,
+) -> Option<RepoInfo> {
+    match (before, after) {
+        (None, None) => None,
+        (Some(sample), None) | (None, Some(sample)) => Some(RepoInfo {
+            dirty: true,
+            ..sample
+        }),
+        (Some(before), Some(after)) => {
+            let stable_clean =
+                !before.dirty && !after.dirty && before.sha.is_some() && before.sha == after.sha;
+            Some(RepoInfo {
+                branch: after.branch.or(before.branch),
+                repo_url: after.repo_url.or(before.repo_url),
+                sha: after.sha.or(before.sha),
+                dirty: !stable_clean,
+                status_dirty: before.status_dirty || after.status_dirty,
+            })
+        }
+    }
 }
 
 /// `origin`'s URL, or None when the remote is missing or carries no URL.
@@ -451,11 +531,15 @@ pub fn get_status(status: &str) -> &str {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RepoInfo {
     pub branch: Option<String>,
     pub repo_url: Option<String>,
     pub sha: Option<String>,
+    /// Not an exact clean HEAD snapshot. Always false from [`get_repo_info`].
+    pub dirty: bool,
+    /// Non-empty git status (excludes index hide-bits). Drives user notice.
+    pub status_dirty: bool,
 }
 
 #[cfg(test)]
@@ -484,12 +568,7 @@ mod tests {
     fn get_repo_info_at_root_only_not_nested_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        git(root, &["init"]);
-        git(root, &["config", "user.email", "test@example.com"]);
-        git(root, &["config", "user.name", "Test"]);
-        fs::write(root.join("README"), "hi").unwrap();
-        git(root, &["add", "README"]);
-        git(root, &["commit", "-m", "init"]);
+        init_committed_repo(root);
 
         let root_s = root.to_str().unwrap();
         let nested = root.join("pkg").join("inner");
@@ -507,6 +586,225 @@ mod tests {
             "nested CWD must not attach parent HEAD SHA / remote project name"
         );
         assert!(!is_at_repo_root(nested_s));
+    }
+
+    fn init_committed_repo(root: &std::path::Path) {
+        git(root, &["init"]);
+        git(root, &["config", "user.email", "test@example.com"]);
+        git(root, &["config", "user.name", "Test"]);
+        fs::write(root.join("README"), "hi").unwrap();
+        git(root, &["add", "README"]);
+        git(root, &["commit", "-m", "init"]);
+    }
+
+    #[test]
+    fn get_repo_info_for_scan_dirty_true_when_tracked_file_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_committed_repo(root);
+        fs::write(root.join("README"), "changed").unwrap();
+        let info = get_repo_info_for_scan(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(info.dirty);
+        assert!(info.status_dirty);
+    }
+
+    #[test]
+    fn get_repo_info_for_scan_dirty_true_when_change_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_committed_repo(root);
+        fs::write(root.join("README"), "staged").unwrap();
+        git(root, &["add", "README"]);
+        let info = get_repo_info_for_scan(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(info.dirty);
+        assert!(info.status_dirty);
+    }
+
+    #[test]
+    fn get_repo_info_for_scan_dirty_true_when_untracked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_committed_repo(root);
+        fs::write(root.join("new.py"), "print(1)").unwrap();
+        let info = get_repo_info_for_scan(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(info.dirty);
+        assert!(info.status_dirty);
+    }
+
+    #[test]
+    fn get_repo_info_for_scan_dirty_false_when_only_gitignored_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_committed_repo(root);
+        fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        git(root, &["add", ".gitignore"]);
+        git(root, &["commit", "-m", "ignore"]);
+        fs::write(root.join("ignored.txt"), "secret").unwrap();
+        let info = get_repo_info_for_scan(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(!info.dirty);
+        assert!(!info.status_dirty);
+    }
+
+    #[test]
+    fn get_repo_info_for_scan_dirty_when_assume_unchanged_hides_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_committed_repo(root);
+        fs::write(root.join("README"), "changed").unwrap();
+        git(root, &["update-index", "--assume-unchanged", "README"]);
+        // status clean; zip would still include the edit
+        let info = get_repo_info_for_scan(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(info.dirty);
+        assert!(!info.status_dirty);
+    }
+
+    #[test]
+    fn get_repo_info_for_scan_dirty_when_skip_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_committed_repo(root);
+        git(root, &["update-index", "--skip-worktree", "README"]);
+        let info = get_repo_info_for_scan(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(info.dirty);
+        assert!(!info.status_dirty);
+    }
+
+    #[test]
+    fn get_repo_info_skips_dirty_sampling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_committed_repo(root);
+
+        let clean = get_repo_info_for_scan(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(!clean.dirty);
+        assert!(!clean.status_dirty);
+
+        fs::write(root.join("README"), "changed").unwrap();
+        let identity = get_repo_info(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(!identity.dirty);
+        assert!(!identity.status_dirty);
+        let scan = get_repo_info_for_scan(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(scan.dirty);
+        assert!(scan.status_dirty);
+    }
+
+    fn sample_info(sha: &str, dirty: bool) -> RepoInfo {
+        RepoInfo {
+            branch: Some("main".into()),
+            repo_url: Some("https://github.com/org/repo.git".into()),
+            sha: Some(sha.into()),
+            dirty,
+            status_dirty: false,
+        }
+    }
+
+    #[test]
+    fn reconcile_clean_same_sha_stays_clean() {
+        let before = sample_info("aaa", false);
+        let after = sample_info("aaa", false);
+        let out = reconcile_repo_info_for_upload(Some(before), Some(after)).unwrap();
+        assert!(!out.dirty);
+        assert_eq!(out.sha.as_deref(), Some("aaa"));
+    }
+
+    #[test]
+    fn reconcile_sha_drift_marks_dirty() {
+        let before = sample_info("aaa", false);
+        let after = sample_info("bbb", false);
+        let out = reconcile_repo_info_for_upload(Some(before), Some(after)).unwrap();
+        assert!(out.dirty);
+        assert_eq!(out.sha.as_deref(), Some("bbb"));
+    }
+
+    #[test]
+    fn reconcile_either_dirty_marks_dirty() {
+        let before = sample_info("aaa", true);
+        let after = sample_info("aaa", false);
+        let out = reconcile_repo_info_for_upload(Some(before), Some(after)).unwrap();
+        assert!(out.dirty);
+
+        let before = sample_info("aaa", false);
+        let after = sample_info("aaa", true);
+        let out = reconcile_repo_info_for_upload(Some(before), Some(after)).unwrap();
+        assert!(out.dirty);
+    }
+
+    #[test]
+    fn reconcile_missing_sample_marks_dirty() {
+        let only = sample_info("aaa", false);
+        assert!(
+            reconcile_repo_info_for_upload(Some(only.clone()), None)
+                .unwrap()
+                .dirty
+        );
+        assert!(
+            reconcile_repo_info_for_upload(None, Some(only))
+                .unwrap()
+                .dirty
+        );
+        assert!(reconcile_repo_info_for_upload(None, None).is_none());
+    }
+
+    #[test]
+    fn get_repo_info_dirty_when_submodule_content_modified() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let parent = parent_dir.path();
+        init_committed_repo(parent);
+
+        // Submodule source outside parent so it isn't an untracked sibling.
+        let sub_dir = tempfile::tempdir().unwrap();
+        let sub_src = sub_dir.path();
+        git(sub_src, &["init"]);
+        git(sub_src, &["config", "user.email", "test@example.com"]);
+        git(sub_src, &["config", "user.name", "Test"]);
+        fs::write(sub_src.join("lib.py"), "v1\n").unwrap();
+        git(sub_src, &["add", "lib.py"]);
+        git(sub_src, &["commit", "-m", "sub init"]);
+
+        git(
+            parent,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub_src.to_str().unwrap(),
+                "vendor",
+            ],
+        );
+        git(parent, &["commit", "-m", "add submodule"]);
+
+        let clean = get_repo_info_for_scan(parent.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(!clean.dirty, "committed submodule should be clean");
+
+        fs::write(parent.join("vendor").join("lib.py"), "v2\n").unwrap();
+        let dirty = get_repo_info_for_scan(parent.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(
+            dirty.dirty,
+            "modified submodule checkout must mark parent dirty"
+        );
     }
 
     #[test]
@@ -633,6 +931,19 @@ mod tests {
         .expect("a >4 GiB entry needs ZIP64, not an error");
 
         assert!(added.contains(&staged));
+    }
+
+    #[test]
+    fn default_exclude_globs_match_abs_tmp_but_not_repo_relative_paths() {
+        // Abs `/tmp/...` hits `**/tmp/**`; repo-relative paths must not.
+        let mut builder = GlobSetBuilder::new();
+        for &pattern in DEFAULT_EXCLUDE_GLOBS {
+            builder.add(Glob::new(pattern).unwrap());
+        }
+        let set = builder.build().unwrap();
+        assert!(set.is_match(Path::new("/tmp/proj/app.py")));
+        assert!(!set.is_match(Path::new("app.py")));
+        assert!(!set.is_match(Path::new("src/app.py")));
     }
 
     #[test]
