@@ -173,8 +173,8 @@ enum Commands {
 
         #[arg(
             long = "skip-if-commit-scanned-recently",
-            conflicts_with_all = ["only_uncommitted", "target", "exclude", "scan_type", "policy", "include_image"],
-            help = "Do not start a new scan when this commit already has a recent completed scan in the project. That scan then drives the rest of the command — results table, --block-on gate, --out-file report — so the pipeline behaves the same either way. Prints CORGEA_SCAN_SKIPPED=true/false so a pipeline can tell the two apart, and fails if no git commit can be resolved. Only a default whole-commit scan can be reused, so it cannot be combined with --only-uncommitted, --target, --exclude, --scan-type, --policy, or --include-image."
+            conflicts_with_all = ["only_uncommitted", "target", "scan_type", "policy", "include_image"],
+            help = "Do not start a new scan when this commit already has a recent completed scan in the project. That scan then drives the rest of the command — results table, --block-on gate, --out-file report — so the pipeline behaves the same either way. Prints CORGEA_SCAN_SKIPPED=true/false so a pipeline can tell the two apart, and fails if no git commit can be resolved. What can be reused is a scan of the whole commit, and no API tells this run how a past scan was scoped or configured, so the flag is refused with --only-uncommitted, --target, --scan-type, --policy and --include-image; with --exclude it warns instead, since a reused scan covers files this run would have skipped."
         )]
         skip_if_commit_scanned_recently: bool,
 

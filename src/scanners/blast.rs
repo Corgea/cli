@@ -92,9 +92,9 @@ pub fn run(
     // A reused scan stands in for the new one: everything below this point —
     // the results table, the blocking-rule gate, the report file — runs against
     // whichever scan id this resolves to.
-    let reused_scan = skip_recent
-        .as_ref()
-        .and_then(|skip| crate::skip_scan::resolve_reusable_scan(config, &project_name, skip));
+    let reused_scan = skip_recent.as_ref().and_then(|skip| {
+        crate::skip_scan::resolve_reusable_scan(config, &project_name, skip, exclude.as_deref())
+    });
 
     let (scan_id, project_id) = match reused_scan {
         Some(scan) => (scan.id, None),

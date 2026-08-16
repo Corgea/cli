@@ -82,8 +82,12 @@ repository, or no commits yet) exits 1 rather than silently scanning. And a run
 that changes what gets scanned cannot be matched against a candidate — the API
 exposes neither a scan's configured scan types and target policies nor whether
 it bundled a container image — so the flag is rejected alongside `--scan-type`,
-`--policy`, `--include-image`, `--only-uncommitted`, `--target`, and
-`--exclude`.
+`--policy`, `--include-image`, `--only-uncommitted`, and `--target`.
+
+`--exclude` is allowed, and warns on a skip. A reused scan is one of the whole
+commit (an `--exclude` upload is recorded as not matching the commit exactly, so
+it is never itself reusable), which means the results and the gate can cover
+files this run would have skipped — over-reporting, never under-reporting.
 
 ## Dependency Inventory (offline)
 

@@ -447,7 +447,6 @@ fn a_custom_scan_configuration_cannot_be_skipped() {
         vec!["--policy", "1"],
         vec!["--include-image", "myapp:1.0.0"],
         vec!["--target", "main.py"],
-        vec!["--exclude", "main.py"],
         vec!["--only-uncommitted"],
     ] {
         let api = ApiStub::start(Vec::new());
@@ -470,6 +469,46 @@ fn a_custom_scan_configuration_cannot_be_skipped() {
             "{narrowing_flag:?}\n{context}"
         );
     }
+}
+
+/// `--exclude` is usually a fixed line in a pipeline template, so it does not
+/// block the flag. It cannot be matched either: an `--exclude` upload is recorded
+/// as not matching the commit exactly, so what gets reused is always a
+/// whole-commit scan, and the gate can cover files this run would have skipped.
+/// That is over-reporting rather than a missed finding, so the run continues —
+/// and says so, because otherwise the extra findings have no explanation.
+#[test]
+fn excluding_files_warns_but_still_reuses_the_commits_scan() {
+    let project = git_project();
+    let api = ApiStub::start(vec![
+        verify_request(),
+        commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
+        clean_detail(&project.sha),
+        reused_scan_issues(),
+    ]);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--skip-if-commit-scanned-recently",
+        "--exclude",
+        "tests/**",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(stdout.contains("CORGEA_SCAN_SKIPPED=true"), "{context}");
+    assert!(
+        stderr.contains("was not narrowed by --exclude 'tests/**'"),
+        "{context}"
+    );
 }
 
 /// The window is meaningless on its own — a pipeline that sets it and forgets

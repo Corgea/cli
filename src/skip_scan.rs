@@ -21,6 +21,11 @@
 //! configured scan types and target policies are not exposed on any read
 //! endpoint — the flag refuses the run rather than guessing (see `main.rs`,
 //! where `--scan-type`/`--policy` conflict with it).
+//!
+//! `--exclude` is the one narrowing flag that only warns. It is typically a
+//! fixed line in a pipeline template rather than a per-run choice, and reusing a
+//! wider scan can only over-report, never miss a finding — so the run continues
+//! and says which files the gate may cover after all.
 
 use crate::config::Config;
 use crate::scanners::blast::{classify_scan_status, format_scan_warnings, ScanState};
@@ -109,6 +114,7 @@ pub fn resolve_reusable_scan(
     config: &Config,
     project_name: &str,
     skip: &SkipRecentScan,
+    exclude: Option<&str>,
 ) -> Option<ScanResponse> {
     // `dirty`, not `status_dirty`: this asks whether the run would upload an
     // exact snapshot of the commit, and that is the flag the upload itself
@@ -179,6 +185,17 @@ pub fn resolve_reusable_scan(
         short, age, scan.id
     );
     println!("Reporting on that scan instead - blocking rules and report output are unchanged.");
+    // A reusable scan is one of the whole commit, and an `--exclude` upload is
+    // recorded dirty, so a reused scan was never narrowed the way this run asks.
+    // The gate below can therefore fail on a file this command line excludes,
+    // which is worth saying out loud rather than leaving to be discovered.
+    if let Some(exclude) = exclude {
+        log::warn!(
+            "Scan {} covers the whole commit, so it was not narrowed by --exclude '{}'. The results and gate below can include files this run would have skipped.",
+            scan.id,
+            exclude
+        );
+    }
     print_skipped_marker(Some(&scan.id));
     Some(scan)
 }
