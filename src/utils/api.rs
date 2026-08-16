@@ -819,7 +819,7 @@ pub fn query_scan_list(
     request_scan_list(url, query_params)
 }
 
-/// The project's scans at exactly `sha`, newest first.
+/// One page of the project's scans at exactly `sha`, newest first.
 ///
 /// The `sha` filter is server-side, but a backend that predates it ignores the
 /// unknown parameter and answers with the project's scans at any commit, so
@@ -828,12 +828,13 @@ pub fn query_scans_for_commit(
     url: &str,
     project: &str,
     sha: &str,
+    page: u16,
     page_size: u16,
 ) -> Result<ScansResponse, Box<dyn Error>> {
     request_scan_list(
         url,
         vec![
-            ("page", "1".to_string()),
+            ("page", page.to_string()),
             ("page_size", page_size.to_string()),
             ("project", project.to_string()),
             ("sha", sha.to_string()),
@@ -1456,6 +1457,10 @@ pub struct ScanResponse {
     /// is not the same as a known-clean tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_dirty: Option<bool>,
+    /// Set when the scan belongs to a pull request rather than to a branch
+    /// build. Carried by the scan list only; `GET /scan/{id}` omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
     /// Why a scan ended without finishing. Only set for failed scans.

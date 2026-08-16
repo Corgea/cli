@@ -68,14 +68,22 @@ Two lines make the outcome scriptable — `CORGEA_SCAN_SKIPPED=true` plus
 `CORGEA_SCAN_ID=<id>` when a scan was reused, `CORGEA_SCAN_SKIPPED=false` when
 one ran — so a later step (an ingest, say) can branch on it.
 
-A new scan runs anyway when nothing is reusable: no scan of the commit inside
-the window, only a failed or still-running one, a scan of a worktree that had
-uncommitted changes, or a lookup the platform could not answer. The one hard
-failure is an unresolvable commit (not a git repository, or no commits yet),
-which exits 1 rather than silently scanning.
+Only a scan that answers the same question is reused, which is stricter than
+"same commit". A candidate has to be a completed BLAST scan of that commit, on a
+branch rather than a pull request, from an explicitly clean worktree, with no
+scanner problems reported — and this run has to be a default whole-commit scan
+itself. Anything else runs a real scan: nothing inside the window, only a failed
+or still-running scan, a worktree that does not match the commit (including
+files the index hides from `git status`), or a lookup the platform could not
+answer.
 
-What gets reused is a scan of the whole commit, so the flag is not accepted
-alongside `--only-uncommitted`, `--target`, or `--exclude`.
+Two things are hard errors instead. An unresolvable commit (not a git
+repository, or no commits yet) exits 1 rather than silently scanning. And a run
+that changes what gets scanned cannot be matched against a candidate — the API
+exposes neither a scan's configured scan types and target policies nor whether
+it bundled a container image — so the flag is rejected alongside `--scan-type`,
+`--policy`, `--include-image`, `--only-uncommitted`, `--target`, and
+`--exclude`.
 
 ## Dependency Inventory (offline)
 

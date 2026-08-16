@@ -1661,6 +1661,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             git_sha: None,
             worktree_dirty: None,
+            pull_request_id: None,
             metadata: None,
             failed_reason: failed_reason.map(|r| r.to_string()),
             scan_errors,

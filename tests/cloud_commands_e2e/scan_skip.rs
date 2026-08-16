@@ -39,10 +39,28 @@ fn commit_lookup(sha: &str, scans: Vec<Value>) -> ExpectedRequest {
         move |request| {
             assert_authenticated_request(request, Method::GET, "/api/v1/scans")?;
             assert_query(request, "project", PROJECT)?;
+            assert_query(request, "page", "1")?;
             assert_query(request, "sha", &sha)
         },
         json_response(scans_response(scans)),
     )
+}
+
+/// The confirmation read of the chosen scan. The scan list carries no
+/// `scan_errors`, so this is the only place a degraded prior scan can be caught.
+fn reused_scan_detail(sha: &str, scan_errors: Value) -> ExpectedRequest {
+    let mut body = prior_scan(sha, &ago(3));
+    body["scan_errors"] = scan_errors;
+    let path = format!("/api/v1/scan/{PRIOR_SCAN}");
+    expected_request(
+        "confirm the scan being reused",
+        move |request| assert_authenticated_request(request, Method::GET, &path),
+        json_response(body),
+    )
+}
+
+fn clean_detail(sha: &str) -> ExpectedRequest {
+    reused_scan_detail(sha, json!([]))
 }
 
 fn reused_scan_issues() -> ExpectedRequest {
@@ -99,6 +117,7 @@ fn skipped_scan_still_fails_the_build_on_the_prior_scans_blocking_rules() {
     let api = ApiStub::start(vec![
         verify_request(),
         commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
+        clean_detail(&project.sha),
         reused_scan_issues(),
         reused_scan_sarif_report(),
         reused_scan_blocking_rules(true),
@@ -149,6 +168,7 @@ fn skipped_scan_reports_the_prior_findings() {
     let api = ApiStub::start(vec![
         verify_request(),
         commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
+        clean_detail(&project.sha),
         reused_scan_issues(),
         reused_scan_blocking_rules(false),
     ]);
@@ -264,10 +284,99 @@ fn a_dirty_worktree_scans_instead_of_reusing_the_commits_scan() {
 
     assert_eq!(output.status.code(), Some(0), "{context}");
     assert!(
-        stdout.contains("does not describe what would be scanned"),
+        stdout.contains("Working tree does not match commit"),
         "{context}"
     );
     assert!(stdout.contains("CORGEA_SCAN_SKIPPED=false"), "{context}");
+}
+
+/// The reuse decision has to read the same dirtiness signal the upload sends.
+/// An assume-unchanged modified file is invisible to `git status` — so no
+/// worktree notice is printed — but it still changes what gets packaged, and the
+/// upload marks it dirty. Reading the narrower status signal here would reuse a
+/// clean scan of the commit and gate on files this run does not contain.
+#[test]
+fn a_file_hidden_from_git_status_scans_instead_of_reusing() {
+    let project = git_project();
+    run_git(
+        project.path(),
+        &["update-index", "--assume-unchanged", "main.py"],
+    );
+    std::fs::write(project.path().join("main.py"), "print('hidden change')\n")
+        .expect("modify assume-unchanged file");
+    let api = ApiStub::start(blast_upload_plan(&project.sha, true, false));
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--skip-if-commit-scanned-recently",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains("Working tree does not match commit"),
+        "{context}"
+    );
+    assert!(stdout.contains("CORGEA_SCAN_SKIPPED=false"), "{context}");
+    // `git status` sees nothing, so the user-facing worktree notice stays quiet;
+    // only the reuse decision and the upload's dirty flag react.
+    assert!(
+        !stdout.contains("Working tree has uncommitted changes"),
+        "{context}"
+    );
+}
+
+/// A prior scan that finished with a scanner's results missing is not reused: a
+/// fresh scan says so out loud and may also clear a transient failure, while
+/// reusing it would gate silently on findings known to be incomplete. The scan
+/// list cannot show this, which is what the confirmation read is for.
+#[test]
+fn a_degraded_prior_scan_is_not_reused() {
+    let project = git_project();
+    let mut plan = blast_upload_plan(&project.sha, false, false);
+    plan.insert(
+        1,
+        commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
+    );
+    plan.insert(
+        2,
+        reused_scan_detail(
+            &project.sha,
+            json!([{
+                "scan_type": "sca",
+                "level": "error",
+                "location": "Project-wide",
+                "message": "Dependency Analysis did not finish."
+            }]),
+        ),
+    );
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--skip-if-commit-scanned-recently",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(stderr.contains("missing some scanner results"), "{context}");
+    assert!(stdout.contains("CORGEA_SCAN_SKIPPED=false"), "{context}");
+    assert!(stdout.contains("Scanning with BLAST"), "{context}");
 }
 
 /// Without a commit the flag has no question to answer, and quietly scanning
@@ -323,6 +432,44 @@ fn an_unreadable_window_is_rejected_before_the_scan_starts() {
         stderr.contains("Invalid --scanned-within value 'yesterday'"),
         "{context}"
     );
+}
+
+/// Only a default whole-commit scan can stand in for this run, and the API
+/// exposes neither a scan's configured scan types and target policies nor
+/// whether it bundled a container image, so a run that changes what gets scanned
+/// cannot be checked for a match — it is refused at parse time instead of
+/// reusing a scan that may have covered less.
+#[test]
+fn a_custom_scan_configuration_cannot_be_skipped() {
+    let project = git_project();
+    for narrowing_flag in [
+        vec!["--scan-type", "secrets"],
+        vec!["--policy", "1"],
+        vec!["--include-image", "myapp:1.0.0"],
+        vec!["--target", "main.py"],
+        vec!["--exclude", "main.py"],
+        vec!["--only-uncommitted"],
+    ] {
+        let api = ApiStub::start(Vec::new());
+        let (mut command, _home) = cloud_command(&api, project.path());
+        command.args(["scan", "blast", "--skip-if-commit-scanned-recently"]);
+        command.args(&narrowing_flag);
+
+        let output = run_with_timeout(command, &api);
+        let transcript = api.assert_finished();
+        let context = output_context(&output, &transcript);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{narrowing_flag:?} should conflict\n{context}"
+        );
+        assert!(
+            stderr.contains("--skip-if-commit-scanned-recently"),
+            "{narrowing_flag:?}\n{context}"
+        );
+    }
 }
 
 /// The window is meaningless on its own — a pipeline that sets it and forgets

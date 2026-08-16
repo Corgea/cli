@@ -11,9 +11,19 @@
 //! Recency is a policy, not a technicality — the same commit scanned last week
 //! predates whatever advisories landed since, so a scan is only reusable
 //! inside the window (24h by default).
+//!
+//! One scan may only stand in for another when it answers the same question,
+//! which is a stricter test than "same commit". Doghouse already settled what
+//! that means for its own server-side dedupe (`ScanManager._find_reusable_scan`):
+//! same commit, not a pull-request scan, an explicitly clean worktree, and
+//! matching scan configuration and policies. The checks here are the client-side
+//! half of that rule, and where the API cannot yet prove the match — the scan's
+//! configured scan types and target policies are not exposed on any read
+//! endpoint — the flag refuses the run rather than guessing (see `main.rs`,
+//! where `--scan-type`/`--policy` conflict with it).
 
 use crate::config::Config;
-use crate::scanners::blast::{classify_scan_status, ScanState};
+use crate::scanners::blast::{classify_scan_status, format_scan_warnings, ScanState};
 use crate::utils;
 use crate::utils::api::ScanResponse;
 use chrono::{DateTime, Utc};
@@ -22,10 +32,19 @@ use std::time::Duration;
 /// How far back a prior scan may have run and still be reused.
 pub const DEFAULT_WINDOW: &str = "24h";
 
-/// How many of the commit's scans to consider. They arrive newest first, and
-/// only the newest reusable one is wanted, so this is a ceiling on re-runs of
-/// one commit rather than a page to walk.
+/// How many of the commit's scans to read at a time, newest first.
 const SCAN_LOOKUP_PAGE_SIZE: u16 = 30;
+
+/// Backstop on pages walked. The window normally ends the search first (the
+/// list is newest first, so an out-of-window page tail means there is nothing
+/// left to find); this bounds the remaining case of one commit with more scans
+/// inside the window than fit on a page.
+const SCAN_LOOKUP_MAX_PAGES: u16 = 3;
+
+/// The engine every blast scan carries, whoever started it — CLI, platform
+/// integration, or scheduled run. An uploaded third-party report carries its
+/// own scanner's name and cannot stand in for `corgea scan blast`.
+const BLAST_ENGINE: &str = "corgea-blast";
 
 /// Grep-able signal for pipelines: printed exactly once per run whenever the
 /// flag is on, so a step can branch on whether a scan actually happened.
@@ -91,11 +110,16 @@ pub fn resolve_reusable_scan(
     project_name: &str,
     skip: &SkipRecentScan,
 ) -> Option<ScanResponse> {
+    // `dirty`, not `status_dirty`: this asks whether the run would upload an
+    // exact snapshot of the commit, and that is the flag the upload itself
+    // sends. `status_dirty` is narrower — it is the user notice, and it cannot
+    // see assume-unchanged/skip-worktree files, dirty submodules, or an index
+    // it failed to read, all of which change what gets packaged.
     let commit = utils::generic::get_repo_info_for_scan("./")
         .ok()
         .flatten()
-        .and_then(|info| Some((info.sha?, info.status_dirty)));
-    let Some((sha, status_dirty)) = commit else {
+        .and_then(|info| Some((info.sha?, info.dirty)));
+    let Some((sha, worktree_dirty)) = commit else {
         log::error!(
             "--skip-if-commit-scanned-recently needs the commit that is being scanned, but no git commit could be resolved here.\n\
              Run it from the root of a git repository with at least one commit, or drop the flag."
@@ -104,9 +128,9 @@ pub fn resolve_reusable_scan(
     };
     let short = short_sha(&sha);
 
-    if status_dirty {
+    if worktree_dirty {
         println!(
-            "Working tree has uncommitted changes, so commit {} does not describe what would be scanned - running a new scan.",
+            "Working tree does not match commit {} exactly (uncommitted changes, or files the index hides from git status), so no scan of that commit describes what would be scanned here - running a new scan.",
             short
         );
         print_skipped_marker(None);
@@ -118,13 +142,8 @@ pub fn resolve_reusable_scan(
         short, project_name, skip.label
     );
 
-    let scans = match utils::api::query_scans_for_commit(
-        &config.get_url(),
-        project_name,
-        &sha,
-        SCAN_LOOKUP_PAGE_SIZE,
-    ) {
-        Ok(response) => response.scans.unwrap_or_default(),
+    let found = match find_reusable_scan(config, project_name, &sha, skip.window, Utc::now()) {
+        Ok(found) => found,
         Err(e) => {
             log::warn!(
                 "Could not check whether commit {} was already scanned: {}. Running a new scan.",
@@ -136,27 +155,99 @@ pub fn resolve_reusable_scan(
         }
     };
 
-    match select_reusable_scan(&scans, &sha, Utc::now(), skip.window) {
-        Some(reusable) => {
-            println!(
-                "Skipping scan: commit {} was already scanned {} ago by scan {}.",
-                short, reusable.age, reusable.scan.id
-            );
-            println!(
-                "Reporting on that scan instead - blocking rules and report output are unchanged."
-            );
-            print_skipped_marker(Some(&reusable.scan.id));
-            Some(reusable.scan.clone())
-        }
-        None => {
-            println!(
-                "No completed scan of commit {} in the last {}; running a new scan.",
-                short, skip.label
-            );
-            print_skipped_marker(None);
-            None
-        }
+    let Some((scan, age)) = found else {
+        println!(
+            "No reusable scan of commit {} in the last {}; running a new scan.",
+            short, skip.label
+        );
+        print_skipped_marker(None);
+        return None;
+    };
+
+    if let Err(reason) = confirm_reusable_scan(config, &scan.id) {
+        log::warn!(
+            "Not reusing scan {}: {}. Running a new scan.",
+            scan.id,
+            reason
+        );
+        print_skipped_marker(None);
+        return None;
     }
+
+    println!(
+        "Skipping scan: commit {} was already scanned {} ago by scan {}.",
+        short, age, scan.id
+    );
+    println!("Reporting on that scan instead - blocking rules and report output are unchanged.");
+    print_skipped_marker(Some(&scan.id));
+    Some(scan)
+}
+
+/// Walk the commit's scans, newest first, for one that can stand in for a fresh
+/// scan. `Err` is a lookup failure, `Ok(None)` a clean miss.
+fn find_reusable_scan(
+    config: &Config,
+    project_name: &str,
+    sha: &str,
+    window: Duration,
+    now: DateTime<Utc>,
+) -> Result<Option<(ScanResponse, String)>, String> {
+    let mut page = 1;
+    loop {
+        let response = utils::api::query_scans_for_commit(
+            &config.get_url(),
+            project_name,
+            sha,
+            page,
+            SCAN_LOOKUP_PAGE_SIZE,
+        )
+        .map_err(|e| e.to_string())?;
+        let scans = response.scans.unwrap_or_default();
+        if scans.is_empty() {
+            return Ok(None);
+        }
+        if let Some(reusable) = select_reusable_scan(&scans, sha, now, window) {
+            return Ok(Some((reusable.scan.clone(), reusable.age)));
+        }
+        // Newest first, so a page that ends outside the window is the end of the
+        // search: everything after it is older still.
+        if page_ends_outside_window(&scans, now, window) {
+            return Ok(None);
+        }
+        // A page holding no scan of this commit means the server is not
+        // filtering on `sha` (a backend predating that parameter answers with
+        // the whole project), so further pages only read other commits' scans.
+        if !scans.iter().any(|scan| scan_matches_commit(scan, sha)) {
+            return Ok(None);
+        }
+        if page >= response.total_pages.unwrap_or(1) as u16 || page >= SCAN_LOOKUP_MAX_PAGES {
+            return Ok(None);
+        }
+        page += 1;
+    }
+}
+
+/// Confirm the scan we intend to reuse against `GET /scan/{id}`.
+///
+/// The scan list carries no `scan_errors`, so there a scan that finished with a
+/// scanner's results missing is indistinguishable from a clean one. A fresh scan
+/// says so out loud and the operator can weigh it; a reused one would gate
+/// silently on findings it has no reason to believe are complete. Since the
+/// alternative here is simply to scan — which may also clear a transient failure
+/// — a degraded scan is not reused at all.
+///
+/// One read, on the one scan we mean to reuse: a candidate rejected here sends
+/// the run to a real scan rather than to the next-oldest scan, because a commit
+/// whose recent scans are all degraded wants a fresh scan anyway.
+fn confirm_reusable_scan(config: &Config, scan_id: &str) -> Result<(), String> {
+    let scan = utils::api::get_scan(&config.get_url(), scan_id, None).map_err(|e| e.to_string())?;
+    if classify_scan_status(&scan.status) != ScanState::Completed {
+        return Err(format!("its status is now '{}'", scan.status));
+    }
+    if let Some(warnings) = format_scan_warnings(&scan) {
+        return Err(format!("it is missing some scanner results.\n{}", warnings));
+    }
+    Ok(())
 }
 
 /// `CORGEA_SCAN_SKIPPED=true|false`, plus the reused scan id when there is one.
@@ -203,6 +294,13 @@ pub fn select_reusable_scan<'a>(
     None
 }
 
+/// True when `scan` records exactly the commit being scanned.
+fn scan_matches_commit(scan: &ScanResponse, sha: &str) -> bool {
+    scan.git_sha
+        .as_deref()
+        .is_some_and(|scan_sha| scan_sha.eq_ignore_ascii_case(sha))
+}
+
 /// How long ago `scan` ran, or why it cannot stand in for a new scan.
 fn scan_age_if_reusable(
     scan: &ScanResponse,
@@ -210,30 +308,41 @@ fn scan_age_if_reusable(
     now: DateTime<Utc>,
     window: Duration,
 ) -> Result<Duration, String> {
-    match scan.git_sha.as_deref() {
-        Some(scan_sha) if scan_sha.eq_ignore_ascii_case(sha) => {}
-        Some(scan_sha) => return Err(format!("it scanned commit {}", short_sha(scan_sha))),
-        None => return Err("it records no commit".to_string()),
+    if !scan_matches_commit(scan, sha) {
+        return match scan.git_sha.as_deref() {
+            Some(scan_sha) => Err(format!("it scanned commit {}", short_sha(scan_sha))),
+            None => Err("it records no commit".to_string()),
+        };
     }
     // A scan that failed has no results to gate on, and one still running has
     // none yet; both mean this run has to do the scan itself.
     if classify_scan_status(&scan.status) != ScanState::Completed {
         return Err(format!("its status is '{}'", scan.status));
     }
-    // Only a known-dirty tree disqualifies. A scan that never reported the
-    // flag (an older CLI, or a platform integration that scans the commit
-    // directly) is not evidence of local edits.
-    if scan.worktree_dirty == Some(true) {
-        return Err("it scanned a worktree with uncommitted changes".to_string());
+    if !scan.engine.eq_ignore_ascii_case(BLAST_ENGINE) {
+        return Err(format!("it came from the '{}' engine", scan.engine));
+    }
+    // A pull-request scan answers a question about a proposed merge, and may be
+    // scoped to the diff; doghouse draws the same line for its own dedupe and
+    // for "which scan represents full project state".
+    if let Some(pull_request_id) = scan.pull_request_id.as_deref() {
+        return Err(format!("it scanned pull request {}", pull_request_id));
+    }
+    // Only an explicit `false` is a clean tree. `None` means the scan never
+    // reported the flag, and unknown is not clean: doghouse applies the same
+    // rule to its own dedupe ("only explicit clean may dedupe on SHA/PR"),
+    // platform and scheduled scans do record `false`, and the scans that do not
+    // include the partial `--target`/`--exclude` uploads of older CLIs — which
+    // this run has no way to tell apart from whole-commit ones.
+    if scan.worktree_dirty != Some(false) {
+        return match scan.worktree_dirty {
+            Some(true) => Err("it scanned a worktree with uncommitted changes".to_string()),
+            _ => Err("it did not report whether its worktree was clean".to_string()),
+        };
     }
     let created_at = parse_timestamp(&scan.created_at)
         .ok_or_else(|| format!("its timestamp '{}' could not be read", scan.created_at))?;
-    let age = now
-        .signed_duration_since(created_at)
-        .to_std()
-        // A scan stamped in the future is a clock skew, not an old scan; treat
-        // it as brand new rather than letting the subtraction underflow.
-        .unwrap_or(Duration::ZERO);
+    let age = age_since(created_at, now);
     if age > window {
         return Err(format!(
             "it ran {} ago, outside the window",
@@ -241,6 +350,24 @@ fn scan_age_if_reusable(
         ));
     }
     Ok(age)
+}
+
+/// Whether this page's oldest scan already falls outside the window, which — the
+/// list being newest first — means no later page can hold a reusable scan.
+/// An unreadable timestamp proves nothing, so it does not end the walk.
+fn page_ends_outside_window(scans: &[ScanResponse], now: DateTime<Utc>, window: Duration) -> bool {
+    scans
+        .last()
+        .and_then(|scan| parse_timestamp(&scan.created_at))
+        .is_some_and(|created_at| age_since(created_at, now) > window)
+}
+
+/// How long ago `created_at` was. A timestamp in the future is clock skew, not
+/// an old scan, so it reads as brand new rather than underflowing.
+fn age_since(created_at: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
+    now.signed_duration_since(created_at)
+        .to_std()
+        .unwrap_or(Duration::ZERO)
 }
 
 /// Timestamps arrive as RFC 3339 from the scan list, but Django can also
@@ -297,6 +424,7 @@ mod tests {
             created_at: created_at.to_string(),
             git_sha: sha.map(|s| s.to_string()),
             worktree_dirty: Some(false),
+            pull_request_id: None,
             metadata: None,
             failed_reason: None,
             scan_errors: vec![],
@@ -427,12 +555,36 @@ mod tests {
     }
 
     #[test]
-    fn scans_that_never_reported_dirtiness_are_still_reusable() {
-        // Older CLIs and platform integrations omit the flag; treating that as
-        // dirty would make the flag useless against existing scan history.
+    fn scans_that_never_reported_dirtiness_are_not_reused() {
+        // `None` says the client did not report, not that the tree was clean.
+        // Platform and scheduled scans do record `false`, so what this rejects
+        // is mainly the partial `--target` uploads of older CLIs, which are
+        // indistinguishable from whole-commit ones from here.
         let mut unknown = scan("unknown", "complete", Some(SHA), "2026-01-01T23:00:00Z");
         unknown.worktree_dirty = None;
-        assert!(select_reusable_scan(&[unknown], SHA, now(), DAY).is_some());
+        assert!(select_reusable_scan(&[unknown], SHA, now(), DAY).is_none());
+    }
+
+    #[test]
+    fn pull_request_scans_are_not_reused() {
+        // A PR scan answers a question about a proposed merge and may be scoped
+        // to the diff, so it cannot stand in for a branch build of the commit.
+        let mut pr_scan = scan("pr", "complete", Some(SHA), "2026-01-01T23:00:00Z");
+        pr_scan.pull_request_id = Some("42".to_string());
+        assert!(select_reusable_scan(&[pr_scan], SHA, now(), DAY).is_none());
+    }
+
+    #[test]
+    fn scans_from_another_engine_are_not_reused() {
+        // An uploaded third-party report covers whatever that scanner found,
+        // which is not what `corgea scan blast` was asked to produce.
+        let mut semgrep = scan("semgrep", "complete", Some(SHA), "2026-01-01T23:00:00Z");
+        semgrep.engine = "semgrep".to_string();
+        assert!(select_reusable_scan(&[semgrep], SHA, now(), DAY).is_none());
+        // Every blast scan carries this engine, whoever started it.
+        let mut blast = scan("blast", "complete", Some(SHA), "2026-01-01T23:00:00Z");
+        blast.engine = BLAST_ENGINE.to_uppercase();
+        assert!(select_reusable_scan(&[blast], SHA, now(), DAY).is_some());
     }
 
     #[test]
@@ -476,6 +628,36 @@ mod tests {
     #[test]
     fn empty_scan_list_reuses_nothing() {
         assert!(select_reusable_scan(&[], SHA, now(), DAY).is_none());
+    }
+
+    #[test]
+    fn a_page_ending_inside_the_window_leaves_more_to_search() {
+        // Newest first: while the page's oldest scan is still inside the window,
+        // a reusable scan can sit on the next page. Anything else would make a
+        // commit with more than a page of scans quietly unreusable.
+        let scans = vec![
+            scan("a", "incomplete", Some(SHA), "2026-01-01T23:00:00Z"),
+            scan("b", "incomplete", Some(SHA), "2026-01-01T22:00:00Z"),
+        ];
+        assert!(!page_ends_outside_window(&scans, now(), DAY));
+    }
+
+    #[test]
+    fn a_page_ending_outside_the_window_ends_the_search() {
+        let scans = vec![
+            scan("a", "incomplete", Some(SHA), "2026-01-01T23:00:00Z"),
+            scan("b", "incomplete", Some(SHA), "2025-12-30T00:00:00Z"),
+        ];
+        assert!(page_ends_outside_window(&scans, now(), DAY));
+    }
+
+    #[test]
+    fn an_unreadable_tail_timestamp_does_not_end_the_search() {
+        // It proves nothing about what follows, and stopping on it would drop
+        // reusable scans on later pages.
+        let scans = vec![scan("a", "incomplete", Some(SHA), "not a timestamp")];
+        assert!(!page_ends_outside_window(&scans, now(), DAY));
+        assert!(!page_ends_outside_window(&[], now(), DAY));
     }
 
     #[test]
