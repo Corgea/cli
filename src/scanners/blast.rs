@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::images;
 use crate::scan::build_scan_url;
 use crate::targets;
 use crate::utils;
@@ -6,10 +7,10 @@ use crate::utils::api::SCAIssue;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 
 /// Overrides how long `wait_for_scan` polls before giving up.
 const SCAN_TIMEOUT_ENV: &str = "CORGEA_SCAN_TIMEOUT_SECONDS";
@@ -17,6 +18,33 @@ const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(10 * 60 * 60);
 
 /// Overrides how long the CI gate waits for blocking rules to be evaluated.
 const BLOCKING_RULES_TIMEOUT_ENV: &str = "CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS";
+
+/// Export every `--include-image` reference into the scan bundle. Corgea scans
+/// the archives it finds there instead of resolving base images from the source
+/// tree, so a fully built image is scanned as it ships.
+fn export_included_images(
+    images: &[String],
+    temp_dir: &Path,
+) -> Result<Vec<images::SavedImage>, String> {
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    println!(
+        "Including {} container image(s) in this scan. Corgea will scan them instead of the base images referenced in your code.\n",
+        images.len()
+    );
+
+    let archives = images::save_images(images, &temp_dir.join("images"))?;
+
+    println!("\nContainer images bundled with this scan:");
+    for archive in &archives {
+        println!("  {}", archive.description());
+    }
+    println!();
+
+    Ok(archives)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -34,6 +62,7 @@ pub fn run(
     exclude: Option<String>,
     project_name: Option<String>,
     sbom: Option<String>,
+    include_images: Vec<String>,
 ) {
     // Validate that only_uncommitted and target are not used together
     if *only_uncommitted && target.is_some() {
@@ -68,20 +97,32 @@ pub fn run(
         );
     }
     println!("\n\n");
-    let temp_dir = env::temp_dir().join(format!("corgea/tmp/{}", Uuid::new_v4()));
-    fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
-    let project_name = utils::generic::determine_project_name(project_name.as_deref());
-    let zip_path = format!("{}/{}.zip", temp_dir.display(), project_name);
-    match utils::generic::create_path_if_not_exists(&temp_dir) {
-        Ok(_) => (),
+    let temp_dir = match utils::generic::create_private_temp_dir("corgea-scan-") {
+        Ok(dir) => dir,
         Err(e) => {
             log::error!(
-                "\n\nOops! Something went wrong while creating the directory at '{}'.\nPlease check if you have the necessary permissions or if the path is valid.\nError details:\n{}\n\n", 
-                temp_dir.display(), e
+                "\n\nOops! Something went wrong while creating a temporary directory in '{}'.\nPlease check if you have the necessary permissions and enough free disk space.\nError details:\n{}\n\n",
+                env::temp_dir().display(),
+                e
             );
             std::process::exit(1);
         }
-    }
+    };
+    let project_name = utils::generic::determine_project_name(project_name.as_deref());
+    let zip_path = format!("{}/{}.zip", temp_dir.display(), project_name);
+
+    let image_archives = match export_included_images(&include_images, &temp_dir) {
+        Ok(archives) => archives,
+        Err(message) => {
+            log::error!("\n\n{}\n", message);
+            let _ = utils::generic::delete_directory(&temp_dir);
+            std::process::exit(1);
+        }
+    };
+    let extra_zip_files: Vec<(PathBuf, String)> = image_archives
+        .iter()
+        .map(|archive| (archive.path.clone(), archive.archive_name.clone()))
+        .collect();
 
     let stop_signal = Arc::new(Mutex::new(false));
     let stop_signal_clone = Arc::clone(&stop_signal);
@@ -109,60 +150,76 @@ pub fn run(
         match targets::resolve_targets_with_exclude(target_value, exclude.as_deref()) {
             Ok(result) => {
                 if result.files.is_empty() {
-                    *stop_signal.lock().unwrap() = true;
-                    let _ = packaging_thread.join();
-                    print!(
-                        "\r{}",
-                        utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
+                    // An exported image is a complete payload on its own, so a
+                    // target that matches nothing is only fatal without one.
+                    if image_archives.is_empty() {
+                        *stop_signal.lock().unwrap() = true;
+                        let _ = packaging_thread.join();
+                        print!(
+                            "\r{}",
+                            utils::terminal::set_text_color(
+                                "",
+                                utils::terminal::TerminalColor::Reset
+                            )
+                        );
+                        log::error!("\n\nError: target resolved to zero files.\n");
+                        log::error!("Target value: {}\n", target_value);
+                        log::error!("Segment results:");
+                        for segment_result in &result.segments {
+                            if let Some(ref error) = segment_result.error {
+                                log::error!("  {}: ERROR - {}", segment_result.segment, error);
+                            } else {
+                                log::error!(
+                                    "  {}: {} matches",
+                                    segment_result.segment,
+                                    segment_result.matches
+                                );
+                            }
+                        }
+                        log::error!("\nPlease check your target specification and try again.\n");
+                        let _ = utils::generic::delete_directory(&temp_dir);
+                        std::process::exit(1);
+                    }
+
+                    log::warn!(
+                        "\n{}",
+                        utils::terminal::set_text_color(
+                            "⚠️  No scannable files matched your target, so this scan covers only the included container image(s).",
+                            utils::terminal::TerminalColor::Yellow
+                        )
                     );
-                    log::error!("\n\nError: target resolved to zero files.\n");
-                    log::error!("Target value: {}\n", target_value);
-                    log::error!("Segment results:");
-                    for segment_result in &result.segments {
-                        if let Some(ref error) = segment_result.error {
-                            log::error!("  {}: ERROR - {}", segment_result.segment, error);
-                        } else {
-                            log::error!(
-                                "  {}: {} matches",
-                                segment_result.segment,
-                                segment_result.matches
-                            );
-                        }
-                    }
-                    log::error!("\nPlease check your target specification and try again.\n");
-                    std::process::exit(1);
-                }
-
-                let file_count = result.files.len();
-                if *only_uncommitted {
-                    println!("\rFiles to be submitted for partial scan:\n");
-                    for (index, file) in result.files.iter().enumerate() {
-                        if let Ok(relative) =
-                            file.strip_prefix(std::env::current_dir().unwrap_or_default())
-                        {
-                            println!("{}: {}", index + 1, relative.display());
-                        } else {
-                            println!("{}: {}", index + 1, file.display());
-                        }
-                    }
-                    println!();
                 } else {
-                    println!("Scanning {} files (target mode)", file_count);
-
-                    let display_count = std::cmp::min(20, file_count);
-                    for file in result.files.iter().take(display_count) {
-                        if let Ok(relative) =
-                            file.strip_prefix(std::env::current_dir().unwrap_or_default())
-                        {
-                            println!("  {}", relative.display());
-                        } else {
-                            println!("  {}", file.display());
+                    let file_count = result.files.len();
+                    if *only_uncommitted {
+                        println!("\rFiles to be submitted for partial scan:\n");
+                        for (index, file) in result.files.iter().enumerate() {
+                            if let Ok(relative) =
+                                file.strip_prefix(std::env::current_dir().unwrap_or_default())
+                            {
+                                println!("{}: {}", index + 1, relative.display());
+                            } else {
+                                println!("{}: {}", index + 1, file.display());
+                            }
                         }
+                        println!();
+                    } else {
+                        println!("Scanning {} files (target mode)", file_count);
+
+                        let display_count = std::cmp::min(20, file_count);
+                        for file in result.files.iter().take(display_count) {
+                            if let Ok(relative) =
+                                file.strip_prefix(std::env::current_dir().unwrap_or_default())
+                            {
+                                println!("  {}", relative.display());
+                            } else {
+                                println!("  {}", file.display());
+                            }
+                        }
+                        if file_count > display_count {
+                            println!("  (+{} more)", file_count - display_count);
+                        }
+                        println!();
                     }
-                    if file_count > display_count {
-                        println!("  (+{} more)", file_count - display_count);
-                    }
-                    println!();
                 }
             }
             Err(e) => {
@@ -173,12 +230,19 @@ pub fn run(
                     utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
                 );
                 log::error!("\n\nError resolving targets: {}\n", e);
+                let _ = utils::generic::delete_directory(&temp_dir);
                 std::process::exit(1);
             }
         }
     }
 
-    match utils::generic::create_zip_from_target(target_str, &zip_path, None, exclude.as_deref()) {
+    match utils::generic::create_zip_from_target(
+        target_str,
+        &zip_path,
+        None,
+        exclude.as_deref(),
+        &extra_zip_files,
+    ) {
         Ok(added_files) => {
             if added_files.is_empty() {
                 *stop_signal.lock().unwrap() = true;
@@ -194,6 +258,7 @@ pub fn run(
                 } else {
                     log::error!("\n\nOops! No valid files found to scan after filtering.\n\n");
                 }
+                let _ = utils::generic::delete_directory(&temp_dir);
                 std::process::exit(1);
             }
         }
@@ -208,6 +273,7 @@ pub fn run(
                 "\n\nUh-oh! We couldn't package your project at '{}'.\nThis might be due to insufficient permissions, invalid file paths, or a file system error.\nPlease check the directory and try again.\nError details:\n{}\n\n", 
                 zip_path, e
             );
+            let _ = utils::generic::delete_directory(&temp_dir);
             std::process::exit(1);
         }
     }
@@ -270,6 +336,8 @@ pub fn run(
                 config.get_url(),
                 e
             );
+            // Exported image archives can be gigabytes; don't leave them behind.
+            let _ = utils::generic::delete_directory(&temp_dir);
             std::process::exit(1);
         }
     };

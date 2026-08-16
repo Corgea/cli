@@ -29,6 +29,11 @@ const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
     "**/.vs/**",
     "**/.vscode/**",
     "**/.idea/**",
+    // A copy of an exported image archive that lives in the repository would put
+    // the backend into image-scanning mode on every scan, whether or not
+    // `--include-image` was passed. Only the archives this run staged (passed as
+    // `extra_files`) are meant to do that.
+    "**/corgea-image-scanning-*.tar",
 ];
 
 /// Create a zip file from a target specification or full repository scan.
@@ -37,11 +42,15 @@ const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
 /// - If `target` is `Some(target_str)`, resolves the target using the targets module and creates zip from those files.
 ///   The target string can be a comma-separated list of files, directories, globs, or git selectors.
 /// - `user_exclude` is an optional comma-separated list of glob patterns from `--exclude`.
+/// - `extra_files` are staged files added to the root of the zip as
+///   `(source path, zip entry name)`. They come from explicit flags such as
+///   `--include-image`, so exclude rules don't apply to them.
 pub fn create_zip_from_target<P: AsRef<Path>>(
     target: Option<&str>,
     output_zip: P,
     exclude_globs: Option<&[&str]>,
     user_exclude: Option<&str>,
+    extra_files: &[(PathBuf, String)],
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let exclude_globs = exclude_globs.unwrap_or(DEFAULT_EXCLUDE_GLOBS);
 
@@ -126,6 +135,17 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
         }
     }
 
+    // Exported container images routinely pass 4 GiB, which a zip entry can only
+    // hold with ZIP64 headers; without `large_file` the writer aborts the entry.
+    let large_file_options: FileOptions<()> = options.large_file(true);
+
+    for (path, entry_name) in extra_files {
+        zip.start_file(entry_name.as_str(), large_file_options)?;
+        let mut file = File::open(path)?;
+        io::copy(&mut file, &mut zip)?;
+        added_files.push(path.clone());
+    }
+
     // Print warnings for excluded files
     if !excluded_files.is_empty() {
         log::warn!(
@@ -154,6 +174,30 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
 
     zip.finish()?;
     Ok(added_files)
+}
+
+/// Create a staging directory under the system temp directory, readable only by
+/// its owner.
+///
+/// Staging holds the project zip and any exported container images, so other users
+/// on a shared host must not be able to read it. `tempfile` creates directories
+/// with default permissions — world-readable under a 0022 umask — so owner-only is
+/// requested explicitly. The random name matters too: a fixed parent such as
+/// `/tmp/corgea` can be pre-created, or pointed elsewhere by a symlink, by another
+/// user first.
+pub fn create_private_temp_dir(prefix: &str) -> io::Result<PathBuf> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+
+    // Keep the path rather than the guard: callers end the process through
+    // `std::process::exit`, which skips destructors, so cleanup stays explicit.
+    Ok(builder.tempdir()?.keep())
 }
 
 pub fn create_path_if_not_exists<P: AsRef<Path>>(path: P) -> io::Result<()> {
@@ -791,7 +835,7 @@ mod tests {
         // which would exclude *everything*. The filter + warn path under test
         // is identical either way.
         let excludes: &[&str] = &["**/node_modules/**"];
-        let added = create_zip_from_target(Some(&target), &output_zip, Some(excludes), None)
+        let added = create_zip_from_target(Some(&target), &output_zip, Some(excludes), None, &[])
             .expect("zip creation should succeed");
 
         assert!(
@@ -804,6 +848,89 @@ mod tests {
             "node_modules file should be excluded: {:?}",
             added
         );
+    }
+
+    /// The staging directory holds the project zip and exported images, so other
+    /// local users must not be able to read it.
+    #[cfg(unix)]
+    #[test]
+    fn create_private_temp_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = create_private_temp_dir("corgea-test-").expect("create staging dir");
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+
+        assert_eq!(mode, 0o700, "staging dir must be owner-only, got {mode:o}");
+        let _ = delete_directory(&dir);
+    }
+
+    #[test]
+    fn create_zip_from_target_adds_extra_files_at_the_zip_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let source = root.join("main.py");
+        fs::write(&source, "print(1)").unwrap();
+
+        let staged = root.join("staged").join("image.tar");
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::write(&staged, "image archive").unwrap();
+
+        let output_zip = root.join("out.zip");
+        let entry_name = "corgea-image-scanning-myapp-1.0.tar".to_string();
+        let extra_files = vec![(staged.clone(), entry_name.clone())];
+        let added = create_zip_from_target(
+            Some(&source.display().to_string()),
+            &output_zip,
+            Some(&[]),
+            None,
+            &extra_files,
+        )
+        .expect("zip creation should succeed");
+
+        assert!(added.contains(&staged), "staged archive should be added");
+
+        let mut archive = zip::ZipArchive::new(File::open(&output_zip).unwrap()).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(names.contains(&entry_name), "zip entries: {:?}", names);
+    }
+
+    /// Exported images pass 4 GiB routinely, which a zip entry can only hold with
+    /// ZIP64 headers. Reads a sparse 4 GiB file, so it is too slow for every run:
+    /// `cargo test -- --ignored zip64`.
+    #[test]
+    #[ignore = "slow: writes and reads a sparse 4 GiB file"]
+    fn create_zip_from_target_writes_extras_larger_than_four_gib() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let source = root.join("main.py");
+        fs::write(&source, "print(1)").unwrap();
+
+        // Sparse: set_len reserves the length without writing 4 GiB of blocks.
+        let staged = root.join("huge.tar");
+        File::create(&staged)
+            .unwrap()
+            .set_len(4 * 1024 * 1024 * 1024 + 1)
+            .unwrap();
+
+        let output_zip = root.join("out.zip");
+        let extra_files = vec![(
+            staged.clone(),
+            "corgea-image-scanning-huge-1.0.tar".to_string(),
+        )];
+        let added = create_zip_from_target(
+            Some(&source.display().to_string()),
+            &output_zip,
+            Some(&[]),
+            None,
+            &extra_files,
+        )
+        .expect("a >4 GiB entry needs ZIP64, not an error");
+
+        assert!(added.contains(&staged));
     }
 
     #[test]
