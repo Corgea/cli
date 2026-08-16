@@ -47,6 +47,48 @@ evaluated; override with `CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS`.
 trips: both are written before `--fail`/`--block-on` are evaluated, so a scan
 that exits 1 on a blocking rule still leaves its report behind to ingest.
 
+### Skipping a re-scan of the same commit
+
+A pipeline that re-runs on an unchanged commit can reuse the scan it already
+has instead of paying for a duplicate:
+
+```bash
+corgea scan --skip-if-commit-scanned-recently --block-on criticals
+corgea scan --skip-if-commit-scanned-recently --scanned-within 4h   # 90s, 30m, 4h, 7d
+```
+
+When the project already has a completed scan of the current commit inside the
+window (24h by default), that scan takes the new scan's place: the results
+table, the `--block-on` gate and its exit code, and any `--out-file` report all
+come from it, so the pipeline behaves the same whether or not a scan ran. The
+window exists because unchanged code is still exposed to advisories published
+since it was last scanned.
+
+Two lines make the outcome scriptable — `CORGEA_SCAN_SKIPPED=true` plus
+`CORGEA_SCAN_ID=<id>` when a scan was reused, `CORGEA_SCAN_SKIPPED=false` when
+one ran — so a later step (an ingest, say) can branch on it.
+
+Only a scan that answers the same question is reused, which is stricter than
+"same commit". A candidate has to be a completed BLAST scan of that commit, on a
+branch rather than a pull request, from an explicitly clean worktree, with no
+scanner problems reported — and this run has to be a default whole-commit scan
+itself. Anything else runs a real scan: nothing inside the window, only a failed
+or still-running scan, a worktree that does not match the commit (including
+files the index hides from `git status`), or a lookup the platform could not
+answer.
+
+Two things are hard errors instead. An unresolvable commit (not a git
+repository, or no commits yet) exits 1 rather than silently scanning. And a run
+that changes what gets scanned cannot be matched against a candidate — the API
+exposes neither a scan's configured scan types and target policies nor whether
+it bundled a container image — so the flag is rejected alongside `--scan-type`,
+`--policy`, `--include-image`, `--only-uncommitted`, and `--target`.
+
+`--exclude` is allowed, and warns on a skip. A reused scan is one of the whole
+commit (an `--exclude` upload is recorded as not matching the commit exactly, so
+it is never itself reusable), which means the results and the gate can cover
+files this run would have skipped — over-reporting, never under-reporting.
+
 ## Dependency Inventory (offline)
 
 `corgea deps` builds a dependency inventory from npm, Python, and Java manifests

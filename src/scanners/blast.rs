@@ -63,6 +63,7 @@ pub fn run(
     project_name: Option<String>,
     sbom: Option<String>,
     include_images: Vec<String>,
+    skip_recent: Option<crate::skip_scan::SkipRecentScan>,
 ) {
     // Validate that only_uncommitted and target are not used together
     if *only_uncommitted && target.is_some() {
@@ -85,6 +86,201 @@ pub fn run(
             }
         }
     }
+
+    let project_name = utils::generic::determine_project_name(project_name.as_deref());
+
+    // A reused scan stands in for the new one: everything below this point —
+    // the results table, the blocking-rule gate, the report file — runs against
+    // whichever scan id this resolves to.
+    let reused_scan = skip_recent.as_ref().and_then(|skip| {
+        crate::skip_scan::resolve_reusable_scan(config, &project_name, skip, exclude.as_deref())
+    });
+
+    let (scan_id, project_id) = match reused_scan {
+        Some(scan) => (scan.id, None),
+        None => start_new_scan(
+            config,
+            &project_name,
+            only_uncommitted,
+            metadata,
+            scan_type,
+            policy,
+            target,
+            exclude,
+            include_images,
+        ),
+    };
+
+    let scan_url = build_scan_url(
+        &config.get_url(),
+        project_id.as_deref(),
+        &project_name,
+        &scan_id,
+    );
+
+    let stop_signal = Arc::new(Mutex::new(false));
+    let stop_signal_clone = Arc::clone(&stop_signal);
+    let results_thread = thread::spawn(move || {
+        utils::terminal::show_loading_message(
+            "Collecting scan results... ([T]s)",
+            stop_signal_clone,
+        );
+    });
+
+    let classifications = match report_scan_status(&config.get_url(), &project_name, &scan_id) {
+        Ok(issues_classes) => {
+            *stop_signal.lock().unwrap() = true;
+            let _ = results_thread.join();
+            println!(
+                "\n\nYou can view the scan results at the following link:\n{}",
+                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
+            );
+            issues_classes
+        }
+        Err(e) => {
+            *stop_signal.lock().unwrap() = true;
+            let _ = results_thread.join();
+            log::error!(
+                "\r{}\n\n{}\n\n\
+                However, the scan results may still be accessible at the following link:\n\n\
+                {}\n\n\
+                \n\nPlease check your network connection, authentication token, and server URL:\n\n\
+                - Server URL: {}\n\
+                - Error details: {}\n",
+                utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset),
+                utils::terminal::set_text_color(
+                    &format!(
+                        "Failed to report the scan status for project: '{}'.",
+                        project_name
+                    ),
+                    utils::terminal::TerminalColor::Red
+                ),
+                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Blue),
+                config.get_url(),
+                e
+            );
+            std::process::exit(1);
+        }
+    };
+    // The report and the SBOM are produced before the blocking-rule gates: a
+    // tripped gate exits 1, and a pipeline that fails on policy is exactly the
+    // one that needs the report, to ingest the findings it failed on.
+    write_scan_report(
+        config,
+        &project_name,
+        &scan_id,
+        &classifications,
+        out_format.as_deref(),
+        out_file.as_deref(),
+    );
+
+    if let Some(sbom_file) = sbom {
+        write_sbom(&sbom_file);
+    }
+
+    if *fail {
+        log::warn!(
+            "\n--fail is deprecated: it evaluates every active blocking rule regardless of whether it applies to pull requests or CI. Use --block-on <slug> to name the CI blocking rules this pipeline should enforce."
+        );
+        let blocking_rules = wait_for_blocking_rules(config, &scan_id, None);
+        if blocking_rules.block {
+            println!("\nExiting with error code 1 due to some issues violating some blocking rules defined for this project.\nfor more details, please check the scan results at the link: {}\nAlternatively, you can run {} to view the issues list on your local machine.",
+            utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green),
+            utils::terminal::set_text_color(
+                &format!("corgea ls -i -s={}", scan_id),
+                utils::terminal::TerminalColor::Green
+            )
+        );
+            std::process::exit(1);
+        }
+    }
+
+    if let Some(block_on) = &block_on {
+        let blocking_rules = wait_for_blocking_rules(config, &scan_id, Some(block_on));
+        if blocking_rules.block {
+            // The count comes from the server's pre-pagination total; the slug
+            // list is drawn from the returned page, which is all the gate needs
+            // to name the rules at fault.
+            let triggered = triggered_slug_summary(&blocking_rules.blocking_issues);
+            println!(
+                "\nExiting with error code 1: {} issue(s) violated the blocking rule(s) {}.\nFor more details, check the scan results at: {}\nAlternatively, run {} to view the issues list on your local machine.",
+                blocking_rules.blocked_count(),
+                utils::terminal::set_text_color(&triggered, utils::terminal::TerminalColor::Red),
+                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green),
+                utils::terminal::set_text_color(
+                    &format!("corgea ls -i -s={}", scan_id),
+                    utils::terminal::TerminalColor::Green
+                )
+            );
+            std::process::exit(1);
+        }
+        println!(
+            "\nNo issues violated the blocking rule(s): {}.",
+            utils::terminal::set_text_color(block_on, utils::terminal::TerminalColor::Green)
+        );
+    }
+
+    print!("\n\nThank you for using Corgea! 🐕\n\n");
+
+    if let Some(fail_on) = fail_on {
+        let tokens = match parse_fail_on_tokens(&fail_on) {
+            Ok(tokens) => tokens,
+            Err(msg) => {
+                log::error!("{}", msg);
+                std::process::exit(1);
+            }
+        };
+
+        let severity_already_tripped = tokens
+            .iter()
+            .filter(|t| t.as_str() != "malicious")
+            .any(|t| severity_gate_trips(t, &classifications));
+        let needs_sca_fetch = !severity_already_tripped && tokens.iter().any(|t| t == "malicious");
+
+        let sca_issues = if needs_sca_fetch {
+            match utils::api::get_all_sca_issues(
+                &config.get_url(),
+                &project_name,
+                Some(scan_id.clone()),
+            ) {
+                Ok(issues) => issues,
+                Err(e) => {
+                    log::error!(
+                        "\n\nFailed to fetch SCA issues for --fail-on malicious: {}\n\n",
+                        e
+                    );
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        if fail_on_gate_trips(&tokens, &classifications, &sca_issues) {
+            println!(
+                "\nExiting with error code 1: scan results matched --fail-on {}.",
+                fail_on
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Package the project, upload it, and wait for the scan to finish.
+///
+/// Returns the new scan's id and, when the server reported one, its project id.
+#[allow(clippy::too_many_arguments)]
+fn start_new_scan(
+    config: &Config,
+    project_name: &str,
+    only_uncommitted: &bool,
+    metadata: Option<String>,
+    scan_type: Option<String>,
+    policy: Option<String>,
+    target: Option<String>,
+    exclude: Option<String>,
+    include_images: Vec<String>,
+) -> (String, Option<String>) {
     println!("\nScanning with BLAST 🚀🚀🚀");
 
     if let Some(scan_type) = &scan_type {
@@ -108,7 +304,6 @@ pub fn run(
             std::process::exit(1);
         }
     };
-    let project_name = utils::generic::determine_project_name(project_name.as_deref());
     let zip_path = format!("{}/{}.zip", temp_dir.display(), project_name);
 
     let image_archives = match export_included_images(&include_images, &temp_dir) {
@@ -315,7 +510,7 @@ pub fn run(
     let upload_result = match utils::api::upload_zip(
         &zip_path,
         &config.get_url(),
-        &project_name,
+        project_name,
         repo_info,
         scan_type,
         policy,
@@ -346,7 +541,7 @@ pub fn run(
     let scan_url = build_scan_url(
         &config.get_url(),
         upload_result.project_id.as_deref(),
-        &project_name,
+        project_name,
         &scan_id,
     );
 
@@ -363,152 +558,7 @@ pub fn run(
     );
 
     wait_for_scan(config, &scan_id, WaitBudget::start());
-    let stop_signal = Arc::new(Mutex::new(false));
-    let stop_signal_clone = Arc::clone(&stop_signal);
-    let results_thread = thread::spawn(move || {
-        utils::terminal::show_loading_message(
-            "Collecting scan results... ([T]s)",
-            stop_signal_clone,
-        );
-    });
-
-    let classifications = match report_scan_status(&config.get_url(), &project_name, &scan_id) {
-        Ok(issues_classes) => {
-            *stop_signal.lock().unwrap() = true;
-            let _ = results_thread.join();
-            println!(
-                "\n\nYou can view the scan results at the following link:\n{}",
-                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
-            );
-            issues_classes
-        }
-        Err(e) => {
-            *stop_signal.lock().unwrap() = true;
-            let _ = results_thread.join();
-            log::error!(
-                "\r{}\n\n{}\n\n\
-                However, the scan results may still be accessible at the following link:\n\n\
-                {}\n\n\
-                \n\nPlease check your network connection, authentication token, and server URL:\n\n\
-                - Server URL: {}\n\
-                - Error details: {}\n",
-                utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset),
-                utils::terminal::set_text_color(
-                    &format!(
-                        "Failed to report the scan status for project: '{}'.",
-                        project_name
-                    ),
-                    utils::terminal::TerminalColor::Red
-                ),
-                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Blue),
-                config.get_url(),
-                e
-            );
-            std::process::exit(1);
-        }
-    };
-    // The report and the SBOM are produced before the blocking-rule gates: a
-    // tripped gate exits 1, and a pipeline that fails on policy is exactly the
-    // one that needs the report, to ingest the findings it failed on.
-    write_scan_report(
-        config,
-        &project_name,
-        &scan_id,
-        &classifications,
-        out_format.as_deref(),
-        out_file.as_deref(),
-    );
-
-    if let Some(sbom_file) = sbom {
-        write_sbom(&sbom_file);
-    }
-
-    if *fail {
-        log::warn!(
-            "\n--fail is deprecated: it evaluates every active blocking rule regardless of whether it applies to pull requests or CI. Use --block-on <slug> to name the CI blocking rules this pipeline should enforce."
-        );
-        let blocking_rules = wait_for_blocking_rules(config, &scan_id, None);
-        if blocking_rules.block {
-            println!("\nExiting with error code 1 due to some issues violating some blocking rules defined for this project.\nfor more details, please check the scan results at the link: {}\nAlternatively, you can run {} to view the issues list on your local machine.",
-            utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green),
-            utils::terminal::set_text_color(
-                &format!("corgea ls -i -s={}", scan_id),
-                utils::terminal::TerminalColor::Green
-            )
-        );
-            std::process::exit(1);
-        }
-    }
-
-    if let Some(block_on) = &block_on {
-        let blocking_rules = wait_for_blocking_rules(config, &scan_id, Some(block_on));
-        if blocking_rules.block {
-            // The count comes from the server's pre-pagination total; the slug
-            // list is drawn from the returned page, which is all the gate needs
-            // to name the rules at fault.
-            let triggered = triggered_slug_summary(&blocking_rules.blocking_issues);
-            println!(
-                "\nExiting with error code 1: {} issue(s) violated the blocking rule(s) {}.\nFor more details, check the scan results at: {}\nAlternatively, run {} to view the issues list on your local machine.",
-                blocking_rules.blocked_count(),
-                utils::terminal::set_text_color(&triggered, utils::terminal::TerminalColor::Red),
-                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green),
-                utils::terminal::set_text_color(
-                    &format!("corgea ls -i -s={}", scan_id),
-                    utils::terminal::TerminalColor::Green
-                )
-            );
-            std::process::exit(1);
-        }
-        println!(
-            "\nNo issues violated the blocking rule(s): {}.",
-            utils::terminal::set_text_color(block_on, utils::terminal::TerminalColor::Green)
-        );
-    }
-
-    print!("\n\nThank you for using Corgea! 🐕\n\n");
-
-    if let Some(fail_on) = fail_on {
-        let tokens = match parse_fail_on_tokens(&fail_on) {
-            Ok(tokens) => tokens,
-            Err(msg) => {
-                log::error!("{}", msg);
-                std::process::exit(1);
-            }
-        };
-
-        let severity_already_tripped = tokens
-            .iter()
-            .filter(|t| t.as_str() != "malicious")
-            .any(|t| severity_gate_trips(t, &classifications));
-        let needs_sca_fetch = !severity_already_tripped && tokens.iter().any(|t| t == "malicious");
-
-        let sca_issues = if needs_sca_fetch {
-            match utils::api::get_all_sca_issues(
-                &config.get_url(),
-                &project_name,
-                Some(scan_id.clone()),
-            ) {
-                Ok(issues) => issues,
-                Err(e) => {
-                    log::error!(
-                        "\n\nFailed to fetch SCA issues for --fail-on malicious: {}\n\n",
-                        e
-                    );
-                    std::process::exit(1);
-                }
-            }
-        } else {
-            Vec::new()
-        };
-
-        if fail_on_gate_trips(&tokens, &classifications, &sca_issues) {
-            println!(
-                "\nExiting with error code 1: scan results matched --fail-on {}.",
-                fail_on
-            );
-            std::process::exit(1);
-        }
-    }
+    (scan_id, upload_result.project_id)
 }
 
 /// Write the `--out-format` report for a completed scan to `--out-file`.
@@ -1610,6 +1660,8 @@ mod tests {
             engine: "corgea-blast".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             git_sha: None,
+            worktree_dirty: None,
+            pull_request_id: None,
             metadata: None,
             failed_reason: failed_reason.map(|r| r.to_string()),
             scan_errors,

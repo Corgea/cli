@@ -8,6 +8,7 @@ mod log;
 mod scan;
 mod setup_hooks;
 mod skill;
+mod skip_scan;
 mod wait;
 mod scanners {
     pub mod blast;
@@ -169,6 +170,21 @@ enum Commands {
             help = "Scan a fully built container image (repeatable), e.g. --include-image myapp:1.2.3 --include-image ghcr.io/acme/api:latest. Each image is exported with docker (or podman), pulled first if it isn't available locally, and uploaded with your project. Corgea scans the images you pass instead of searching your code for base images. Requires container scanning to be enabled for your account."
         )]
         include_image: Vec<String>,
+
+        #[arg(
+            long = "skip-if-commit-scanned-recently",
+            conflicts_with_all = ["only_uncommitted", "target", "scan_type", "policy", "include_image"],
+            help = "Do not start a new scan when this commit already has a recent completed scan in the project. That scan then drives the rest of the command — results table, --block-on gate, --out-file report — so the pipeline behaves the same either way. Prints CORGEA_SCAN_SKIPPED=true/false so a pipeline can tell the two apart, and fails if no git commit can be resolved. What can be reused is a scan of the whole commit, and no API tells this run how a past scan was scoped or configured, so the flag is refused with --only-uncommitted, --target, --scan-type, --policy and --include-image; with --exclude it warns instead, since a reused scan covers files this run would have skipped."
+        )]
+        skip_if_commit_scanned_recently: bool,
+
+        #[arg(
+            long = "scanned-within",
+            value_name = "DURATION",
+            requires = "skip_if_commit_scanned_recently",
+            help = "How recent a prior scan of the same commit must be for --skip-if-commit-scanned-recently to reuse it, e.g. 90s, 30m, 24h, 7d (a bare number means hours). Defaults to 24h, because unchanged code is still exposed to advisories published since it was last scanned."
+        )]
+        scanned_within: Option<String>,
     },
     /// Wait for the latest in progress scan
     Wait {
@@ -648,6 +664,8 @@ fn main() {
             project_name,
             sbom,
             include_image,
+            skip_if_commit_scanned_recently,
+            scanned_within,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             if let Some(level) = fail_on {
@@ -784,6 +802,25 @@ fn main() {
                 }
             };
 
+            if *skip_if_commit_scanned_recently && *scanner != Scanner::Blast {
+                ::log::error!(
+                    "skip-if-commit-scanned-recently is only supported with blast scanner."
+                );
+                std::process::exit(1);
+            }
+
+            let skip_recent = if *skip_if_commit_scanned_recently {
+                match skip_scan::SkipRecentScan::new(scanned_within.as_deref()) {
+                    Ok(skip) => Some(skip),
+                    Err(msg) => {
+                        ::log::error!("{}", msg);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                None
+            };
+
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config, project_name.clone()),
                 Scanner::Semgrep => scan::run_semgrep(&corgea_config, project_name.clone()),
@@ -803,6 +840,7 @@ fn main() {
                     project_name.clone(),
                     sbom.clone(),
                     include_images,
+                    skip_recent,
                 ),
             }
         }

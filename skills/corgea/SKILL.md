@@ -44,6 +44,8 @@ corgea scan --sbom sbom.cdx.json               # SBOM to a custom file
 corgea scan --include-image myapp:1.2.3        # Also scan a fully built container image
 corgea scan --include-image myapp:1.2.3 --include-image ghcr.io/acme/api:latest  # Repeatable
 corgea scan --project-name my-service          # Override project name
+corgea scan --skip-if-commit-scanned-recently  # Reuse a recent scan of this commit instead of scanning again
+corgea scan --skip-if-commit-scanned-recently --scanned-within 4h  # Window for "recently" (default 24h)
 ```
 
 Scan types: `blast` (base AI), `policy` (PolicyIQ), `malicious`, `secrets`, `pii`.
@@ -61,6 +63,10 @@ An included image is enough on its own: when it is combined with `--only-uncommi
 `--only-uncommitted` and `--target` are mutually exclusive. `--fail-on`, `--fail`, and `--block-on` are mutually exclusive.
 
 `--out-format`/`--out-file` and `--sbom` are honored regardless of the gate: the report and the SBOM are written before `--fail`/`--block-on` are evaluated, so a scan that exits 1 on a blocking rule still leaves the report file behind for the pipeline to ingest.
+
+`--skip-if-commit-scanned-recently` reuses the project's most recent reusable scan of the current commit instead of starting a duplicate, when one ran inside the `--scanned-within` window (default `24h`; accepts `90s`, `30m`, `4h`, `7d`, and a bare number as hours). The reused scan takes the new scan's place for the rest of the command — results table, `--block-on` gate and its exit code, `--out-file` report — so the pipeline behaves the same either way. It prints `CORGEA_SCAN_SKIPPED=true` plus `CORGEA_SCAN_ID=<id>` on a reuse and `CORGEA_SCAN_SKIPPED=false` when a scan runs, so a later step can branch on it.
+
+Reuse requires a candidate that answers the same question: a completed `corgea-blast` scan of that commit, on a branch rather than a pull request, from an explicitly clean worktree, reporting no scanner problems. Anything else runs a real scan (nothing in the window, a failed or still-running scan, a worktree that does not match the commit including files hidden from `git status`, or a failed lookup). An unresolvable commit is a hard error (exit 1). Because the API exposes neither a scan's configured scan types and target policies nor whether it bundled a container image, a run that changes what gets scanned cannot be matched against a candidate, so the flag cannot be combined with `--scan-type`, `--policy`, `--include-image`, `--only-uncommitted`, or `--target`. `--exclude` is allowed but warns on a skip: what gets reused is a scan of the whole commit, so the results and the gate can cover files the run would have skipped (over-reporting, never under-reporting).
 
 ### Upload — `corgea upload [report]`
 
@@ -387,6 +393,7 @@ corgea inspect --issue --diff ISSUE_ID
 corgea scan --fail-on CR --out-format sarif --out-file results.sarif
 corgea scan --fail-on CR,malicious --out-format sarif --out-file results.sarif  # also block malicious dependencies
 corgea scan --block-on criticals --out-format sarif --out-file results.sarif  # gate on a CI blocking rule from the web app
+corgea scan --block-on criticals --skip-if-commit-scanned-recently  # re-runs of an already-scanned commit gate on that scan instead of rescanning
 ```
 
 The report is written whether or not the gate trips, so a pipeline can both fail
