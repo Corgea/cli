@@ -185,6 +185,13 @@ enum Commands {
             help = "How recent a prior scan of the same commit must be for --skip-if-commit-scanned-recently to reuse it, e.g. 90s, 30m, 24h, 7d (a bare number means hours). Defaults to 24h, because unchanged code is still exposed to advisories published since it was last scanned."
         )]
         scanned_within: Option<String>,
+
+        #[arg(
+            long = "ignore-dirty-worktree",
+            requires = "skip_if_commit_scanned_recently",
+            help = "With --skip-if-commit-scanned-recently, reuse a recent scan of this commit even if this worktree is dirty or the prior scan recorded worktree_dirty. A new scan still reports the real dirty status."
+        )]
+        ignore_dirty_worktree: bool,
     },
     /// Wait for the latest in progress scan
     Wait {
@@ -674,6 +681,7 @@ fn main() {
             include_image,
             skip_if_commit_scanned_recently,
             scanned_within,
+            ignore_dirty_worktree,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             if let Some(level) = fail_on {
@@ -849,6 +857,7 @@ fn main() {
                     sbom.clone(),
                     include_images,
                     skip_recent,
+                    ignore_dirty_worktree,
                 ),
             }
         }

@@ -64,6 +64,7 @@ pub fn run(
     sbom: Option<String>,
     include_images: Vec<String>,
     skip_recent: Option<crate::skip_scan::SkipRecentScan>,
+    ignore_dirty_worktree: &bool,
 ) {
     // Validate that only_uncommitted and target are not used together
     if *only_uncommitted && target.is_some() {
@@ -93,7 +94,13 @@ pub fn run(
     // the results table, the blocking-rule gate, the report file — runs against
     // whichever scan id this resolves to.
     let reused_scan = skip_recent.as_ref().and_then(|skip| {
-        crate::skip_scan::resolve_reusable_scan(config, &project_name, skip, exclude.as_deref())
+        crate::skip_scan::resolve_reusable_scan(
+            config,
+            &project_name,
+            skip,
+            exclude.as_deref(),
+            *ignore_dirty_worktree,
+        )
     });
 
     let (scan_id, project_id) = match reused_scan {

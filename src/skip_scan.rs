@@ -10,7 +10,12 @@
 //!
 //! Recency is a policy, not a technicality — the same commit scanned last week
 //! predates whatever advisories landed since, so a scan is only reusable
-//! inside the window (24h by default).
+//! inside the window (24h by default). `--ignore-dirty-worktree` is the
+//! explicit override for reuse only: a dirty current tree, or a prior scan
+//! that recorded `worktree_dirty=true`, can still stand in for this commit.
+//! A prior scan that never reported the flag (`None`) is still rejected —
+//! unknown scope is not dirtiness. A new scan still reports the real dirty
+//! status.
 //!
 //! One scan may only stand in for another when it answers the same question,
 //! which is a stricter test than "same commit". Doghouse already settled what
@@ -107,7 +112,10 @@ pub fn parse_window(raw: &str) -> Result<Duration, String> {
 ///
 /// Every `None` is a decision to do the more expensive, more correct thing, so
 /// a lookup failure, an unreadable timestamp, or a dirty worktree all land
-/// here rather than skipping a scan on incomplete information. The one hard
+/// here rather than skipping a scan on incomplete information. `--ignore-dirty-worktree`
+/// is the exception for known dirtiness: a dirty current tree, or a prior scan
+/// that recorded `worktree_dirty=true`, can still be reused. `None` is still
+/// rejected. The one hard
 /// failure is an unresolvable commit: the flag asks a question about the
 /// commit, and without one there is no question to answer.
 pub fn resolve_reusable_scan(
@@ -115,6 +123,7 @@ pub fn resolve_reusable_scan(
     project_name: &str,
     skip: &SkipRecentScan,
     exclude: Option<&str>,
+    ignore_dirty_worktree: bool,
 ) -> Option<ScanResponse> {
     // `dirty`, not `status_dirty`: this asks whether the run would upload an
     // exact snapshot of the commit, and that is the flag the upload itself
@@ -135,12 +144,19 @@ pub fn resolve_reusable_scan(
     let short = short_sha(&sha);
 
     if worktree_dirty {
-        println!(
-            "Working tree does not match commit {} exactly (uncommitted changes, or files the index hides from git status), so no scan of that commit describes what would be scanned here - running a new scan.",
-            short
-        );
-        print_skipped_marker(None);
-        return None;
+        if ignore_dirty_worktree {
+            println!(
+                "Ignoring dirty worktree (--ignore-dirty-worktree); treating this as a scan of commit {}.",
+                short
+            );
+        } else {
+            println!(
+                "Working tree does not match commit {} exactly (uncommitted changes, or files the index hides from git status), so no scan of that commit describes what would be scanned here - running a new scan.",
+                short
+            );
+            print_skipped_marker(None);
+            return None;
+        }
     }
 
     println!(
@@ -148,7 +164,14 @@ pub fn resolve_reusable_scan(
         short, project_name, skip.label
     );
 
-    let found = match find_reusable_scan(config, project_name, &sha, skip.window, Utc::now()) {
+    let found = match find_reusable_scan(
+        config,
+        project_name,
+        &sha,
+        skip.window,
+        Utc::now(),
+        ignore_dirty_worktree,
+    ) {
         Ok(found) => found,
         Err(e) => {
             log::warn!(
@@ -208,6 +231,7 @@ fn find_reusable_scan(
     sha: &str,
     window: Duration,
     now: DateTime<Utc>,
+    ignore_dirty_worktree: bool,
 ) -> Result<Option<(ScanResponse, String)>, String> {
     let mut page = 1;
     loop {
@@ -223,7 +247,9 @@ fn find_reusable_scan(
         if scans.is_empty() {
             return Ok(None);
         }
-        if let Some(reusable) = select_reusable_scan(&scans, sha, now, window) {
+        if let Some(reusable) =
+            select_reusable_scan(&scans, sha, now, window, ignore_dirty_worktree)
+        {
             return Ok(Some((reusable.scan.clone(), reusable.age)));
         }
         // Newest first, so a page that ends outside the window is the end of the
@@ -296,9 +322,10 @@ pub fn select_reusable_scan<'a>(
     sha: &str,
     now: DateTime<Utc>,
     window: Duration,
+    ignore_dirty_worktree: bool,
 ) -> Option<ReusableScan<'a>> {
     for scan in scans {
-        match scan_age_if_reusable(scan, sha, now, window) {
+        match scan_age_if_reusable(scan, sha, now, window, ignore_dirty_worktree) {
             Ok(age) => {
                 return Some(ReusableScan {
                     scan,
@@ -324,6 +351,7 @@ fn scan_age_if_reusable(
     sha: &str,
     now: DateTime<Utc>,
     window: Duration,
+    ignore_dirty_worktree: bool,
 ) -> Result<Duration, String> {
     if !scan_matches_commit(scan, sha) {
         return match scan.git_sha.as_deref() {
@@ -351,11 +379,17 @@ fn scan_age_if_reusable(
     // platform and scheduled scans do record `false`, and the scans that do not
     // include the partial `--target`/`--exclude` uploads of older CLIs — which
     // this run has no way to tell apart from whole-commit ones.
-    if scan.worktree_dirty != Some(false) {
-        return match scan.worktree_dirty {
-            Some(true) => Err("it scanned a worktree with uncommitted changes".to_string()),
-            _ => Err("it did not report whether its worktree was clean".to_string()),
-        };
+    // `--ignore-dirty-worktree` may reuse a known-dirty scan (`Some(true)`),
+    // but not `None`: unknown scope is not dirtiness.
+    match scan.worktree_dirty {
+        Some(false) => {}
+        Some(true) if ignore_dirty_worktree => {}
+        Some(true) => {
+            return Err("it scanned a worktree with uncommitted changes".to_string());
+        }
+        None => {
+            return Err("it did not report whether its worktree was clean".to_string());
+        }
     }
     let created_at = parse_timestamp(&scan.created_at)
         .ok_or_else(|| format!("its timestamp '{}' could not be read", scan.created_at))?;
@@ -485,7 +519,8 @@ mod tests {
             scan("newer", "complete", Some(SHA), "2026-01-01T21:00:00Z"),
             scan("older", "complete", Some(SHA), "2026-01-01T12:00:00Z"),
         ];
-        let reusable = select_reusable_scan(&scans, SHA, now(), DAY).expect("expected a reuse");
+        let reusable =
+            select_reusable_scan(&scans, SHA, now(), DAY, false).expect("expected a reuse");
         assert_eq!(reusable.scan.id, "newer");
         assert_eq!(reusable.age, "3h 0m");
     }
@@ -498,7 +533,8 @@ mod tests {
             scan("failed", "incomplete", Some(SHA), "2026-01-01T23:00:00Z"),
             scan("good", "complete", Some(SHA), "2026-01-01T22:00:00Z"),
         ];
-        let reusable = select_reusable_scan(&scans, SHA, now(), DAY).expect("expected a reuse");
+        let reusable =
+            select_reusable_scan(&scans, SHA, now(), DAY, false).expect("expected a reuse");
         assert_eq!(reusable.scan.id, "good");
     }
 
@@ -507,7 +543,7 @@ mod tests {
         for status in ["processing", "scanning", "incomplete", "failed", ""] {
             let scans = vec![scan("s", status, Some(SHA), "2026-01-01T23:00:00Z")];
             assert!(
-                select_reusable_scan(&scans, SHA, now(), DAY).is_none(),
+                select_reusable_scan(&scans, SHA, now(), DAY, false).is_none(),
                 "status {status} must not be reused"
             );
         }
@@ -527,7 +563,7 @@ mod tests {
             ),
             scan("no-commit", "complete", None, "2026-01-01T23:00:00Z"),
         ];
-        assert!(select_reusable_scan(&scans, SHA, now(), DAY).is_none());
+        assert!(select_reusable_scan(&scans, SHA, now(), DAY, false).is_none());
     }
 
     #[test]
@@ -538,7 +574,7 @@ mod tests {
             Some(&SHA.to_uppercase()),
             "2026-01-01T23:00:00Z",
         )];
-        assert!(select_reusable_scan(&scans, SHA, now(), DAY).is_some());
+        assert!(select_reusable_scan(&scans, SHA, now(), DAY, false).is_some());
     }
 
     #[test]
@@ -546,7 +582,7 @@ mod tests {
         // The point of the window: the code is unchanged, but the advisories
         // it is scanned against are not.
         let scans = vec![scan("stale", "complete", Some(SHA), "2025-12-30T00:00:00Z")];
-        assert!(select_reusable_scan(&scans, SHA, now(), DAY).is_none());
+        assert!(select_reusable_scan(&scans, SHA, now(), DAY, false).is_none());
         // A shorter window is what makes a scan from this morning stale.
         let scans = vec![scan(
             "morning",
@@ -554,13 +590,15 @@ mod tests {
             Some(SHA),
             "2026-01-01T20:00:00Z",
         )];
-        assert!(select_reusable_scan(&scans, SHA, now(), Duration::from_secs(3_600)).is_none());
+        assert!(
+            select_reusable_scan(&scans, SHA, now(), Duration::from_secs(3_600), false).is_none()
+        );
     }
 
     #[test]
     fn a_scan_exactly_at_the_window_edge_is_still_reusable() {
         let scans = vec![scan("edge", "complete", Some(SHA), "2026-01-01T00:00:00Z")];
-        assert!(select_reusable_scan(&scans, SHA, now(), DAY).is_some());
+        assert!(select_reusable_scan(&scans, SHA, now(), DAY, false).is_some());
     }
 
     #[test]
@@ -568,7 +606,22 @@ mod tests {
         // Those results describe someone's uncommitted edits, not this commit.
         let mut dirty = scan("dirty", "complete", Some(SHA), "2026-01-01T23:00:00Z");
         dirty.worktree_dirty = Some(true);
-        assert!(select_reusable_scan(&[dirty], SHA, now(), DAY).is_none());
+        assert!(select_reusable_scan(&[dirty], SHA, now(), DAY, false).is_none());
+    }
+
+    #[test]
+    fn ignore_dirty_worktree_reuses_a_dirty_prior_scan() {
+        let mut dirty = scan("dirty", "complete", Some(SHA), "2026-01-01T23:00:00Z");
+        dirty.worktree_dirty = Some(true);
+        assert!(select_reusable_scan(&[dirty], SHA, now(), DAY, true).is_some());
+    }
+
+    #[test]
+    fn ignore_dirty_worktree_still_rejects_a_scan_that_never_reported_dirtiness() {
+        // `None` is unknown scope (legacy / partial uploads), not known dirty.
+        let mut unknown = scan("unknown", "complete", Some(SHA), "2026-01-01T23:00:00Z");
+        unknown.worktree_dirty = None;
+        assert!(select_reusable_scan(&[unknown], SHA, now(), DAY, true).is_none());
     }
 
     #[test]
@@ -579,7 +632,7 @@ mod tests {
         // indistinguishable from whole-commit ones from here.
         let mut unknown = scan("unknown", "complete", Some(SHA), "2026-01-01T23:00:00Z");
         unknown.worktree_dirty = None;
-        assert!(select_reusable_scan(&[unknown], SHA, now(), DAY).is_none());
+        assert!(select_reusable_scan(&[unknown], SHA, now(), DAY, false).is_none());
     }
 
     #[test]
@@ -588,7 +641,7 @@ mod tests {
         // to the diff, so it cannot stand in for a branch build of the commit.
         let mut pr_scan = scan("pr", "complete", Some(SHA), "2026-01-01T23:00:00Z");
         pr_scan.pull_request_id = Some("42".to_string());
-        assert!(select_reusable_scan(&[pr_scan], SHA, now(), DAY).is_none());
+        assert!(select_reusable_scan(&[pr_scan], SHA, now(), DAY, false).is_none());
     }
 
     #[test]
@@ -597,17 +650,17 @@ mod tests {
         // which is not what `corgea scan blast` was asked to produce.
         let mut semgrep = scan("semgrep", "complete", Some(SHA), "2026-01-01T23:00:00Z");
         semgrep.engine = "semgrep".to_string();
-        assert!(select_reusable_scan(&[semgrep], SHA, now(), DAY).is_none());
+        assert!(select_reusable_scan(&[semgrep], SHA, now(), DAY, false).is_none());
         // Every blast scan carries this engine, whoever started it.
         let mut blast = scan("blast", "complete", Some(SHA), "2026-01-01T23:00:00Z");
         blast.engine = BLAST_ENGINE.to_uppercase();
-        assert!(select_reusable_scan(&[blast], SHA, now(), DAY).is_some());
+        assert!(select_reusable_scan(&[blast], SHA, now(), DAY, false).is_some());
     }
 
     #[test]
     fn unreadable_timestamps_do_not_skip_the_scan() {
         let scans = vec![scan("bad-time", "complete", Some(SHA), "not a timestamp")];
-        assert!(select_reusable_scan(&scans, SHA, now(), DAY).is_none());
+        assert!(select_reusable_scan(&scans, SHA, now(), DAY, false).is_none());
     }
 
     #[test]
@@ -622,7 +675,7 @@ mod tests {
         ] {
             let scans = vec![scan("s", "complete", Some(SHA), raw)];
             assert!(
-                select_reusable_scan(&scans, SHA, now(), DAY).is_some(),
+                select_reusable_scan(&scans, SHA, now(), DAY, false).is_some(),
                 "{raw} should parse"
             );
         }
@@ -638,13 +691,14 @@ mod tests {
             Some(SHA),
             "2026-01-02T01:00:00Z",
         )];
-        let reusable = select_reusable_scan(&scans, SHA, now(), DAY).expect("expected a reuse");
+        let reusable =
+            select_reusable_scan(&scans, SHA, now(), DAY, false).expect("expected a reuse");
         assert_eq!(reusable.age, "0s");
     }
 
     #[test]
     fn empty_scan_list_reuses_nothing() {
-        assert!(select_reusable_scan(&[], SHA, now(), DAY).is_none());
+        assert!(select_reusable_scan(&[], SHA, now(), DAY, false).is_none());
     }
 
     #[test]
