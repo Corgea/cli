@@ -333,6 +333,171 @@ fn a_file_hidden_from_git_status_scans_instead_of_reusing() {
     );
 }
 
+/// `--ignore-dirty-worktree` lets `--skip-if-commit-scanned-recently` reuse a
+/// prior scan even when this worktree is dirty. A new scan still reports dirty.
+#[test]
+fn ignore_dirty_worktree_reuses_a_scan_a_dirty_tree_would_otherwise_run() {
+    let project = git_project();
+    std::fs::write(project.path().join("main.py"), "print('dirty')\n")
+        .expect("modify tracked file");
+    let api = ApiStub::start(vec![
+        verify_request(),
+        commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
+        clean_detail(&project.sha),
+        reused_scan_issues(),
+        reused_scan_blocking_rules(false),
+    ]);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--skip-if-commit-scanned-recently",
+        "--ignore-dirty-worktree",
+        "--block-on",
+        "criticals",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains("Ignoring dirty worktree (--ignore-dirty-worktree)"),
+        "{context}"
+    );
+    assert!(stdout.contains("CORGEA_SCAN_SKIPPED=true"), "{context}");
+    assert!(!stdout.contains("Scanning with BLAST"), "{context}");
+    assert!(
+        !stdout.contains("Working tree does not match commit"),
+        "{context}"
+    );
+}
+
+/// Same override for index hide-bits: assume-unchanged is invisible to
+/// `git status` but still blocks reuse unless ignored.
+#[test]
+fn ignore_dirty_worktree_reuses_when_a_file_is_hidden_from_git_status() {
+    let project = git_project();
+    run_git(
+        project.path(),
+        &["update-index", "--assume-unchanged", "main.py"],
+    );
+    std::fs::write(project.path().join("main.py"), "print('hidden change')\n")
+        .expect("modify assume-unchanged file");
+    let api = ApiStub::start(vec![
+        verify_request(),
+        commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
+        clean_detail(&project.sha),
+        reused_scan_issues(),
+        reused_scan_blocking_rules(false),
+    ]);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--skip-if-commit-scanned-recently",
+        "--ignore-dirty-worktree",
+        "--block-on",
+        "criticals",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(stdout.contains("CORGEA_SCAN_SKIPPED=true"), "{context}");
+    assert!(
+        stdout.contains("Ignoring dirty worktree (--ignore-dirty-worktree)"),
+        "{context}"
+    );
+}
+
+/// A prior scan that itself recorded `worktree_dirty` is also reusable when
+/// the override is on — the customer case where the last scan of the commit
+/// was marked dirty even though they consider the tree clean.
+#[test]
+fn ignore_dirty_worktree_reuses_a_prior_dirty_scan() {
+    let project = git_project();
+    let mut prior = prior_scan(&project.sha, &ago(3));
+    prior["worktree_dirty"] = json!(true);
+    let mut detail = prior.clone();
+    detail["scan_errors"] = json!([]);
+    let path = format!("/api/v1/scan/{PRIOR_SCAN}");
+    let api = ApiStub::start(vec![
+        verify_request(),
+        commit_lookup(&project.sha, vec![prior]),
+        expected_request(
+            "confirm the dirty scan being reused",
+            move |request| assert_authenticated_request(request, Method::GET, &path),
+            json_response(detail),
+        ),
+        reused_scan_issues(),
+        reused_scan_blocking_rules(false),
+    ]);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--skip-if-commit-scanned-recently",
+        "--ignore-dirty-worktree",
+        "--block-on",
+        "criticals",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(stdout.contains("CORGEA_SCAN_SKIPPED=true"), "{context}");
+    assert!(!stdout.contains("Scanning with BLAST"), "{context}");
+}
+
+/// The override is only a reuse rule. When nothing can be reused, the new
+/// scan still sends the real dirty status.
+#[test]
+fn ignore_dirty_worktree_still_uploads_dirty_when_nothing_is_reused() {
+    let project = git_project();
+    std::fs::write(project.path().join("main.py"), "print('dirty')\n")
+        .expect("modify tracked file");
+    let mut plan = blast_upload_plan(&project.sha, true, false);
+    plan.insert(1, commit_lookup(&project.sha, vec![]));
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--skip-if-commit-scanned-recently",
+        "--ignore-dirty-worktree",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(stdout.contains("CORGEA_SCAN_SKIPPED=false"), "{context}");
+    assert!(stdout.contains("Scanning with BLAST"), "{context}");
+    assert!(
+        stdout.contains("Working tree has uncommitted changes"),
+        "{context}"
+    );
+}
+
 /// A prior scan that finished with a scanner's results missing is not reused: a
 /// fresh scan says so out loud and may also clear a transient failure, while
 /// reusing it would gate silently on findings known to be incomplete. The scan
@@ -519,6 +684,27 @@ fn the_window_cannot_be_set_without_the_skip_flag() {
     let project = git_project();
     let (mut command, _home) = cloud_command(&api, project.path());
     command.args(["scan", "blast", "--scanned-within", "1h"]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2), "{context}");
+    assert!(
+        stderr.contains("--skip-if-commit-scanned-recently"),
+        "{context}"
+    );
+}
+
+/// `--ignore-dirty-worktree` only changes reuse; it is meaningless without
+/// `--skip-if-commit-scanned-recently`.
+#[test]
+fn ignore_dirty_worktree_cannot_be_set_without_the_skip_flag() {
+    let api = ApiStub::start(Vec::new());
+    let project = git_project();
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--ignore-dirty-worktree"]);
 
     let output = run_with_timeout(command, &api);
     let transcript = api.assert_finished();
