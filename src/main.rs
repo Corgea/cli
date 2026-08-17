@@ -535,7 +535,15 @@ fn default_log_level(debug_flag: i8) -> &'static str {
 
 fn main() {
     let cli = Cli::parse();
-    let mut corgea_config = Config::load().expect("Failed to load config");
+    let mut corgea_config = match Config::load() {
+        Ok(config) => config,
+        // `config.toml` is a file the user can edit, so a bad one is theirs to
+        // fix, not a Rust panic with a backtrace note.
+        Err(e) => {
+            eprintln!("Failed to load config: {}", e);
+            std::process::exit(1);
+        }
+    };
     init_logging(&corgea_config);
     fn verify_token_and_exit_when_fail(config: &Config) {
         if config.get_token().is_empty() {
