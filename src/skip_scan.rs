@@ -12,8 +12,10 @@
 //! predates whatever advisories landed since, so a scan is only reusable
 //! inside the window (24h by default). `--ignore-dirty-worktree` is the
 //! explicit override for reuse only: a dirty current tree, or a prior scan
-//! that recorded `worktree_dirty`, can still stand in for this commit. A new
-//! scan still reports the real dirty status.
+//! that recorded `worktree_dirty=true`, can still stand in for this commit.
+//! A prior scan that never reported the flag (`None`) is still rejected —
+//! unknown scope is not dirtiness. A new scan still reports the real dirty
+//! status.
 //!
 //! One scan may only stand in for another when it answers the same question,
 //! which is a stricter test than "same commit". Doghouse already settled what
@@ -111,8 +113,9 @@ pub fn parse_window(raw: &str) -> Result<Duration, String> {
 /// Every `None` is a decision to do the more expensive, more correct thing, so
 /// a lookup failure, an unreadable timestamp, or a dirty worktree all land
 /// here rather than skipping a scan on incomplete information. `--ignore-dirty-worktree`
-/// is the exception for dirtiness: a dirty current tree, or a prior scan that
-/// recorded `worktree_dirty`, can still be reused. The one hard
+/// is the exception for known dirtiness: a dirty current tree, or a prior scan
+/// that recorded `worktree_dirty=true`, can still be reused. `None` is still
+/// rejected. The one hard
 /// failure is an unresolvable commit: the flag asks a question about the
 /// commit, and without one there is no question to answer.
 pub fn resolve_reusable_scan(
@@ -376,11 +379,17 @@ fn scan_age_if_reusable(
     // platform and scheduled scans do record `false`, and the scans that do not
     // include the partial `--target`/`--exclude` uploads of older CLIs — which
     // this run has no way to tell apart from whole-commit ones.
-    if !ignore_dirty_worktree && scan.worktree_dirty != Some(false) {
-        return match scan.worktree_dirty {
-            Some(true) => Err("it scanned a worktree with uncommitted changes".to_string()),
-            _ => Err("it did not report whether its worktree was clean".to_string()),
-        };
+    // `--ignore-dirty-worktree` may reuse a known-dirty scan (`Some(true)`),
+    // but not `None`: unknown scope is not dirtiness.
+    match scan.worktree_dirty {
+        Some(false) => {}
+        Some(true) if ignore_dirty_worktree => {}
+        Some(true) => {
+            return Err("it scanned a worktree with uncommitted changes".to_string());
+        }
+        None => {
+            return Err("it did not report whether its worktree was clean".to_string());
+        }
     }
     let created_at = parse_timestamp(&scan.created_at)
         .ok_or_else(|| format!("its timestamp '{}' could not be read", scan.created_at))?;
@@ -608,10 +617,11 @@ mod tests {
     }
 
     #[test]
-    fn ignore_dirty_worktree_reuses_a_scan_that_never_reported_dirtiness() {
+    fn ignore_dirty_worktree_still_rejects_a_scan_that_never_reported_dirtiness() {
+        // `None` is unknown scope (legacy / partial uploads), not known dirty.
         let mut unknown = scan("unknown", "complete", Some(SHA), "2026-01-01T23:00:00Z");
         unknown.worktree_dirty = None;
-        assert!(select_reusable_scan(&[unknown], SHA, now(), DAY, true).is_some());
+        assert!(select_reusable_scan(&[unknown], SHA, now(), DAY, true).is_none());
     }
 
     #[test]
