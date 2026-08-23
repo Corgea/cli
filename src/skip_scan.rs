@@ -456,8 +456,13 @@ fn format_age(age: Duration) -> String {
     format!("{}s", seconds)
 }
 
+/// First 7 characters, by char boundary rather than byte index. The value comes
+/// from the API, so a non-ASCII one must shorten, not panic mid-scan.
 fn short_sha(sha: &str) -> &str {
-    &sha[..sha.len().min(7)]
+    match sha.char_indices().nth(7) {
+        Some((byte, _)) => &sha[..byte],
+        None => sha,
+    }
 }
 
 #[cfg(test)]

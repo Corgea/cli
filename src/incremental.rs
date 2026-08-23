@@ -300,8 +300,13 @@ fn commit_tree<'repo>(
     repo.revparse_single(rev)?.peel_to_commit()?.tree()
 }
 
+/// First 7 characters, by char boundary rather than byte index. The value comes
+/// from the API, so a non-ASCII one must shorten, not panic mid-scan.
 fn short_sha(sha: &str) -> &str {
-    &sha[..sha.len().min(7)]
+    match sha.char_indices().nth(7) {
+        Some((byte, _)) => &sha[..byte],
+        None => sha,
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +331,15 @@ mod tests {
             failed_reason: None,
             scan_errors: Vec::new(),
         }
+    }
+
+    #[test]
+    fn short_sha_shortens_a_non_ascii_value_instead_of_panicking() {
+        // The API supplies git_sha; a malformed one must not kill the scan.
+        assert_eq!(short_sha("0123456789abcdef"), "0123456");
+        assert_eq!(short_sha("abc"), "abc");
+        assert_eq!(short_sha(""), "");
+        assert_eq!(short_sha("ααααααααα"), "ααααααα");
     }
 
     #[test]
