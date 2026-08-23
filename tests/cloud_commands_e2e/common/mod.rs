@@ -794,8 +794,19 @@ pub(crate) fn blast_upload_plan(sha: &str, dirty: bool, include_sca: bool) -> Ve
     let patch_path = "/api/v1/start-scan/transfer-123/".to_string();
     let detail_path = "/api/v1/scan/blast-scan-123".to_string();
     let issue_path = "/api/v1/scan/blast-scan-123/issues".to_string();
-    let mut plan = vec![
-        verify_request(),
+    let mut plan = vec![verify_request()];
+    // Scans are incremental by default, so every clean-tree run looks for a
+    // baseline to diff against before uploading. Answering with no scans is what
+    // keeps this the full-scan contract: with nothing to diff from, the upload
+    // carries no incremental fields. A dirty tree never asks.
+    if !dirty {
+        plan.push(expected_request(
+            "look up a baseline scan to diff against",
+            |request| assert_scan_list_request(request, "cloud-e2e"),
+            json_response(scans_response(Vec::new())),
+        ));
+    }
+    plan.extend([
         expected_request(
             "start BLAST upload",
             |request| {
@@ -852,7 +863,7 @@ pub(crate) fn blast_upload_plan(sha: &str, dirty: bool, include_sca: bool) -> Ve
             },
             json_response(empty_issue_page()),
         ),
-    ];
+    ]);
     if include_sca {
         let sca_path = "/api/v1/scan/blast-scan-123/issues/sca".to_string();
         plan.push(expected_request(

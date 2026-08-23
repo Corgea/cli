@@ -53,7 +53,7 @@ pub fn run(
     fail: &bool,
     block_on: Option<String>,
     only_uncommitted: &bool,
-    incremental: &bool,
+    disable_incremental: &bool,
     metadata: Option<String>,
     scan_type: Option<String>,
     policy: Option<String>,
@@ -110,7 +110,7 @@ pub fn run(
             config,
             &project_name,
             only_uncommitted,
-            incremental,
+            disable_incremental,
             metadata,
             scan_type,
             policy,
@@ -283,7 +283,7 @@ fn start_new_scan(
     config: &Config,
     project_name: &str,
     only_uncommitted: &bool,
-    incremental: &bool,
+    disable_incremental: &bool,
     metadata: Option<String>,
     scan_type: Option<String>,
     policy: Option<String>,
@@ -516,24 +516,30 @@ fn start_new_scan(
             info.dirty = true;
         }
     }
-    // Resolved from the reconciled repo info, so a tree that turned out dirty —
-    // or a HEAD that moved while the archive was being built — refuses the
-    // incremental scan rather than diffing against a commit this upload is not
-    // a snapshot of.
-    let incremental_plan = (*incremental)
-        .then(|| {
-            crate::incremental::resolve_incremental_plan(
-                config,
-                project_name,
-                repo_info.as_ref().and_then(|info| info.branch.as_deref()),
-                repo_info.as_ref().and_then(|info| info.sha.as_deref()),
-                // No repo info at all is not dirtiness; it is the missing
-                // branch/commit the resolver reports next, with a message that
-                // names the real problem.
-                repo_info.as_ref().is_some_and(|info| info.dirty),
-            )
-        })
-        .flatten();
+    // Incremental is the default, so this asks whether anything has taken it off
+    // the table. A narrowed archive is the silent case: those runs are already
+    // scanning a subset the user chose, and carrying findings forward for files
+    // the archive no longer contains would be wrong — but they are also not
+    // "scanning every file", so there is no honest message to print.
+    let narrowed_archive = target_str.is_some() || exclude.is_some();
+    let incremental_plan = if *disable_incremental || narrowed_archive {
+        None
+    } else {
+        // Resolved from the reconciled repo info, so a tree that turned out
+        // dirty — or a HEAD that moved while the archive was being built —
+        // refuses the incremental scan rather than diffing against a commit
+        // this upload is not a snapshot of.
+        crate::incremental::resolve_incremental_plan(
+            config,
+            project_name,
+            repo_info.as_ref().and_then(|info| info.branch.as_deref()),
+            repo_info.as_ref().and_then(|info| info.sha.as_deref()),
+            // No repo info at all is not dirtiness; it is the missing
+            // branch/commit the resolver reports next, with a message that
+            // names the real problem.
+            repo_info.as_ref().is_some_and(|info| info.dirty),
+        )
+    };
     println!("\n\nSubmitting scan to Corgea:");
     let upload_result = match utils::api::upload_zip(
         &zip_path,

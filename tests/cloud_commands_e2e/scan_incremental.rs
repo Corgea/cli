@@ -1,10 +1,15 @@
-//! `--incremental`: the CLI finds the project's last clean scan, diffs this
-//! commit against it locally, and sends the changed-file list with the archive.
+//! Incremental scans, which every `corgea scan blast` run attempts by default:
+//! the CLI finds the project's last clean scan, diffs this commit against it
+//! locally, and sends the changed-file list with the archive.
 //!
 //! The stub asserts the exact wire contract, because the two fields are what
 //! the server acts on: `incremental_base_sha` decides which scan's findings are
 //! carried forward, and `incremental_changed_files` decides which files are
 //! excluded from that carry-forward and analyzed instead.
+//!
+//! Being the default means the ways it declines matter as much as the way it
+//! works, so each of those is a case here: the run must stay correct and must
+//! not even look for a baseline when it already knows it cannot use one.
 
 use crate::common::*;
 use hyper::Method;
@@ -119,7 +124,7 @@ fn the_upload_carries_the_baseline_commit_and_the_files_that_changed_since_it() 
 
     let api = ApiStub::start(plan);
     let (mut command, _home) = cloud_command(&api, project.path());
-    command.args(["scan", "blast", "--incremental", "--project-name", PROJECT]);
+    command.args(["scan", "blast", "--project-name", PROJECT]);
 
     let output = run_with_timeout(command, &api);
     let transcript = api.assert_finished();
@@ -167,7 +172,7 @@ fn a_project_with_no_baseline_scan_uploads_without_a_diff() {
 
     let api = ApiStub::start(plan);
     let (mut command, _home) = cloud_command(&api, project.path());
-    command.args(["scan", "blast", "--incremental", "--project-name", PROJECT]);
+    command.args(["scan", "blast", "--project-name", PROJECT]);
 
     let output = run_with_timeout(command, &api);
     let transcript = api.assert_finished();
@@ -177,6 +182,147 @@ fn a_project_with_no_baseline_scan_uploads_without_a_diff() {
     assert_eq!(output.status.code(), Some(0), "{context}");
     assert!(
         stdout.contains("Scanning every file: no earlier completed scan of a clean worktree"),
+        "{context}"
+    );
+}
+
+/// The opt-out has to be absolute: no baseline lookup, no fields, no message.
+/// Someone reaching for it wants every file analyzed, usually because something
+/// outside `corgea.yaml` changed that the server's baseline checks cannot see.
+#[test]
+fn disable_incremental_does_not_even_look_for_a_baseline() {
+    let project = git_project();
+    let head_sha = second_commit(&project);
+
+    let patch_sha = head_sha.clone();
+    let mut plan = vec![
+        verify_request(),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with no diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_multipart_text_field(request, "sha", &patch_sha)?;
+                assert_multipart_text_field(request, "dirty", "false")?;
+                assert_no_multipart_field(request, "incremental_base_sha")?;
+                assert_no_multipart_field(request, "incremental_changed_files")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--disable-incremental",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(!stdout.contains("Scanning every file:"), "{context}");
+    assert!(!stdout.contains("Incremental scan:"), "{context}");
+}
+
+/// `--target` already uploads a subset the user chose. Carrying findings forward
+/// for files the archive no longer contains would be wrong, so incremental is
+/// skipped — silently, because "scanning every file" would be a lie here.
+#[test]
+fn a_narrowed_archive_skips_incremental_without_claiming_a_full_scan() {
+    let project = git_project();
+    second_commit(&project);
+
+    let mut plan = vec![
+        verify_request(),
+        start_upload(),
+        expected_request(
+            "upload narrowed BLAST archive",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                // A partial archive is never an exact snapshot of the commit.
+                assert_multipart_text_field(request, "dirty", "true")?;
+                assert_no_multipart_field(request, "incremental_base_sha")?;
+                assert_no_multipart_field(request, "incremental_changed_files")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--target",
+        "main.py",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(!stdout.contains("Scanning every file:"), "{context}");
+}
+
+/// A directory with no git repository must not stall or fail: it has no commit
+/// to diff from, so it skips the lookup and scans everything.
+#[test]
+fn a_directory_that_is_not_a_git_repository_scans_everything() {
+    let project = tempfile::TempDir::new().expect("create project");
+    std::fs::write(project.path().join("main.py"), "print('hi')\n").expect("write source");
+
+    let mut plan = vec![
+        verify_request(),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with no repo metadata",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_no_multipart_field(request, "incremental_base_sha")?;
+                assert_no_multipart_field(request, "incremental_changed_files")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains("Scanning every file: no git branch and commit to diff from"),
         "{context}"
     );
 }
@@ -215,7 +361,7 @@ fn a_dirty_worktree_skips_the_baseline_lookup_and_scans_everything() {
 
     let api = ApiStub::start(plan);
     let (mut command, _home) = cloud_command(&api, project.path());
-    command.args(["scan", "blast", "--incremental", "--project-name", PROJECT]);
+    command.args(["scan", "blast", "--project-name", PROJECT]);
 
     let output = run_with_timeout(command, &api);
     let transcript = api.assert_finished();

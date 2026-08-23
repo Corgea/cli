@@ -91,11 +91,10 @@ enum Commands {
         only_uncommitted: bool,
 
         #[arg(
-            long = "incremental",
-            conflicts_with_all = ["only_uncommitted", "target", "exclude"],
-            help = "Analyze only the files that changed since this project's last scan. The whole project is still uploaded — Corgea reads unchanged files for context and carries their existing findings forward — so the result is a full picture of the project, just cheaper to produce. Requires a git repository with a commit; the run scans everything instead (and says why) when the worktree is dirty, when no earlier scan of a clean worktree exists, or when the last scanned commit is missing from a shallow clone. Cannot be combined with the flags that upload a partial archive."
+            long = "disable-incremental",
+            help = "Analyze every file, even when Corgea could have analyzed only what changed. Scans are incremental by default: the whole project is still uploaded, but only files that changed since this project's last scan are analyzed, and unchanged files keep their existing findings, so the result is a full picture either way. Use this to force a fresh analysis of every file — after changing scanner configuration outside corgea.yaml, for example. Incremental is skipped on its own, with a reason, when there is no git repository or commit to diff from, when the worktree is dirty, when no earlier scan of a clean worktree exists, or when the last scanned commit is missing from a shallow clone; and silently when --only-uncommitted, --target or --exclude already narrow the upload."
         )]
-        incremental: bool,
+        disable_incremental: bool,
 
         #[arg(
             long = "metadata",
@@ -677,7 +676,7 @@ fn main() {
             fail,
             block_on,
             only_uncommitted,
-            incremental,
+            disable_incremental,
             metadata,
             scan_type,
             policy,
@@ -719,8 +718,8 @@ fn main() {
                 std::process::exit(1);
             }
 
-            if *incremental && *scanner != Scanner::Blast {
-                ::log::error!("--incremental is only supported with blast scanner.");
+            if *disable_incremental && *scanner != Scanner::Blast {
+                ::log::error!("--disable-incremental is only supported with blast scanner.");
                 std::process::exit(1);
             }
 
@@ -860,7 +859,7 @@ fn main() {
                     fail,
                     block_on,
                     only_uncommitted,
-                    incremental,
+                    disable_incremental,
                     metadata_json,
                     scan_type.clone(),
                     policy.clone(),

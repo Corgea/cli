@@ -1,4 +1,4 @@
-//! `--incremental`: upload the whole project, analyze only what changed.
+//! Incremental scans: upload the whole project, analyze only what changed.
 //!
 //! Corgea already runs incremental scans, but it works the diff out server-side
 //! by asking the project's SCM integration to compare two commits. That leaves
@@ -7,6 +7,12 @@
 //! that were never pushed. Those projects pay for a full analysis on every run
 //! no matter how little moved. This module closes that gap by diffing in the
 //! clone the scan is already reading from.
+//!
+//! This runs by default, so it has to be safe on a repository that was never
+//! set up for it. Nothing here is required to succeed: the first scan of a
+//! project, a directory that is not a git repository at all, and a CI job with
+//! a shallow clone all fall through to a full scan, which is what those runs
+//! would have done anyway. `--disable-incremental` forces that path.
 //!
 //! Two values travel together and must stay together: the changed-file list and
 //! the commit it was measured from. The server carries findings forward for
@@ -83,10 +89,14 @@ pub fn resolve_incremental_plan(
         return None;
     }
 
+    // No branch and commit means there is nothing to diff from. That covers a
+    // directory that is not a git repository, a repository with no commit yet,
+    // a detached HEAD, and a scan started below the repository root — all of
+    // which report no RepoInfo to the upload either.
     let (Some(branch), Some(head_sha)) = (branch, head_sha) else {
         explain_full_scan(
-            "this run could not resolve a git branch and commit for the project \
-             (a scan started outside the repository root reports neither)",
+            "no git branch and commit to diff from (not a git repository, no commit \
+             yet, a detached HEAD, or a scan started below the repository root)",
         );
         return None;
     };
