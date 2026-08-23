@@ -486,9 +486,10 @@ fn start_new_scan(
         utils::terminal::set_text_color("", utils::terminal::TerminalColor::Green)
     );
     let repo_after = utils::generic::get_repo_info_for_scan("./").unwrap_or_default();
-    // Notice = visible status only (not index hide-bits / --target / SHA drift).
-    let worktree_dirty = repo_before.as_ref().is_some_and(|i| i.status_dirty)
-        || repo_after.as_ref().is_some_and(|i| i.status_dirty);
+    // Notice = what `git status` shows, from the raw samples (so neither
+    // --target/--exclude nor SHA drift, which the upload flag also covers).
+    let worktree_dirty = repo_before.as_ref().is_some_and(|i| i.dirty)
+        || repo_after.as_ref().is_some_and(|i| i.dirty);
     if worktree_dirty {
         let notice_sha = repo_after
             .as_ref()

@@ -290,13 +290,13 @@ fn a_dirty_worktree_scans_instead_of_reusing_the_commits_scan() {
     assert!(stdout.contains("CORGEA_SCAN_SKIPPED=false"), "{context}");
 }
 
-/// The reuse decision has to read the same dirtiness signal the upload sends.
-/// An assume-unchanged modified file is invisible to `git status` — so no
-/// worktree notice is printed — but it still changes what gets packaged, and the
-/// upload marks it dirty. Reading the narrower status signal here would reuse a
-/// clean scan of the commit and gate on files this run does not contain.
+/// Dirtiness is whatever `git status` reports, and nothing else: an
+/// assume-unchanged edit is invisible to it (as are the sparse-checkout and
+/// clean-filter setups that put whole repositories in this state), so the tree
+/// counts as clean and the commit's scan is reused. Anything stricter here
+/// scans on a dirtiness the user cannot see in their own `git status`.
 #[test]
-fn a_file_hidden_from_git_status_scans_instead_of_reusing() {
+fn a_file_hidden_from_git_status_reuses_the_commits_scan() {
     let project = git_project();
     run_git(
         project.path(),
@@ -304,12 +304,20 @@ fn a_file_hidden_from_git_status_scans_instead_of_reusing() {
     );
     std::fs::write(project.path().join("main.py"), "print('hidden change')\n")
         .expect("modify assume-unchanged file");
-    let api = ApiStub::start(blast_upload_plan(&project.sha, true, false));
+    let api = ApiStub::start(vec![
+        verify_request(),
+        commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
+        clean_detail(&project.sha),
+        reused_scan_issues(),
+        reused_scan_blocking_rules(false),
+    ]);
     let (mut command, _home) = cloud_command(&api, project.path());
     command.args([
         "scan",
         "blast",
         "--skip-if-commit-scanned-recently",
+        "--block-on",
+        "criticals",
         "--project-name",
         PROJECT,
     ]);
@@ -320,13 +328,12 @@ fn a_file_hidden_from_git_status_scans_instead_of_reusing() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(stdout.contains("CORGEA_SCAN_SKIPPED=true"), "{context}");
+    assert!(!stdout.contains("Scanning with BLAST"), "{context}");
     assert!(
-        stdout.contains("Working tree does not match commit"),
+        !stdout.contains("Working tree does not match commit"),
         "{context}"
     );
-    assert!(stdout.contains("CORGEA_SCAN_SKIPPED=false"), "{context}");
-    // `git status` sees nothing, so the user-facing worktree notice stays quiet;
-    // only the reuse decision and the upload's dirty flag react.
     assert!(
         !stdout.contains("Working tree has uncommitted changes"),
         "{context}"
@@ -373,49 +380,6 @@ fn ignore_dirty_worktree_reuses_a_scan_a_dirty_tree_would_otherwise_run() {
     assert!(!stdout.contains("Scanning with BLAST"), "{context}");
     assert!(
         !stdout.contains("Working tree does not match commit"),
-        "{context}"
-    );
-}
-
-/// Same override for index hide-bits: assume-unchanged is invisible to
-/// `git status` but still blocks reuse unless ignored.
-#[test]
-fn ignore_dirty_worktree_reuses_when_a_file_is_hidden_from_git_status() {
-    let project = git_project();
-    run_git(
-        project.path(),
-        &["update-index", "--assume-unchanged", "main.py"],
-    );
-    std::fs::write(project.path().join("main.py"), "print('hidden change')\n")
-        .expect("modify assume-unchanged file");
-    let api = ApiStub::start(vec![
-        verify_request(),
-        commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
-        clean_detail(&project.sha),
-        reused_scan_issues(),
-        reused_scan_blocking_rules(false),
-    ]);
-    let (mut command, _home) = cloud_command(&api, project.path());
-    command.args([
-        "scan",
-        "blast",
-        "--skip-if-commit-scanned-recently",
-        "--ignore-dirty-worktree",
-        "--block-on",
-        "criticals",
-        "--project-name",
-        PROJECT,
-    ]);
-
-    let output = run_with_timeout(command, &api);
-    let transcript = api.assert_finished();
-    let context = output_context(&output, &transcript);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert_eq!(output.status.code(), Some(0), "{context}");
-    assert!(stdout.contains("CORGEA_SCAN_SKIPPED=true"), "{context}");
-    assert!(
-        stdout.contains("Ignoring dirty worktree (--ignore-dirty-worktree)"),
         "{context}"
     );
 }
