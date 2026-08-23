@@ -1,3 +1,4 @@
+use crate::incremental::IncrementalPlan;
 use crate::log::debug;
 use crate::utils;
 use corgea::vuln_api::{auth_header, source};
@@ -233,15 +234,30 @@ pub struct UploadZipResult {
     pub project_id: Option<String>,
 }
 
+/// Per-scan settings that travel with the archive without being part of it.
+#[derive(Debug, Default)]
+pub struct UploadOptions {
+    pub scan_type: Option<String>,
+    pub policy: Option<String>,
+    pub metadata: Option<String>,
+    /// Set when this run resolved a diff for the server to analyze instead of
+    /// the whole project.
+    pub incremental: Option<IncrementalPlan>,
+}
+
 pub fn upload_zip(
     file_path: &str,
     url: &str,
     project_name: &str,
     repo_info: Option<utils::generic::RepoInfo>,
-    scan_type: Option<String>,
-    policy: Option<String>,
-    metadata: Option<String>,
+    options: UploadOptions,
 ) -> Result<UploadZipResult, Box<dyn std::error::Error>> {
+    let UploadOptions {
+        scan_type,
+        policy,
+        metadata,
+        incremental,
+    } = options;
     let client = http_client();
     let file_size = std::fs::metadata(file_path)?.len();
     let file_name = Path::new(file_path).file_name().unwrap().to_str().unwrap();
@@ -369,6 +385,27 @@ pub fn upload_zip(
         }
         if let Some(meta) = &metadata {
             form = form.part("metadata", multipart::Part::text(meta.clone()));
+        }
+        // Both fields or neither: the file list is only safe to act on next to
+        // the commit it was measured from, and a server that saw one without
+        // the other would have to guess a baseline. A list that will not
+        // serialize drops both and leaves this a full scan.
+        if let Some(plan) = &incremental {
+            match serde_json::to_string(&plan.changed_files) {
+                Ok(changed_files) => {
+                    form = form.part(
+                        "incremental_base_sha",
+                        multipart::Part::text(plan.base_sha.clone()),
+                    );
+                    form = form.part(
+                        "incremental_changed_files",
+                        multipart::Part::text(changed_files),
+                    );
+                }
+                Err(e) => debug(&format!(
+                    "Could not serialize the incremental file list, scanning every file: {e}"
+                )),
+            }
         }
 
         let response = match client

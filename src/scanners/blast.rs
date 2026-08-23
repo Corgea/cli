@@ -53,6 +53,7 @@ pub fn run(
     fail: &bool,
     block_on: Option<String>,
     only_uncommitted: &bool,
+    incremental: &bool,
     metadata: Option<String>,
     scan_type: Option<String>,
     policy: Option<String>,
@@ -109,6 +110,7 @@ pub fn run(
             config,
             &project_name,
             only_uncommitted,
+            incremental,
             metadata,
             scan_type,
             policy,
@@ -281,6 +283,7 @@ fn start_new_scan(
     config: &Config,
     project_name: &str,
     only_uncommitted: &bool,
+    incremental: &bool,
     metadata: Option<String>,
     scan_type: Option<String>,
     policy: Option<String>,
@@ -513,15 +516,36 @@ fn start_new_scan(
             info.dirty = true;
         }
     }
+    // Resolved from the reconciled repo info, so a tree that turned out dirty —
+    // or a HEAD that moved while the archive was being built — refuses the
+    // incremental scan rather than diffing against a commit this upload is not
+    // a snapshot of.
+    let incremental_plan = (*incremental)
+        .then(|| {
+            crate::incremental::resolve_incremental_plan(
+                config,
+                project_name,
+                repo_info.as_ref().and_then(|info| info.branch.as_deref()),
+                repo_info.as_ref().and_then(|info| info.sha.as_deref()),
+                // No repo info at all is not dirtiness; it is the missing
+                // branch/commit the resolver reports next, with a message that
+                // names the real problem.
+                repo_info.as_ref().is_some_and(|info| info.dirty),
+            )
+        })
+        .flatten();
     println!("\n\nSubmitting scan to Corgea:");
     let upload_result = match utils::api::upload_zip(
         &zip_path,
         &config.get_url(),
         project_name,
         repo_info,
-        scan_type,
-        policy,
-        metadata,
+        utils::api::UploadOptions {
+            scan_type,
+            policy,
+            metadata,
+            incremental: incremental_plan,
+        },
     ) {
         Ok(result) => result,
         Err(e) => {

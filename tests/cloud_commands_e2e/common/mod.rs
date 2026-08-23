@@ -381,6 +381,23 @@ pub(crate) fn assert_multipart_text_field(
     }
 }
 
+/// Proves a field was left off the form entirely. Some fields are only safe in
+/// pairs, so "absent" is as much a part of the contract as any value.
+pub(crate) fn assert_no_multipart_field(
+    request: &CapturedRequest,
+    name: &str,
+) -> Result<(), String> {
+    let needle = format!("name=\"{name}\"");
+    if request
+        .body
+        .windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+    {
+        return Err(format!("unexpected multipart field {name}"));
+    }
+    Ok(())
+}
+
 pub(crate) fn format_transcript(requests: &[CapturedRequest]) -> String {
     if requests.is_empty() {
         return "<no requests>".to_string();
