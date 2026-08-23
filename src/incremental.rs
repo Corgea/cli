@@ -42,9 +42,13 @@ use std::collections::BTreeSet;
 /// How many of the project's scans to read at a time, newest first.
 const SCAN_LOOKUP_PAGE_SIZE: u16 = 30;
 
-/// Backstop on pages walked looking for a baseline. The newest usable scan is
-/// almost always on the first page; this bounds a project whose recent history
-/// is all pull-request or dirty-worktree scans.
+/// Backstop on pages walked looking for a baseline.
+///
+/// The server filters out the scans that cannot be a baseline, so the answer is
+/// normally the first entry of the first page and this never iterates. It is
+/// here for a backend that predates those filters: it ignores the unknown
+/// parameters and returns scans of every kind, which for a project with heavy
+/// pull-request traffic can fill a page with nothing usable.
 const SCAN_LOOKUP_MAX_PAGES: u16 = 3;
 
 /// The engine every blast scan carries, whoever started it. An uploaded
@@ -171,11 +175,12 @@ fn find_baseline_sha(config: &Config, project_name: &str, branch: &str) -> Optio
     let mut any_branch_fallback: Option<String> = None;
 
     for page in 1..=SCAN_LOOKUP_MAX_PAGES {
-        let response = match api::query_scan_list(
+        let response = match api::query_baseline_scans(
             &url,
-            Some(project_name),
-            Some(page),
-            Some(SCAN_LOOKUP_PAGE_SIZE),
+            project_name,
+            BLAST_ENGINE,
+            page,
+            SCAN_LOOKUP_PAGE_SIZE,
         ) {
             Ok(response) => response,
             Err(e) => {
@@ -227,6 +232,11 @@ fn usable_baselines(scans: &[ScanResponse]) -> impl Iterator<Item = &ScanRespons
 /// not a pull request. `worktree_dirty` must be an explicit `false` — `None`
 /// means the scan never reported it, and unknown scope is not a clean tree, so
 /// the server would reject it as a baseline anyway.
+///
+/// `query_baseline_scans` asks the server for exactly these, which is what
+/// keeps the page walk from iterating. This stays because a backend that
+/// predates those parameters ignores them, and acting on a dirty or
+/// pull-request scan's commit would diff against the wrong tree.
 fn is_usable_baseline(scan: &ScanResponse) -> bool {
     classify_scan_status(&scan.status) == ScanState::Completed
         && scan.engine.eq_ignore_ascii_case(BLAST_ENGINE)

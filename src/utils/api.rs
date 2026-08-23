@@ -856,6 +856,35 @@ pub fn query_scan_list(
     request_scan_list(url, query_params)
 }
 
+/// One page of the project's scans that could be diffed against, newest first.
+///
+/// The filters are server-side so the answer is usually the first entry of the
+/// first page. A backend that predates them ignores the unknown parameters and
+/// answers with the project's scans of every kind, so the caller still has to
+/// re-check each scan it acts on — see `incremental::is_usable_baseline`.
+pub fn query_baseline_scans(
+    url: &str,
+    project: &str,
+    engine: &str,
+    page: u16,
+    page_size: u16,
+) -> Result<ScansResponse, Box<dyn Error>> {
+    request_scan_list(
+        url,
+        vec![
+            ("page", page.to_string()),
+            ("page_size", page_size.to_string()),
+            ("project", project.to_string()),
+            ("engine", engine.to_string()),
+            ("status", "complete".to_string()),
+            ("exclude_pull_requests", "true".to_string()),
+            // Explicitly clean only. A scan that never reported the flag is
+            // unknown scope, and the server will not accept it as a baseline.
+            ("worktree_dirty", "false".to_string()),
+        ],
+    )
+}
+
 /// One page of the project's scans at exactly `sha`, newest first.
 ///
 /// The `sha` filter is server-side, but a backend that predates it ignores the

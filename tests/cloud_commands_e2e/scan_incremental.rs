@@ -35,7 +35,7 @@ fn baseline_scan(sha: &str) -> Value {
 fn baseline_lookup(scans: Vec<Value>) -> ExpectedRequest {
     expected_request(
         "look up a baseline scan to diff against",
-        move |request| assert_scan_list_request(request, PROJECT),
+        move |request| assert_baseline_lookup_request(request, PROJECT),
         json_response(scans_response(scans)),
     )
 }
