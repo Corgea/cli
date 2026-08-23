@@ -238,6 +238,13 @@ fn is_usable_baseline(scan: &ScanResponse) -> bool {
 /// Files git does not track are not a gap here: an untracked file makes the
 /// worktree dirty, and a dirty tree has already refused the incremental scan
 /// above.
+///
+/// A submodule is the one thing this cannot describe. A committed pointer bump
+/// is a single gitlink delta naming the submodule directory, while packaging
+/// walks into that directory and uploads the files inside it — so the files
+/// that actually changed would be missing from the list and keep their old
+/// findings. Diffing the two submodule commits would mean opening a repository
+/// that may not even be checked out, so this fails closed to a full scan.
 fn changed_files_between(
     repo: &Repository,
     base_sha: &str,
@@ -262,6 +269,21 @@ fn changed_files_between(
     // stable order keeps the uploaded list reproducible for the same two commits.
     let mut files = BTreeSet::new();
     for delta in diff.deltas() {
+        if delta.old_file().mode() == git2::FileMode::Commit
+            || delta.new_file().mode() == git2::FileMode::Commit
+        {
+            let name = delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path())
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "a submodule".to_string());
+            return Err(format!(
+                "submodule {name} moved to a different commit, and the diff names only \
+                 the submodule itself rather than the files inside it that this scan \
+                 uploads"
+            ));
+        }
         for file in [delta.old_file(), delta.new_file()] {
             if let Some(path) = file.path() {
                 let path = path.to_string_lossy().replace('\\', "/");
@@ -416,6 +438,39 @@ mod tests {
         assert!(changed_files_between(&repo, &head, &head)
             .expect("diff")
             .is_empty());
+    }
+
+    /// A commit whose tree carries a `vendor` gitlink pointing at `target`.
+    fn commit_with_gitlink(repo: &Repository, parent: git2::Oid, target: git2::Oid) -> git2::Oid {
+        let sig = git2::Signature::now("t", "t@example.com").expect("sig");
+        let parent_commit = repo.find_commit(parent).expect("parent");
+        let mut builder = repo
+            .treebuilder(Some(&parent_commit.tree().expect("parent tree")))
+            .expect("treebuilder");
+        builder
+            .insert("vendor", target, i32::from(git2::FileMode::Commit))
+            .expect("insert gitlink");
+        let tree_oid = builder.write().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        repo.commit(None, &sig, &sig, "gitlink", &tree, &[&parent_commit])
+            .expect("commit")
+    }
+
+    #[test]
+    fn a_moved_submodule_pointer_refuses_the_diff() {
+        // Packaging walks into the submodule and uploads the files inside it,
+        // but the diff names only `vendor`, so those files would keep findings
+        // nothing re-examined.
+        let (_dir, repo, base, head) = repo_with_history();
+        let base_oid = git2::Oid::from_str(&base).expect("base oid");
+        let head_oid = git2::Oid::from_str(&head).expect("head oid");
+        let before = commit_with_gitlink(&repo, base_oid, base_oid);
+        let after = commit_with_gitlink(&repo, before, head_oid);
+
+        let err = changed_files_between(&repo, &before.to_string(), &after.to_string())
+            .expect_err("a moved submodule must refuse the diff");
+
+        assert!(err.contains("submodule vendor"), "{err}");
     }
 
     #[test]
