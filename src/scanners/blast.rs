@@ -516,27 +516,24 @@ fn start_new_scan(
             info.dirty = true;
         }
     }
-    // Incremental is the default, so this asks whether anything has taken it off
-    // the table. A narrowed archive is the silent case: those runs are already
-    // scanning a subset the user chose, and carrying findings forward for files
-    // the archive no longer contains would be wrong — but they are also not
-    // "scanning every file", so there is no honest message to print.
+    // Incremental is the default, so this asks what took it off the table. A
+    // narrowed archive is the silent case: carrying findings forward for files
+    // the archive no longer holds would be wrong, but those runs are not
+    // "scanning every file" either, so no message is honest.
     let narrowed_archive = target_str.is_some() || exclude.is_some();
     let incremental_plan = if *disable_incremental || narrowed_archive {
         None
     } else {
-        // Resolved from the reconciled repo info, so a tree that turned out
-        // dirty — or a HEAD that moved while the archive was being built —
-        // refuses the incremental scan rather than diffing against a commit
-        // this upload is not a snapshot of.
+        // Reconciled repo info, so a tree that turned out dirty — or a HEAD
+        // that moved mid-packaging — refuses rather than diffing against a
+        // commit this upload is not a snapshot of.
         crate::incremental::resolve_incremental_plan(
             config,
             project_name,
             repo_info.as_ref().and_then(|info| info.branch.as_deref()),
             repo_info.as_ref().and_then(|info| info.sha.as_deref()),
-            // No repo info at all is not dirtiness; it is the missing
-            // branch/commit the resolver reports next, with a message that
-            // names the real problem.
+            // Missing repo info is not dirtiness; it is the missing
+            // branch/commit the resolver reports next, by its real name.
             repo_info.as_ref().is_some_and(|info| info.dirty),
         )
     };

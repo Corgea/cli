@@ -234,7 +234,7 @@ pub struct UploadZipResult {
     pub project_id: Option<String>,
 }
 
-/// Per-scan settings that travel with the archive without being part of it.
+/// Per-scan settings travelling with the archive without being part of it.
 #[derive(Debug, Default)]
 pub struct UploadOptions {
     pub scan_type: Option<String>,
@@ -386,10 +386,10 @@ pub fn upload_zip(
         if let Some(meta) = &metadata {
             form = form.part("metadata", multipart::Part::text(meta.clone()));
         }
-        // Both fields or neither: the file list is only safe to act on next to
-        // the commit it was measured from, and a server that saw one without
-        // the other would have to guess a baseline. A list that will not
-        // serialize drops both and leaves this a full scan.
+        // Both fields or neither: the list is only safe next to the commit it
+        // was measured from, and a server seeing one without the other would
+        // guess a baseline. A list that will not serialize drops both, leaving
+        // a full scan.
         if let Some(plan) = &incremental {
             match serde_json::to_string(&plan.changed_files) {
                 Ok(changed_files) => {
@@ -858,10 +858,10 @@ pub fn query_scan_list(
 
 /// One page of the project's scans that could be diffed against, newest first.
 ///
-/// The filters are server-side so the answer is usually the first entry of the
-/// first page. A backend that predates them ignores the unknown parameters and
-/// answers with the project's scans of every kind, so the caller still has to
-/// re-check each scan it acts on — see `incremental::is_usable_baseline`.
+/// Filters are server-side, so the answer is usually the first entry of page
+/// one. A backend predating them ignores the unknown parameters and returns
+/// scans of every kind, so the caller must still re-check each scan it acts on
+/// — see `incremental::is_usable_baseline`.
 pub fn query_baseline_scans(
     url: &str,
     project: &str,
@@ -879,7 +879,7 @@ pub fn query_baseline_scans(
             ("status", "complete".to_string()),
             ("exclude_pull_requests", "true".to_string()),
             // Explicitly clean only. A scan that never reported the flag is
-            // unknown scope, and the server will not accept it as a baseline.
+            // unknown scope, which the server rejects as a baseline.
             ("worktree_dirty", "false".to_string()),
         ],
     )

@@ -1,15 +1,15 @@
-//! Incremental scans, which every `corgea scan blast` run attempts by default:
-//! the CLI finds the project's last clean scan, diffs this commit against it
-//! locally, and sends the changed-file list with the archive.
+//! Incremental scans, attempted by default on every `corgea scan blast`: find
+//! the project's last clean scan, diff this commit against it locally, send the
+//! changed-file list with the archive.
 //!
-//! The stub asserts the exact wire contract, because the two fields are what
-//! the server acts on: `incremental_base_sha` decides which scan's findings are
-//! carried forward, and `incremental_changed_files` decides which files are
-//! excluded from that carry-forward and analyzed instead.
+//! The stub asserts the exact wire contract because those two fields are what
+//! the server acts on: `incremental_base_sha` picks whose findings carry
+//! forward, `incremental_changed_files` picks which files are excluded from
+//! that and analyzed instead.
 //!
-//! Being the default means the ways it declines matter as much as the way it
-//! works, so each of those is a case here: the run must stay correct and must
-//! not even look for a baseline when it already knows it cannot use one.
+//! Being the default, the ways it declines matter as much as the way it works,
+//! so each is a case here: stay correct, and do not even look for a baseline
+//! when it already cannot be used.
 
 use crate::common::*;
 use hyper::Method;
@@ -40,7 +40,7 @@ fn baseline_lookup(scans: Vec<Value>) -> ExpectedRequest {
     )
 }
 
-/// Everything after the archive upload, which `--incremental` does not change.
+/// Everything after the archive upload, which incremental does not change.
 fn scan_tail() -> Vec<ExpectedRequest> {
     let detail_path = "/api/v1/scan/blast-scan-123".to_string();
     let issue_path = "/api/v1/scan/blast-scan-123/issues".to_string();
@@ -73,8 +73,8 @@ fn start_upload() -> ExpectedRequest {
     )
 }
 
-/// Adds a file and edits another on top of the fixture's first commit, so the
-/// diff has more than one entry and a file the baseline already contained.
+/// Adds a file and edits another, so the diff has more than one entry and a
+/// file the baseline already contained.
 fn second_commit(project: &GitProject) -> String {
     std::fs::write(project.path().join("helper.py"), "print('helper')\n").expect("write helper");
     std::fs::write(project.path().join("main.py"), "print('edited')\n").expect("edit main");
@@ -138,9 +138,8 @@ fn the_upload_carries_the_baseline_commit_and_the_files_that_changed_since_it() 
     );
 }
 
-/// A project with no scan to diff against is a full scan, not an error: the
-/// first `--incremental` run of any project takes this path and must still
-/// produce a complete result.
+/// No scan to diff against is a full scan, not an error. Every project's first
+/// scan takes this path and must still produce a complete result.
 #[test]
 fn a_project_with_no_baseline_scan_uploads_without_a_diff() {
     let project = git_project();
@@ -160,8 +159,8 @@ fn a_project_with_no_baseline_scan_uploads_without_a_diff() {
                     "/api/v1/start-scan/transfer-123/",
                 )?;
                 assert_multipart_text_field(request, "sha", &patch_sha)?;
-                // Neither field may appear alone or at all: a base commit
-                // without a list would let the server carry everything forward.
+                // Neither field alone, nor at all: a base commit without a
+                // list lets the server carry everything forward.
                 assert_no_multipart_field(request, "incremental_base_sha")?;
                 assert_no_multipart_field(request, "incremental_changed_files")
             },
@@ -186,9 +185,9 @@ fn a_project_with_no_baseline_scan_uploads_without_a_diff() {
     );
 }
 
-/// The opt-out has to be absolute: no baseline lookup, no fields, no message.
-/// Someone reaching for it wants every file analyzed, usually because something
-/// outside `corgea.yaml` changed that the server's baseline checks cannot see.
+/// The opt-out is absolute: no baseline lookup, no fields, no message. Someone
+/// reaching for it wants every file analyzed, usually because something outside
+/// `corgea.yaml` changed that the server's baseline checks cannot see.
 #[test]
 fn disable_incremental_does_not_even_look_for_a_baseline() {
     let project = git_project();
@@ -236,9 +235,9 @@ fn disable_incremental_does_not_even_look_for_a_baseline() {
     assert!(!stdout.contains("Incremental scan:"), "{context}");
 }
 
-/// `--target` already uploads a subset the user chose. Carrying findings forward
-/// for files the archive no longer contains would be wrong, so incremental is
-/// skipped — silently, because "scanning every file" would be a lie here.
+/// `--target` already uploads a chosen subset. Carrying findings forward for
+/// files the archive no longer holds would be wrong, so incremental is skipped
+/// — silently, since "scanning every file" would be a lie here.
 #[test]
 fn a_narrowed_archive_skips_incremental_without_claiming_a_full_scan() {
     let project = git_project();
@@ -285,8 +284,8 @@ fn a_narrowed_archive_skips_incremental_without_claiming_a_full_scan() {
     assert!(!stdout.contains("Scanning every file:"), "{context}");
 }
 
-/// A directory with no git repository must not stall or fail: it has no commit
-/// to diff from, so it skips the lookup and scans everything.
+/// No git repository must not stall or fail: no commit to diff from, so skip
+/// the lookup and scan everything.
 #[test]
 fn a_directory_that_is_not_a_git_repository_scans_everything() {
     let project = tempfile::TempDir::new().expect("create project");
@@ -327,9 +326,9 @@ fn a_directory_that_is_not_a_git_repository_scans_everything() {
     );
 }
 
-/// A dirty tree is the one refusal the server would also make, and it must
-/// happen before the baseline lookup: a commit-to-commit diff cannot see
-/// uncommitted edits, so no baseline could make the list correct.
+/// The server refuses a dirty tree too, and the refusal must come before the
+/// baseline lookup: a commit-to-commit diff cannot see uncommitted edits, so no
+/// baseline makes the list correct.
 #[test]
 fn a_dirty_worktree_skips_the_baseline_lookup_and_scans_everything() {
     let project = git_project();

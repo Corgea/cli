@@ -312,9 +312,9 @@ pub(crate) fn assert_scan_list_request(
 
 /// The baseline lookup an incremental scan makes before uploading.
 ///
-/// Asserting the filters is the point: they are what keeps this to one request
-/// instead of a page walk, and a server that drops them would silently return
-/// pull-request and dirty scans for the client to reject.
+/// Asserting the filters is the point: they keep this to one request instead of
+/// a page walk, and a server dropping them silently returns pull-request and
+/// dirty scans for the client to reject.
 pub(crate) fn assert_baseline_lookup_request(
     request: &CapturedRequest,
     project: &str,
@@ -398,7 +398,7 @@ pub(crate) fn assert_multipart_text_field(
 }
 
 /// Proves a field was left off the form entirely. Some fields are only safe in
-/// pairs, so "absent" is as much a part of the contract as any value.
+/// pairs, so "absent" is as much the contract as any value.
 pub(crate) fn assert_no_multipart_field(
     request: &CapturedRequest,
     name: &str,
@@ -812,9 +812,9 @@ pub(crate) fn blast_upload_plan(sha: &str, dirty: bool, include_sca: bool) -> Ve
     let issue_path = "/api/v1/scan/blast-scan-123/issues".to_string();
     let mut plan = vec![verify_request()];
     // Scans are incremental by default, so every clean-tree run looks for a
-    // baseline to diff against before uploading. Answering with no scans is what
-    // keeps this the full-scan contract: with nothing to diff from, the upload
-    // carries no incremental fields. A dirty tree never asks.
+    // baseline before uploading. Answering with no scans keeps this the
+    // full-scan contract: nothing to diff from, no incremental fields on the
+    // upload. A dirty tree never asks.
     if !dirty {
         plan.push(expected_request(
             "look up a baseline scan to diff against",

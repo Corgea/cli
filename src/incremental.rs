@@ -1,37 +1,22 @@
-//! Incremental scans: upload the whole project, analyze only what changed.
+//! Incremental scans: upload whole project, analyze only what changed.
 //!
-//! Corgea already runs incremental scans, but it works the diff out server-side
-//! by asking the project's SCM integration to compare two commits. That leaves
-//! out every project the integration cannot answer for: zip-only projects with
-//! no integration at all, self-hosted hosts Corgea cannot reach, and commits
-//! that were never pushed. Those projects pay for a full analysis on every run
-//! no matter how little moved. This module closes that gap by diffing in the
-//! clone the scan is already reading from.
+//! The server already does this, but it derives the diff through the project's
+//! SCM integration, which leaves out every project that integration cannot
+//! answer for: zip-only projects, unreachable self-hosted hosts, unpushed
+//! commits. This module diffs in the clone the scan already reads from.
 //!
-//! This runs by default, so it has to be safe on a repository that was never
-//! set up for it. Nothing here is required to succeed: the first scan of a
-//! project, a directory that is not a git repository at all, and a CI job with
-//! a shallow clone all fall through to a full scan, which is what those runs
-//! would have done anyway. `--disable-incremental` forces that path.
+//! Runs by default, so it must be safe on a repo never set up for it. Every
+//! refusal falls through to the full scan that run would have done anyway.
+//! `--disable-incremental` forces it.
 //!
-//! Two values travel together and must stay together: the changed-file list and
-//! the commit it was measured from. The server carries findings forward for
-//! every file *absent* from the list, so if it were to pick a different
-//! baseline than the one diffed here, findings in the files that changed
-//! between the two baselines would be carried forward stale — reported as
-//! current when nobody looked at them. Sending `base_sha` alongside the list
-//! lets the server copy from exactly the scan this diff describes, or refuse
-//! and scan everything.
+//! `base_sha` travels with the file list because the server carries findings
+//! forward for every file the list omits. Copy from a different baseline than
+//! the one diffed here and files changed between the two keep stale findings,
+//! reported as current. The server copies from exactly this scan, or refuses.
 //!
-//! The archive is unchanged: a full scan still uploads the full project. Fusion
-//! reads unchanged files for cross-file context even when it only analyzes the
-//! diff, and the server can only carry a finding forward for a file the archive
-//! still contains. What shrinks is the analysis, not the upload.
-//!
-//! Every refusal below scans everything instead. That is the expensive answer,
-//! and it is always the correct one, so anything this module cannot prove —
-//! a dirty tree, a missing baseline, a base commit this clone does not have —
-//! lands there rather than narrowing a scan on a guess.
+//! The archive is unchanged. Fusion reads unchanged files for cross-file
+//! context, and a finding can only carry forward for a file the archive still
+//! holds. Analysis shrinks, not the upload.
 
 use crate::config::Config;
 use crate::scanners::blast::{classify_scan_status, ScanState};
@@ -44,31 +29,29 @@ const SCAN_LOOKUP_PAGE_SIZE: u16 = 30;
 
 /// Backstop on pages walked looking for a baseline.
 ///
-/// The server filters out the scans that cannot be a baseline, so the answer is
-/// normally the first entry of the first page and this never iterates. It is
-/// here for a backend that predates those filters: it ignores the unknown
-/// parameters and returns scans of every kind, which for a project with heavy
-/// pull-request traffic can fill a page with nothing usable.
+/// The server filters out scans that cannot be a baseline, so the answer is
+/// normally the first entry of page one and this never iterates. Kept for a
+/// backend predating those filters: it ignores unknown parameters and returns
+/// scans of every kind, so heavy pull-request traffic can fill a page with
+/// nothing usable.
 const SCAN_LOOKUP_MAX_PAGES: u16 = 3;
 
-/// The engine every blast scan carries, whoever started it. An uploaded
-/// third-party report describes someone else's analysis and cannot be the
-/// baseline for one of ours.
+/// Engine every blast scan carries. An uploaded third-party report describes
+/// someone else's analysis and cannot be a baseline for ours.
 const BLAST_ENGINE: &str = "corgea-blast";
 
 /// Payload guard, not policy. The server applies the real ceiling
-/// (`INCREMENTAL_SCAN_MAX_FILES`, 300 by default) and falls back to a full scan
-/// above it; this only keeps the CLI from building a multi-megabyte form field
-/// for a diff that is obviously going to be refused.
+/// (`INCREMENTAL_SCAN_MAX_FILES`, 300) and falls back to a full scan above it.
+/// This only avoids building a multi-megabyte form field to be refused.
 const MAX_CHANGED_FILES: usize = 5_000;
 
 /// A diff the server can turn into an incremental scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncrementalPlan {
-    /// The commit this diff was measured from: the scan whose findings the
-    /// server carries forward for every file the diff does not name.
+    /// Commit this diff was measured from. The server carries its findings
+    /// forward for every file the diff does not name.
     pub base_sha: String,
-    /// Repo-relative paths that differ between `base_sha` and the commit being
+    /// Repo-relative paths differing between `base_sha` and the commit being
     /// scanned, including deletions and both sides of a rename.
     pub changed_files: Vec<String>,
 }
@@ -82,10 +65,10 @@ pub fn resolve_incremental_plan(
     head_sha: Option<&str>,
     worktree_dirty: bool,
 ) -> Option<IncrementalPlan> {
-    // A commit-to-commit diff cannot see edits that were never committed, so a
-    // dirty tree would leave modified files out of the list and their old
-    // findings copied forward as if current. The server enforces this too; it
-    // is repeated here so the run says why before paying for the upload.
+    // A commit-to-commit diff cannot see uncommitted edits, so a dirty tree
+    // leaves modified files off the list and their old findings copied forward
+    // as current. The server enforces this too; repeated here so the run says
+    // why before paying for the upload.
     if worktree_dirty {
         explain_full_scan(
             "this worktree has uncommitted changes, and a commit-to-commit diff cannot see them",
@@ -93,10 +76,9 @@ pub fn resolve_incremental_plan(
         return None;
     }
 
-    // No branch and commit means there is nothing to diff from. That covers a
-    // directory that is not a git repository, a repository with no commit yet,
-    // a detached HEAD, and a scan started below the repository root — all of
-    // which report no RepoInfo to the upload either.
+    // Nothing to diff from. Covers a non-git directory, a repo with no commit,
+    // a detached HEAD, and a scan started below the repo root — none of which
+    // report RepoInfo to the upload either.
     let (Some(branch), Some(head_sha)) = (branch, head_sha) else {
         explain_full_scan(
             "no git branch and commit to diff from (not a git repository, no commit \
@@ -158,18 +140,18 @@ pub fn resolve_incremental_plan(
     })
 }
 
-/// Say why this run is scanning everything. Never fatal: a full scan is the
-/// correct answer, just a slower one, so the run continues.
+/// Say why this run scans everything. Never fatal — a full scan is correct,
+/// only slower, so the run continues.
 fn explain_full_scan(reason: &str) {
     println!("Scanning every file: {reason}.");
 }
 
-/// The commit of the newest scan this project can be diffed against.
+/// Commit of the newest scan this project can be diffed against.
 ///
-/// Prefers the branch being scanned and falls back to the newest usable scan on
-/// any branch, mirroring how doghouse orders its own baseline lookup
-/// (`ScanManager._try_incremental_scan`). The fallback is what makes the first
-/// scan of a feature branch incremental against the trunk instead of full.
+/// Prefers the branch being scanned, falls back to the newest usable scan on
+/// any branch, mirroring doghouse's own baseline order
+/// (`ScanManager._try_incremental_scan`). That fallback is what makes a feature
+/// branch's first scan incremental against trunk instead of full.
 fn find_baseline_sha(config: &Config, project_name: &str, branch: &str) -> Option<String> {
     let url = config.get_url();
     let mut any_branch_fallback: Option<String> = None;
@@ -184,8 +166,8 @@ fn find_baseline_sha(config: &Config, project_name: &str, branch: &str) -> Optio
         ) {
             Ok(response) => response,
             Err(e) => {
-                // A lookup that fails proves nothing about the project's
-                // history, so this is a full scan, not an error.
+                // A failed lookup proves nothing about the project's history,
+                // so it means full scan, not error.
                 crate::log::debug(&format!("Baseline scan lookup failed: {e}"));
                 return any_branch_fallback;
             }
@@ -196,8 +178,8 @@ fn find_baseline_sha(config: &Config, project_name: &str, branch: &str) -> Optio
             break;
         }
 
-        // The list is newest first, so the first same-branch match is the best
-        // baseline available and no later page can improve on it.
+        // Newest first, so the first same-branch match is the best available
+        // and no later page can improve on it.
         if let Some(scan) = usable_baselines(&scans)
             .find(|scan| scan.branch.as_deref().is_some_and(|b| b == branch))
         {
@@ -220,23 +202,22 @@ fn find_baseline_sha(config: &Config, project_name: &str, branch: &str) -> Optio
     any_branch_fallback
 }
 
-/// The scans on one page that can serve as a baseline, newest first.
+/// Scans on one page that can serve as a baseline, newest first.
 fn usable_baselines(scans: &[ScanResponse]) -> impl Iterator<Item = &ScanResponse> {
     scans.iter().filter(|scan| is_usable_baseline(scan))
 }
 
 /// Whether `scan` may be diffed against.
 ///
-/// These are the client-side half of the filter doghouse applies when it picks
-/// a baseline itself: a completed blast scan of a whole, clean commit that is
-/// not a pull request. `worktree_dirty` must be an explicit `false` — `None`
-/// means the scan never reported it, and unknown scope is not a clean tree, so
-/// the server would reject it as a baseline anyway.
+/// Client-side half of the filter doghouse applies picking a baseline itself: a
+/// completed blast scan of a whole, clean, non-pull-request commit.
+/// `worktree_dirty` must be an explicit `false` — `None` means never reported,
+/// and unknown scope is not clean, so the server rejects it as a baseline too.
 ///
-/// `query_baseline_scans` asks the server for exactly these, which is what
-/// keeps the page walk from iterating. This stays because a backend that
-/// predates those parameters ignores them, and acting on a dirty or
-/// pull-request scan's commit would diff against the wrong tree.
+/// `query_baseline_scans` asks the server for exactly these, which keeps the
+/// page walk from iterating. This stays because a backend predating those
+/// parameters ignores them, and a dirty or pull-request scan's commit would
+/// diff against the wrong tree.
 fn is_usable_baseline(scan: &ScanResponse) -> bool {
     classify_scan_status(&scan.status) == ScanState::Completed
         && scan.engine.eq_ignore_ascii_case(BLAST_ENGINE)
@@ -245,26 +226,22 @@ fn is_usable_baseline(scan: &ScanResponse) -> bool {
         && scan.git_sha.as_deref().is_some_and(|sha| !sha.is_empty())
 }
 
-/// Every repo-relative path that differs between two commits.
+/// Every repo-relative path differing between two commits.
 ///
-/// Both sides of every delta are collected, and no status is filtered out,
-/// because the list decides which findings are *not* carried forward. A deleted
-/// file left off the list keeps its old findings in a tree where the file no
-/// longer exists, and a rename is a delete plus an add whose old path needs the
-/// same treatment. `--target`'s `git:diff=` selector deliberately does the
-/// opposite — it wants paths that still exist on disk to put in an archive —
-/// which is why this does not reuse it.
+/// Both sides of every delta, no status filtered out, because the list decides
+/// which findings are *not* carried forward. A deleted file left off keeps its
+/// findings in a tree no longer holding it; a rename is a delete plus an add
+/// whose old path needs the same. `--target`'s `git:diff=` selector wants the
+/// opposite — paths still on disk, to archive — hence no reuse.
 ///
-/// Files git does not track are not a gap here: an untracked file makes the
-/// worktree dirty, and a dirty tree has already refused the incremental scan
-/// above.
+/// Untracked files are not a gap: they make the worktree dirty, already
+/// refused above.
 ///
-/// A submodule is the one thing this cannot describe. A committed pointer bump
-/// is a single gitlink delta naming the submodule directory, while packaging
-/// walks into that directory and uploads the files inside it — so the files
-/// that actually changed would be missing from the list and keep their old
-/// findings. Diffing the two submodule commits would mean opening a repository
-/// that may not even be checked out, so this fails closed to a full scan.
+/// Submodules are the one thing this cannot describe. A committed pointer bump
+/// is one gitlink delta naming the submodule directory, while packaging walks
+/// into it and uploads the files inside, so those files would be missing from
+/// the list and keep old findings. Diffing the two submodule commits means
+/// opening a repo that may not be checked out, so this fails closed.
 fn changed_files_between(
     repo: &Repository,
     base_sha: &str,
@@ -285,8 +262,8 @@ fn changed_files_between(
         .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)
         .map_err(|e| format!("the diff against {} failed ({e})", short_sha(base_sha)))?;
 
-    // Sorted and deduplicated: a rename reports one path from each side, and a
-    // stable order keeps the uploaded list reproducible for the same two commits.
+    // Sorted and deduplicated: a rename reports one path per side, and stable
+    // order keeps the uploaded list reproducible for the same two commits.
     let mut files = BTreeSet::new();
     for delta in diff.deltas() {
         if delta.old_file().mode() == git2::FileMode::Commit
@@ -358,8 +335,8 @@ mod tests {
 
     #[test]
     fn scans_that_cannot_describe_a_whole_clean_commit_are_rejected() {
-        // Each of these would make the server refuse the baseline too, so
-        // diffing against them would narrow a scan the server then widens.
+        // The server refuses each of these too, so diffing against them narrows
+        // a scan the server then widens.
         let mut running = scan("main", "abc");
         running.status = "processing".to_string();
         assert!(!is_usable_baseline(&running));
@@ -376,7 +353,7 @@ mod tests {
         dirty.worktree_dirty = Some(true);
         assert!(!is_usable_baseline(&dirty));
 
-        // Never reported is not the same as known clean.
+        // Never reported is not known clean.
         let mut unknown = scan("main", "abc");
         unknown.worktree_dirty = None;
         assert!(!is_usable_baseline(&unknown));
@@ -395,8 +372,7 @@ mod tests {
         );
     }
 
-    /// A repo with two commits: `first.txt`, then a commit that adds, edits and
-    /// deletes. Returns `(tempdir, base_sha, head_sha)`.
+    /// Two commits: three files, then one that adds, edits and deletes.
     fn repo_with_history() -> (tempfile::TempDir, Repository, String, String) {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = Repository::init(dir.path()).expect("init");
@@ -447,8 +423,8 @@ mod tests {
     fn the_diff_names_added_edited_and_deleted_files_but_not_untouched_ones() {
         let (_dir, repo, base, head) = repo_with_history();
         let files = changed_files_between(&repo, &base, &head).expect("diff");
-        // A deleted file must be listed: leaving it out would carry its old
-        // findings into a scan of a tree that no longer contains it.
+        // Deleted file must be listed, else its findings carry into a tree that
+        // no longer holds it.
         assert_eq!(files, vec!["added.txt", "edit.txt", "gone.txt"]);
     }
 
@@ -460,7 +436,7 @@ mod tests {
             .is_empty());
     }
 
-    /// A commit whose tree carries a `vendor` gitlink pointing at `target`.
+    /// Commit whose tree carries a `vendor` gitlink pointing at `target`.
     fn commit_with_gitlink(repo: &Repository, parent: git2::Oid, target: git2::Oid) -> git2::Oid {
         let sig = git2::Signature::now("t", "t@example.com").expect("sig");
         let parent_commit = repo.find_commit(parent).expect("parent");
@@ -478,9 +454,8 @@ mod tests {
 
     #[test]
     fn a_moved_submodule_pointer_refuses_the_diff() {
-        // Packaging walks into the submodule and uploads the files inside it,
-        // but the diff names only `vendor`, so those files would keep findings
-        // nothing re-examined.
+        // Packaging uploads the files inside the submodule, but the diff names
+        // only `vendor`, so those files would keep unexamined findings.
         let (_dir, repo, base, head) = repo_with_history();
         let base_oid = git2::Oid::from_str(&base).expect("base oid");
         let head_oid = git2::Oid::from_str(&head).expect("head oid");
