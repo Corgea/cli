@@ -453,6 +453,64 @@ fn a_directory_that_is_not_a_git_repository_scans_everything() {
     );
 }
 
+/// `--ignore-dirty-worktree` does not pretend the tree is clean: it moves the
+/// far side of the diff to the working tree, so the edited file is named and
+/// rescanned rather than keeping findings nothing analyzed.
+#[test]
+fn ignore_dirty_worktree_diffs_the_working_tree_instead_of_refusing() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    std::fs::write(project.path().join("main.py"), "print('uncommitted')\n")
+        .expect("dirty the tree");
+
+    let expected_base = base_sha.clone();
+    let mut plan = vec![
+        verify_request(),
+        baseline_lookup("main", vec![baseline_scan(&base_sha)]),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with a worktree diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                // Still reported dirty: the upload is not a snapshot of the
+                // commit, and the scan must never become a baseline itself.
+                assert_multipart_text_field(request, "dirty", "true")?;
+                assert_multipart_text_field(request, "incremental_base_sha", &expected_base)?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_changed_files",
+                    r#"["main.py"]"#,
+                )?;
+                assert_multipart_text_field(request, "incremental_covers_worktree", "true")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--ignore-dirty-worktree",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(stdout.contains("and your uncommitted changes"), "{context}");
+}
+
 /// The server refuses a dirty tree too, and the refusal must come before the
 /// baseline lookup: a commit-to-commit diff cannot see uncommitted edits, so no
 /// baseline makes the list correct.

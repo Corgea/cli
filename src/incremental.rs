@@ -51,9 +51,13 @@ pub struct IncrementalPlan {
     /// Commit this diff was measured from. The server carries its findings
     /// forward for every file the diff does not name.
     pub base_sha: String,
-    /// Repo-relative paths differing between `base_sha` and the commit being
-    /// scanned, including deletions and both sides of a rename.
+    /// Repo-relative paths differing from `base_sha`, including deletions and
+    /// both sides of a rename.
     pub changed_files: Vec<String>,
+    /// Whether the diff measured the working tree rather than a commit. The
+    /// server refuses a dirty upload otherwise, because a commit-to-commit diff
+    /// cannot describe one.
+    pub covers_worktree: bool,
 }
 
 /// What an incremental scan of this commit would cover, or `None` to scan
@@ -64,14 +68,18 @@ pub fn resolve_incremental_plan(
     branch: Option<&str>,
     head_sha: Option<&str>,
     worktree_dirty: bool,
+    ignore_dirty_worktree: bool,
 ) -> Option<IncrementalPlan> {
-    // A commit-to-commit diff cannot see uncommitted edits, so a dirty tree
-    // leaves modified files off the list and their old findings copied forward
-    // as current. The server enforces this too; repeated here so the run says
-    // why before paying for the upload.
-    if worktree_dirty {
+    // A commit-to-commit diff cannot see uncommitted edits, so on a dirty tree
+    // it leaves modified files off the list and their old findings are copied
+    // forward as current. --ignore-dirty-worktree does not paper over that; it
+    // switches the diff to measure the working tree, so those files are named
+    // and rescanned like any other change.
+    let covers_worktree = worktree_dirty;
+    if worktree_dirty && !ignore_dirty_worktree {
         explain_full_scan(
-            "this worktree has uncommitted changes, and a commit-to-commit diff cannot see them",
+            "this worktree has uncommitted changes, and a commit-to-commit diff cannot \
+             see them. Pass --ignore-dirty-worktree to diff the working tree instead",
         );
         return None;
     }
@@ -115,7 +123,7 @@ pub fn resolve_incremental_plan(
         }
     };
 
-    let changed_files = match changed_files_between(&repo, &base_sha, head_sha) {
+    let changed_files = match changed_files_since(&repo, &base_sha, head_sha, covers_worktree) {
         Ok(files) => files,
         Err(reason) => {
             explain_full_scan(&reason);
@@ -132,23 +140,26 @@ pub fn resolve_incremental_plan(
         return None;
     }
 
+    let since = if covers_worktree {
+        format!(
+            "commit {} and your uncommitted changes",
+            short_sha(&base_sha)
+        )
+    } else {
+        format!("commit {}", short_sha(&base_sha))
+    };
     match changed_files.len() {
-        0 => println!(
-            "Incremental scan: nothing changed since commit {}. Corgea will carry every \
-             finding forward.",
-            short_sha(&base_sha)
-        ),
+        0 => println!("Incremental scan: nothing changed since {since}. Corgea will carry every finding forward."),
         count => println!(
-            "Incremental scan: {} file(s) changed since commit {}. Corgea will analyze those \
-             and carry findings forward for the rest.",
-            count,
-            short_sha(&base_sha)
+            "Incremental scan: {count} file(s) changed since {since}. Corgea will analyze \
+             those and carry findings forward for the rest."
         ),
     }
 
     Some(IncrementalPlan {
         base_sha,
         changed_files,
+        covers_worktree,
     })
 }
 
@@ -300,7 +311,15 @@ fn is_usable_baseline(scan: &ScanResponse) -> bool {
         && scan.git_sha.as_deref().is_some_and(|sha| !sha.is_empty())
 }
 
-/// Every repo-relative path differing between two commits.
+/// Every repo-relative path differing from the baseline commit.
+///
+/// `include_worktree` decides what the far side of the diff is. False compares
+/// two commits, which is exact when the tree is clean. True compares the
+/// baseline against the index and working tree, which is what makes a dirty
+/// tree scannable: a file edited but not committed differs from the baseline
+/// and has to be named, or its old findings would be carried forward over
+/// content nothing analyzed. Untracked files count for the same reason — the
+/// archive contains them.
 ///
 /// Both sides of every delta, no status filtered out, because the list decides
 /// which findings are *not* carried forward. A deleted file left off keeps its
@@ -316,10 +335,11 @@ fn is_usable_baseline(scan: &ScanResponse) -> bool {
 /// into it and uploads the files inside, so those files would be missing from
 /// the list and keep old findings. Diffing the two submodule commits means
 /// opening a repo that may not be checked out, so this fails closed.
-fn changed_files_between(
+fn changed_files_since(
     repo: &Repository,
     base_sha: &str,
     head_sha: &str,
+    include_worktree: bool,
 ) -> Result<Vec<String>, String> {
     let base_tree = commit_tree(repo, base_sha).map_err(|e| {
         format!(
@@ -329,12 +349,17 @@ fn changed_files_between(
             short_sha(base_sha)
         )
     })?;
-    let head_tree = commit_tree(repo, head_sha)
-        .map_err(|e| format!("commit {} could not be read ({e})", short_sha(head_sha)))?;
 
-    let diff = repo
-        .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)
-        .map_err(|e| format!("the diff against {} failed ({e})", short_sha(base_sha)))?;
+    let diff = if include_worktree {
+        let mut options = git2::DiffOptions::new();
+        options.include_untracked(true).recurse_untracked_dirs(true);
+        repo.diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut options))
+    } else {
+        let head_tree = commit_tree(repo, head_sha)
+            .map_err(|e| format!("commit {} could not be read ({e})", short_sha(head_sha)))?;
+        repo.diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)
+    }
+    .map_err(|e| format!("the diff against {} failed ({e})", short_sha(base_sha)))?;
 
     // Sorted and deduplicated: a rename reports one path per side, and stable
     // order keeps the uploaded list reproducible for the same two commits.
@@ -567,7 +592,7 @@ mod tests {
     #[test]
     fn the_diff_names_added_edited_and_deleted_files_but_not_untouched_ones() {
         let (_dir, repo, base, head) = repo_with_history();
-        let files = changed_files_between(&repo, &base, &head).expect("diff");
+        let files = changed_files_since(&repo, &base, &head, false).expect("diff");
         // Deleted file must be listed, else its findings carry into a tree that
         // no longer holds it.
         assert_eq!(files, vec!["added.txt", "edit.txt", "gone.txt"]);
@@ -576,9 +601,45 @@ mod tests {
     #[test]
     fn a_commit_diffed_against_itself_reports_nothing_changed() {
         let (_dir, repo, _base, head) = repo_with_history();
-        assert!(changed_files_between(&repo, &head, &head)
+        assert!(changed_files_since(&repo, &head, &head, false)
             .expect("diff")
             .is_empty());
+    }
+
+    #[test]
+    fn a_commit_range_diff_cannot_see_uncommitted_work() {
+        // Why a dirty tree may not use one: keep.txt differs from what will be
+        // uploaded, yet the diff does not name it, so its findings would be
+        // carried forward over content nothing analyzed.
+        let (dir, repo, _base, head) = repo_with_history();
+        fs::write(dir.path().join("keep.txt"), "edited").expect("edit");
+        fs::write(dir.path().join("brand-new.txt"), "new").expect("add");
+
+        let committed = changed_files_since(&repo, &head, &head, false).expect("diff");
+        assert!(committed.is_empty());
+    }
+
+    #[test]
+    fn a_worktree_diff_names_edited_and_untracked_files() {
+        let (dir, repo, _base, head) = repo_with_history();
+        fs::write(dir.path().join("keep.txt"), "edited").expect("edit");
+        fs::write(dir.path().join("brand-new.txt"), "new").expect("add");
+
+        let files = changed_files_since(&repo, &head, &head, true).expect("diff");
+
+        assert_eq!(files, vec!["brand-new.txt", "keep.txt"]);
+    }
+
+    #[test]
+    fn a_worktree_diff_still_spans_the_commits_behind_it() {
+        // The baseline is a commit, so committed changes since it count too --
+        // the working tree is the far side of the diff, not the whole of it.
+        let (dir, repo, base, _head) = repo_with_history();
+        fs::write(dir.path().join("keep.txt"), "edited").expect("edit");
+
+        let files = changed_files_since(&repo, &base, "unused", true).expect("diff");
+
+        assert_eq!(files, vec!["added.txt", "edit.txt", "gone.txt", "keep.txt"]);
     }
 
     /// Commit whose tree carries a `vendor` gitlink pointing at `target`.
@@ -607,7 +668,7 @@ mod tests {
         let before = commit_with_gitlink(&repo, base_oid, base_oid);
         let after = commit_with_gitlink(&repo, before, head_oid);
 
-        let err = changed_files_between(&repo, &before.to_string(), &after.to_string())
+        let err = changed_files_since(&repo, &before.to_string(), &after.to_string(), false)
             .expect_err("a moved submodule must refuse the diff");
 
         assert!(err.contains("submodule vendor"), "{err}");
@@ -616,7 +677,7 @@ mod tests {
     #[test]
     fn a_base_commit_this_clone_does_not_have_is_reported_not_panicked() {
         let (_dir, repo, _base, head) = repo_with_history();
-        let err = changed_files_between(&repo, &"0".repeat(40), &head)
+        let err = changed_files_since(&repo, &"0".repeat(40), &head, false)
             .expect_err("unknown base must fail");
         assert!(err.contains("shallow clone"), "{err}");
     }

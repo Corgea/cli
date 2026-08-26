@@ -32,6 +32,16 @@ fn prior_scan(sha: &str, created_at: &str) -> Value {
     })
 }
 
+/// The trunk baseline lookup a dirty run makes once --ignore-dirty-worktree
+/// puts incremental back on the table.
+fn baseline_lookup_for_branch(branch: &'static str, scans: Vec<Value>) -> ExpectedRequest {
+    expected_request(
+        "look up a baseline scan to diff against",
+        move |request| assert_baseline_lookup_request(request, PROJECT, branch),
+        json_response(scans_response(scans)),
+    )
+}
+
 fn commit_lookup(sha: &str, scans: Vec<Value>) -> ExpectedRequest {
     let sha = sha.to_string();
     expected_request(
@@ -428,14 +438,17 @@ fn ignore_dirty_worktree_reuses_a_prior_dirty_scan() {
     assert!(!stdout.contains("Scanning with BLAST"), "{context}");
 }
 
-/// The override is only a reuse rule. When nothing can be reused, the new
-/// scan still sends the real dirty status.
+/// When nothing can be reused, the new scan still sends the real dirty status.
+/// The override does not launder it -- it only lets the diff measure the
+/// working tree, which is why a baseline lookup follows the reuse lookup here.
 #[test]
 fn ignore_dirty_worktree_still_uploads_dirty_when_nothing_is_reused() {
     let project = git_project();
     std::fs::write(project.path().join("main.py"), "print('dirty')\n")
         .expect("modify tracked file");
     let mut plan = blast_upload_plan(&project.sha, true, false);
+    plan.insert(1, baseline_lookup_for_branch("master", vec![]));
+    plan.insert(1, baseline_lookup_for_branch("main", vec![]));
     plan.insert(1, commit_lookup(&project.sha, vec![]));
     let api = ApiStub::start(plan);
     let (mut command, _home) = cloud_command(&api, project.path());
@@ -661,25 +674,27 @@ fn the_window_cannot_be_set_without_the_skip_flag() {
     );
 }
 
-/// `--ignore-dirty-worktree` only changes reuse; it is meaningless without
-/// `--skip-if-commit-scanned-recently`.
+/// `--ignore-dirty-worktree` stands alone now: it governs the incremental diff
+/// as well as reuse, so a run may pass it without the reuse flag. Covered end
+/// to end in `scan_incremental`; this only asserts clap accepts it.
 #[test]
-fn ignore_dirty_worktree_cannot_be_set_without_the_skip_flag() {
-    let api = ApiStub::start(Vec::new());
+fn ignore_dirty_worktree_may_be_set_without_the_skip_flag() {
     let project = git_project();
+    let api = ApiStub::start(blast_upload_plan(&project.sha, false, false));
     let (mut command, _home) = cloud_command(&api, project.path());
-    command.args(["scan", "blast", "--ignore-dirty-worktree"]);
+    command.args([
+        "scan",
+        "blast",
+        "--ignore-dirty-worktree",
+        "--project-name",
+        PROJECT,
+    ]);
 
     let output = run_with_timeout(command, &api);
     let transcript = api.assert_finished();
     let context = output_context(&output, &transcript);
-    let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(output.status.code(), Some(2), "{context}");
-    assert!(
-        stderr.contains("--skip-if-commit-scanned-recently"),
-        "{context}"
-    );
+    assert_eq!(output.status.code(), Some(0), "{context}");
 }
 
 /// A backend that predates the `sha` filter answers with the project's scans

@@ -195,8 +195,7 @@ enum Commands {
 
         #[arg(
             long = "ignore-dirty-worktree",
-            requires = "skip_if_commit_scanned_recently",
-            help = "With --skip-if-commit-scanned-recently, reuse a recent scan of this commit even if this worktree is dirty or the prior scan recorded worktree_dirty. A new scan still reports the real dirty status."
+            help = "Do not let uncommitted changes stop this run from taking a shortcut. For an incremental scan, the diff is measured against the working tree instead of the last commit, so edited and untracked files are analyzed rather than skipped. With --skip-if-commit-scanned-recently, a recent scan of this commit may be reused even though this worktree is dirty or the prior scan recorded worktree_dirty. A new scan still reports the real dirty status."
         )]
         ignore_dirty_worktree: bool,
     },
@@ -860,6 +859,7 @@ fn main() {
                     block_on,
                     only_uncommitted,
                     disable_incremental,
+                    ignore_dirty_worktree,
                     metadata_json,
                     scan_type.clone(),
                     policy.clone(),

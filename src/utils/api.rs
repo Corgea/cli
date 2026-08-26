@@ -401,6 +401,13 @@ pub fn upload_zip(
                         "incremental_changed_files",
                         multipart::Part::text(changed_files),
                     );
+                    // Tells the server the list describes the working tree, not
+                    // just a commit range, which is the only way it can accept a
+                    // diff from a dirty upload.
+                    if plan.covers_worktree {
+                        form =
+                            form.part("incremental_covers_worktree", multipart::Part::text("true"));
+                    }
                 }
                 Err(e) => debug(&format!(
                     "Could not serialize the incremental file list, scanning every file: {e}"

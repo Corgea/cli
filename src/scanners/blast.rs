@@ -54,6 +54,7 @@ pub fn run(
     block_on: Option<String>,
     only_uncommitted: &bool,
     disable_incremental: &bool,
+    ignore_dirty_worktree_for_run: &bool,
     metadata: Option<String>,
     scan_type: Option<String>,
     policy: Option<String>,
@@ -111,6 +112,7 @@ pub fn run(
             &project_name,
             only_uncommitted,
             disable_incremental,
+            ignore_dirty_worktree_for_run,
             metadata,
             scan_type,
             policy,
@@ -284,6 +286,7 @@ fn start_new_scan(
     project_name: &str,
     only_uncommitted: &bool,
     disable_incremental: &bool,
+    ignore_dirty_worktree: &bool,
     metadata: Option<String>,
     scan_type: Option<String>,
     policy: Option<String>,
@@ -536,6 +539,7 @@ fn start_new_scan(
             // Missing repo info is not dirtiness; it is the missing
             // branch/commit the resolver reports next, by its real name.
             repo_info.as_ref().is_some_and(|info| info.dirty),
+            *ignore_dirty_worktree,
         )
     };
     println!("\n\nSubmitting scan to Corgea:");
