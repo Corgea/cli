@@ -381,7 +381,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let path = dir.join("stub-engine.sh");
-        let mut file = fs::File::create(&path).unwrap();
+        // Write to a sibling, fsync, chmod, then rename. Creating the
+        // executable in place and execing it immediately races overlayfs
+        // (GitHub Actions + llvm-cov) with ETXTBSY / "Text file busy".
+        let tmp = dir.join("stub-engine.sh.tmp");
+        let mut file = fs::File::create(&tmp).unwrap();
         writeln!(
             file,
             r#"#!/bin/sh
@@ -396,13 +400,34 @@ exit 1
 "#
         )
         .unwrap();
+        file.sync_all().unwrap();
         drop(file);
 
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        let mut permissions = fs::metadata(&tmp).unwrap().permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).unwrap();
+        fs::set_permissions(&tmp, permissions).unwrap();
+        fs::rename(&tmp, &path).unwrap();
+        wait_until_executable(&path);
 
         path
+    }
+
+    /// Overlayfs can still return ETXTBSY on the first exec after rename.
+    /// Spin briefly so the tests do not flake under cargo-llvm-cov.
+    #[cfg(unix)]
+    fn wait_until_executable(path: &Path) {
+        for delay_ms in [0_u64, 2, 5, 10, 20, 50] {
+            if delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            if Command::new(path)
+                .args(["image", "inspect", "warmup"])
+                .output()
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -501,13 +526,10 @@ exit 1
     }
 
     fn env_temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "corgea-images-test-{}-{}",
-            name,
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        tempfile::Builder::new()
+            .prefix(&format!("corgea-images-test-{name}-"))
+            .tempdir()
+            .expect("temp dir")
+            .keep()
     }
 }
