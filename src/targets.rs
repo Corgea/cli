@@ -342,7 +342,7 @@ fn get_git_untracked_files(repo_root: &Path) -> Result<Vec<PathBuf>, String> {
     for entry in statuses.iter() {
         let status = entry.status();
         if status.is_wt_new() && !status.is_ignored() {
-            if let Some(path) = entry.path() {
+            if let Ok(path) = entry.path() {
                 files.push(PathBuf::from(path));
             }
         }
