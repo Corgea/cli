@@ -12,7 +12,7 @@
 //! when it already cannot be used.
 
 use crate::common::*;
-use hyper::Method;
+use hyper::{Method, StatusCode};
 use serde_json::{json, Value};
 
 const PROJECT: &str = "cloud-e2e";
@@ -37,6 +37,25 @@ fn baseline_lookup(scans: Vec<Value>) -> ExpectedRequest {
         "look up a baseline scan to diff against",
         move |request| assert_baseline_lookup_request(request, PROJECT),
         json_response(scans_response(scans)),
+    )
+}
+
+/// One page of the baseline lookup, for the walk an old backend forces.
+fn baseline_lookup_page(page: u16, total_pages: u32, scans: Vec<Value>) -> ExpectedRequest {
+    expected_request(
+        "look up a baseline scan to diff against",
+        move |request| {
+            assert_authenticated_request(request, Method::GET, "/api/v1/scans")?;
+            assert_query(request, "project", PROJECT)?;
+            assert_query(request, "page", &page.to_string())?;
+            assert_query(request, "engine", "corgea-blast")
+        },
+        json_response(json!({
+            "status": "ok",
+            "page": page,
+            "total_pages": total_pages,
+            "scans": scans,
+        })),
     )
 }
 
@@ -182,6 +201,99 @@ fn a_project_with_no_baseline_scan_uploads_without_a_diff() {
     assert!(
         stdout.contains("Scanning every file: no earlier completed scan of a clean worktree"),
         "{context}"
+    );
+}
+
+/// A backend predating the server-side filters returns scans of every kind, so
+/// a page can hold nothing usable. The walk is what stops that project from
+/// being permanently unable to find a baseline it has.
+#[test]
+fn a_baseline_on_a_later_page_is_still_found() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    let head_sha = second_commit(&project);
+
+    let mut unusable = baseline_scan(&head_sha);
+    unusable["worktree_dirty"] = json!(true);
+    let expected_base = base_sha.clone();
+
+    let mut plan = vec![
+        verify_request(),
+        baseline_lookup_page(1, 2, vec![unusable]),
+        baseline_lookup_page(2, 2, vec![baseline_scan(&base_sha)]),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with the diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_multipart_text_field(request, "incremental_base_sha", &expected_base)
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+}
+
+/// A lookup that failed says so. Reporting it as "no earlier scan" tells someone
+/// with years of scan history that they have none, and now that incremental is
+/// the default, any network blip would say it.
+#[test]
+fn a_failed_lookup_is_not_reported_as_a_missing_baseline() {
+    let project = git_project();
+    second_commit(&project);
+
+    let mut plan = vec![
+        verify_request(),
+        expected_request(
+            "fail the baseline lookup",
+            |request| assert_baseline_lookup_request(request, PROJECT),
+            json_response_with_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "boom"})),
+        ),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with no diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_no_multipart_field(request, "incremental_base_sha")?;
+                assert_no_multipart_field(request, "incremental_changed_files")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(stdout.contains("could not be looked up"), "{context}");
+    assert!(
+        !stdout.contains("no earlier completed scan"),
+        "a lookup failure must not claim the project has no scan history\n{context}"
     );
 }
 

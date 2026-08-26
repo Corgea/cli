@@ -87,12 +87,22 @@ pub fn resolve_incremental_plan(
         return None;
     };
 
-    let Some(base_sha) = find_baseline_sha(config, project_name, branch) else {
-        explain_full_scan(&format!(
-            "no earlier completed scan of a clean worktree was found for project '{project_name}', \
-             so there is nothing to diff against"
-        ));
-        return None;
+    let base_sha = match find_baseline_sha(config, project_name, branch) {
+        Baseline::Found(sha) => sha,
+        Baseline::NotFound => {
+            explain_full_scan(&format!(
+                "no earlier completed scan of a clean worktree was found for project \
+                 '{project_name}', so there is nothing to diff against"
+            ));
+            return None;
+        }
+        Baseline::LookupFailed => {
+            explain_full_scan(&format!(
+                "the earlier scans of project '{project_name}' could not be looked up, \
+                 so there is nothing to diff against. Run with --verbose for the error"
+            ));
+            return None;
+        }
     };
 
     let repo = match Repository::discover(".") {
@@ -146,13 +156,25 @@ fn explain_full_scan(reason: &str) {
     println!("Scanning every file: {reason}.");
 }
 
+/// Outcome of looking for a scan to diff against.
+///
+/// `NotFound` and `LookupFailed` both mean a full scan, but they are different
+/// things to tell someone: one says this project has no scan history to build
+/// on, the other says we could not read the history it may well have.
+#[derive(Debug, PartialEq, Eq)]
+enum Baseline {
+    Found(String),
+    NotFound,
+    LookupFailed,
+}
+
 /// Commit of the newest scan this project can be diffed against.
 ///
 /// Prefers the branch being scanned, falls back to the newest usable scan on
 /// any branch, mirroring doghouse's own baseline order
 /// (`ScanManager._try_incremental_scan`). That fallback is what makes a feature
 /// branch's first scan incremental against trunk instead of full.
-fn find_baseline_sha(config: &Config, project_name: &str, branch: &str) -> Option<String> {
+fn find_baseline_sha(config: &Config, project_name: &str, branch: &str) -> Baseline {
     let url = config.get_url();
     let mut any_branch_fallback: Option<String> = None;
 
@@ -167,9 +189,13 @@ fn find_baseline_sha(config: &Config, project_name: &str, branch: &str) -> Optio
             Ok(response) => response,
             Err(e) => {
                 // A failed lookup proves nothing about the project's history,
-                // so it means full scan, not error.
+                // so it means full scan, not error. An earlier page that did
+                // answer still counts: that scan is a real baseline.
                 crate::log::debug(&format!("Baseline scan lookup failed: {e}"));
-                return any_branch_fallback;
+                return match any_branch_fallback {
+                    Some(sha) => Baseline::Found(sha),
+                    None => Baseline::LookupFailed,
+                };
             }
         };
 
@@ -180,15 +206,11 @@ fn find_baseline_sha(config: &Config, project_name: &str, branch: &str) -> Optio
 
         // Newest first, so the first same-branch match is the best available
         // and no later page can improve on it.
-        if let Some(scan) = usable_baselines(&scans)
-            .find(|scan| scan.branch.as_deref().is_some_and(|b| b == branch))
-        {
-            return scan.git_sha.clone();
+        if let Some(sha) = same_branch_baseline(&scans, branch) {
+            return Baseline::Found(sha);
         }
         if any_branch_fallback.is_none() {
-            any_branch_fallback = usable_baselines(&scans)
-                .next()
-                .and_then(|s| s.git_sha.clone());
+            any_branch_fallback = any_branch_baseline(&scans);
         }
 
         if response
@@ -199,7 +221,24 @@ fn find_baseline_sha(config: &Config, project_name: &str, branch: &str) -> Optio
         }
     }
 
-    any_branch_fallback
+    match any_branch_fallback {
+        Some(sha) => Baseline::Found(sha),
+        None => Baseline::NotFound,
+    }
+}
+
+/// Newest usable scan of `branch` on this page.
+fn same_branch_baseline(scans: &[ScanResponse], branch: &str) -> Option<String> {
+    usable_baselines(scans)
+        .find(|scan| scan.branch.as_deref() == Some(branch))
+        .and_then(|scan| scan.git_sha.clone())
+}
+
+/// Newest usable scan on this page, whatever branch it ran on.
+fn any_branch_baseline(scans: &[ScanResponse]) -> Option<String> {
+    usable_baselines(scans)
+        .next()
+        .and_then(|scan| scan.git_sha.clone())
 }
 
 /// Scans on one page that can serve as a baseline, newest first.
@@ -283,7 +322,10 @@ fn changed_files_between(
         }
         for file in [delta.old_file(), delta.new_file()] {
             if let Some(path) = file.path() {
-                let path = path.to_string_lossy().replace('\\', "/");
+                // Byte-for-byte. Git stores `/` as its separator on every
+                // platform, so a backslash here is part of the filename, and
+                // translating it would name a file that did not change.
+                let path = path.to_string_lossy().into_owned();
                 if !path.is_empty() {
                     files.insert(path);
                 }
@@ -380,10 +422,46 @@ mod tests {
     #[test]
     fn the_newest_usable_scan_wins_within_a_page() {
         let scans = vec![scan("main", "newest"), scan("main", "older")];
+        assert_eq!(any_branch_baseline(&scans).as_deref(), Some("newest"));
+    }
+
+    #[test]
+    fn the_branch_being_scanned_is_preferred_over_a_newer_one_elsewhere() {
+        let scans = vec![scan("main", "newer-on-main"), scan("feature", "on-feature")];
         assert_eq!(
-            usable_baselines(&scans).next().unwrap().git_sha.as_deref(),
-            Some("newest")
+            same_branch_baseline(&scans, "feature").as_deref(),
+            Some("on-feature")
         );
+    }
+
+    #[test]
+    fn a_branch_with_no_scan_of_its_own_falls_back_to_any_branch() {
+        // A feature branch's first scan diffs against trunk rather than going
+        // full, which is the whole point of the fallback.
+        let scans = vec![scan("main", "on-main")];
+        assert_eq!(same_branch_baseline(&scans, "feature"), None);
+        assert_eq!(any_branch_baseline(&scans).as_deref(), Some("on-main"));
+    }
+
+    #[test]
+    fn unusable_scans_are_skipped_when_picking_a_fallback() {
+        let mut dirty = scan("main", "dirty");
+        dirty.worktree_dirty = Some(true);
+        let scans = vec![dirty, scan("main", "clean")];
+        assert_eq!(any_branch_baseline(&scans).as_deref(), Some("clean"));
+        assert_eq!(
+            same_branch_baseline(&scans, "main").as_deref(),
+            Some("clean")
+        );
+    }
+
+    #[test]
+    fn a_page_of_nothing_usable_yields_no_baseline() {
+        let mut pr = scan("main", "pr");
+        pr.pull_request_id = Some("42".to_string());
+        let scans = vec![pr];
+        assert_eq!(same_branch_baseline(&scans, "main"), None);
+        assert_eq!(any_branch_baseline(&scans), None);
     }
 
     /// Two commits: three files, then one that adds, edits and deletes.
