@@ -310,20 +310,23 @@ pub(crate) fn assert_scan_list_request(
     assert_query(request, "project", project)
 }
 
-/// The baseline lookup an incremental scan makes before uploading.
+/// One baseline lookup an incremental scan makes before uploading.
 ///
-/// Asserting the filters is the point: they keep this to one request instead of
-/// a page walk, and a server dropping them silently returns pull-request and
-/// dirty scans for the client to reject.
+/// Asserting the filters is the point: they keep this to one request per trunk
+/// branch instead of a page walk, and a server dropping them silently returns
+/// pull-request and dirty scans for the client to reject. `branch` is asserted
+/// because a baseline may only come from trunk.
 pub(crate) fn assert_baseline_lookup_request(
     request: &CapturedRequest,
     project: &str,
+    branch: &str,
 ) -> Result<(), String> {
     assert_scan_list_request(request, project)?;
     assert_query(request, "engine", "corgea-blast")?;
     assert_query(request, "status", "complete")?;
     assert_query(request, "exclude_pull_requests", "true")?;
-    assert_query(request, "worktree_dirty", "false")
+    assert_query(request, "worktree_dirty", "false")?;
+    assert_query(request, "branch", branch)
 }
 
 pub(crate) fn query_value(request: &CapturedRequest, key: &str) -> Result<String, String> {
@@ -812,15 +815,18 @@ pub(crate) fn blast_upload_plan(sha: &str, dirty: bool, include_sca: bool) -> Ve
     let issue_path = "/api/v1/scan/blast-scan-123/issues".to_string();
     let mut plan = vec![verify_request()];
     // Scans are incremental by default, so every clean-tree run looks for a
-    // baseline before uploading. Answering with no scans keeps this the
-    // full-scan contract: nothing to diff from, no incremental fields on the
-    // upload. A dirty tree never asks.
+    // baseline before uploading -- once per trunk branch, since the fixture
+    // records no origin/HEAD. Answering with no scans keeps this the full-scan
+    // contract: nothing to diff from, no incremental fields on the upload. A
+    // dirty tree never asks.
     if !dirty {
-        plan.push(expected_request(
-            "look up a baseline scan to diff against",
-            |request| assert_baseline_lookup_request(request, "cloud-e2e"),
-            json_response(scans_response(Vec::new())),
-        ));
+        for branch in ["main", "master"] {
+            plan.push(expected_request(
+                "look up a baseline scan to diff against",
+                move |request| assert_baseline_lookup_request(request, "cloud-e2e", branch),
+                json_response(scans_response(Vec::new())),
+            ));
+        }
     }
     plan.extend([
         expected_request(

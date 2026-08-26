@@ -866,6 +866,7 @@ pub fn query_baseline_scans(
     url: &str,
     project: &str,
     engine: &str,
+    branch: &str,
     page: u16,
     page_size: u16,
 ) -> Result<ScansResponse, Box<dyn Error>> {
@@ -876,6 +877,7 @@ pub fn query_baseline_scans(
             ("page_size", page_size.to_string()),
             ("project", project.to_string()),
             ("engine", engine.to_string()),
+            ("branch", branch.to_string()),
             ("status", "complete".to_string()),
             ("exclude_pull_requests", "true".to_string()),
             // Explicitly clean only. A scan that never reported the flag is

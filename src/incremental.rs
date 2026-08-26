@@ -79,7 +79,7 @@ pub fn resolve_incremental_plan(
     // Nothing to diff from. Covers a non-git directory, a repo with no commit,
     // a detached HEAD, and a scan started below the repo root — none of which
     // report RepoInfo to the upload either.
-    let (Some(branch), Some(head_sha)) = (branch, head_sha) else {
+    let (Some(_branch), Some(head_sha)) = (branch, head_sha) else {
         explain_full_scan(
             "no git branch and commit to diff from (not a git repository, no commit \
              yet, a detached HEAD, or a scan started below the repository root)",
@@ -87,12 +87,22 @@ pub fn resolve_incremental_plan(
         return None;
     };
 
-    let base_sha = match find_baseline_sha(config, project_name, branch) {
+    let repo = match Repository::discover(".") {
+        Ok(repo) => repo,
+        Err(e) => {
+            explain_full_scan(&format!("this directory is not a git repository ({e})"));
+            return None;
+        }
+    };
+
+    let trunks = baseline_branches(&repo);
+    let base_sha = match find_baseline_sha(config, project_name, &trunks) {
         Baseline::Found(sha) => sha,
         Baseline::NotFound => {
             explain_full_scan(&format!(
-                "no earlier completed scan of a clean worktree was found for project \
-                 '{project_name}', so there is nothing to diff against"
+                "project '{project_name}' has no completed scan of a clean worktree on \
+                 {}, so there is nothing stable to diff against",
+                join_or(&trunks)
             ));
             return None;
         }
@@ -101,14 +111,6 @@ pub fn resolve_incremental_plan(
                 "the earlier scans of project '{project_name}' could not be looked up, \
                  so there is nothing to diff against. Run with --verbose for the error"
             ));
-            return None;
-        }
-    };
-
-    let repo = match Repository::discover(".") {
-        Ok(repo) => repo,
-        Err(e) => {
-            explain_full_scan(&format!("this directory is not a git repository ({e})"));
             return None;
         }
     };
@@ -168,76 +170,109 @@ enum Baseline {
     LookupFailed,
 }
 
-/// Commit of the newest scan this project can be diffed against.
+/// The branches a baseline may come from, best first.
 ///
-/// Prefers the branch being scanned, falls back to the newest usable scan on
-/// any branch, mirroring doghouse's own baseline order
-/// (`ScanManager._try_incremental_scan`). That fallback is what makes a feature
-/// branch's first scan incremental against trunk instead of full.
-fn find_baseline_sha(config: &Config, project_name: &str, branch: &str) -> Baseline {
+/// Only trunk qualifies. Any completed clean scan is a *correct* thing to diff
+/// against, but not a *stable* one: a scan of someone else's feature branch is
+/// a baseline whose contents nobody can predict, and the findings copied
+/// forward from it would be that branch's, not this project's. Trunk is the
+/// line every branch descends from, so it is the only shared reference point.
+///
+/// `origin/HEAD` records what the remote advertised as its default when this
+/// clone was made. It is absent from single-branch and `actions/checkout`
+/// checkouts and is never refreshed after a rename, so `main` and `master`
+/// follow it rather than replace it.
+fn baseline_branches(repo: &Repository) -> Vec<String> {
+    let mut branches: Vec<String> = default_branch(repo).into_iter().collect();
+    for fallback in ["main", "master"] {
+        if !branches.iter().any(|branch| branch == fallback) {
+            branches.push(fallback.to_string());
+        }
+    }
+    branches
+}
+
+/// Default branch this clone recorded, or None when it recorded none.
+fn default_branch(repo: &Repository) -> Option<String> {
+    let name = repo
+        .find_reference("refs/remotes/origin/HEAD")
+        .ok()?
+        .symbolic_target()?
+        .strip_prefix("refs/remotes/origin/")?
+        .to_string();
+    (!name.is_empty() && name != "HEAD").then_some(name)
+}
+
+fn join_or(branches: &[String]) -> String {
+    match branches.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => "any branch".to_string(),
+    }
+}
+
+/// Commit of the newest scan on the first trunk branch that has one.
+///
+/// One query per branch, because the branch filter is server-side: a project
+/// with heavy feature-branch traffic can push trunk's newest scan far past any
+/// page limit, and asking for trunk directly cannot miss it that way. The page
+/// budget is shared across branches so the worst case stays bounded.
+fn find_baseline_sha(config: &Config, project_name: &str, branches: &[String]) -> Baseline {
     let url = config.get_url();
-    let mut any_branch_fallback: Option<String> = None;
+    let mut budget = SCAN_LOOKUP_MAX_PAGES;
 
-    for page in 1..=SCAN_LOOKUP_MAX_PAGES {
-        let response = match api::query_baseline_scans(
-            &url,
-            project_name,
-            BLAST_ENGINE,
-            page,
-            SCAN_LOOKUP_PAGE_SIZE,
-        ) {
-            Ok(response) => response,
-            Err(e) => {
-                // A failed lookup proves nothing about the project's history,
-                // so it means full scan, not error. An earlier page that did
-                // answer still counts: that scan is a real baseline.
-                crate::log::debug(&format!("Baseline scan lookup failed: {e}"));
-                return match any_branch_fallback {
-                    Some(sha) => Baseline::Found(sha),
-                    None => Baseline::LookupFailed,
-                };
+    for branch in branches {
+        let mut page = 1;
+        while budget > 0 {
+            budget -= 1;
+            let response = match api::query_baseline_scans(
+                &url,
+                project_name,
+                BLAST_ENGINE,
+                branch,
+                page,
+                SCAN_LOOKUP_PAGE_SIZE,
+            ) {
+                Ok(response) => response,
+                Err(e) => {
+                    // Proves nothing about this project's history, so it is a
+                    // full scan rather than an error -- but it is a different
+                    // answer from "trunk has no scan", so say which it was.
+                    // Whatever failed is the endpoint, not the branch, so the
+                    // remaining candidates would fail the same way.
+                    crate::log::debug(&format!("Baseline scan lookup failed: {e}"));
+                    return Baseline::LookupFailed;
+                }
+            };
+
+            let scans = response.scans.unwrap_or_default();
+            if scans.is_empty() {
+                break;
             }
-        };
-
-        let scans = response.scans.unwrap_or_default();
-        if scans.is_empty() {
-            break;
-        }
-
-        // Newest first, so the first same-branch match is the best available
-        // and no later page can improve on it.
-        if let Some(sha) = same_branch_baseline(&scans, branch) {
-            return Baseline::Found(sha);
-        }
-        if any_branch_fallback.is_none() {
-            any_branch_fallback = any_branch_baseline(&scans);
-        }
-
-        if response
-            .total_pages
-            .is_some_and(|total| u32::from(page) >= total)
-        {
-            break;
+            // Newest first, so the first match on this branch is the best
+            // available and no later page can improve on it. Matched
+            // client-side too: a backend that ignored the branch filter would
+            // otherwise hand back another branch's scan.
+            if let Some(sha) = branch_baseline(&scans, branch) {
+                return Baseline::Found(sha);
+            }
+            if response
+                .total_pages
+                .is_some_and(|total| u32::from(page) >= total)
+            {
+                break;
+            }
+            page += 1;
         }
     }
 
-    match any_branch_fallback {
-        Some(sha) => Baseline::Found(sha),
-        None => Baseline::NotFound,
-    }
+    Baseline::NotFound
 }
 
 /// Newest usable scan of `branch` on this page.
-fn same_branch_baseline(scans: &[ScanResponse], branch: &str) -> Option<String> {
+fn branch_baseline(scans: &[ScanResponse], branch: &str) -> Option<String> {
     usable_baselines(scans)
         .find(|scan| scan.branch.as_deref() == Some(branch))
-        .and_then(|scan| scan.git_sha.clone())
-}
-
-/// Newest usable scan on this page, whatever branch it ran on.
-fn any_branch_baseline(scans: &[ScanResponse]) -> Option<String> {
-    usable_baselines(scans)
-        .next()
         .and_then(|scan| scan.git_sha.clone())
 }
 
@@ -420,48 +455,66 @@ mod tests {
     }
 
     #[test]
-    fn the_newest_usable_scan_wins_within_a_page() {
+    fn the_newest_usable_scan_on_the_branch_wins() {
         let scans = vec![scan("main", "newest"), scan("main", "older")];
-        assert_eq!(any_branch_baseline(&scans).as_deref(), Some("newest"));
+        assert_eq!(branch_baseline(&scans, "main").as_deref(), Some("newest"));
     }
 
     #[test]
-    fn the_branch_being_scanned_is_preferred_over_a_newer_one_elsewhere() {
-        let scans = vec![scan("main", "newer-on-main"), scan("feature", "on-feature")];
-        assert_eq!(
-            same_branch_baseline(&scans, "feature").as_deref(),
-            Some("on-feature")
-        );
+    fn a_scan_on_another_branch_is_never_the_baseline() {
+        // A backend that ignored the branch filter would otherwise hand back a
+        // feature branch's scan as trunk's.
+        let scans = vec![scan("feature", "on-feature")];
+        assert_eq!(branch_baseline(&scans, "main"), None);
     }
 
     #[test]
-    fn a_branch_with_no_scan_of_its_own_falls_back_to_any_branch() {
-        // A feature branch's first scan diffs against trunk rather than going
-        // full, which is the whole point of the fallback.
-        let scans = vec![scan("main", "on-main")];
-        assert_eq!(same_branch_baseline(&scans, "feature"), None);
-        assert_eq!(any_branch_baseline(&scans).as_deref(), Some("on-main"));
-    }
-
-    #[test]
-    fn unusable_scans_are_skipped_when_picking_a_fallback() {
+    fn unusable_scans_on_the_branch_are_skipped() {
         let mut dirty = scan("main", "dirty");
         dirty.worktree_dirty = Some(true);
         let scans = vec![dirty, scan("main", "clean")];
-        assert_eq!(any_branch_baseline(&scans).as_deref(), Some("clean"));
-        assert_eq!(
-            same_branch_baseline(&scans, "main").as_deref(),
-            Some("clean")
-        );
+        assert_eq!(branch_baseline(&scans, "main").as_deref(), Some("clean"));
     }
 
     #[test]
     fn a_page_of_nothing_usable_yields_no_baseline() {
         let mut pr = scan("main", "pr");
         pr.pull_request_id = Some("42".to_string());
-        let scans = vec![pr];
-        assert_eq!(same_branch_baseline(&scans, "main"), None);
-        assert_eq!(any_branch_baseline(&scans), None);
+        assert_eq!(branch_baseline(&[pr], "main"), None);
+    }
+
+    #[test]
+    fn trunk_candidates_fall_back_to_main_then_master() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(dir.path()).expect("init");
+        // No origin/HEAD: single-branch and actions/checkout clones have none.
+        assert_eq!(default_branch(&repo), None);
+        assert_eq!(baseline_branches(&repo), vec!["main", "master"]);
+    }
+
+    #[test]
+    fn a_recorded_default_branch_leads_and_is_not_repeated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(dir.path()).expect("init");
+        repo.reference_symbolic(
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+            true,
+            "test",
+        )
+        .expect("set origin/HEAD");
+
+        assert_eq!(default_branch(&repo).as_deref(), Some("trunk"));
+        assert_eq!(baseline_branches(&repo), vec!["trunk", "main", "master"]);
+
+        repo.reference_symbolic(
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+            true,
+            "test",
+        )
+        .expect("set origin/HEAD");
+        assert_eq!(baseline_branches(&repo), vec!["main", "master"]);
     }
 
     /// Two commits: three files, then one that adds, edits and deletes.

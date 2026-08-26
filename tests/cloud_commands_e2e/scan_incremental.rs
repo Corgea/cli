@@ -23,7 +23,7 @@ fn baseline_scan(sha: &str) -> Value {
         "id": BASELINE_SCAN,
         "project": PROJECT,
         "repo": null,
-        "branch": "e2e-main",
+        "branch": "main",
         "status": "complete",
         "engine": "corgea-blast",
         "created_at": "2026-07-30T12:00:00Z",
@@ -32,21 +32,36 @@ fn baseline_scan(sha: &str) -> Value {
     })
 }
 
-fn baseline_lookup(scans: Vec<Value>) -> ExpectedRequest {
+fn baseline_lookup(branch: &'static str, scans: Vec<Value>) -> ExpectedRequest {
     expected_request(
         "look up a baseline scan to diff against",
-        move |request| assert_baseline_lookup_request(request, PROJECT),
+        move |request| assert_baseline_lookup_request(request, PROJECT, branch),
         json_response(scans_response(scans)),
     )
 }
 
+/// The lookups a fixture repo makes when no trunk branch has a baseline. It
+/// records no origin/HEAD, so the candidates are `main` then `master`.
+fn baseline_lookups_finding_nothing() -> Vec<ExpectedRequest> {
+    vec![
+        baseline_lookup("main", vec![]),
+        baseline_lookup("master", vec![]),
+    ]
+}
+
 /// One page of the baseline lookup, for the walk an old backend forces.
-fn baseline_lookup_page(page: u16, total_pages: u32, scans: Vec<Value>) -> ExpectedRequest {
+fn baseline_lookup_page(
+    branch: &'static str,
+    page: u16,
+    total_pages: u32,
+    scans: Vec<Value>,
+) -> ExpectedRequest {
     expected_request(
         "look up a baseline scan to diff against",
         move |request| {
             assert_authenticated_request(request, Method::GET, "/api/v1/scans")?;
             assert_query(request, "project", PROJECT)?;
+            assert_query(request, "branch", branch)?;
             assert_query(request, "page", &page.to_string())?;
             assert_query(request, "engine", "corgea-blast")
         },
@@ -115,7 +130,7 @@ fn the_upload_carries_the_baseline_commit_and_the_files_that_changed_since_it() 
     let expected_base = base_sha.clone();
     let mut plan = vec![
         verify_request(),
-        baseline_lookup(vec![baseline_scan(&base_sha)]),
+        baseline_lookup("main", vec![baseline_scan(&base_sha)]),
         start_upload(),
         expected_request(
             "upload BLAST archive with the diff",
@@ -165,9 +180,9 @@ fn a_project_with_no_baseline_scan_uploads_without_a_diff() {
     let head_sha = second_commit(&project);
 
     let patch_sha = head_sha.clone();
-    let mut plan = vec![
-        verify_request(),
-        baseline_lookup(vec![]),
+    let mut plan = vec![verify_request()];
+    plan.extend(baseline_lookups_finding_nothing());
+    plan.extend([
         start_upload(),
         expected_request(
             "upload BLAST archive with no diff",
@@ -185,7 +200,7 @@ fn a_project_with_no_baseline_scan_uploads_without_a_diff() {
             },
             json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
         ),
-    ];
+    ]);
     plan.extend(scan_tail());
 
     let api = ApiStub::start(plan);
@@ -199,7 +214,7 @@ fn a_project_with_no_baseline_scan_uploads_without_a_diff() {
 
     assert_eq!(output.status.code(), Some(0), "{context}");
     assert!(
-        stdout.contains("Scanning every file: no earlier completed scan of a clean worktree"),
+        stdout.contains("has no completed scan of a clean worktree on main or master"),
         "{context}"
     );
 }
@@ -219,8 +234,8 @@ fn a_baseline_on_a_later_page_is_still_found() {
 
     let mut plan = vec![
         verify_request(),
-        baseline_lookup_page(1, 2, vec![unusable]),
-        baseline_lookup_page(2, 2, vec![baseline_scan(&base_sha)]),
+        baseline_lookup_page("main", 1, 2, vec![unusable]),
+        baseline_lookup_page("main", 2, 2, vec![baseline_scan(&base_sha)]),
         start_upload(),
         expected_request(
             "upload BLAST archive with the diff",
@@ -260,7 +275,7 @@ fn a_failed_lookup_is_not_reported_as_a_missing_baseline() {
         verify_request(),
         expected_request(
             "fail the baseline lookup",
-            |request| assert_baseline_lookup_request(request, PROJECT),
+            |request| assert_baseline_lookup_request(request, PROJECT, "main"),
             json_response_with_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "boom"})),
         ),
         start_upload(),
@@ -292,7 +307,7 @@ fn a_failed_lookup_is_not_reported_as_a_missing_baseline() {
     assert_eq!(output.status.code(), Some(0), "{context}");
     assert!(stdout.contains("could not be looked up"), "{context}");
     assert!(
-        !stdout.contains("no earlier completed scan"),
+        !stdout.contains("no completed scan of a clean worktree"),
         "a lookup failure must not claim the project has no scan history\n{context}"
     );
 }
