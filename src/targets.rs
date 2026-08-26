@@ -571,6 +571,17 @@ mod tests {
     }
 
     #[test]
+    fn git_untracked_files_lists_worktree_paths() {
+        let dir = setup_test_dir();
+        let files = get_git_untracked_files(dir.path()).expect("untracked listing");
+        let names: Vec<_> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+        assert!(names.contains(&"config.toml"), "{names:?}");
+    }
+
+    #[test]
     fn build_exclude_glob_set_returns_none_for_none() {
         let result = build_exclude_glob_set(None).unwrap();
         assert!(result.is_none());
