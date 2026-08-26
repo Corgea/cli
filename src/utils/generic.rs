@@ -341,7 +341,7 @@ fn get_repo_info_inner(dir: &str, sample_dirty: bool) -> Result<Option<RepoInfo>
 
     let branch = repo.head().ok().and_then(|head| {
         if head.is_branch() {
-            head.shorthand().map(|s| s.to_string())
+            head.shorthand().ok().map(|s| s.to_string())
         } else {
             None
         }
@@ -432,7 +432,7 @@ pub fn reconcile_repo_info_for_upload(
 fn origin_url(repo: &Repository) -> Option<String> {
     repo.find_remote("origin")
         .ok()
-        .and_then(|remote| remote.url().map(|url| url.to_string()))
+        .and_then(|remote| remote.url().ok().map(|url| url.to_string()))
 }
 
 /// The enclosing repository's `origin` remote URL, searched upward from the
