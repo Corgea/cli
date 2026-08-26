@@ -194,13 +194,13 @@ fn baseline_branches(repo: &Repository) -> Vec<String> {
 
 /// Default branch this clone recorded, or None when it recorded none.
 fn default_branch(repo: &Repository) -> Option<String> {
-    let name = repo
-        .find_reference("refs/remotes/origin/HEAD")
-        .ok()?
-        .symbolic_target()?
-        .strip_prefix("refs/remotes/origin/")?
-        .to_string();
-    (!name.is_empty() && name != "HEAD").then_some(name)
+    let reference = repo.find_reference("refs/remotes/origin/HEAD").ok()?;
+    let name = reference
+        .symbolic_target()
+        .ok()
+        .flatten()?
+        .strip_prefix("refs/remotes/origin/")?;
+    (!name.is_empty() && name != "HEAD").then(|| name.to_string())
 }
 
 fn join_or(branches: &[String]) -> String {

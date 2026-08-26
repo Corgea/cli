@@ -1,12 +1,37 @@
 use crate::utils::terminal::{set_text_color, TerminalColor};
-use git2::{IndexEntryExtendedFlag, IndexEntryFlag, Repository, StatusOptions};
+use git2::{Repository, StatusOptions};
 use globset::{Glob, GlobSetBuilder};
 use ignore::WalkBuilder;
 use std::env;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use zip::{write::FileOptions, ZipWriter};
+
+/// Environment variables through which git pins a subprocess to a specific
+/// repository, index or config. Git exports them to hooks, so a `corgea` run
+/// invoked from one would otherwise read the state the hook was handed instead
+/// of the worktree it was pointed at. `deps::run` scrubs the same set for its
+/// own git subprocesses; the library and binary crates share no module that
+/// could hold one copy.
+const GIT_LOCAL_ENV_VARS: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
 
 // Global exclude globs used across multiple functions
 const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
@@ -341,7 +366,7 @@ fn get_repo_info_inner(dir: &str, sample_dirty: bool) -> Result<Option<RepoInfo>
 
     let branch = repo.head().ok().and_then(|head| {
         if head.is_branch() {
-            head.shorthand().map(|s| s.to_string())
+            head.shorthand().ok().map(|s| s.to_string())
         } else {
             None
         }
@@ -353,29 +378,46 @@ fn get_repo_info_inner(dir: &str, sample_dirty: bool) -> Result<Option<RepoInfo>
             .map(|commit| commit.id().to_string())
     });
 
-    let (dirty, status_dirty) = if sample_dirty {
-        worktree_dirty_flags(&repo)
-    } else {
-        (false, false)
-    };
+    let dirty = sample_dirty && worktree_is_dirty(&repo, Path::new(dir));
 
     Ok(Some(RepoInfo {
         branch,
         repo_url: origin_url(&repo),
         sha,
         dirty,
-        status_dirty,
     }))
 }
 
-/// `(upload_dirty, status_dirty)`.
-/// `upload_dirty`: status changes, dirty submodules, or assume-unchanged /
-/// skip-worktree (status hides those). Errors fail closed to dirty.
-/// `status_dirty`: non-empty `statuses()` only (user notice).
-fn worktree_dirty_flags(repo: &Repository) -> (bool, bool) {
-    let status_dirty = status_has_changes(repo);
-    let upload_dirty = index_hides_worktree(repo) || status_dirty;
-    (upload_dirty, status_dirty)
+/// True when the worktree holds changes `git status` reports.
+///
+/// `git status` is what a user checks this answer against, so git itself is
+/// asked and libgit2 only stands in when the git binary cannot answer. The two
+/// disagree more often than it looks: libgit2 runs no clean filters (git-lfs
+/// and friends), cannot read a sparse index, and knows nothing of a
+/// `status.showUntrackedFiles` preference, and each disagreement surfaces as an
+/// uncommitted change the user's own `git status` does not show. A status
+/// nobody can produce still fails closed to dirty.
+fn worktree_is_dirty(repo: &Repository, dir: &Path) -> bool {
+    git_status_has_changes(dir).unwrap_or_else(|| status_has_changes(repo))
+}
+
+/// Whether `git status` reports anything, or None when the git binary is
+/// missing or the command failed - the only cases libgit2 answers instead.
+fn git_status_has_changes(dir: &Path) -> Option<bool> {
+    let mut command = Command::new("git");
+    for var in GIT_LOCAL_ENV_VARS {
+        command.env_remove(var);
+    }
+    let output = command
+        // `--no-optional-locks` keeps this read from writing the user's index.
+        .args(["--no-optional-locks", "status", "--porcelain"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(output.stdout.iter().any(|b| !b.is_ascii_whitespace()))
 }
 
 fn status_has_changes(repo: &Repository) -> bool {
@@ -386,19 +428,6 @@ fn status_has_changes(repo: &Repository) -> bool {
         .include_ignored(false);
     repo.statuses(Some(&mut opts))
         .map(|s| !s.is_empty())
-        .unwrap_or(true)
-}
-
-/// assume-unchanged / skip-worktree are omitted from `statuses()`.
-fn index_hides_worktree(repo: &Repository) -> bool {
-    repo.index()
-        .map(|index| {
-            index.iter().any(|entry| {
-                IndexEntryFlag::from_bits_truncate(entry.flags).is_valid()
-                    || IndexEntryExtendedFlag::from_bits_truncate(entry.flags_extended)
-                        .is_skip_worktree()
-            })
-        })
         .unwrap_or(true)
 }
 
@@ -422,7 +451,6 @@ pub fn reconcile_repo_info_for_upload(
                 repo_url: after.repo_url.or(before.repo_url),
                 sha: after.sha.or(before.sha),
                 dirty: !stable_clean,
-                status_dirty: before.status_dirty || after.status_dirty,
             })
         }
     }
@@ -432,7 +460,7 @@ pub fn reconcile_repo_info_for_upload(
 fn origin_url(repo: &Repository) -> Option<String> {
     repo.find_remote("origin")
         .ok()
-        .and_then(|remote| remote.url().map(|url| url.to_string()))
+        .and_then(|remote| remote.url().ok().map(|url| url.to_string()))
 }
 
 /// The enclosing repository's `origin` remote URL, searched upward from the
@@ -538,8 +566,6 @@ pub struct RepoInfo {
     pub sha: Option<String>,
     /// Not an exact clean HEAD snapshot. Always false from [`get_repo_info`].
     pub dirty: bool,
-    /// Non-empty git status (excludes index hide-bits). Drives user notice.
-    pub status_dirty: bool,
 }
 
 #[cfg(test)]
@@ -561,6 +587,21 @@ mod tests {
         assert!(
             cmd.args(args).current_dir(root).status().unwrap().success(),
             "git {args:?} failed"
+        );
+    }
+
+    /// Dates a file so its recorded stat data no longer matches the index.
+    #[cfg(unix)]
+    fn touch(path: &std::path::Path) {
+        assert!(
+            Command::new("touch")
+                .args(["-t", "203001010000"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success(),
+            "touch {} failed",
+            path.display()
         );
     }
 
@@ -607,7 +648,6 @@ mod tests {
             .unwrap()
             .expect("repo info");
         assert!(info.dirty);
-        assert!(info.status_dirty);
     }
 
     #[test]
@@ -621,7 +661,6 @@ mod tests {
             .unwrap()
             .expect("repo info");
         assert!(info.dirty);
-        assert!(info.status_dirty);
     }
 
     #[test]
@@ -634,7 +673,6 @@ mod tests {
             .unwrap()
             .expect("repo info");
         assert!(info.dirty);
-        assert!(info.status_dirty);
     }
 
     #[test]
@@ -650,26 +688,27 @@ mod tests {
             .unwrap()
             .expect("repo info");
         assert!(!info.dirty);
-        assert!(!info.status_dirty);
     }
 
+    /// `git status` shows nothing for an assume-unchanged edit, so neither does
+    /// the CLI: the reported state is the one the user can check.
     #[test]
-    fn get_repo_info_for_scan_dirty_when_assume_unchanged_hides_edit() {
+    fn get_repo_info_for_scan_clean_when_assume_unchanged_hides_edit() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_committed_repo(root);
         fs::write(root.join("README"), "changed").unwrap();
         git(root, &["update-index", "--assume-unchanged", "README"]);
-        // status clean; zip would still include the edit
         let info = get_repo_info_for_scan(root.to_str().unwrap())
             .unwrap()
             .expect("repo info");
-        assert!(info.dirty);
-        assert!(!info.status_dirty);
+        assert!(!info.dirty);
     }
 
+    /// Same for skip-worktree, which sparse checkouts set on every file they
+    /// leave out - a whole clean repository would otherwise read as dirty.
     #[test]
-    fn get_repo_info_for_scan_dirty_when_skip_worktree() {
+    fn get_repo_info_for_scan_clean_when_skip_worktree() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_committed_repo(root);
@@ -677,8 +716,42 @@ mod tests {
         let info = get_repo_info_for_scan(root.to_str().unwrap())
             .unwrap()
             .expect("repo info");
-        assert!(info.dirty);
-        assert!(!info.status_dirty);
+        assert!(!info.dirty);
+    }
+
+    /// A clean filter (how git-lfs and similar tools store a file) makes the
+    /// worktree copy differ from the stored blob on purpose. `git status`
+    /// applies the filter and reports nothing; libgit2 cannot run it and reads
+    /// every such file as modified, which is why git is the one asked.
+    #[cfg(unix)]
+    #[test]
+    fn get_repo_info_for_scan_clean_when_a_clean_filter_rewrites_the_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_committed_repo(root);
+        git(root, &["config", "filter.upper.clean", "tr a-z A-Z"]);
+        git(root, &["config", "filter.upper.smudge", "cat"]);
+        fs::write(root.join(".gitattributes"), "*.txt filter=upper\n").unwrap();
+        fs::write(root.join("payload.txt"), "lowercase\n").unwrap();
+        git(root, &["add", ".gitattributes", "payload.txt"]);
+        git(root, &["commit", "-m", "filtered"]);
+        // Stale timestamps are how a checkout out of a CI cache looks. Both
+        // implementations stop trusting the index's stat cache and compare
+        // content; only git runs the filter while doing it.
+        touch(&root.join("payload.txt"));
+
+        let repo = Repository::discover(root).unwrap();
+        assert!(
+            status_has_changes(&repo),
+            "libgit2 runs no clean filter, so it should read the file as modified"
+        );
+        let info = get_repo_info_for_scan(root.to_str().unwrap())
+            .unwrap()
+            .expect("repo info");
+        assert!(
+            !info.dirty,
+            "git status is empty, so the scan must not report a dirty worktree"
+        );
     }
 
     #[test]
@@ -691,19 +764,30 @@ mod tests {
             .unwrap()
             .expect("repo info");
         assert!(!clean.dirty);
-        assert!(!clean.status_dirty);
 
         fs::write(root.join("README"), "changed").unwrap();
         let identity = get_repo_info(root.to_str().unwrap())
             .unwrap()
             .expect("repo info");
         assert!(!identity.dirty);
-        assert!(!identity.status_dirty);
         let scan = get_repo_info_for_scan(root.to_str().unwrap())
             .unwrap()
             .expect("repo info");
         assert!(scan.dirty);
-        assert!(scan.status_dirty);
+    }
+
+    /// The libgit2 fallback answers only when the git binary cannot, so it is
+    /// exercised directly.
+    #[test]
+    fn libgit2_fallback_sees_a_modified_tracked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_committed_repo(root);
+        let repo = Repository::discover(root).unwrap();
+        assert!(!status_has_changes(&repo));
+
+        fs::write(root.join("README"), "changed").unwrap();
+        assert!(status_has_changes(&repo));
     }
 
     fn sample_info(sha: &str, dirty: bool) -> RepoInfo {
@@ -712,7 +796,6 @@ mod tests {
             repo_url: Some("https://github.com/org/repo.git".into()),
             sha: Some(sha.into()),
             dirty,
-            status_dirty: false,
         }
     }
 
