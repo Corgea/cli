@@ -5,6 +5,7 @@ mod images;
 mod inspect;
 mod list;
 mod log;
+mod mcp;
 mod scan;
 mod setup_hooks;
 mod skill;
@@ -307,6 +308,11 @@ enum Commands {
         #[command(subcommand)]
         command: SkillCommands,
     },
+    /// Install the Corgea MCP server into an agent's config
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
+    },
     /// Offline dependency inventory: scan, graph, explain, diff, sbom, policy
     Deps {
         #[command(subcommand)]
@@ -493,6 +499,37 @@ enum SkillCommands {
     SetDefaultAgent {
         #[arg(help = "Agent id (e.g. cursor, claude-code, codex).")]
         agent: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum McpCommands {
+    /// Install (or reinstall) the Corgea MCP server in an agent's JSON config
+    Install {
+        #[arg(
+            long,
+            help = "Agent to install for (e.g. cursor, claude, claude-code). Defaults to the configured default agent."
+        )]
+        agent: Option<String>,
+
+        #[arg(
+            long,
+            default_value = "user",
+            help = "Installation scope: user or project."
+        )]
+        scope: String,
+
+        #[arg(
+            long,
+            help = "Write to a custom JSON file (overrides the agent's default path)."
+        )]
+        dir: Option<String>,
+
+        #[arg(
+            long,
+            help = "Persist the provided --agent as the default for future installs."
+        )]
+        set_default: bool,
     },
 }
 
@@ -958,6 +995,23 @@ fn main() {
             }
             SkillCommands::SetDefaultAgent { agent } => {
                 skill::run_set_default_agent(&mut corgea_config, agent);
+            }
+        },
+        Some(Commands::Mcp { command }) => match command {
+            McpCommands::Install {
+                agent,
+                scope,
+                dir,
+                set_default,
+            } => {
+                verify_token_and_exit_when_fail(&corgea_config);
+                mcp::run_install(
+                    &mut corgea_config,
+                    agent.clone(),
+                    scope,
+                    dir.clone(),
+                    *set_default,
+                );
             }
         },
         Some(Commands::Deps { command }) => {
