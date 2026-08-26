@@ -125,11 +125,9 @@ pub fn resolve_reusable_scan(
     exclude: Option<&str>,
     ignore_dirty_worktree: bool,
 ) -> Option<ScanResponse> {
-    // `dirty`, not `status_dirty`: this asks whether the run would upload an
-    // exact snapshot of the commit, and that is the flag the upload itself
-    // sends. `status_dirty` is narrower — it is the user notice, and it cannot
-    // see assume-unchanged/skip-worktree files, dirty submodules, or an index
-    // it failed to read, all of which change what gets packaged.
+    // Dirtiness here is what `git status` reports, the same signal the upload
+    // sends and the same one the user can check for themselves before asking
+    // why a scan ran.
     let commit = utils::generic::get_repo_info_for_scan("./")
         .ok()
         .flatten()
@@ -151,7 +149,7 @@ pub fn resolve_reusable_scan(
             );
         } else {
             println!(
-                "Working tree does not match commit {} exactly (uncommitted changes, or files the index hides from git status), so no scan of that commit describes what would be scanned here - running a new scan.",
+                "Working tree does not match commit {} exactly (git status reports uncommitted changes), so no scan of that commit describes what would be scanned here - running a new scan.",
                 short
             );
             print_skipped_marker(None);
