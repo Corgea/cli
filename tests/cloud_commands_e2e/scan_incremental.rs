@@ -167,7 +167,7 @@ fn the_upload_carries_the_baseline_commit_and_the_files_that_changed_since_it() 
 
     assert_eq!(output.status.code(), Some(0), "{context}");
     assert!(
-        stdout.contains("Incremental scan: 2 file(s) changed since commit"),
+        stdout.contains("Incremental scan: 2 files changed since commit"),
         "{context}"
     );
 }

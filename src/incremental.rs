@@ -149,11 +149,9 @@ pub fn resolve_incremental_plan(
         format!("commit {}", short_sha(&base_sha))
     };
     match changed_files.len() {
-        0 => println!("Incremental scan: nothing changed since {since}. Corgea will carry every finding forward."),
-        count => println!(
-            "Incremental scan: {count} file(s) changed since {since}. Corgea will analyze \
-             those and carry findings forward for the rest."
-        ),
+        0 => println!("Incremental scan: nothing changed since {since}."),
+        1 => println!("Incremental scan: 1 file changed since {since}."),
+        count => println!("Incremental scan: {count} files changed since {since}."),
     }
 
     Some(IncrementalPlan {
