@@ -22,3 +22,17 @@ Coverage needs LLVM's `llvm-cov`/`llvm-profdata`. On a rustup toolchain, run
 Homebrew Rust) those are missing, so point cargo-llvm-cov at a system LLVM:
 `LLVM_COV="$(brew --prefix llvm)/bin/llvm-cov" LLVM_PROFDATA="$(brew --prefix llvm)/bin/llvm-profdata" ./harness coverage`.
 CI uses its own toolchain and is unaffected.
+
+## Vendored agent components
+
+`.cursor/skills/` and `.cursor/agents/` are vendored from
+[Corgea/agent-toolkit](https://github.com/Corgea/agent-toolkit) so Cursor Cloud Agents
+working on this repository load them from the checkout. Do not hand-edit them; change
+them upstream and re-run the installer from an `agent-toolkit` checkout:
+
+```bash
+python3 /path/to/agent-toolkit/scripts/install_project_skills.py --target "$(pwd)"
+python3 /path/to/agent-toolkit/scripts/install_project_skills.py --target "$(pwd)" --check
+```
+
+`--check` exits non-zero when the vendored copy has drifted from upstream.
