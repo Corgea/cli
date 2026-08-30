@@ -1,3 +1,4 @@
+use crate::incremental::IncrementalPlan;
 use crate::log::debug;
 use crate::utils;
 use corgea::vuln_api::{auth_header, source};
@@ -233,15 +234,30 @@ pub struct UploadZipResult {
     pub project_id: Option<String>,
 }
 
+/// Per-scan settings travelling with the archive without being part of it.
+#[derive(Debug, Default)]
+pub struct UploadOptions {
+    pub scan_type: Option<String>,
+    pub policy: Option<String>,
+    pub metadata: Option<String>,
+    /// Set when this run resolved a diff for the server to analyze instead of
+    /// the whole project.
+    pub incremental: Option<IncrementalPlan>,
+}
+
 pub fn upload_zip(
     file_path: &str,
     url: &str,
     project_name: &str,
     repo_info: Option<utils::generic::RepoInfo>,
-    scan_type: Option<String>,
-    policy: Option<String>,
-    metadata: Option<String>,
+    options: UploadOptions,
 ) -> Result<UploadZipResult, Box<dyn std::error::Error>> {
+    let UploadOptions {
+        scan_type,
+        policy,
+        metadata,
+        incremental,
+    } = options;
     let client = http_client();
     let file_size = std::fs::metadata(file_path)?.len();
     let file_name = Path::new(file_path).file_name().unwrap().to_str().unwrap();
@@ -369,6 +385,34 @@ pub fn upload_zip(
         }
         if let Some(meta) = &metadata {
             form = form.part("metadata", multipart::Part::text(meta.clone()));
+        }
+        // Both fields or neither: the list is only safe next to the commit it
+        // was measured from, and a server seeing one without the other would
+        // guess a baseline. A list that will not serialize drops both, leaving
+        // a full scan.
+        if let Some(plan) = &incremental {
+            match serde_json::to_string(&plan.changed_files) {
+                Ok(changed_files) => {
+                    form = form.part(
+                        "incremental_base_sha",
+                        multipart::Part::text(plan.base_sha.clone()),
+                    );
+                    form = form.part(
+                        "incremental_changed_files",
+                        multipart::Part::text(changed_files),
+                    );
+                    // Tells the server the list describes the working tree, not
+                    // just a commit range, which is the only way it can accept a
+                    // diff from a dirty upload.
+                    if plan.covers_worktree {
+                        form =
+                            form.part("incremental_covers_worktree", multipart::Part::text("true"));
+                    }
+                }
+                Err(e) => debug(&format!(
+                    "Could not serialize the incremental file list, scanning every file: {e}"
+                )),
+            }
         }
 
         let response = match client
@@ -817,6 +861,40 @@ pub fn query_scan_list(
         query_params.push(("project", project.to_string()));
     }
     request_scan_list(url, query_params)
+}
+
+/// One page of the project's scans that could be diffed against, newest first.
+///
+/// Filters are server-side, so the answer is usually the first entry of page
+/// one. A backend predating them ignores the unknown parameters and returns
+/// scans of every kind, so the caller must still re-check each scan it acts on
+/// — see `incremental::is_usable_baseline`.
+pub fn query_baseline_scans(
+    url: &str,
+    project: &str,
+    engine: &str,
+    branch: &str,
+    page: u16,
+    page_size: u16,
+) -> Result<ScansResponse, Box<dyn Error>> {
+    request_scan_list(
+        url,
+        vec![
+            ("page", page.to_string()),
+            ("page_size", page_size.to_string()),
+            ("project", project.to_string()),
+            ("engine", engine.to_string()),
+            ("branch", branch.to_string()),
+            ("status", "complete".to_string()),
+            ("exclude_pull_requests", "true".to_string()),
+            // A partial scan's findings cover only the files it was pointed at,
+            // so copying forward from one would drop everything else.
+            ("full_project_state", "true".to_string()),
+            // Explicitly clean only. A scan that never reported the flag is
+            // unknown scope, which the server rejects as a baseline.
+            ("worktree_dirty", "false".to_string()),
+        ],
+    )
 }
 
 /// One page of the project's scans at exactly `sha`, newest first.

@@ -53,6 +53,8 @@ pub fn run(
     fail: &bool,
     block_on: Option<String>,
     only_uncommitted: &bool,
+    disable_incremental: &bool,
+    ignore_dirty_worktree_for_run: &bool,
     metadata: Option<String>,
     scan_type: Option<String>,
     policy: Option<String>,
@@ -109,6 +111,8 @@ pub fn run(
             config,
             &project_name,
             only_uncommitted,
+            disable_incremental,
+            ignore_dirty_worktree_for_run,
             metadata,
             scan_type,
             policy,
@@ -281,6 +285,8 @@ fn start_new_scan(
     config: &Config,
     project_name: &str,
     only_uncommitted: &bool,
+    disable_incremental: &bool,
+    ignore_dirty_worktree: &bool,
     metadata: Option<String>,
     scan_type: Option<String>,
     policy: Option<String>,
@@ -514,15 +520,40 @@ fn start_new_scan(
             info.dirty = true;
         }
     }
+    // Incremental is the default, so this asks what took it off the table. A
+    // narrowed archive is the silent case: carrying findings forward for files
+    // the archive no longer holds would be wrong, but those runs are not
+    // "scanning every file" either, so no message is honest.
+    let narrowed_archive = target_str.is_some() || exclude.is_some();
+    let incremental_plan = if *disable_incremental || narrowed_archive {
+        None
+    } else {
+        // Reconciled repo info, so a tree that turned out dirty — or a HEAD
+        // that moved mid-packaging — refuses rather than diffing against a
+        // commit this upload is not a snapshot of.
+        crate::incremental::resolve_incremental_plan(
+            config,
+            project_name,
+            repo_info.as_ref().and_then(|info| info.branch.as_deref()),
+            repo_info.as_ref().and_then(|info| info.sha.as_deref()),
+            // Missing repo info is not dirtiness; it is the missing
+            // branch/commit the resolver reports next, by its real name.
+            repo_info.as_ref().is_some_and(|info| info.dirty),
+            *ignore_dirty_worktree,
+        )
+    };
     println!("\n\nSubmitting scan to Corgea:");
     let upload_result = match utils::api::upload_zip(
         &zip_path,
         &config.get_url(),
         project_name,
         repo_info,
-        scan_type,
-        policy,
-        metadata,
+        utils::api::UploadOptions {
+            scan_type,
+            policy,
+            metadata,
+            incremental: incremental_plan,
+        },
     ) {
         Ok(result) => result,
         Err(e) => {

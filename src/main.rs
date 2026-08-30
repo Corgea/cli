@@ -2,6 +2,7 @@ mod authorize;
 mod cicd;
 mod config;
 mod images;
+mod incremental;
 mod inspect;
 mod list;
 mod log;
@@ -90,6 +91,12 @@ enum Commands {
         only_uncommitted: bool,
 
         #[arg(
+            long = "disable-incremental",
+            help = "Analyze every file, even when Corgea could have analyzed only what changed. Scans are incremental by default: the whole project is still uploaded, but only files that changed since this project's last scan are analyzed, and unchanged files keep their existing findings, so the result is a full picture either way. Use this to force a fresh analysis of every file — after changing scanner configuration outside corgea.yaml, for example. Incremental is skipped on its own, with a reason, when there is no git repository or commit to diff from, when the worktree is dirty, when no earlier scan of a clean worktree exists, or when the last scanned commit is missing from a shallow clone; and silently when --only-uncommitted, --target or --exclude already narrow the upload."
+        )]
+        disable_incremental: bool,
+
+        #[arg(
             long = "metadata",
             value_name = "KEY=VALUE",
             help = "Attach scan-level metadata (repeatable), e.g. --metadata pipeline_url=... --metadata artifact_version=1.2.3"
@@ -173,8 +180,8 @@ enum Commands {
 
         #[arg(
             long = "skip-if-commit-scanned-recently",
-            conflicts_with_all = ["only_uncommitted", "target", "scan_type", "policy", "include_image"],
-            help = "Do not start a new scan when this commit already has a recent completed scan in the project. That scan then drives the rest of the command — results table, --block-on gate, --out-file report — so the pipeline behaves the same either way. Prints CORGEA_SCAN_SKIPPED=true/false so a pipeline can tell the two apart, and fails if no git commit can be resolved. What can be reused is a scan of the whole commit, and no API tells this run how a past scan was scoped or configured, so the flag is refused with --only-uncommitted, --target, --scan-type, --policy and --include-image; with --exclude it warns instead, since a reused scan covers files this run would have skipped."
+            conflicts_with_all = ["only_uncommitted", "target", "scan_type", "policy", "include_image", "disable_incremental"],
+            help = "Do not start a new scan when this commit already has a recent completed scan in the project. That scan then drives the rest of the command — results table, --block-on gate, --out-file report — so the pipeline behaves the same either way. Prints CORGEA_SCAN_SKIPPED=true/false so a pipeline can tell the two apart, and fails if no git commit can be resolved. What can be reused is a scan of the whole commit, and no API tells this run how a past scan was scoped or configured, so the flag is refused with --only-uncommitted, --target, --scan-type, --policy, --include-image and --disable-incremental; with --exclude it warns instead, since a reused scan covers files this run would have skipped."
         )]
         skip_if_commit_scanned_recently: bool,
 
@@ -188,8 +195,7 @@ enum Commands {
 
         #[arg(
             long = "ignore-dirty-worktree",
-            requires = "skip_if_commit_scanned_recently",
-            help = "With --skip-if-commit-scanned-recently, reuse a recent scan of this commit even if this worktree is dirty or the prior scan recorded worktree_dirty. A new scan still reports the real dirty status."
+            help = "Do not let uncommitted changes stop this run from taking a shortcut. For an incremental scan, the diff is measured against the working tree instead of the last commit, so edited and untracked files are analyzed rather than skipped. With --skip-if-commit-scanned-recently, a recent scan of this commit may be reused even though this worktree is dirty or the prior scan recorded worktree_dirty. A new scan still reports the real dirty status."
         )]
         ignore_dirty_worktree: bool,
     },
@@ -669,6 +675,7 @@ fn main() {
             fail,
             block_on,
             only_uncommitted,
+            disable_incremental,
             metadata,
             scan_type,
             policy,
@@ -707,6 +714,11 @@ fn main() {
 
             if *only_uncommitted && *scanner != Scanner::Blast {
                 ::log::error!("only_uncommitted is only supported with blast scanner.");
+                std::process::exit(1);
+            }
+
+            if *disable_incremental && *scanner != Scanner::Blast {
+                ::log::error!("--disable-incremental is only supported with blast scanner.");
                 std::process::exit(1);
             }
 
@@ -846,6 +858,8 @@ fn main() {
                     fail,
                     block_on,
                     only_uncommitted,
+                    disable_incremental,
+                    ignore_dirty_worktree,
                     metadata_json,
                     scan_type.clone(),
                     policy.clone(),

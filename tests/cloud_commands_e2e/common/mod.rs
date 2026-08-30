@@ -310,6 +310,26 @@ pub(crate) fn assert_scan_list_request(
     assert_query(request, "project", project)
 }
 
+/// One baseline lookup an incremental scan makes before uploading.
+///
+/// Asserting the filters is the point: they keep this to one request per trunk
+/// branch instead of a page walk, and a server dropping them silently returns
+/// pull-request and dirty scans for the client to reject. `branch` is asserted
+/// because a baseline may only come from trunk.
+pub(crate) fn assert_baseline_lookup_request(
+    request: &CapturedRequest,
+    project: &str,
+    branch: &str,
+) -> Result<(), String> {
+    assert_scan_list_request(request, project)?;
+    assert_query(request, "engine", "corgea-blast")?;
+    assert_query(request, "status", "complete")?;
+    assert_query(request, "exclude_pull_requests", "true")?;
+    assert_query(request, "worktree_dirty", "false")?;
+    assert_query(request, "full_project_state", "true")?;
+    assert_query(request, "branch", branch)
+}
+
 pub(crate) fn query_value(request: &CapturedRequest, key: &str) -> Result<String, String> {
     let (_, query) = target_path_and_query(&request.target);
     query
@@ -379,6 +399,23 @@ pub(crate) fn assert_multipart_text_field(
     } else {
         Err(format!("missing multipart field {name}={value:?}"))
     }
+}
+
+/// Proves a field was left off the form entirely. Some fields are only safe in
+/// pairs, so "absent" is as much the contract as any value.
+pub(crate) fn assert_no_multipart_field(
+    request: &CapturedRequest,
+    name: &str,
+) -> Result<(), String> {
+    let needle = format!("name=\"{name}\"");
+    if request
+        .body
+        .windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+    {
+        return Err(format!("unexpected multipart field {name}"));
+    }
+    Ok(())
 }
 
 pub(crate) fn format_transcript(requests: &[CapturedRequest]) -> String {
@@ -777,8 +814,22 @@ pub(crate) fn blast_upload_plan(sha: &str, dirty: bool, include_sca: bool) -> Ve
     let patch_path = "/api/v1/start-scan/transfer-123/".to_string();
     let detail_path = "/api/v1/scan/blast-scan-123".to_string();
     let issue_path = "/api/v1/scan/blast-scan-123/issues".to_string();
-    let mut plan = vec![
-        verify_request(),
+    let mut plan = vec![verify_request()];
+    // Scans are incremental by default, so every clean-tree run looks for a
+    // baseline before uploading -- once per trunk branch, since the fixture
+    // records no origin/HEAD. Answering with no scans keeps this the full-scan
+    // contract: nothing to diff from, no incremental fields on the upload. A
+    // dirty tree never asks.
+    if !dirty {
+        for branch in ["main", "master"] {
+            plan.push(expected_request(
+                "look up a baseline scan to diff against",
+                move |request| assert_baseline_lookup_request(request, "cloud-e2e", branch),
+                json_response(scans_response(Vec::new())),
+            ));
+        }
+    }
+    plan.extend([
         expected_request(
             "start BLAST upload",
             |request| {
@@ -835,7 +886,7 @@ pub(crate) fn blast_upload_plan(sha: &str, dirty: bool, include_sca: bool) -> Ve
             },
             json_response(empty_issue_page()),
         ),
-    ];
+    ]);
     if include_sca {
         let sca_path = "/api/v1/scan/blast-scan-123/issues/sca".to_string();
         plan.push(expected_request(
