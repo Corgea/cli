@@ -326,6 +326,7 @@ pub(crate) fn assert_baseline_lookup_request(
     assert_query(request, "status", "complete")?;
     assert_query(request, "exclude_pull_requests", "true")?;
     assert_query(request, "worktree_dirty", "false")?;
+    assert_query(request, "full_project_state", "true")?;
     assert_query(request, "branch", branch)
 }
 

@@ -887,6 +887,9 @@ pub fn query_baseline_scans(
             ("branch", branch.to_string()),
             ("status", "complete".to_string()),
             ("exclude_pull_requests", "true".to_string()),
+            // A partial scan's findings cover only the files it was pointed at,
+            // so copying forward from one would drop everything else.
+            ("full_project_state", "true".to_string()),
             // Explicitly clean only. A scan that never reported the flag is
             // unknown scope, which the server rejects as a baseline.
             ("worktree_dirty", "false".to_string()),
