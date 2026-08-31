@@ -48,6 +48,9 @@ corgea scan --target "src/**/*.py"             # Glob patterns
 corgea scan --target git:diff=origin/main...HEAD  # Git diff range
 corgea scan --target git:staged,git:modified   # Git selectors
 corgea scan --target -                         # File list from stdin
+corgea scan --exclude "tests/**,*.md"          # Exclude glob patterns (comma-separated)
+corgea scan --include src/myProj/MyClass.java  # Force a file in that Corgea would skip as vendored
+corgea scan --include 'vendor/our-fork/**' --include generated/  # Repeatable; path, directory or glob
 corgea scan --scan-type secrets                # Single scan type
 corgea scan --scan-type blast,policy,secrets,pii  # Multiple scan types
 corgea scan --scan-type policy --policy 1      # Specific policy ID
@@ -79,6 +82,8 @@ Scan types: `blast` (base AI), `policy` (PolicyIQ), `malicious`, `secrets`, `pii
 `--include-image` scans the image you actually ship. Without it, container scanning discovers the base images referenced by Dockerfiles and Compose files in the repo and scans those. With it, each image is exported to a tar archive with `docker save` (or `podman save`), bundled with the project, and scanned as a whole — base-image discovery is skipped for that scan. Images that aren't available locally are pulled first, so build (or pull) the image before the scan and stay logged in to its registry. Set `CORGEA_CONTAINER_ENGINE` to choose a specific container CLI. Container scanning must be enabled for your account.
 
 An included image is enough on its own: when it is combined with `--only-uncommitted` or `--target` and no source files match (a clean working tree, for example), the scan warns and covers just the image rather than failing. An archive named `corgea-image-scanning-*.tar` that is committed to the repository is ignored — only images passed on the command line are scanned.
+
+`--include` forces files into the scan that Corgea would otherwise skip because it classified them as vendored, third-party, generated or test code. It overrides the CLI's own packaging filters, `.gitignore`, `--exclude`, and the engine's classification, and force-included files are analyzed on every run — including incremental ones, where an unchanged file would normally have its previous findings carried forward. Use it when proprietary code lives somewhere Corgea assumes dependencies live, e.g. a fork checked into `vendor/`. Project-level include rules configured in the web app (scan settings → File Include Rules) are fetched before packaging and applied too; `--include` adds to them for one run.
 
 `--only-uncommitted` and `--target` are mutually exclusive. `--fail-on`, `--fail`, and `--block-on` are mutually exclusive.
 

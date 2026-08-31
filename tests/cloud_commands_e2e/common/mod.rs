@@ -596,6 +596,24 @@ pub(crate) fn verify_request() -> ExpectedRequest {
     )
 }
 
+/// Every new BLAST scan reads the project's include rules before packaging, so
+/// files Corgea would classify away can still be forced into the archive.
+pub(crate) fn scan_settings_request(project: &str) -> ExpectedRequest {
+    let project = project.to_string();
+    expected_request(
+        "read project include rules",
+        move |request| {
+            assert_authenticated_request(request, Method::GET, "/api/v1/scan-settings")?;
+            assert_query(request, "project_name", &project)
+        },
+        json_response(json!({
+            "status": "ok",
+            "project": null,
+            "settings": {"include_paths": [], "ignore_paths": []}
+        })),
+    )
+}
+
 pub(crate) fn scan_response(scan_id: &str, project: &str, status: &str) -> Value {
     json!({
         "id": scan_id,
@@ -814,7 +832,7 @@ pub(crate) fn blast_upload_plan(sha: &str, dirty: bool, include_sca: bool) -> Ve
     let patch_path = "/api/v1/start-scan/transfer-123/".to_string();
     let detail_path = "/api/v1/scan/blast-scan-123".to_string();
     let issue_path = "/api/v1/scan/blast-scan-123/issues".to_string();
-    let mut plan = vec![verify_request()];
+    let mut plan = vec![verify_request(), scan_settings_request("cloud-e2e")];
     // Scans are incremental by default, so every clean-tree run looks for a
     // baseline before uploading -- once per trunk branch, since the fixture
     // records no origin/HEAD. Answering with no scans keeps this the full-scan
