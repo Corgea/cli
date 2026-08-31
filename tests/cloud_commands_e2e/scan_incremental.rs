@@ -130,6 +130,7 @@ fn the_upload_carries_the_baseline_commit_and_the_files_that_changed_since_it() 
     let expected_base = base_sha.clone();
     let mut plan = vec![
         verify_request(),
+        scan_settings_request(PROJECT),
         baseline_lookup("main", vec![baseline_scan(&base_sha)]),
         start_upload(),
         expected_request(
@@ -180,7 +181,7 @@ fn a_project_with_no_baseline_scan_uploads_without_a_diff() {
     let head_sha = second_commit(&project);
 
     let patch_sha = head_sha.clone();
-    let mut plan = vec![verify_request()];
+    let mut plan = vec![verify_request(), scan_settings_request(PROJECT)];
     plan.extend(baseline_lookups_finding_nothing());
     plan.extend([
         start_upload(),
@@ -234,6 +235,7 @@ fn a_baseline_on_a_later_page_is_still_found() {
 
     let mut plan = vec![
         verify_request(),
+        scan_settings_request(PROJECT),
         baseline_lookup_page("main", 1, 2, vec![unusable]),
         baseline_lookup_page("main", 2, 2, vec![baseline_scan(&base_sha)]),
         start_upload(),
@@ -273,6 +275,7 @@ fn a_failed_lookup_is_not_reported_as_a_missing_baseline() {
 
     let mut plan = vec![
         verify_request(),
+        scan_settings_request(PROJECT),
         expected_request(
             "fail the baseline lookup",
             |request| assert_baseline_lookup_request(request, PROJECT, "main"),
@@ -323,6 +326,7 @@ fn disable_incremental_does_not_even_look_for_a_baseline() {
     let patch_sha = head_sha.clone();
     let mut plan = vec![
         verify_request(),
+        scan_settings_request(PROJECT),
         start_upload(),
         expected_request(
             "upload BLAST archive with no diff",
@@ -372,6 +376,7 @@ fn a_narrowed_archive_skips_incremental_without_claiming_a_full_scan() {
 
     let mut plan = vec![
         verify_request(),
+        scan_settings_request(PROJECT),
         start_upload(),
         expected_request(
             "upload narrowed BLAST archive",
@@ -420,6 +425,7 @@ fn a_directory_that_is_not_a_git_repository_scans_everything() {
 
     let mut plan = vec![
         verify_request(),
+        scan_settings_request(PROJECT),
         start_upload(),
         expected_request(
             "upload BLAST archive with no repo metadata",
@@ -466,6 +472,7 @@ fn ignore_dirty_worktree_diffs_the_working_tree_instead_of_refusing() {
     let expected_base = base_sha.clone();
     let mut plan = vec![
         verify_request(),
+        scan_settings_request(PROJECT),
         baseline_lookup("main", vec![baseline_scan(&base_sha)]),
         start_upload(),
         expected_request(
@@ -524,6 +531,7 @@ fn a_dirty_worktree_skips_the_baseline_lookup_and_scans_everything() {
     let patch_sha = head_sha.clone();
     let mut plan = vec![
         verify_request(),
+        scan_settings_request(PROJECT),
         start_upload(),
         expected_request(
             "upload BLAST archive with no diff",

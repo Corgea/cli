@@ -243,6 +243,9 @@ pub struct UploadOptions {
     /// Set when this run resolved a diff for the server to analyze instead of
     /// the whole project.
     pub incremental: Option<IncrementalPlan>,
+    /// `--include` patterns for this run. The project's own include rules are
+    /// already stored server-side, so only the flag values are sent.
+    pub include_paths: Vec<String>,
 }
 
 pub fn upload_zip(
@@ -257,7 +260,18 @@ pub fn upload_zip(
         policy,
         metadata,
         incremental,
+        include_paths,
     } = options;
+    let include_paths_field = match include_paths.is_empty() {
+        true => None,
+        false => match serde_json::to_string(&include_paths) {
+            Ok(json) => Some(json),
+            Err(e) => {
+                debug(&format!("Could not serialize the --include patterns: {e}"));
+                None
+            }
+        },
+    };
     let client = http_client();
     let file_size = std::fs::metadata(file_path)?.len();
     let file_name = Path::new(file_path).file_name().unwrap().to_str().unwrap();
@@ -385,6 +399,9 @@ pub fn upload_zip(
         }
         if let Some(meta) = &metadata {
             form = form.part("metadata", multipart::Part::text(meta.clone()));
+        }
+        if let Some(patterns) = &include_paths_field {
+            form = form.part("include_paths", multipart::Part::text(patterns.clone()));
         }
         // Both fields or neither: the list is only safe next to the commit it
         // was measured from, and a server seeing one without the other would
@@ -946,6 +963,63 @@ fn request_scan_list(
         Ok(api_response)
     } else {
         Err(format!("API request failed with status: {}", response.status()).into())
+    }
+}
+
+/// Project-level path rules a client needs before it packages a scan.
+#[derive(Deserialize, Debug, Default, PartialEq, Eq)]
+pub struct ScanSettings {
+    /// Patterns that force files into the scan even when Corgea would classify
+    /// them as vendored, third-party, generated or test code.
+    #[serde(default)]
+    pub include_paths: Vec<String>,
+    #[serde(default)]
+    pub ignore_paths: Vec<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct ScanSettingsResponse {
+    #[serde(default)]
+    settings: ScanSettings,
+}
+
+/// GET /api/v1/scan-settings — the project's ignore and include rules.
+///
+/// `Ok(None)` only for a 404, which is a backend predating the endpoint: it has
+/// no rules to apply, so the caller proceeds with just its own flags. Anything
+/// else is an `Err`, because reading zero rules from a broken lookup and
+/// reading zero rules from a project that has none are not the same thing.
+pub fn query_scan_settings(
+    url: &str,
+    project_name: &str,
+    repo_url: Option<&str>,
+) -> Result<Option<ScanSettings>, Box<dyn Error>> {
+    let request_url = format!("{}{}/scan-settings", url, API_BASE);
+    let client = http_client();
+    let mut query = vec![("project_name", project_name.to_string())];
+    if let Some(repo_url) = repo_url {
+        query.push(("repo_url", repo_url.to_string()));
+    }
+    debug(&format!(
+        "Reading project scan settings from {} ({:?})",
+        request_url, query
+    ));
+    let response = client.get(&request_url).query(&query).send()?;
+    check_for_warnings(response.headers(), response.status());
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(format!("/scan-settings request failed: HTTP {}", status).into());
+    }
+    let text = response.text()?;
+    match serde_json::from_str::<ScanSettingsResponse>(&text) {
+        Ok(parsed) => Ok(Some(parsed.settings)),
+        Err(e) => {
+            debug(&format!("/scan-settings response body: {}", text));
+            Err(format!("Failed to parse the /scan-settings response: {}", e).into())
+        }
     }
 }
 

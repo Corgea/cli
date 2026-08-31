@@ -446,9 +446,11 @@ fn ignore_dirty_worktree_still_uploads_dirty_when_nothing_is_reused() {
     let project = git_project();
     std::fs::write(project.path().join("main.py"), "print('dirty')\n")
         .expect("modify tracked file");
+    // blast_upload_plan already holds verify then the include-rule lookup; the
+    // baselines follow it and the reuse lookup precedes it.
     let mut plan = blast_upload_plan(&project.sha, true, false);
-    plan.insert(1, baseline_lookup_for_branch("master", vec![]));
-    plan.insert(1, baseline_lookup_for_branch("main", vec![]));
+    plan.insert(2, baseline_lookup_for_branch("master", vec![]));
+    plan.insert(2, baseline_lookup_for_branch("main", vec![]));
     plan.insert(1, commit_lookup(&project.sha, vec![]));
     let api = ApiStub::start(plan);
     let (mut command, _home) = cloud_command(&api, project.path());

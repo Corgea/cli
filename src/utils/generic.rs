@@ -2,6 +2,7 @@ use crate::utils::terminal::{set_text_color, TerminalColor};
 use git2::{Repository, StatusOptions};
 use globset::{Glob, GlobSetBuilder};
 use ignore::WalkBuilder;
+use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File};
 use std::io;
@@ -67,6 +68,10 @@ const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
 /// - If `target` is `Some(target_str)`, resolves the target using the targets module and creates zip from those files.
 ///   The target string can be a comma-separated list of files, directories, globs, or git selectors.
 /// - `user_exclude` is an optional comma-separated list of glob patterns from `--exclude`.
+/// - `force_include` are repo-relative paths the project's include rules or
+///   `--include` matched. They override every filter here — the default
+///   excludes, `--exclude`, and `.gitignore` — because a file left out of the
+///   archive cannot be scanned whatever the engine later decides about it.
 /// - `extra_files` are staged files added to the root of the zip as
 ///   `(source path, zip entry name)`. They come from explicit flags such as
 ///   `--include-image`, so exclude rules don't apply to them.
@@ -75,6 +80,7 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     output_zip: P,
     exclude_globs: Option<&[&str]>,
     user_exclude: Option<&str>,
+    force_include: &[PathBuf],
     extra_files: &[(PathBuf, String)],
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let exclude_globs = exclude_globs.unwrap_or(DEFAULT_EXCLUDE_GLOBS);
@@ -88,7 +94,7 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     let user_exclude_glob_set = crate::targets::build_user_exclude_glob_set(user_exclude)
         .map_err(|e| format!("Failed to build exclude patterns: {}", e))?;
 
-    let files_to_zip: Vec<(PathBuf, PathBuf)> = if let Some(target_str) = target {
+    let mut files_to_zip: Vec<(PathBuf, PathBuf)> = if let Some(target_str) = target {
         let current_dir = env::current_dir()?;
         let result = crate::targets::resolve_targets_with_exclude(target_str, user_exclude)
             .map_err(|e| format!("Failed to resolve targets: {}", e))?;
@@ -132,6 +138,20 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
         files
     };
 
+    let forced: HashSet<&Path> = force_include.iter().map(PathBuf::as_path).collect();
+    let already_present: HashSet<PathBuf> = files_to_zip
+        .iter()
+        .map(|(_, relative)| relative.clone())
+        .collect();
+    for relative in force_include {
+        if already_present.contains(relative) {
+            continue;
+        }
+        if relative.is_file() {
+            files_to_zip.push((relative.clone(), relative.clone()));
+        }
+    }
+
     let zip_file = File::create(output_zip.as_ref())?;
     let mut zip = ZipWriter::new(zip_file);
 
@@ -144,7 +164,8 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
 
     for (path, relative_path) in files_to_zip {
         // Match repo-relative paths so abs `/tmp/...` targets don't hit `**/tmp/**`.
-        let is_excluded = glob_set.is_match(&relative_path);
+        let is_excluded =
+            glob_set.is_match(&relative_path) && !forced.contains(relative_path.as_path());
 
         if (path.is_file() || path.is_dir()) && !is_excluded {
             if path.is_file() {
@@ -918,8 +939,9 @@ mod tests {
         // which would exclude *everything*. The filter + warn path under test
         // is identical either way.
         let excludes: &[&str] = &["**/node_modules/**"];
-        let added = create_zip_from_target(Some(&target), &output_zip, Some(excludes), None, &[])
-            .expect("zip creation should succeed");
+        let added =
+            create_zip_from_target(Some(&target), &output_zip, Some(excludes), None, &[], &[])
+                .expect("zip creation should succeed");
 
         assert!(
             added.iter().any(|p| p.ends_with("src/main.py")),
@@ -931,6 +953,38 @@ mod tests {
             "node_modules file should be excluded: {:?}",
             added
         );
+    }
+
+    /// A force-include rule is the customer overruling Corgea's own judgement
+    /// about a file, so it has to beat the default excludes.
+    #[test]
+    fn create_zip_from_target_keeps_force_included_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let node_modules = root.join("node_modules");
+        fs::create_dir_all(&node_modules).unwrap();
+        let forced = node_modules.join("internal-sdk.js");
+        fs::write(&forced, "console.log(1)").unwrap();
+        let excluded = node_modules.join("third-party.js");
+        fs::write(&excluded, "console.log(2)").unwrap();
+
+        let output_zip = root.join("out.zip");
+        let target = format!("{},{}", forced.display(), excluded.display());
+        // Explicit file targets outside the cwd keep their absolute paths as
+        // zip entry names, so that is the shape the exemption check compares.
+        let added = create_zip_from_target(
+            Some(&target),
+            &output_zip,
+            Some(&["**/node_modules/**"]),
+            None,
+            std::slice::from_ref(&forced),
+            &[],
+        )
+        .expect("zip creation should succeed");
+
+        assert!(added.contains(&forced), "force-included: {:?}", added);
+        assert!(!added.contains(&excluded), "still excluded: {:?}", added);
     }
 
     /// The staging directory holds the project zip and exported images, so other
@@ -967,6 +1021,7 @@ mod tests {
             &output_zip,
             Some(&[]),
             None,
+            &[],
             &extra_files,
         )
         .expect("zip creation should succeed");
@@ -1009,6 +1064,7 @@ mod tests {
             &output_zip,
             Some(&[]),
             None,
+            &[],
             &extra_files,
         )
         .expect("a >4 GiB entry needs ZIP64, not an error");
