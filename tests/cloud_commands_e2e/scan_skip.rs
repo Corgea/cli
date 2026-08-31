@@ -676,6 +676,33 @@ fn the_window_cannot_be_set_without_the_skip_flag() {
     );
 }
 
+/// A force-include rule widens what gets scanned, and the reused candidate was
+/// scanned without it — so reuse would silently skip the very file the run
+/// mandated. That is under-reporting, which the flag refuses rather than warns.
+#[test]
+fn reuse_is_refused_alongside_an_include_rule() {
+    let api = ApiStub::start(Vec::new());
+    let project = git_project();
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--skip-if-commit-scanned-recently",
+        "--include",
+        "vendor/our-fork/**",
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+
+    assert_eq!(output.status.code(), Some(2), "{context}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--include"),
+        "{context}"
+    );
+}
+
 /// `--ignore-dirty-worktree` stands alone now: it governs the incremental diff
 /// as well as reuse, so a run may pass it without the reuse flag. Covered end
 /// to end in `scan_incremental`; this only asserts clap accepts it.
