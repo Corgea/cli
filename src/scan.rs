@@ -6,9 +6,62 @@ use reqwest::header;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
+
+const CORGEA_POLICY_FILENAMES: &[&str] = &["corgea.yaml", "corgea.yml"];
+
+/// `corgea.yaml` / `corgea.yml` under `root`, including a gitignored copy at `root`.
+fn find_corgea_policy_files(root: &Path) -> Vec<String> {
+    if !root.is_dir() {
+        return Vec::new();
+    }
+
+    let mut found = Vec::new();
+    for name in CORGEA_POLICY_FILENAMES {
+        if root.join(name).is_file() {
+            found.push((*name).to_string());
+        }
+    }
+
+    let walker = ignore::WalkBuilder::new(root)
+        .standard_filters(true)
+        .build();
+    for result in walker {
+        let Ok(entry) = result else {
+            continue;
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !CORGEA_POLICY_FILENAMES.contains(&name) {
+            continue;
+        }
+        if let Ok(rel) = path.strip_prefix(root) {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if !found.iter().any(|existing| existing == &rel) {
+                found.push(rel);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+fn merge_corgea_policy_files(mut paths: Vec<String>, root: &Path) -> Vec<String> {
+    for yaml in find_corgea_policy_files(root) {
+        if !paths.iter().any(|path| path == &yaml) {
+            debug(&format!("Including repo policy file: {yaml}"));
+            paths.push(yaml);
+        }
+    }
+    paths
+}
 
 pub fn run_command(base_cmd: &String, mut command: Command) -> String {
     match which::which(base_cmd) {
@@ -222,6 +275,8 @@ pub fn upload_scan(
     save_to_file: bool,
     project_name: Option<String>,
 ) -> Option<ScanUploadResult> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let paths = merge_corgea_policy_files(paths, &cwd);
     let in_ci = running_in_ci();
     let ci_platform = which_ci();
     let github_env_vars = get_github_env_vars();
@@ -597,6 +652,7 @@ pub fn upload_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn scan_url_prefers_project_id_when_present() {
@@ -629,6 +685,80 @@ mod tests {
         assert_eq!(
             url,
             "https://www.corgea.app/project/corgea_cli-1.0?scan_id=scan-123"
+        );
+    }
+
+    fn write_policy(path: &Path) {
+        std::fs::write(path, "policies: []\n").unwrap();
+    }
+
+    fn git_repo(root: &Path) {
+        std::fs::create_dir(root.join(".git")).unwrap();
+    }
+
+    #[test]
+    fn find_corgea_policy_files_picks_yaml_and_yml_by_basename() {
+        let root = tempfile::tempdir().unwrap();
+        write_policy(&root.path().join("corgea.yaml"));
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        write_policy(&root.path().join("src/corgea.yml"));
+        write_policy(&root.path().join("with-guidance.yaml"));
+
+        assert_eq!(
+            find_corgea_policy_files(root.path()),
+            vec!["corgea.yaml".to_string(), "src/corgea.yml".to_string()]
+        );
+    }
+
+    #[test]
+    fn find_corgea_policy_files_returns_empty_when_none_exist() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(find_corgea_policy_files(root.path()).is_empty());
+    }
+
+    #[test]
+    fn find_corgea_policy_files_skips_gitignored_nested_copies() {
+        let root = tempfile::tempdir().unwrap();
+        git_repo(root.path());
+        std::fs::write(root.path().join(".gitignore"), "node_modules/\n").unwrap();
+        write_policy(&root.path().join("corgea.yaml"));
+        std::fs::create_dir_all(root.path().join("node_modules/pkg")).unwrap();
+        write_policy(&root.path().join("node_modules/pkg/corgea.yaml"));
+
+        assert_eq!(
+            find_corgea_policy_files(root.path()),
+            vec!["corgea.yaml".to_string()]
+        );
+    }
+
+    #[test]
+    fn find_corgea_policy_files_keeps_root_file_even_if_gitignored() {
+        let root = tempfile::tempdir().unwrap();
+        git_repo(root.path());
+        std::fs::write(root.path().join(".gitignore"), "corgea.yaml\n").unwrap();
+        write_policy(&root.path().join("corgea.yaml"));
+
+        assert_eq!(
+            find_corgea_policy_files(root.path()),
+            vec!["corgea.yaml".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_corgea_policy_files_appends_missing_and_skips_duplicates() {
+        let root = tempfile::tempdir().unwrap();
+        write_policy(&root.path().join("corgea.yaml"));
+
+        assert_eq!(
+            merge_corgea_policy_files(vec!["src/source.py".into()], root.path()),
+            vec!["src/source.py".to_string(), "corgea.yaml".to_string()]
+        );
+        assert_eq!(
+            merge_corgea_policy_files(
+                vec!["src/source.py".into(), "corgea.yaml".into()],
+                root.path()
+            ),
+            vec!["src/source.py".to_string(), "corgea.yaml".to_string()]
         );
     }
 }
