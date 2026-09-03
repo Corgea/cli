@@ -53,6 +53,8 @@ pub fn run(
     fail: &bool,
     block_on: Option<String>,
     only_uncommitted: &bool,
+    disable_incremental: &bool,
+    ignore_dirty_worktree_for_run: &bool,
     metadata: Option<String>,
     scan_type: Option<String>,
     policy: Option<String>,
@@ -109,6 +111,8 @@ pub fn run(
             config,
             &project_name,
             only_uncommitted,
+            disable_incremental,
+            ignore_dirty_worktree_for_run,
             metadata,
             scan_type,
             policy,
@@ -281,6 +285,8 @@ fn start_new_scan(
     config: &Config,
     project_name: &str,
     only_uncommitted: &bool,
+    disable_incremental: &bool,
+    ignore_dirty_worktree: &bool,
     metadata: Option<String>,
     scan_type: Option<String>,
     policy: Option<String>,
@@ -514,15 +520,40 @@ fn start_new_scan(
             info.dirty = true;
         }
     }
+    // Incremental is the default, so this asks what took it off the table. A
+    // narrowed archive is the silent case: carrying findings forward for files
+    // the archive no longer holds would be wrong, but those runs are not
+    // "scanning every file" either, so no message is honest.
+    let narrowed_archive = target_str.is_some() || exclude.is_some();
+    let incremental_plan = if *disable_incremental || narrowed_archive {
+        None
+    } else {
+        // Reconciled repo info, so a tree that turned out dirty — or a HEAD
+        // that moved mid-packaging — refuses rather than diffing against a
+        // commit this upload is not a snapshot of.
+        crate::incremental::resolve_incremental_plan(
+            config,
+            project_name,
+            repo_info.as_ref().and_then(|info| info.branch.as_deref()),
+            repo_info.as_ref().and_then(|info| info.sha.as_deref()),
+            // Missing repo info is not dirtiness; it is the missing
+            // branch/commit the resolver reports next, by its real name.
+            repo_info.as_ref().is_some_and(|info| info.dirty),
+            *ignore_dirty_worktree,
+        )
+    };
     println!("\n\nSubmitting scan to Corgea:");
     let upload_result = match utils::api::upload_zip(
         &zip_path,
         &config.get_url(),
         project_name,
         repo_info,
-        scan_type,
-        policy,
-        metadata,
+        utils::api::UploadOptions {
+            scan_type,
+            policy,
+            metadata,
+            incremental: incremental_plan,
+        },
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -1065,8 +1096,12 @@ pub fn wait_for_scan(config: &Config, scan_id: &str, budget: WaitBudget) {
     }
 }
 
-/// Match doghouse `LICENSE_DEPS_WAIT_TIMEOUT` (15 minutes).
-const DEFAULT_BLOCKING_RULES_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Must outlast the longest doghouse wait window, currently
+/// `SCA_REACHABILITY_WAIT_TIMEOUT` (30 minutes), with margin for the poll
+/// interval and request latency. Whichever side's clock expires first decides
+/// the outcome, and this side fails closed: expiring early would hard-fail a
+/// pipeline on data doghouse was about to resolve as non-blocking.
+const DEFAULT_BLOCKING_RULES_TIMEOUT: Duration = Duration::from_secs(35 * 60);
 const BLOCKING_RULES_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 fn stop_blocking_rules_spinner(stop_signal: &Arc<Mutex<bool>>, spinner: thread::JoinHandle<()>) {
@@ -1130,7 +1165,7 @@ fn decide_blocking_rules_poll(
 }
 
 /// Poll until blocking-rules status is `complete`, or `BLOCKING_RULES_TIMEOUT_ENV`
-/// (15m by default) runs out.
+/// (35m by default) runs out.
 /// Older backends omit status (serde defaults to complete: one-shot).
 /// `block_on` is forwarded as the CI rule-slug filter (`--block-on`); `None`
 /// keeps legacy `--fail` "all active rules" behavior.
@@ -1740,10 +1775,24 @@ mod tests {
         // The docs promise these two numbers; drifting from them silently is
         // the failure mode worth catching.
         assert_eq!(DEFAULT_SCAN_TIMEOUT, Duration::from_secs(10 * 60 * 60));
-        assert_eq!(DEFAULT_BLOCKING_RULES_TIMEOUT, Duration::from_secs(15 * 60));
+        assert_eq!(DEFAULT_BLOCKING_RULES_TIMEOUT, Duration::from_secs(35 * 60));
         assert_eq!(format_timeout(DEFAULT_SCAN_TIMEOUT), "10h");
-        assert_eq!(format_timeout(DEFAULT_BLOCKING_RULES_TIMEOUT), "15m");
+        assert_eq!(format_timeout(DEFAULT_BLOCKING_RULES_TIMEOUT), "35m");
         assert_eq!(format_timeout(Duration::from_secs(90)), "90s");
+    }
+
+    #[test]
+    fn blocking_rules_timeout_outlasts_the_doghouse_wait_windows() {
+        // This side fails closed on its own deadline, so it must never expire
+        // while doghouse is still answering `pending`. The longest doghouse
+        // window is SCA_REACHABILITY_WAIT_TIMEOUT at 30 minutes.
+        let longest_doghouse_window = Duration::from_secs(30 * 60);
+        assert!(
+            DEFAULT_BLOCKING_RULES_TIMEOUT > longest_doghouse_window,
+            "poll deadline {DEFAULT_BLOCKING_RULES_TIMEOUT:?} must outlast the \
+             doghouse wait window {longest_doghouse_window:?}, or a pipeline \
+             hard-fails on a rule doghouse was about to resolve"
+        );
     }
 
     #[test]
