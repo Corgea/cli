@@ -1096,8 +1096,12 @@ pub fn wait_for_scan(config: &Config, scan_id: &str, budget: WaitBudget) {
     }
 }
 
-/// Match doghouse `LICENSE_DEPS_WAIT_TIMEOUT` (15 minutes).
-const DEFAULT_BLOCKING_RULES_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Must outlast the longest doghouse wait window, currently
+/// `SCA_REACHABILITY_WAIT_TIMEOUT` (30 minutes), with margin for the poll
+/// interval and request latency. Whichever side's clock expires first decides
+/// the outcome, and this side fails closed: expiring early would hard-fail a
+/// pipeline on data doghouse was about to resolve as non-blocking.
+const DEFAULT_BLOCKING_RULES_TIMEOUT: Duration = Duration::from_secs(35 * 60);
 const BLOCKING_RULES_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 fn stop_blocking_rules_spinner(stop_signal: &Arc<Mutex<bool>>, spinner: thread::JoinHandle<()>) {
@@ -1161,7 +1165,7 @@ fn decide_blocking_rules_poll(
 }
 
 /// Poll until blocking-rules status is `complete`, or `BLOCKING_RULES_TIMEOUT_ENV`
-/// (15m by default) runs out.
+/// (35m by default) runs out.
 /// Older backends omit status (serde defaults to complete: one-shot).
 /// `block_on` is forwarded as the CI rule-slug filter (`--block-on`); `None`
 /// keeps legacy `--fail` "all active rules" behavior.
@@ -1771,10 +1775,24 @@ mod tests {
         // The docs promise these two numbers; drifting from them silently is
         // the failure mode worth catching.
         assert_eq!(DEFAULT_SCAN_TIMEOUT, Duration::from_secs(10 * 60 * 60));
-        assert_eq!(DEFAULT_BLOCKING_RULES_TIMEOUT, Duration::from_secs(15 * 60));
+        assert_eq!(DEFAULT_BLOCKING_RULES_TIMEOUT, Duration::from_secs(35 * 60));
         assert_eq!(format_timeout(DEFAULT_SCAN_TIMEOUT), "10h");
-        assert_eq!(format_timeout(DEFAULT_BLOCKING_RULES_TIMEOUT), "15m");
+        assert_eq!(format_timeout(DEFAULT_BLOCKING_RULES_TIMEOUT), "35m");
         assert_eq!(format_timeout(Duration::from_secs(90)), "90s");
+    }
+
+    #[test]
+    fn blocking_rules_timeout_outlasts_the_doghouse_wait_windows() {
+        // This side fails closed on its own deadline, so it must never expire
+        // while doghouse is still answering `pending`. The longest doghouse
+        // window is SCA_REACHABILITY_WAIT_TIMEOUT at 30 minutes.
+        let longest_doghouse_window = Duration::from_secs(30 * 60);
+        assert!(
+            DEFAULT_BLOCKING_RULES_TIMEOUT > longest_doghouse_window,
+            "poll deadline {DEFAULT_BLOCKING_RULES_TIMEOUT:?} must outlast the \
+             doghouse wait window {longest_doghouse_window:?}, or a pipeline \
+             hard-fails on a rule doghouse was about to resolve"
+        );
     }
 
     #[test]
