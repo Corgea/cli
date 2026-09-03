@@ -186,6 +186,100 @@ fn mcp_install_claude_writes_desktop_env_block() {
     );
 }
 
+/// Continue only registers MCP servers from a block file under
+/// `.continue/mcpServers/`; a `contextProviders` entry in `config.json` is a
+/// different feature and leaves the agent with no Corgea tools.
+#[test]
+fn mcp_install_continue_writes_a_block_file_continue_can_read() {
+    let base_url = spawn_verify_stub();
+    let (mut cmd, home) = corgea_isolated();
+    let out = cmd
+        .env("CORGEA_URL", &base_url)
+        .env("CORGEA_TOKEN", "continue-token")
+        .args(["mcp", "install", "--agent", "continue"])
+        .output()
+        .expect("run corgea mcp install --agent continue");
+
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        !home.path().join(".continue/config.json").exists(),
+        "config.json is not where Continue reads MCP servers"
+    );
+
+    let path = home.path().join(".continue/mcpServers/corgea.yaml");
+    let body = fs::read_to_string(&path).expect("continue block file");
+    let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&body).expect("valid yaml");
+
+    assert_eq!(v["schema"], serde_yaml_ng::Value::from("v1"));
+    let servers = v["mcpServers"].as_sequence().expect("mcpServers list");
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0]["name"], serde_yaml_ng::Value::from("corgea"));
+    assert_eq!(
+        servers[0]["type"],
+        serde_yaml_ng::Value::from("streamable-http")
+    );
+    assert_eq!(
+        servers[0]["url"],
+        serde_yaml_ng::Value::from(format!("{base_url}/mcp"))
+    );
+    assert_eq!(
+        servers[0]["requestOptions"]["headers"]["CORGEA-TOKEN"],
+        serde_yaml_ng::Value::from("continue-token")
+    );
+}
+
+/// A reinstall must refresh Corgea and leave every other server alone, even
+/// when a neighbor's URL merely looks like Corgea's.
+#[test]
+fn mcp_install_leaves_lookalike_hosts_alone() {
+    let base_url = spawn_verify_stub();
+    let (mut cmd, home) = corgea_isolated();
+    let path = home.path().join(".cursor/mcp.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        r#"{
+  "mcpServers": {
+    "unrelated": { "url": "https://notcorgea.app/mcp" },
+    "corgea": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://www.corgea.app/mcp", "--header", "CORGEA-TOKEN:stale"]
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let out = cmd
+        .env("CORGEA_URL", &base_url)
+        .env("CORGEA_TOKEN", "fresh-token")
+        .args(["mcp", "install", "--agent", "cursor"])
+        .output()
+        .expect("run corgea mcp install");
+
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let body = fs::read_to_string(&path).expect("cursor mcp.json");
+    let v: Value = serde_json::from_str(&body).expect("valid json");
+    assert_eq!(
+        v["mcpServers"]["unrelated"]["url"], "https://notcorgea.app/mcp",
+        "a server on a lookalike host must survive: {body}"
+    );
+    assert!(!body.contains("stale"), "stale token must be gone: {body}");
+}
+
 #[test]
 fn mcp_help_lists_install() {
     let (mut cmd, _home) = corgea_isolated();

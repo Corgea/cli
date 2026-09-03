@@ -1,9 +1,12 @@
 use crate::config::Config;
 use crate::utils;
 use crate::utils::terminal::{set_text_color, TerminalColor};
+use serde::Serialize;
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use url::Url;
 
 /// Well-known name written into every agent config we manage.
 pub const SERVER_NAME: &str = "corgea";
@@ -145,8 +148,11 @@ pub fn resolve_config_path(
         (Agent::Vscode, Scope::Project) => Ok(ctx.cwd.join(".vscode/mcp.json")),
         (Agent::GeminiCli, Scope::User) => Ok(ctx.home.join(".gemini/settings.json")),
         (Agent::GeminiCli, Scope::Project) => Ok(ctx.cwd.join(".gemini/settings.json")),
-        (Agent::Continue, Scope::User) => Ok(ctx.home.join(".continue/config.json")),
-        (Agent::Continue, Scope::Project) => Ok(ctx.cwd.join(".continue/config.json")),
+        // Continue discovers standalone block files under `mcpServers/`, in the
+        // global directory and in the workspace. `config.json` is a different
+        // thing entirely and does not register an MCP server.
+        (Agent::Continue, Scope::User) => Ok(ctx.home.join(".continue/mcpServers/corgea.yaml")),
+        (Agent::Continue, Scope::Project) => Ok(ctx.cwd.join(".continue/mcpServers/corgea.yaml")),
         (Agent::OpenCode, Scope::User) => Ok(ctx.config_dir.join("opencode/opencode.json")),
         (Agent::OpenCode, Scope::Project) => Ok(ctx.cwd.join("opencode.json")),
     }
@@ -162,37 +168,62 @@ fn cursor_user_path(ctx: &PathContext<'_>) -> PathBuf {
     }
 }
 
-pub fn looks_like_corgea_mcp_url(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    lower.contains("corgea.") && lower.contains("/mcp")
+/// The host of an MCP endpoint URL, lowercased, or `None` when `value` is not
+/// a URL that addresses an `mcp` path.
+fn mcp_url_host(value: &str) -> Option<String> {
+    let parsed = Url::parse(value.trim()).ok()?;
+    let addresses_mcp = parsed
+        .path_segments()
+        .is_some_and(|mut segments| segments.any(|segment| segment.eq_ignore_ascii_case("mcp")));
+    if !addresses_mcp {
+        return None;
+    }
+    Some(parsed.host_str()?.to_ascii_lowercase())
 }
 
-fn entry_points_at_corgea(entry: &Value) -> bool {
-    for key in ["url", "httpUrl", "serverUrl"] {
+/// Corgea's own SaaS hosts, matched on host boundaries. A substring test would
+/// also accept `notcorgea.app` and `evil-corgea.attacker.test`.
+fn is_corgea_saas_host(host: &str) -> bool {
+    host == "corgea.app" || host.ends_with(".corgea.app")
+}
+
+/// Whether `value` addresses the Corgea MCP endpoint.
+///
+/// `install_host` is the host this run is installing, which is what recognizes
+/// a self-hosted instance on a domain that has nothing to do with `corgea.app`.
+pub fn points_at_corgea_mcp(value: &str, install_host: Option<&str>) -> bool {
+    match mcp_url_host(value) {
+        Some(host) => {
+            is_corgea_saas_host(&host)
+                || install_host.is_some_and(|expected| expected.eq_ignore_ascii_case(&host))
+        }
+        None => false,
+    }
+}
+
+fn entry_points_at_corgea(entry: &Value, install_host: Option<&str>) -> bool {
+    for key in ["url", "httpUrl"] {
         if entry
             .get(key)
             .and_then(|v| v.as_str())
-            .is_some_and(looks_like_corgea_mcp_url)
+            .is_some_and(|url| points_at_corgea_mcp(url, install_host))
         {
             return true;
         }
     }
     if let Some(args) = entry.get("args").and_then(|a| a.as_array()) {
-        if args
-            .iter()
-            .any(|arg| arg.as_str().is_some_and(looks_like_corgea_mcp_url))
-        {
+        if args.iter().any(|arg| {
+            arg.as_str()
+                .is_some_and(|a| points_at_corgea_mcp(a, install_host))
+        }) {
             return true;
         }
-    }
-    if let Some(params) = entry.get("params") {
-        return entry_points_at_corgea(params);
     }
     false
 }
 
-fn is_corgea_server(name: &str, entry: &Value) -> bool {
-    name.eq_ignore_ascii_case(SERVER_NAME) || entry_points_at_corgea(entry)
+fn is_corgea_server(name: &str, entry: &Value, install_host: Option<&str>) -> bool {
+    name.eq_ignore_ascii_case(SERVER_NAME) || entry_points_at_corgea(entry, install_host)
 }
 
 fn token_header(token: &str) -> Value {
@@ -227,17 +258,15 @@ fn mcp_remote_entry(url: &str, token: &str, http_only: bool, use_env_block: bool
     }
 }
 
-/// The per-server object (or Continue provider object) we write for `agent`.
+/// The per-server object we write for `agent`.
+///
+/// Continue is absent on purpose: it takes a standalone block file of its own,
+/// not an entry merged into a JSON server map. See [`continue_block_yaml`].
 pub fn corgea_server_entry(agent: Agent, url: &str, token: &str) -> Value {
     match agent {
         Agent::Cursor | Agent::Windsurf => mcp_remote_entry(url, token, true, false),
         Agent::ClaudeDesktop => mcp_remote_entry(url, token, false, true),
-        Agent::ClaudeCode => json!({
-            "type": "http",
-            "url": url,
-            "headers": token_header(token)
-        }),
-        Agent::Vscode => json!({
+        Agent::ClaudeCode | Agent::Vscode => json!({
             "type": "http",
             "url": url,
             "headers": token_header(token)
@@ -246,19 +275,61 @@ pub fn corgea_server_entry(agent: Agent, url: &str, token: &str) -> Value {
             "httpUrl": url,
             "headers": token_header(token)
         }),
-        Agent::Continue => json!({
-            "name": SERVER_NAME,
-            "params": {
-                "serverUrl": url,
-                "headers": token_header(token)
-            }
-        }),
         Agent::OpenCode => json!({
             "type": "remote",
             "url": url,
             "headers": token_header(token)
         }),
+        Agent::Continue => unreachable!("Continue is written as a standalone block file"),
     }
+}
+
+/// Continue reads standalone block files from `.continue/mcpServers/`, keyed by
+/// a `name`/`version`/`schema` preamble and an `mcpServers` list. Its config
+/// schema drops unknown keys, and an HTTP server carries its headers under
+/// `requestOptions` — a top-level `headers` map is silently discarded.
+#[derive(Serialize)]
+struct ContinueBlock {
+    name: String,
+    version: String,
+    schema: String,
+    #[serde(rename = "mcpServers")]
+    mcp_servers: Vec<ContinueMcpServer>,
+}
+
+#[derive(Serialize)]
+struct ContinueMcpServer {
+    name: String,
+    #[serde(rename = "type")]
+    transport: String,
+    url: String,
+    #[serde(rename = "requestOptions")]
+    request_options: ContinueRequestOptions,
+}
+
+#[derive(Serialize)]
+struct ContinueRequestOptions {
+    headers: BTreeMap<String, String>,
+}
+
+/// The whole Continue block file. Corgea owns this file outright, so a
+/// reinstall rewrites it rather than merging into the user's config.
+pub fn continue_block_yaml(url: &str, token: &str) -> Result<String, String> {
+    let block = ContinueBlock {
+        name: "Corgea MCP".to_string(),
+        version: "0.0.1".to_string(),
+        schema: "v1".to_string(),
+        mcp_servers: vec![ContinueMcpServer {
+            name: SERVER_NAME.to_string(),
+            transport: "streamable-http".to_string(),
+            url: url.to_string(),
+            request_options: ContinueRequestOptions {
+                headers: BTreeMap::from([("CORGEA-TOKEN".to_string(), token.to_string())]),
+            },
+        }],
+    };
+    serde_yaml_ng::to_string(&block)
+        .map_err(|e| format!("failed to serialize the Continue MCP block: {e}"))
 }
 
 fn as_object_root(value: Value) -> Result<Map<String, Value>, String> {
@@ -297,53 +368,21 @@ fn object_field<'a>(
     }
 }
 
-fn remove_corgea_from_map(servers: &mut Map<String, Value>) -> bool {
-    let keys: Vec<String> = servers
-        .iter()
-        .filter(|(name, entry)| is_corgea_server(name, entry))
-        .map(|(name, _)| name.clone())
-        .collect();
-    let removed = !keys.is_empty();
-    for key in keys {
-        servers.remove(&key);
-    }
-    removed
+fn remove_corgea_from_map(servers: &mut Map<String, Value>, install_host: Option<&str>) -> bool {
+    let before = servers.len();
+    servers.retain(|name, entry| !is_corgea_server(name, entry, install_host));
+    servers.len() != before
 }
 
 fn upsert_named_server(
     root: &mut Map<String, Value>,
     container_key: &str,
     entry: Value,
+    install_host: Option<&str>,
 ) -> Result<bool, String> {
     let servers = object_field(root, container_key)?;
-    let replaced = remove_corgea_from_map(servers);
+    let replaced = remove_corgea_from_map(servers, install_host);
     servers.insert(SERVER_NAME.to_string(), entry);
-    Ok(replaced)
-}
-
-fn upsert_continue(root: &mut Map<String, Value>, entry: Value) -> Result<bool, String> {
-    let providers = root
-        .entry("contextProviders".to_string())
-        .or_insert_with(|| json!([]));
-    let arr = match providers {
-        Value::Array(arr) => arr,
-        other => {
-            return Err(format!(
-                "'contextProviders' must be a JSON array, found {}",
-                value_kind(other)
-            ))
-        }
-    };
-    let before = arr.len();
-    arr.retain(|provider| {
-        let named_corgea = provider
-            .get("name")
-            .and_then(|n| n.as_str())
-            .is_some_and(|n| n.eq_ignore_ascii_case(SERVER_NAME));
-        !named_corgea && !entry_points_at_corgea(provider)
-    });
-    let replaced = arr.len() != before;
-    arr.push(entry);
     Ok(replaced)
 }
 
@@ -357,6 +396,13 @@ pub fn upsert_corgea(
     url: &str,
     token: &str,
 ) -> Result<(String, bool), String> {
+    // Corgea owns Continue's block file, so there is nothing to merge: an
+    // existing file is our own previous install being refreshed.
+    if agent == Agent::Continue {
+        let had_previous = !existing.trim().is_empty();
+        return Ok((continue_block_yaml(url, token)?, had_previous));
+    }
+
     let parsed = if existing.trim().is_empty() {
         Value::Object(Map::new())
     } else {
@@ -364,16 +410,19 @@ pub fn upsert_corgea(
     };
     let mut root = as_object_root(parsed)?;
     let entry = corgea_server_entry(agent, url, token);
-    let replaced = match agent {
-        Agent::Continue => upsert_continue(&mut root, entry)?,
-        Agent::Vscode => upsert_named_server(&mut root, "servers", entry)?,
-        Agent::OpenCode => upsert_named_server(&mut root, "mcp", entry)?,
+    let install_host = mcp_url_host(url);
+    let install_host = install_host.as_deref();
+    let container = match agent {
+        Agent::Vscode => "servers",
+        Agent::OpenCode => "mcp",
         Agent::Cursor
         | Agent::ClaudeDesktop
         | Agent::ClaudeCode
         | Agent::Windsurf
-        | Agent::GeminiCli => upsert_named_server(&mut root, "mcpServers", entry)?,
+        | Agent::GeminiCli => "mcpServers",
+        Agent::Continue => unreachable!("handled above"),
     };
+    let replaced = upsert_named_server(&mut root, container, entry, install_host)?;
     let mut rendered = serde_json::to_string_pretty(&Value::Object(root))
         .map_err(|e| format!("failed to serialize MCP config: {e}"))?;
     if !rendered.ends_with('\n') {
@@ -754,34 +803,168 @@ mod tests {
         assert_eq!(v["servers"]["corgea"]["headers"]["CORGEA-TOKEN"], "tok");
     }
 
+    /// Continue registers MCP servers from a block file with a
+    /// `name`/`version`/`schema` preamble and an `mcpServers` list — not from a
+    /// `contextProviders` entry, which it does not read as an MCP server.
     #[test]
-    fn upsert_continue_replaces_provider_and_keeps_others() {
-        let existing = r#"{
-            "models": [{"title": "gpt"}],
-            "contextProviders": [
-                {"name": "code", "params": {}},
-                {"name": "corgea", "params": {"serverUrl": "https://old.corgea.app/mcp"}}
-            ]
-        }"#;
+    fn continue_block_is_an_mcp_server_not_a_context_provider() {
+        let (out, replaced) =
+            upsert_corgea(Agent::Continue, "", "https://www.corgea.app/mcp", "tok").unwrap();
+        assert!(!replaced);
+
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
+        assert_eq!(v["schema"], serde_yaml_ng::Value::from("v1"));
+        assert!(v.get("contextProviders").is_none());
+        assert!(v.get("name").is_some(), "preamble needs a name: {out}");
+        assert!(
+            v.get("version").is_some(),
+            "preamble needs a version: {out}"
+        );
+
+        let servers = v["mcpServers"].as_sequence().expect("mcpServers list");
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["name"], serde_yaml_ng::Value::from("corgea"));
+        assert_eq!(
+            servers[0]["type"],
+            serde_yaml_ng::Value::from("streamable-http")
+        );
+        assert_eq!(
+            servers[0]["url"],
+            serde_yaml_ng::Value::from("https://www.corgea.app/mcp")
+        );
+        // Continue's schema carries HTTP headers under requestOptions and
+        // drops an unknown top-level `headers` map.
+        assert_eq!(
+            servers[0]["requestOptions"]["headers"]["CORGEA-TOKEN"],
+            serde_yaml_ng::Value::from("tok")
+        );
+        assert!(servers[0].get("headers").is_none());
+    }
+
+    /// Corgea owns the block file, so a reinstall rewrites it with the new
+    /// token instead of appending a second server.
+    #[test]
+    fn continue_reinstall_rewrites_the_block_file() {
+        let first = continue_block_yaml("https://www.corgea.app/mcp", "old").unwrap();
         let (out, replaced) = upsert_corgea(
             Agent::Continue,
+            &first,
+            "https://tenant.corgea.app/mcp",
+            "new",
+        )
+        .unwrap();
+        assert!(replaced);
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&out).unwrap();
+        let servers = v["mcpServers"].as_sequence().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(
+            servers[0]["url"],
+            serde_yaml_ng::Value::from("https://tenant.corgea.app/mcp")
+        );
+        assert!(!out.contains("old"), "stale token must be gone: {out}");
+    }
+
+    /// The reinstall sweep matches Corgea by host, not by substring. A server
+    /// on an unrelated host that merely contains "corgea" must survive.
+    #[test]
+    fn upsert_keeps_servers_on_lookalike_hosts() {
+        let existing = r#"{
+            "mcpServers": {
+                "unrelated": {"url": "https://notcorgea.app/mcp"},
+                "spoof": {"url": "https://evil-corgea.attacker.test/mcp"},
+                "pathy": {"url": "https://internal.example.com/corgea.svc/mcp"}
+            }
+        }"#;
+        let (out, _) = upsert_corgea(
+            Agent::ClaudeCode,
             existing,
             "https://www.corgea.app/mcp",
             "tok",
         )
         .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let servers = v["mcpServers"].as_object().unwrap();
+        for survivor in ["unrelated", "spoof", "pathy"] {
+            assert!(
+                servers.contains_key(survivor),
+                "{survivor} is not Corgea and must be left alone: {out}"
+            );
+        }
+        assert_eq!(servers["corgea"]["url"], "https://www.corgea.app/mcp");
+    }
+
+    /// A self-hosted instance lives on a domain unrelated to corgea.app, so it
+    /// is recognized by matching the host being installed.
+    #[test]
+    fn upsert_replaces_a_renamed_self_hosted_entry() {
+        let existing = r#"{
+            "mcpServers": {
+                "corgea-onprem": {
+                    "url": "https://corgea.acme.internal/mcp",
+                    "headers": {"CORGEA-TOKEN": "stale"}
+                }
+            }
+        }"#;
+        let (out, replaced) = upsert_corgea(
+            Agent::ClaudeCode,
+            existing,
+            "https://corgea.acme.internal/mcp",
+            "fresh",
+        )
+        .unwrap();
         assert!(replaced);
         let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["models"][0]["title"], "gpt");
-        let providers = v["contextProviders"].as_array().unwrap();
-        assert_eq!(providers.len(), 2);
-        assert_eq!(providers[0]["name"], "code");
-        assert_eq!(providers[1]["name"], "corgea");
+        let servers = v["mcpServers"].as_object().unwrap();
+        assert!(!servers.contains_key("corgea-onprem"));
+        assert_eq!(servers["corgea"]["headers"]["CORGEA-TOKEN"], "fresh");
+    }
+
+    #[test]
+    fn corgea_mcp_url_matching_is_host_scoped() {
+        let install = Some("corgea.acme.internal");
+        assert!(points_at_corgea_mcp("https://www.corgea.app/mcp", None));
+        assert!(points_at_corgea_mcp("https://tenant.corgea.app/mcp", None));
+        assert!(points_at_corgea_mcp("https://corgea.app/mcp", None));
+        // Lookalikes and path coincidences are not Corgea.
+        assert!(!points_at_corgea_mcp("https://notcorgea.app/mcp", None));
+        assert!(!points_at_corgea_mcp(
+            "https://evil-corgea.attacker.test/mcp",
+            None
+        ));
+        assert!(!points_at_corgea_mcp(
+            "https://internal.example.com/corgea.svc/mcp",
+            None
+        ));
+        // A Corgea host on a non-MCP path is some other service.
+        assert!(!points_at_corgea_mcp("https://www.corgea.app/api/v1", None));
+        // Self-hosted: only the host being installed matches.
+        assert!(points_at_corgea_mcp(
+            "https://corgea.acme.internal/mcp",
+            install
+        ));
+        assert!(!points_at_corgea_mcp(
+            "https://other.acme.internal/mcp",
+            install
+        ));
+        // Not a URL at all.
+        assert!(!points_at_corgea_mcp("mcp-remote", None));
+    }
+
+    #[test]
+    fn resolve_continue_points_at_the_mcp_servers_block_dir() {
+        let home = PathBuf::from("/home/ada");
+        let cwd = PathBuf::from("/work/repo");
+        let config_dir = PathBuf::from("/home/ada/.config");
+        let ctx = ctx(&home, &cwd, &config_dir);
+
         assert_eq!(
-            providers[1]["params"]["serverUrl"],
-            "https://www.corgea.app/mcp"
+            resolve_config_path(Agent::Continue, Scope::User, None, &ctx).unwrap(),
+            PathBuf::from("/home/ada/.continue/mcpServers/corgea.yaml")
         );
-        assert_eq!(providers[1]["params"]["headers"]["CORGEA-TOKEN"], "tok");
+        assert_eq!(
+            resolve_config_path(Agent::Continue, Scope::Project, None, &ctx).unwrap(),
+            PathBuf::from("/work/repo/.continue/mcpServers/corgea.yaml")
+        );
     }
 
     #[test]
