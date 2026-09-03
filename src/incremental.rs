@@ -60,6 +60,41 @@ pub struct IncrementalPlan {
     pub covers_worktree: bool,
 }
 
+impl IncrementalPlan {
+    /// Add force-included files to what the server will analyze.
+    ///
+    /// The server carries findings forward for every file the diff omits, so a
+    /// force-included file that has not changed would never be looked at — and
+    /// the reason to add an include rule is precisely that the file was never
+    /// scanned before, so there is nothing to carry forward. Returns `None`
+    /// when the combined list outgrows an incremental scan, which falls back to
+    /// scanning everything.
+    pub fn including(mut self, forced: &[String]) -> Option<Self> {
+        let mut listed: BTreeSet<String> = self.changed_files.iter().cloned().collect();
+        let additions: Vec<String> = forced
+            .iter()
+            .filter(|path| listed.insert((*path).clone()))
+            .cloned()
+            .collect();
+        if additions.is_empty() {
+            return Some(self);
+        }
+        if self.changed_files.len() + additions.len() > MAX_CHANGED_FILES {
+            explain_full_scan(
+                "the include rules cover more files than an incremental scan is worth",
+            );
+            return None;
+        }
+        match additions.len() {
+            1 => println!("Incremental scan: also analyzing 1 force-included file."),
+            count => println!("Incremental scan: also analyzing {count} force-included files."),
+        }
+        self.changed_files.extend(additions);
+        self.changed_files.sort();
+        Some(self)
+    }
+}
+
 /// What an incremental scan of this commit would cover, or `None` to scan
 /// everything.
 pub fn resolve_incremental_plan(
@@ -440,6 +475,51 @@ mod tests {
         assert_eq!(short_sha("abc"), "abc");
         assert_eq!(short_sha(""), "");
         assert_eq!(short_sha("ααααααααα"), "ααααααα");
+    }
+
+    fn plan(changed: &[&str]) -> IncrementalPlan {
+        IncrementalPlan {
+            base_sha: "abc123".to_string(),
+            changed_files: changed.iter().map(|f| f.to_string()).collect(),
+            covers_worktree: false,
+        }
+    }
+
+    #[test]
+    fn including_adds_force_included_files_the_diff_left_out() {
+        let forced = vec![
+            "src/app.py".to_string(),
+            "vendor/mylib/Payments.java".to_string(),
+        ];
+
+        let widened = plan(&["src/app.py"])
+            .including(&forced)
+            .expect("still worth it");
+
+        assert_eq!(
+            widened.changed_files,
+            vec![
+                "src/app.py".to_string(),
+                "vendor/mylib/Payments.java".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn including_nothing_new_leaves_the_plan_alone() {
+        let original = plan(&["src/app.py"]);
+        assert_eq!(
+            original.clone().including(&["src/app.py".to_string()]),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn including_too_many_files_falls_back_to_a_full_scan() {
+        let forced: Vec<String> = (0..=MAX_CHANGED_FILES)
+            .map(|i| format!("v/{i}.js"))
+            .collect();
+        assert_eq!(plan(&["src/app.py"]).including(&forced), None);
     }
 
     #[test]

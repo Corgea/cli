@@ -62,6 +62,7 @@ pub fn run(
     out_file: Option<String>,
     target: Option<String>,
     exclude: Option<String>,
+    include: Vec<String>,
     project_name: Option<String>,
     sbom: Option<String>,
     include_images: Vec<String>,
@@ -118,6 +119,7 @@ pub fn run(
             policy,
             target,
             exclude,
+            include,
             include_images,
         ),
     };
@@ -277,6 +279,19 @@ pub fn run(
     }
 }
 
+/// Repo-relative paths as the `/`-separated strings the server's file lists use.
+fn repo_relative_strings(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| {
+            path.components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect()
+}
+
 /// Package the project, upload it, and wait for the scan to finish.
 ///
 /// Returns the new scan's id and, when the server reported one, its project id.
@@ -292,6 +307,7 @@ fn start_new_scan(
     policy: Option<String>,
     target: Option<String>,
     exclude: Option<String>,
+    include: Vec<String>,
     include_images: Vec<String>,
 ) -> (String, Option<String>) {
     println!("\nScanning with BLAST 🚀🚀🚀");
@@ -349,6 +365,33 @@ fn start_new_scan(
 
     // Before packaging: mid-pack HEAD move must not look like a clean new SHA.
     let repo_before = utils::generic::get_repo_info_for_scan("./").unwrap_or_default();
+
+    // Resolved before packaging: the rules decide what goes into the archive,
+    // and a file left out of it cannot be scanned however the engine classifies
+    // what it did receive.
+    let include_rules = crate::include_rules::resolve(
+        config,
+        project_name,
+        repo_before
+            .as_ref()
+            .and_then(|info| info.repo_url.as_deref()),
+        &include,
+    );
+    let force_included = include_rules.matching_files(Path::new("."));
+    if !include_rules.is_empty() && force_included.is_empty() {
+        log::warn!(
+            "\n{}",
+            utils::terminal::set_text_color(
+                "⚠️  No files matched your include rules, so nothing was forced into this scan.",
+                utils::terminal::TerminalColor::Yellow
+            )
+        );
+    } else if !force_included.is_empty() {
+        println!(
+            "Force-including {} file(s) Corgea would otherwise skip.",
+            force_included.len()
+        );
+    }
 
     if target_str.is_none() && exclude.is_some() {
         println!("Excluding files matching: {}", exclude.as_deref().unwrap());
@@ -449,6 +492,7 @@ fn start_new_scan(
         &zip_path,
         None,
         exclude.as_deref(),
+        &force_included,
         &extra_zip_files,
     ) {
         Ok(added_files) => {
@@ -541,6 +585,10 @@ fn start_new_scan(
             repo_info.as_ref().is_some_and(|info| info.dirty),
             *ignore_dirty_worktree,
         )
+        // Force-included files are usually unchanged, and the server carries
+        // findings forward for whatever the diff omits — so without this an
+        // include rule would never get the file looked at on an incremental run.
+        .and_then(|plan| plan.including(&repo_relative_strings(&force_included)))
     };
     println!("\n\nSubmitting scan to Corgea:");
     let upload_result = match utils::api::upload_zip(
@@ -553,6 +601,7 @@ fn start_new_scan(
             policy,
             metadata,
             incremental: incremental_plan,
+            include_paths: include_rules.cli_patterns,
         },
     ) {
         Ok(result) => result,

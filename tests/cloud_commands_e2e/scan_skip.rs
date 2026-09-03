@@ -446,9 +446,11 @@ fn ignore_dirty_worktree_still_uploads_dirty_when_nothing_is_reused() {
     let project = git_project();
     std::fs::write(project.path().join("main.py"), "print('dirty')\n")
         .expect("modify tracked file");
+    // blast_upload_plan already holds verify then the include-rule lookup; the
+    // baselines follow it and the reuse lookup precedes it.
     let mut plan = blast_upload_plan(&project.sha, true, false);
-    plan.insert(1, baseline_lookup_for_branch("master", vec![]));
-    plan.insert(1, baseline_lookup_for_branch("main", vec![]));
+    plan.insert(2, baseline_lookup_for_branch("master", vec![]));
+    plan.insert(2, baseline_lookup_for_branch("main", vec![]));
     plan.insert(1, commit_lookup(&project.sha, vec![]));
     let api = ApiStub::start(plan);
     let (mut command, _home) = cloud_command(&api, project.path());
@@ -670,6 +672,33 @@ fn the_window_cannot_be_set_without_the_skip_flag() {
     assert_eq!(output.status.code(), Some(2), "{context}");
     assert!(
         stderr.contains("--skip-if-commit-scanned-recently"),
+        "{context}"
+    );
+}
+
+/// A force-include rule widens what gets scanned, and the reused candidate was
+/// scanned without it — so reuse would silently skip the very file the run
+/// mandated. That is under-reporting, which the flag refuses rather than warns.
+#[test]
+fn reuse_is_refused_alongside_an_include_rule() {
+    let api = ApiStub::start(Vec::new());
+    let project = git_project();
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--skip-if-commit-scanned-recently",
+        "--include",
+        "vendor/our-fork/**",
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+
+    assert_eq!(output.status.code(), Some(2), "{context}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--include"),
         "{context}"
     );
 }

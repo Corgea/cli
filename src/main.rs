@@ -2,6 +2,7 @@ mod authorize;
 mod cicd;
 mod config;
 mod images;
+mod include_rules;
 mod incremental;
 mod inspect;
 mod list;
@@ -39,6 +40,11 @@ struct Cli {
     args: Vec<String>,
 }
 
+// `Scan` carries by far the largest flag set of any subcommand, and exactly one
+// `Commands` value exists per process — parsed once at startup and destructured
+// immediately — so the wasted stack in the other variants costs nothing that
+// boxing would recover.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Authenticate to Corgea
@@ -157,6 +163,13 @@ enum Commands {
         exclude: Option<String>,
 
         #[arg(
+            long = "include",
+            value_name = "PATH",
+            help = "Force files into the scan that Corgea would otherwise skip as vendored, third-party, generated or test code (repeatable), e.g. --include src/myProj/MyClass.java --include 'vendor/our-fork/**'. Accepts a path, a directory, or a glob pattern, and overrides this command's packaging filters, .gitignore, --exclude and the engine's own classification. Force-included files are analyzed on every run, including incremental ones. Your project's include rules in Corgea apply too; this flag adds to them for one run."
+        )]
+        include: Vec<String>,
+
+        #[arg(
             long,
             help = "The name of the Corgea project. Defaults to git repository name if found, otherwise to the current directory name."
         )]
@@ -180,8 +193,8 @@ enum Commands {
 
         #[arg(
             long = "skip-if-commit-scanned-recently",
-            conflicts_with_all = ["only_uncommitted", "target", "scan_type", "policy", "include_image", "disable_incremental"],
-            help = "Do not start a new scan when this commit already has a recent completed scan in the project. That scan then drives the rest of the command — results table, --block-on gate, --out-file report — so the pipeline behaves the same either way. Prints CORGEA_SCAN_SKIPPED=true/false so a pipeline can tell the two apart, and fails if no git commit can be resolved. What can be reused is a scan of the whole commit, and no API tells this run how a past scan was scoped or configured, so the flag is refused with --only-uncommitted, --target, --scan-type, --policy, --include-image and --disable-incremental; with --exclude it warns instead, since a reused scan covers files this run would have skipped."
+            conflicts_with_all = ["only_uncommitted", "target", "scan_type", "policy", "include_image", "include", "disable_incremental"],
+            help = "Do not start a new scan when this commit already has a recent completed scan in the project. That scan then drives the rest of the command — results table, --block-on gate, --out-file report — so the pipeline behaves the same either way. Prints CORGEA_SCAN_SKIPPED=true/false so a pipeline can tell the two apart, and fails if no git commit can be resolved. What can be reused is a scan of the whole commit, and no API tells this run how a past scan was scoped or configured, so the flag is refused with --only-uncommitted, --target, --scan-type, --policy, --include-image, --include and --disable-incremental; with --exclude it warns instead, since a reused scan covers files this run would have skipped."
         )]
         skip_if_commit_scanned_recently: bool,
 
@@ -683,6 +696,7 @@ fn main() {
             out_file,
             target,
             exclude,
+            include,
             project_name,
             sbom,
             include_image,
@@ -812,6 +826,11 @@ fn main() {
                 std::process::exit(1);
             }
 
+            if !include.is_empty() && *scanner != Scanner::Blast {
+                ::log::error!("--include is only supported with the blast scanner.");
+                std::process::exit(1);
+            }
+
             if sbom.is_some() && *scanner != Scanner::Blast {
                 ::log::error!("sbom is only supported with blast scanner.");
                 std::process::exit(1);
@@ -867,6 +886,7 @@ fn main() {
                     out_file.clone(),
                     target.clone(),
                     exclude.clone(),
+                    include.clone(),
                     project_name.clone(),
                     sbom.clone(),
                     include_images,
