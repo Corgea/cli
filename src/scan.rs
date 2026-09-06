@@ -12,6 +12,10 @@ use uuid::Uuid;
 
 const CORGEA_POLICY_FILENAMES: &[&str] = &["corgea.yaml", "corgea.yml"];
 
+fn is_regular_file(path: &Path) -> bool {
+    !path.is_symlink() && path.is_file()
+}
+
 /// `corgea.yaml` / `corgea.yml` under `root`, including a gitignored copy at `root`.
 fn find_corgea_policy_files(root: &Path) -> Vec<String> {
     if !root.is_dir() {
@@ -20,7 +24,7 @@ fn find_corgea_policy_files(root: &Path) -> Vec<String> {
 
     let mut found = Vec::new();
     for name in CORGEA_POLICY_FILENAMES {
-        if root.join(name).is_file() {
+        if is_regular_file(&root.join(name)) {
             found.push((*name).to_string());
         }
     }
@@ -33,7 +37,7 @@ fn find_corgea_policy_files(root: &Path) -> Vec<String> {
             continue;
         };
         let path = entry.path();
-        if !path.is_file() {
+        if !is_regular_file(path) {
             continue;
         }
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -713,6 +717,18 @@ mod tests {
     #[test]
     fn find_corgea_policy_files_returns_empty_when_none_exist() {
         let root = tempfile::tempdir().unwrap();
+        assert!(find_corgea_policy_files(root.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_corgea_policy_files_skips_symlink_outside_repo() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let secret = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(secret.path(), "secret").unwrap();
+        symlink(secret.path(), root.path().join("corgea.yaml")).unwrap();
+
         assert!(find_corgea_policy_files(root.path()).is_empty());
     }
 
