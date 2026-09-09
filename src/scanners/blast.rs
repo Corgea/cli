@@ -16,6 +16,15 @@ use std::time::{Duration, Instant};
 const SCAN_TIMEOUT_ENV: &str = "CORGEA_SCAN_TIMEOUT_SECONDS";
 const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(10 * 60 * 60);
 
+/// How long to pause between scan status reads.
+///
+/// Scans run for minutes, so reading more often than this only adds load: at
+/// one read a second, a single wait against the default 10-hour budget can
+/// reach 36,000 requests, and a pipeline scanning in parallel multiplies that
+/// by every concurrent wait. Three seconds costs a pipeline no more than a few
+/// seconds of extra latency on the final status.
+const SCAN_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
 /// Overrides how long the CI gate waits for blocking rules to be evaluated.
 const BLOCKING_RULES_TIMEOUT_ENV: &str = "CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS";
 
@@ -1034,7 +1043,7 @@ pub fn wait_for_scan(config: &Config, scan_id: &str, budget: WaitBudget) {
     let mut last_status = String::from("unknown");
 
     let result = loop {
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(SCAN_POLL_INTERVAL);
         // Every read is capped to what is left of the budget: on the client's
         // own timeout a stalled read would otherwise keep us going long past
         // the wait the user asked for.
@@ -1779,6 +1788,18 @@ mod tests {
         assert_eq!(format_timeout(DEFAULT_SCAN_TIMEOUT), "10h");
         assert_eq!(format_timeout(DEFAULT_BLOCKING_RULES_TIMEOUT), "35m");
         assert_eq!(format_timeout(Duration::from_secs(90)), "90s");
+    }
+
+    #[test]
+    fn poll_interval_is_the_documented_one_and_short_against_the_budget() {
+        assert_eq!(SCAN_POLL_INTERVAL, Duration::from_secs(3));
+        // A pause that ever grew toward the budget would spend the whole wait
+        // asleep and report a finished scan long after it finished.
+        assert!(
+            SCAN_POLL_INTERVAL < DEFAULT_SCAN_TIMEOUT / 100,
+            "poll interval {SCAN_POLL_INTERVAL:?} is not short against the \
+             {DEFAULT_SCAN_TIMEOUT:?} budget it runs inside"
+        );
     }
 
     #[test]
