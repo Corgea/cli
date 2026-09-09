@@ -54,7 +54,6 @@ pub fn run(
     block_on: Option<String>,
     only_uncommitted: &bool,
     disable_incremental: &bool,
-    ignore_dirty_worktree_for_run: &bool,
     metadata: Option<String>,
     scan_type: Option<String>,
     policy: Option<String>,
@@ -92,6 +91,19 @@ pub fn run(
 
     let project_name = utils::generic::determine_project_name(project_name.as_deref());
 
+    // 1.11.1 gave the flag a `requires` clause, 1.12.0 dropped it to let the
+    // flag also put incremental back on the table for a dirty tree, and nothing
+    // needs it for that any more. So a run can still pass it alone, where it now
+    // governs nothing -- and someone passing it to get an incremental scan would
+    // otherwise get full scans with no idea why.
+    if *ignore_dirty_worktree && skip_recent.is_none() {
+        log::warn!(
+            "--ignore-dirty-worktree has no effect without --skip-if-commit-scanned-recently. \
+             Incremental scans do not need it: a dirty worktree is diffed against the working \
+             tree, so uncommitted and untracked files are analyzed."
+        );
+    }
+
     // A reused scan stands in for the new one: everything below this point —
     // the results table, the blocking-rule gate, the report file — runs against
     // whichever scan id this resolves to.
@@ -112,7 +124,6 @@ pub fn run(
             &project_name,
             only_uncommitted,
             disable_incremental,
-            ignore_dirty_worktree_for_run,
             metadata,
             scan_type,
             policy,
@@ -286,7 +297,6 @@ fn start_new_scan(
     project_name: &str,
     only_uncommitted: &bool,
     disable_incremental: &bool,
-    ignore_dirty_worktree: &bool,
     metadata: Option<String>,
     scan_type: Option<String>,
     policy: Option<String>,
@@ -528,9 +538,9 @@ fn start_new_scan(
     let incremental_plan = if *disable_incremental || narrowed_archive {
         None
     } else {
-        // Reconciled repo info, so a tree that turned out dirty — or a HEAD
-        // that moved mid-packaging — refuses rather than diffing against a
-        // commit this upload is not a snapshot of.
+        // Reconciled repo info, so the flag here is the one the upload reports.
+        // They have to agree: the server refuses a dirty upload whose diff does
+        // not claim to cover the worktree.
         crate::incremental::resolve_incremental_plan(
             config,
             project_name,
@@ -539,7 +549,6 @@ fn start_new_scan(
             // Missing repo info is not dirtiness; it is the missing
             // branch/commit the resolver reports next, by its real name.
             repo_info.as_ref().is_some_and(|info| info.dirty),
-            *ignore_dirty_worktree,
         )
     };
     println!("\n\nSubmitting scan to Corgea:");
