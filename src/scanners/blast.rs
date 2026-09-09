@@ -13,6 +13,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// Overrides how long `wait_for_scan` polls before giving up.
+/// How many force-included paths to name before collapsing the rest to a count.
+/// Same shape as the `--target` file preview.
+const FORCE_INCLUDE_PREVIEW: usize = 20;
+
 const SCAN_TIMEOUT_ENV: &str = "CORGEA_SCAN_TIMEOUT_SECONDS";
 const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(10 * 60 * 60);
 
@@ -62,6 +66,7 @@ pub fn run(
     out_file: Option<String>,
     target: Option<String>,
     exclude: Option<String>,
+    include: Vec<String>,
     project_name: Option<String>,
     sbom: Option<String>,
     include_images: Vec<String>,
@@ -92,10 +97,32 @@ pub fn run(
 
     let project_name = utils::generic::determine_project_name(project_name.as_deref());
 
+    // Resolved before the reuse decision, not inside start_new_scan: a
+    // reusable scan predates any include rule, so reusing it would leave the
+    // files the rule forces in unscanned. `--include` already refuses the reuse
+    // flag in clap; the project's own rules are invisible to clap, so they are
+    // checked here.
+    let include_rules = crate::include_rules::resolve(
+        config,
+        &project_name,
+        utils::generic::get_repo_info_for_scan("./")
+            .unwrap_or_default()
+            .and_then(|info| info.repo_url)
+            .as_deref(),
+        &include,
+    );
+
     // A reused scan stands in for the new one: everything below this point —
     // the results table, the blocking-rule gate, the report file — runs against
     // whichever scan id this resolves to.
     let reused_scan = skip_recent.as_ref().and_then(|skip| {
+        if let Some(reason) = include_rules.reuse_refusal() {
+            println!("Scanning instead of reusing a previous scan: {reason}.");
+            // The flag promises this marker on every run, and reuse was
+            // declined before resolve_reusable_scan could print it.
+            crate::skip_scan::report_scan_not_skipped();
+            return None;
+        }
         crate::skip_scan::resolve_reusable_scan(
             config,
             &project_name,
@@ -118,6 +145,7 @@ pub fn run(
             policy,
             target,
             exclude,
+            include_rules,
             include_images,
         ),
     };
@@ -277,6 +305,19 @@ pub fn run(
     }
 }
 
+/// Repo-relative paths as the `/`-separated strings the server's file lists use.
+fn repo_relative_strings(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| {
+            path.components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect()
+}
+
 /// Package the project, upload it, and wait for the scan to finish.
 ///
 /// Returns the new scan's id and, when the server reported one, its project id.
@@ -292,6 +333,7 @@ fn start_new_scan(
     policy: Option<String>,
     target: Option<String>,
     exclude: Option<String>,
+    include_rules: crate::include_rules::IncludeRules,
     include_images: Vec<String>,
 ) -> (String, Option<String>) {
     println!("\nScanning with BLAST 🚀🚀🚀");
@@ -350,6 +392,34 @@ fn start_new_scan(
     // Before packaging: mid-pack HEAD move must not look like a clean new SHA.
     let repo_before = utils::generic::get_repo_info_for_scan("./").unwrap_or_default();
 
+    // The rules were resolved in run(), before the reuse decision; they decide
+    // what goes into the archive, and a file left out of it cannot be scanned
+    // however the engine classifies what it did receive.
+    let force_included = include_rules.matching_files(Path::new("."));
+    if !include_rules.is_empty() && force_included.is_empty() {
+        log::warn!(
+            "\n{}",
+            utils::terminal::set_text_color(
+                "⚠️  No files matched your include rules, so nothing was forced into this scan.",
+                utils::terminal::TerminalColor::Yellow
+            )
+        );
+    } else if !force_included.is_empty() {
+        // Named, not just counted: these paths override .gitignore and the
+        // default excludes (which cover `**/*.env` among others), so whoever
+        // reads the log needs to see what actually went into the archive.
+        println!(
+            "Force-including {} file(s) Corgea would otherwise skip:",
+            force_included.len()
+        );
+        for path in force_included.iter().take(FORCE_INCLUDE_PREVIEW) {
+            println!("  {}", path.display());
+        }
+        if force_included.len() > FORCE_INCLUDE_PREVIEW {
+            println!("  (+{} more)", force_included.len() - FORCE_INCLUDE_PREVIEW);
+        }
+    }
+
     if target_str.is_none() && exclude.is_some() {
         println!("Excluding files matching: {}", exclude.as_deref().unwrap());
     }
@@ -358,9 +428,10 @@ fn start_new_scan(
         match targets::resolve_targets_with_exclude(target_value, exclude.as_deref()) {
             Ok(result) => {
                 if result.files.is_empty() {
-                    // An exported image is a complete payload on its own, so a
-                    // target that matches nothing is only fatal without one.
-                    if image_archives.is_empty() {
+                    // An exported image, or a file an include rule forces in,
+                    // is a complete payload on its own — so a target that
+                    // matches nothing is only fatal without either.
+                    if image_archives.is_empty() && force_included.is_empty() {
                         *stop_signal.lock().unwrap() = true;
                         let _ = packaging_thread.join();
                         print!(
@@ -389,10 +460,19 @@ fn start_new_scan(
                         std::process::exit(1);
                     }
 
+                    let covers = match (force_included.is_empty(), image_archives.is_empty()) {
+                        (true, _) => "the included container image(s)",
+                        (false, true) => "the force-included file(s)",
+                        (false, false) => {
+                            "the force-included file(s) and the included container image(s)"
+                        }
+                    };
                     log::warn!(
                         "\n{}",
                         utils::terminal::set_text_color(
-                            "⚠️  No scannable files matched your target, so this scan covers only the included container image(s).",
+                            &format!(
+                                "⚠️  No scannable files matched your target, so this scan covers only {covers}."
+                            ),
                             utils::terminal::TerminalColor::Yellow
                         )
                     );
@@ -449,6 +529,7 @@ fn start_new_scan(
         &zip_path,
         None,
         exclude.as_deref(),
+        &force_included,
         &extra_zip_files,
     ) {
         Ok(added_files) => {
@@ -541,6 +622,10 @@ fn start_new_scan(
             repo_info.as_ref().is_some_and(|info| info.dirty),
             *ignore_dirty_worktree,
         )
+        // Force-included files are usually unchanged, and the server carries
+        // findings forward for whatever the diff omits — so without this an
+        // include rule would never get the file looked at on an incremental run.
+        .and_then(|plan| plan.including(&repo_relative_strings(&force_included)))
     };
     println!("\n\nSubmitting scan to Corgea:");
     let upload_result = match utils::api::upload_zip(
@@ -553,6 +638,7 @@ fn start_new_scan(
             policy,
             metadata,
             incremental: incremental_plan,
+            include_paths: include_rules.cli_patterns,
         },
     ) {
         Ok(result) => result,
