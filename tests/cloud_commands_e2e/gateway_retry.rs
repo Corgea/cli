@@ -133,6 +133,56 @@ fn a_source_upload_is_not_retried_past_the_schedule() {
 }
 
 #[test]
+fn an_exhausted_gateway_stops_the_whole_source_upload_walk() {
+    // The schedule is spent on the platform being unavailable, not on one file,
+    // so the paths behind the failed one must not each start a fresh 90s of
+    // retries. With two referenced sources, a walk that kept going would ask
+    // for eight uploads instead of four.
+    let project = two_source_report_project();
+    let mut plan = vec![verify_request()];
+    for _ in 0..ATTEMPTS {
+        plan.push(expected_request(
+            "reject the source upload with a gateway error",
+            |request| {
+                assert_authenticated_request(request, Method::POST, "/api/v1/code-upload")?;
+                // Whichever of the two sources is walked first: the point is
+                // how many uploads are attempted, not their order.
+                let path = query_value(request, "path")?;
+                if !path.starts_with("src/") {
+                    return Err(format!("unexpected upload path {path}"));
+                }
+                Ok(())
+            },
+            bad_gateway(),
+        ));
+    }
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.env(FAST_RETRIES.0, FAST_RETRIES.1);
+    command.args([
+        "upload",
+        project.report_path().to_str().expect("UTF-8 report path"),
+        "--project-name",
+        "upload-contract",
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    // A fifth upload would be the second file starting the schedule again, and
+    // the stub rejects it as unexpected.
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    assert_eq!(output.status.code(), Some(1), "{context}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The file that was never attempted is still reported as unsent, so the
+    // summary cannot read as a single bad file.
+    assert!(stderr.contains("2 of 2 files were not sent"), "{context}");
+    assert!(
+        stderr.contains("Failed to upload any files for the scan"),
+        "{context}"
+    );
+}
+
+#[test]
 fn blast_upload_replays_an_archive_chunk_the_gateway_rejects() {
     // The upload bodies are streamed multipart forms, which cannot be replayed
     // from a built request — this is what proves the form is rebuilt, since the

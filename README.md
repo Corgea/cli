@@ -58,6 +58,11 @@ blips a busy platform produces under parallel scans. Each retry is logged, and
 the count belongs to a single request: any successful call starts the next one
 with the full three retries again.
 
+The one place this stops early is `corgea upload`'s per-file source upload: a 502
+that outlives the retries there is taken as the platform being unavailable rather
+than one bad file, so the remaining paths are reported as unsent instead of each
+spending another 90 seconds.
+
 ### Skipping a re-scan of the same commit
 
 A pipeline that re-runs on an unchanged commit can reuse the scan it already

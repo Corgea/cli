@@ -328,8 +328,9 @@ pub fn upload_scan(
     let mut uploaded_paths = HashSet::new();
     let mut uploaded_count = 0;
     let mut upload_error_count = 0;
+    let mut gateway_gave_up = false;
 
-    for path in &paths {
+    'files: for path in &paths {
         if !Path::new(&path).exists() {
             log::error!(
                 "Required file {} not found which is required for the scan, exiting.",
@@ -372,17 +373,19 @@ pub fn upload_scan(
                             "Code upload failed with status: {}. Response body: {}",
                             status, body
                         ));
-                        // A gateway error already spent this request's retry
-                        // schedule; three more one-second attempts would spend
-                        // it again for every file.
+                        // A 502 that outlived the retry schedule is the platform
+                        // being unavailable, not this one file. Retrying it here
+                        // would spend the schedule twice over, and walking the
+                        // remaining paths would spend a fresh 90 seconds on each
+                        // of them, so stop uploading source files altogether.
                         if utils::api::is_gateway_error(status) {
-                            upload_error_count += 1;
                             log::warn!(
-                                "Failed to upload file {} after the gateway retries: {}. skipping...",
+                                "Failed to upload file {} after the gateway retries: {}",
                                 path,
                                 status
                             );
-                            break;
+                            gateway_gave_up = true;
+                            break 'files;
                         }
                         log::warn!("Failed to upload file {} {}... retrying", status, path);
                         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -412,6 +415,19 @@ pub fn upload_scan(
                 path
             );
         }
+    }
+
+    // Everything the aborted walk never attempted still counts as unsent, or
+    // the closing summary would report one failure for a whole skipped tree.
+    if gateway_gave_up {
+        let distinct: HashSet<&String> = paths.iter().collect();
+        let unsent = distinct.len() - uploaded_paths.len();
+        upload_error_count += unsent;
+        log::warn!(
+            "Stopped uploading source files: Corgea was still answering 502 after the retries. {} of {} files were not sent.",
+            unsent,
+            distinct.len()
+        );
     }
 
     if uploaded_count == 0 {
