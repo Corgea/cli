@@ -328,8 +328,9 @@ pub fn upload_scan(
     let mut uploaded_paths = HashSet::new();
     let mut uploaded_count = 0;
     let mut upload_error_count = 0;
+    let mut gateway_gave_up = false;
 
-    for path in &paths {
+    'files: for path in &paths {
         if !Path::new(&path).exists() {
             log::error!(
                 "Required file {} not found which is required for the scan, exiting.",
@@ -354,7 +355,7 @@ pub fn upload_scan(
 
         while attempts < 3 && !success {
             debug(&format!("POST: {}", src_upload_url));
-            let res = utils::api::retry_on_network_error("file upload", || {
+            let res = utils::api::send_with_retries("a source file upload", || {
                 let form = reqwest::blocking::multipart::Form::new()
                     .file("file", fp)
                     .expect("Failed to read file");
@@ -372,6 +373,20 @@ pub fn upload_scan(
                             "Code upload failed with status: {}. Response body: {}",
                             status, body
                         ));
+                        // A 502 that outlived the retry schedule is the platform
+                        // being unavailable, not this one file. Retrying it here
+                        // would spend the schedule twice over, and walking the
+                        // remaining paths would spend a fresh 90 seconds on each
+                        // of them, so stop uploading source files altogether.
+                        if utils::api::is_gateway_error(status) {
+                            log::warn!(
+                                "Failed to upload file {} after the gateway retries: {}",
+                                path,
+                                status
+                            );
+                            gateway_gave_up = true;
+                            break 'files;
+                        }
                         log::warn!("Failed to upload file {} {}... retrying", status, path);
                         std::thread::sleep(std::time::Duration::from_secs(1));
                         attempts += 1;
@@ -400,6 +415,19 @@ pub fn upload_scan(
                 path
             );
         }
+    }
+
+    // Everything the aborted walk never attempted still counts as unsent, or
+    // the closing summary would report one failure for a whole skipped tree.
+    if gateway_gave_up {
+        let distinct: HashSet<&String> = paths.iter().collect();
+        let unsent = distinct.len() - uploaded_paths.len();
+        upload_error_count += unsent;
+        log::warn!(
+            "Stopped uploading source files: Corgea was still answering 502 after the retries. {} of {} files were not sent.",
+            unsent,
+            distinct.len()
+        );
     }
 
     if uploaded_count == 0 {
@@ -440,7 +468,7 @@ pub fn upload_scan(
                 index + 1,
                 total_chunks
             ));
-            let response = utils::api::retry_on_network_error("scan chunk upload", || {
+            let response = utils::api::send_with_retries("a scan report chunk upload", || {
                 client
                     .post(&scan_upload_url)
                     .header(header::CONTENT_TYPE, "application/json")
@@ -491,7 +519,7 @@ pub fn upload_scan(
         last_response.expect("Failed to upload scan.")
     } else {
         debug(&format!("POST: {}", scan_upload_url));
-        utils::api::retry_on_network_error("scan upload", || {
+        utils::api::send_with_retries("the scan report upload", || {
             client
                 .post(&scan_upload_url)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -572,7 +600,7 @@ pub fn upload_scan(
     if git_config_path.exists() {
         debug("Uploading .git/config");
         debug(&format!("POST: {}", git_config_upload_url));
-        let res = utils::api::retry_on_network_error("git config upload", || {
+        let res = utils::api::send_with_retries("the git config upload", || {
             let form = reqwest::blocking::multipart::Form::new()
                 .file("file", git_config_path)
                 .expect("Failed to read file");

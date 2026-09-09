@@ -537,6 +537,24 @@ pub(crate) fn report_project() -> ReportProject {
     ReportProject { root, report_path }
 }
 
+/// A report referencing two source files, so a test can tell "one upload
+/// stopped" from "every upload was attempted".
+pub(crate) fn two_source_report_project() -> ReportProject {
+    let root = TempDir::new().expect("create report project");
+    let source_dir = root.path().join("src");
+    std::fs::create_dir(&source_dir).expect("create source directory");
+    for name in ["main.py", "helper.py"] {
+        std::fs::write(source_dir.join(name), SOURCE_BODY).expect("write source");
+    }
+    let report_path = root.path().join("semgrep.json");
+    std::fs::write(
+        &report_path,
+        r#"{"version":"semgrep.dev/v1","results":[{"path":"src/main.py"},{"path":"src/helper.py"}]}"#,
+    )
+    .expect("write report");
+    ReportProject { root, report_path }
+}
+
 pub(crate) fn git_project() -> GitProject {
     let root = TempDir::new().expect("create Git project");
     for args in [

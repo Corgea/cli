@@ -52,6 +52,7 @@ pub fn corgea_isolated() -> (Command, TempDir) {
         .env_remove("GITHUB_PR")
         .env_remove("REPO_DATA")
         .env_remove("DEBUG_CORGEA_OVERRIDE_REPORT_CHUNK_SIZE")
+        .env_remove("DEBUG_CORGEA_OVERRIDE_RETRY_DELAYS_MS")
         .env_remove("RUST_LOG")
         .env_remove("CORGEA_DEBUG")
         .env_remove("HTTP_PROXY")

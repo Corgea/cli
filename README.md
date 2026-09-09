@@ -39,13 +39,29 @@ third-party report.
 
 All three exit 1 if the scan fails, printing the reason and the scanners that hit
 problems. A scan that completes with a scanner missing exits 0 with a warning.
-Waiting gives up after 10 hours; override with `CORGEA_SCAN_TIMEOUT_SECONDS`.
+While waiting, the scan's status is read every 3 seconds. Waiting gives up after
+10 hours; override with `CORGEA_SCAN_TIMEOUT_SECONDS`.
 `--fail`/`--block-on` then wait up to 15 minutes for blocking rules to be
 evaluated; override with `CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS`.
 
 `--out-format`/`--out-file` and `--sbom` are honored whether or not a gate
 trips: both are written before `--fail`/`--block-on` are evaluated, so a scan
 that exits 1 on a blocking rule still leaves its report behind to ingest.
+
+### Gateway errors are retried, not surfaced
+
+Every Corgea API call the CLI makes — uploads included — replays itself when the
+platform's proxy answers `502 Bad Gateway`, waiting 10s, then 30s, then 50s. A
+request that is still answered 502 after those three retries fails the command
+in the usual way, so a pipeline exits non-zero on a real outage and rides out the
+blips a busy platform produces under parallel scans. Each retry is logged, and
+the count belongs to a single request: any successful call starts the next one
+with the full three retries again.
+
+The one place this stops early is `corgea upload`'s per-file source upload: a 502
+that outlives the retries there is taken as the platform being unavailable rather
+than one bad file, so the remaining paths are reported as unsent instead of each
+spending another 90 seconds.
 
 ### Skipping a re-scan of the same commit
 
