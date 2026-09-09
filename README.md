@@ -47,6 +47,16 @@ evaluated; override with `CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS`.
 trips: both are written before `--fail`/`--block-on` are evaluated, so a scan
 that exits 1 on a blocking rule still leaves its report behind to ingest.
 
+### Gateway errors are retried, not surfaced
+
+Every Corgea API call the CLI makes — uploads included — replays itself when the
+platform's proxy answers `502 Bad Gateway`, waiting 10s, then 30s, then 50s. A
+request that is still answered 502 after those three retries fails the command
+in the usual way, so a pipeline exits non-zero on a real outage and rides out the
+blips a busy platform produces under parallel scans. Each retry is logged, and
+the count belongs to a single request: any successful call starts the next one
+with the full three retries again.
+
 ### Skipping a re-scan of the same commit
 
 A pipeline that re-runs on an unchanged commit can reuse the scan it already

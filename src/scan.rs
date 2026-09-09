@@ -354,7 +354,7 @@ pub fn upload_scan(
 
         while attempts < 3 && !success {
             debug(&format!("POST: {}", src_upload_url));
-            let res = utils::api::retry_on_network_error("file upload", || {
+            let res = utils::api::send_with_retries("a source file upload", || {
                 let form = reqwest::blocking::multipart::Form::new()
                     .file("file", fp)
                     .expect("Failed to read file");
@@ -372,6 +372,18 @@ pub fn upload_scan(
                             "Code upload failed with status: {}. Response body: {}",
                             status, body
                         ));
+                        // A gateway error already spent this request's retry
+                        // schedule; three more one-second attempts would spend
+                        // it again for every file.
+                        if utils::api::is_gateway_error(status) {
+                            upload_error_count += 1;
+                            log::warn!(
+                                "Failed to upload file {} after the gateway retries: {}. skipping...",
+                                path,
+                                status
+                            );
+                            break;
+                        }
                         log::warn!("Failed to upload file {} {}... retrying", status, path);
                         std::thread::sleep(std::time::Duration::from_secs(1));
                         attempts += 1;
@@ -440,7 +452,7 @@ pub fn upload_scan(
                 index + 1,
                 total_chunks
             ));
-            let response = utils::api::retry_on_network_error("scan chunk upload", || {
+            let response = utils::api::send_with_retries("a scan report chunk upload", || {
                 client
                     .post(&scan_upload_url)
                     .header(header::CONTENT_TYPE, "application/json")
@@ -491,7 +503,7 @@ pub fn upload_scan(
         last_response.expect("Failed to upload scan.")
     } else {
         debug(&format!("POST: {}", scan_upload_url));
-        utils::api::retry_on_network_error("scan upload", || {
+        utils::api::send_with_retries("the scan report upload", || {
             client
                 .post(&scan_upload_url)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -572,7 +584,7 @@ pub fn upload_scan(
     if git_config_path.exists() {
         debug("Uploading .git/config");
         debug(&format!("POST: {}", git_config_upload_url));
-        let res = utils::api::retry_on_network_error("git config upload", || {
+        let res = utils::api::send_with_retries("the git config upload", || {
             let form = reqwest::blocking::multipart::Form::new()
                 .file("file", git_config_path)
                 .expect("Failed to read file");

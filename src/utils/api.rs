@@ -140,14 +140,16 @@ impl DebugRequestBuilder {
     pub fn send(self) -> reqwest::Result<reqwest::blocking::Response> {
         use reqwest::cookie::CookieStore;
 
+        let DebugRequestBuilder { client, inner } = self;
+
         let token = AUTH_TOKEN.read().unwrap().clone();
         let builder = if !token.is_empty() {
-            self.inner.headers(auth_headers(&token))
+            inner.headers(auth_headers(&token))
         } else {
-            self.inner
+            inner
         };
 
-        let request = builder.build()?;
+        let mut request = builder.build()?;
 
         debug(&format!("→ {} {}", request.method(), request.url()));
         debug(&format!("  Request headers: {:?}", request.headers()));
@@ -159,12 +161,195 @@ impl DebugRequestBuilder {
             None => debug("  Cookie: (none in jar for this URL)"),
         }
 
-        let response = self.client.execute(request)?;
+        let mut retries =
+            GatewayRetries::new(format!("{} {}", request.method(), request.url().path()));
+        loop {
+            // Cloned before the send, which consumes the request. A streamed
+            // body (the multipart uploads) has nothing to clone, so those call
+            // sites rebuild the whole request through `send_with_retries`.
+            let replay = request.try_clone();
+            let response = client.execute(request)?;
 
-        debug(&format!("← {} {}", response.status(), response.url()));
-        debug(&format!("  Response headers: {:?}", response.headers()));
+            debug(&format!("← {} {}", response.status(), response.url()));
+            debug(&format!("  Response headers: {:?}", response.headers()));
 
-        Ok(response)
+            let Some(replay) = replay else {
+                debug("  Not retrying: this request's body cannot be re-sent from here.");
+                return Ok(response);
+            };
+            if GatewayRetryGuard::outer_loop_active() || !retries.wait_for_retry(response.status())
+            {
+                return Ok(response);
+            }
+            request = replay;
+        }
+    }
+}
+
+/// Statuses worth replaying the same request for. A 502 is the proxy in front
+/// of Corgea reporting it could not get an answer from the API, so the request
+/// itself is usually still good — under the parallel scanning load that
+/// produces these, the retry succeeds where failing the pipeline would not.
+pub fn is_gateway_error(status: StatusCode) -> bool {
+    status == StatusCode::BAD_GATEWAY
+}
+
+/// Pauses before each replay of a request the gateway rejected: a 502 has to
+/// survive four attempts spread over 90 seconds before a command fails.
+///
+/// The schedule belongs to one request. Any answer that is not a gateway error
+/// ends it, so the next 502 — on this request or a later one — starts again at
+/// the first pause.
+const GATEWAY_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(50),
+];
+
+/// Overrides the pauses above with a comma-separated list of milliseconds, so
+/// the retry path can be exercised end to end without spending 90 seconds.
+const RETRY_DELAYS_OVERRIDE_ENV: &str = "DEBUG_CORGEA_OVERRIDE_RETRY_DELAYS_MS";
+
+fn parse_retry_delays(raw: Option<&str>) -> Vec<Duration> {
+    let Some(raw) = raw else {
+        return GATEWAY_RETRY_DELAYS.to_vec();
+    };
+    let parsed: Option<Vec<Duration>> = raw
+        .split(',')
+        .map(|part| part.trim().parse::<u64>().ok().map(Duration::from_millis))
+        .collect();
+    match parsed.filter(|delays| !delays.is_empty()) {
+        Some(delays) => delays,
+        // A bad override must not silently take the retries away.
+        None => {
+            log::warn!(
+                "Ignoring {}='{}': expected a comma-separated list of whole milliseconds. Retrying on the default schedule instead.",
+                RETRY_DELAYS_OVERRIDE_ENV,
+                raw
+            );
+            GATEWAY_RETRY_DELAYS.to_vec()
+        }
+    }
+}
+
+fn gateway_retry_delays() -> &'static [Duration] {
+    static DELAYS: std::sync::LazyLock<Vec<Duration>> = std::sync::LazyLock::new(|| {
+        parse_retry_delays(std::env::var(RETRY_DELAYS_OVERRIDE_ENV).ok().as_deref())
+    });
+    DELAYS.as_slice()
+}
+
+/// Unit tests exercise the schedule, not the waiting.
+#[cfg(test)]
+fn wait_before_retry(_delay: Duration) {}
+
+#[cfg(not(test))]
+fn wait_before_retry(delay: Duration) {
+    std::thread::sleep(delay);
+}
+
+fn format_delay(delay: Duration) -> String {
+    if delay >= Duration::from_secs(1) {
+        format!("{}s", delay.as_secs())
+    } else {
+        format!("{}ms", delay.as_millis())
+    }
+}
+
+/// One request's progress through `GATEWAY_RETRY_DELAYS`, and the log lines a
+/// pipeline needs to tell a retried blip from a real outage.
+struct GatewayRetries {
+    operation: String,
+    retries_spent: usize,
+}
+
+impl GatewayRetries {
+    fn new(operation: impl Into<String>) -> Self {
+        Self {
+            operation: operation.into(),
+            retries_spent: 0,
+        }
+    }
+
+    /// Whether to send `operation` again, having waited for the next pause.
+    ///
+    /// `false` means this response is the answer: either it is not a gateway
+    /// error — which resets the schedule, so a later 502 gets the full run of
+    /// retries again — or the retries are spent and the caller should fail.
+    fn wait_for_retry(&mut self, status: StatusCode) -> bool {
+        if !is_gateway_error(status) {
+            self.retries_spent = 0;
+            return false;
+        }
+        let delays = gateway_retry_delays();
+        let Some(delay) = delays.get(self.retries_spent) else {
+            log::error!(
+                "Corgea answered {} with {} on {} attempts. Giving up.",
+                self.operation,
+                status,
+                delays.len() + 1
+            );
+            return false;
+        };
+        self.retries_spent += 1;
+        log::warn!(
+            "Corgea answered {} with {}. Retrying in {}... ({}/{})",
+            self.operation,
+            status,
+            format_delay(*delay),
+            self.retries_spent,
+            delays.len()
+        );
+        wait_before_retry(*delay);
+        true
+    }
+}
+
+thread_local! {
+    /// Set while `send_with_retries` is running the schedule itself, so `send`
+    /// does not stack a second one underneath it — four attempts each would be
+    /// sixteen requests and six minutes of waiting.
+    static IN_GATEWAY_RETRY_LOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct GatewayRetryGuard(bool);
+
+impl GatewayRetryGuard {
+    fn enter() -> Self {
+        Self(IN_GATEWAY_RETRY_LOOP.with(|active| active.replace(true)))
+    }
+
+    fn outer_loop_active() -> bool {
+        IN_GATEWAY_RETRY_LOOP.with(|active| active.get())
+    }
+}
+
+impl Drop for GatewayRetryGuard {
+    fn drop(&mut self) {
+        IN_GATEWAY_RETRY_LOOP.with(|active| active.set(self.0));
+    }
+}
+
+/// Send a request that has to be rebuilt for every attempt, retrying both
+/// network errors and gateway errors.
+///
+/// `send` replays a request it can clone; a multipart body is a stream with
+/// nothing to clone, so the upload call sites come through here and build a
+/// fresh form each time. `operation` names the request in the retry logs.
+pub fn send_with_retries<F>(
+    operation: &str,
+    mut make_request: F,
+) -> reqwest::Result<reqwest::blocking::Response>
+where
+    F: FnMut() -> reqwest::Result<reqwest::blocking::Response>,
+{
+    let _guard = GatewayRetryGuard::enter();
+    let mut retries = GatewayRetries::new(operation);
+    loop {
+        let response = retry_on_network_error(operation, &mut make_request)?;
+        if !retries.wait_for_retry(response.status()) {
+            return Ok(response);
+        }
     }
 }
 
@@ -266,18 +451,22 @@ pub fn upload_zip(
         "file_size": file_size
     });
 
-    let form = reqwest::blocking::multipart::Form::new()
-        .part(
-            "files",
-            reqwest::blocking::multipart::Part::bytes(Vec::new()).file_name(file_name.to_string()),
-        )
-        .text("json", json_object.to_string());
-
-    let response_object = client
-        .post(format!("{}{}/start-scan", url, API_BASE))
-        .query(&[("scan_type", "blast")])
-        .multipart(form)
-        .send();
+    // The form is built per attempt: a multipart body is a stream, so a retry
+    // has nothing to replay unless the whole request is made again.
+    let response_object = send_with_retries("the scan start request", || {
+        let form = reqwest::blocking::multipart::Form::new()
+            .part(
+                "files",
+                reqwest::blocking::multipart::Part::bytes(Vec::new())
+                    .file_name(file_name.to_string()),
+            )
+            .text("json", json_object.to_string());
+        client
+            .post(format!("{}{}/start-scan", url, API_BASE))
+            .query(&[("scan_type", "blast")])
+            .multipart(form)
+            .send()
+    });
     let response_object = match response_object {
         Ok(response) => {
             check_for_warnings(response.headers(), response.status());
@@ -344,86 +533,89 @@ pub fn upload_zip(
 
         let chunk = &buffer[..bytes_read];
 
-        let mut form = Form::new()
-            .part(
-                "chunk_data",
-                Part::bytes(chunk.to_vec())
-                    .file_name(file_name.to_string())
-                    .mime_str("application/octet-stream")?,
-            )
-            .part(
-                "project_name",
-                multipart::Part::text(project_name.to_string()),
-            )
-            .part("file_size", multipart::Part::text(file_size.to_string()));
-        if let Some(ref info) = repo_info {
-            if let Some(branch) = &info.branch {
-                form = form.part("branch", multipart::Part::text(branch.to_string()));
-            }
-            if let Some(repo_url) = &info.repo_url {
-                form = form.part("repo_url", multipart::Part::text(repo_url.to_string()));
-            }
-            if let Some(sha) = &info.sha {
-                form = form.part("sha", multipart::Part::text(sha.to_string()));
-            }
-            // Always send: omitted = old CLI; false = clean HEAD snapshot.
-            form = form.part(
-                "dirty",
-                multipart::Part::text(if info.dirty { DIRTY_TRUE } else { DIRTY_FALSE }),
-            );
-        }
-        if let Some(scan_type) = scan_type.clone() {
-            let scan_type = if scan_type.contains("blast") {
-                "base".to_string()
-            } else {
-                scan_type
-            };
-            form = form.part("scan_configs", multipart::Part::text(scan_type.to_string()));
-        }
-        if let Some(policy) = policy.clone() {
-            form = form.part("target_policies", multipart::Part::text(policy.to_string()));
-        }
-        if let Some(meta) = &metadata {
-            form = form.part("metadata", multipart::Part::text(meta.clone()));
-        }
-        // Both fields or neither: the list is only safe next to the commit it
-        // was measured from, and a server seeing one without the other would
-        // guess a baseline. A list that will not serialize drops both, leaving
-        // a full scan.
-        if let Some(plan) = &incremental {
-            match serde_json::to_string(&plan.changed_files) {
-                Ok(changed_files) => {
-                    form = form.part(
-                        "incremental_base_sha",
-                        multipart::Part::text(plan.base_sha.clone()),
-                    );
-                    form = form.part(
-                        "incremental_changed_files",
-                        multipart::Part::text(changed_files),
-                    );
-                    // Tells the server the list describes the working tree, not
-                    // just a commit range, which is the only way it can accept a
-                    // diff from a dirty upload.
-                    if plan.covers_worktree {
-                        form =
-                            form.part("incremental_covers_worktree", multipart::Part::text("true"));
-                    }
+        // Rebuilt per attempt: a multipart body is a stream, so a retry has
+        // nothing to replay unless the whole request is made again.
+        let response = match send_with_retries("a scan archive chunk upload", || {
+            let mut form = Form::new()
+                .part(
+                    "chunk_data",
+                    Part::bytes(chunk.to_vec())
+                        .file_name(file_name.to_string())
+                        .mime_str("application/octet-stream")?,
+                )
+                .part(
+                    "project_name",
+                    multipart::Part::text(project_name.to_string()),
+                )
+                .part("file_size", multipart::Part::text(file_size.to_string()));
+            if let Some(ref info) = repo_info {
+                if let Some(branch) = &info.branch {
+                    form = form.part("branch", multipart::Part::text(branch.to_string()));
                 }
-                Err(e) => debug(&format!(
-                    "Could not serialize the incremental file list, scanning every file: {e}"
-                )),
+                if let Some(repo_url) = &info.repo_url {
+                    form = form.part("repo_url", multipart::Part::text(repo_url.to_string()));
+                }
+                if let Some(sha) = &info.sha {
+                    form = form.part("sha", multipart::Part::text(sha.to_string()));
+                }
+                // Always send: omitted = old CLI; false = clean HEAD snapshot.
+                form = form.part(
+                    "dirty",
+                    multipart::Part::text(if info.dirty { DIRTY_TRUE } else { DIRTY_FALSE }),
+                );
             }
-        }
+            if let Some(scan_type) = scan_type.clone() {
+                let scan_type = if scan_type.contains("blast") {
+                    "base".to_string()
+                } else {
+                    scan_type
+                };
+                form = form.part("scan_configs", multipart::Part::text(scan_type.to_string()));
+            }
+            if let Some(policy) = policy.clone() {
+                form = form.part("target_policies", multipart::Part::text(policy.to_string()));
+            }
+            if let Some(meta) = &metadata {
+                form = form.part("metadata", multipart::Part::text(meta.clone()));
+            }
+            // Both fields or neither: the list is only safe next to the commit
+            // it was measured from, and a server seeing one without the other
+            // would guess a baseline. A list that will not serialize drops
+            // both, leaving a full scan.
+            if let Some(plan) = &incremental {
+                match serde_json::to_string(&plan.changed_files) {
+                    Ok(changed_files) => {
+                        form = form.part(
+                            "incremental_base_sha",
+                            multipart::Part::text(plan.base_sha.clone()),
+                        );
+                        form = form.part(
+                            "incremental_changed_files",
+                            multipart::Part::text(changed_files),
+                        );
+                        // Tells the server the list describes the working tree,
+                        // not just a commit range, which is the only way it can
+                        // accept a diff from a dirty upload.
+                        if plan.covers_worktree {
+                            form = form
+                                .part("incremental_covers_worktree", multipart::Part::text("true"));
+                        }
+                    }
+                    Err(e) => debug(&format!(
+                        "Could not serialize the incremental file list, scanning every file: {e}"
+                    )),
+                }
+            }
 
-        let response = match client
-            .patch(format!("{}{}/start-scan/{}/", url, API_BASE, transfer_id))
-            .header("Upload-Offset", offset.to_string())
-            .header("Upload-Length", file_size.to_string())
-            .header("Upload-Name", file_name)
-            .query(&[("scan_type", "blast")])
-            .multipart(form)
-            .send()
-        {
+            client
+                .patch(format!("{}{}/start-scan/{}/", url, API_BASE, transfer_id))
+                .header("Upload-Offset", offset.to_string())
+                .header("Upload-Length", file_size.to_string())
+                .header("Upload-Name", file_name)
+                .query(&[("scan_type", "blast")])
+                .multipart(form)
+                .send()
+        }) {
             Ok(response) => {
                 check_for_warnings(response.headers(), response.status());
                 response
@@ -561,6 +753,18 @@ pub fn get_scan_issues(
         }
         Err(e) => return Err(format!("Failed to send request: {}", e).into()),
     };
+    // A 5xx body is the gateway's or the server's, not the API's JSON, and
+    // reading it as a parse failure hides the status a pipeline needs. 4xx
+    // still goes through the body, which carries `no_project_found`.
+    let status = response.status();
+    if status.is_server_error() {
+        let body = response.text().unwrap_or_default();
+        debug(&format!(
+            "Issue listing failed: HTTP {}. Response body: {}",
+            status, body
+        ));
+        return Err(format!("Request failed with status: {}", status).into());
+    }
     let response_text = response.text()?;
     let project_issues_response: ProjectIssuesResponse = serde_json::from_str(&response_text)
         .map_err(|e| {
@@ -2045,6 +2249,8 @@ mod tests {
 
     use std::cell::Cell;
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
@@ -2431,6 +2637,153 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    /// Answers the first `failures` requests with 502, then 200. Returns the
+    /// base URL and the request counter.
+    fn spawn_gateway_stub(failures: usize) -> (String, Arc<AtomicUsize>) {
+        use std::io::Write;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = corgea::vuln_api_stub::read_http_request(&mut stream);
+                let served = counter.fetch_add(1, Ordering::SeqCst);
+                let response = if served < failures {
+                    // What a proxy in front of the API actually returns: HTML,
+                    // not the JSON envelope every endpoint parses.
+                    corgea::vuln_api_stub::http_response(
+                        "502 Bad Gateway",
+                        "",
+                        "<html><body>502 Bad Gateway</body></html>",
+                    )
+                } else {
+                    corgea::vuln_api_stub::http_response("200 OK", "", r#"{"status":"ok"}"#)
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (base, hits)
+    }
+
+    #[test]
+    fn gateway_retry_schedule_is_the_documented_one() {
+        // The customer contract: retry after 10s, 30s and 50s, then fail.
+        assert_eq!(
+            GATEWAY_RETRY_DELAYS,
+            [
+                Duration::from_secs(10),
+                Duration::from_secs(30),
+                Duration::from_secs(50)
+            ]
+        );
+        assert!(is_gateway_error(StatusCode::BAD_GATEWAY));
+        // Everything else is the API answering for itself, including the other
+        // 5xx: those are not what the pipelines are hitting, and replaying an
+        // upload the server did read is not free.
+        for status in [
+            StatusCode::OK,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::NOT_FOUND,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(!is_gateway_error(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn gateway_retries_stop_after_the_schedule_and_a_success_resets_them() {
+        let mut retries = GatewayRetries::new("GET /api/v1/scan/s1");
+        for _ in 0..GATEWAY_RETRY_DELAYS.len() {
+            assert!(retries.wait_for_retry(StatusCode::BAD_GATEWAY));
+        }
+        assert!(
+            !retries.wait_for_retry(StatusCode::BAD_GATEWAY),
+            "the fourth 502 is the answer, not a fourth retry"
+        );
+
+        // Any answer that is not a gateway error puts the full schedule back,
+        // so a later blip is retried rather than counted against the last one.
+        assert!(!retries.wait_for_retry(StatusCode::OK));
+        for _ in 0..GATEWAY_RETRY_DELAYS.len() {
+            assert!(retries.wait_for_retry(StatusCode::BAD_GATEWAY));
+        }
+        assert!(!retries.wait_for_retry(StatusCode::BAD_GATEWAY));
+    }
+
+    #[test]
+    fn retry_delay_override_falls_back_to_the_schedule_when_unusable() {
+        assert_eq!(parse_retry_delays(None), GATEWAY_RETRY_DELAYS.to_vec());
+        assert_eq!(
+            parse_retry_delays(Some("50, 100")),
+            vec![Duration::from_millis(50), Duration::from_millis(100)]
+        );
+        // A typo must not quietly leave the CLI without retries.
+        for raw in ["", "abc", "50,,100", "1.5"] {
+            assert_eq!(
+                parse_retry_delays(Some(raw)),
+                GATEWAY_RETRY_DELAYS.to_vec(),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn send_retries_bad_gateway_until_the_server_answers() {
+        let (base, hits) = spawn_gateway_stub(2);
+
+        let response = http_client().get(&base).send().expect("send");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "two 502s, then the answer");
+    }
+
+    #[test]
+    fn send_gives_up_after_the_last_retry() {
+        let (base, hits) = spawn_gateway_stub(usize::MAX);
+
+        let response = http_client().get(&base).send().expect("send");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            GATEWAY_RETRY_DELAYS.len() + 1,
+            "the caller must see the 502 once the retries are spent"
+        );
+    }
+
+    #[test]
+    fn send_with_retries_replays_a_multipart_body_send_cannot_clone() {
+        let (base, hits) = spawn_gateway_stub(2);
+
+        let response = send_with_retries("a multipart upload", || {
+            let form = reqwest::blocking::multipart::Form::new().text("field", "value");
+            http_client().post(&base).multipart(form).send()
+        })
+        .expect("send");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn nested_retry_loops_do_not_multiply_the_attempts() {
+        // A replayable body inside `send_with_retries` is retried by exactly
+        // one of the two loops: four attempts each would be sixteen requests
+        // and six minutes of waiting.
+        let (base, hits) = spawn_gateway_stub(usize::MAX);
+
+        let response = send_with_retries("a retryable body", || {
+            http_client().post(&base).body("{}").send()
+        })
+        .expect("send");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits.load(Ordering::SeqCst), GATEWAY_RETRY_DELAYS.len() + 1);
     }
 
     #[test]
