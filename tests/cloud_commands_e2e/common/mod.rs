@@ -596,21 +596,28 @@ pub(crate) fn verify_request() -> ExpectedRequest {
     )
 }
 
-/// Every new BLAST scan reads the project's include rules before packaging, so
-/// files Corgea would classify away can still be forced into the archive.
+/// Every BLAST run reads the project's include rules before deciding whether a
+/// previous scan can be reused and before packaging, so files Corgea would
+/// classify away can still be forced into the archive.
 pub(crate) fn scan_settings_request(project: &str) -> ExpectedRequest {
+    scan_settings_request_with(project, &[])
+}
+
+/// `scan_settings_request` answering with the given project include rules.
+pub(crate) fn scan_settings_request_with(project: &str, include_paths: &[&str]) -> ExpectedRequest {
     let project = project.to_string();
+    let body = json!({
+        "status": "ok",
+        "project": null,
+        "settings": {"include_paths": include_paths, "ignore_paths": []}
+    });
     expected_request(
         "read project include rules",
         move |request| {
             assert_authenticated_request(request, Method::GET, "/api/v1/scan-settings")?;
             assert_query(request, "project_name", &project)
         },
-        json_response(json!({
-            "status": "ok",
-            "project": null,
-            "settings": {"include_paths": [], "ignore_paths": []}
-        })),
+        json_response(body),
     )
 }
 

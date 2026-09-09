@@ -868,6 +868,14 @@ fn main() {
                 std::process::exit(1);
             }
 
+            // Checked up front rather than dropped later: a pattern that cannot
+            // compile packages nothing, so the scan would appear to succeed
+            // having silently ignored what was asked for.
+            if let Err(msg) = include_rules::validate_cli_patterns(include) {
+                ::log::error!("{}", msg);
+                std::process::exit(1);
+            }
+
             if sbom.is_some() && *scanner != Scanner::Blast {
                 ::log::error!("sbom is only supported with blast scanner.");
                 std::process::exit(1);

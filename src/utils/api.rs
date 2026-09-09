@@ -25,6 +25,11 @@ const DIRTY_FALSE: &str = "false";
 /// How long any one request may take before the client gives up.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
 
+/// Budget for the pre-scan project-settings lookup. Short on purpose: the run
+/// continues without the project's include rules if it fails, so waiting out
+/// the default would delay every scan for no gain.
+const SETTINGS_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
 fn auth_headers(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     let (name, value) = auth_header(token);
@@ -998,13 +1003,25 @@ pub fn query_scan_settings(
     let client = http_client();
     let mut query = vec![("project_name", project_name.to_string())];
     if let Some(repo_url) = repo_url {
-        query.push(("repo_url", repo_url.to_string()));
+        // A git origin can embed a token (`https://oauth2:glpat-x@host/...`).
+        // Strip it before it reaches a query string, a proxy log, or --verbose.
+        query.push((
+            "repo_url",
+            utils::generic::strip_remote_credentials(repo_url),
+        ));
     }
     debug(&format!(
         "Reading project scan settings from {} ({:?})",
         request_url, query
     ));
-    let response = client.get(&request_url).query(&query).send()?;
+    // Pre-flight lookup whose failure path is "run without the project's
+    // rules", so it must not sit behind the 150s default: a hung endpoint would
+    // otherwise add minutes to every scan before falling back.
+    let response = client
+        .get(&request_url)
+        .query(&query)
+        .timeout(SETTINGS_REQUEST_TIMEOUT)
+        .send()?;
     check_for_warnings(response.headers(), response.status());
     let status = response.status();
     if status == StatusCode::NOT_FOUND {

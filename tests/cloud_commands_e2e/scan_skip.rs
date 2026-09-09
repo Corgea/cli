@@ -126,6 +126,7 @@ fn skipped_scan_still_fails_the_build_on_the_prior_scans_blocking_rules() {
     let out_file = out_dir.path().join("results.sarif");
     let api = ApiStub::start(vec![
         verify_request(),
+        scan_settings_request(PROJECT),
         commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
         clean_detail(&project.sha),
         reused_scan_issues(),
@@ -177,6 +178,7 @@ fn skipped_scan_reports_the_prior_findings() {
     let project = git_project();
     let api = ApiStub::start(vec![
         verify_request(),
+        scan_settings_request(PROJECT),
         commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
         clean_detail(&project.sha),
         reused_scan_issues(),
@@ -213,7 +215,7 @@ fn a_scan_older_than_the_window_still_triggers_a_new_scan() {
     let project = git_project();
     let mut plan = blast_upload_plan(&project.sha, false, false);
     plan.insert(
-        1,
+        2,
         commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(30))]),
     );
     let api = ApiStub::start(plan);
@@ -244,7 +246,7 @@ fn a_shorter_window_rejects_a_scan_the_default_would_reuse() {
     let project = git_project();
     let mut plan = blast_upload_plan(&project.sha, false, false);
     plan.insert(
-        1,
+        2,
         commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
     );
     let api = ApiStub::start(plan);
@@ -316,6 +318,7 @@ fn a_file_hidden_from_git_status_reuses_the_commits_scan() {
         .expect("modify assume-unchanged file");
     let api = ApiStub::start(vec![
         verify_request(),
+        scan_settings_request(PROJECT),
         commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
         clean_detail(&project.sha),
         reused_scan_issues(),
@@ -359,6 +362,7 @@ fn ignore_dirty_worktree_reuses_a_scan_a_dirty_tree_would_otherwise_run() {
         .expect("modify tracked file");
     let api = ApiStub::start(vec![
         verify_request(),
+        scan_settings_request(PROJECT),
         commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
         clean_detail(&project.sha),
         reused_scan_issues(),
@@ -407,6 +411,7 @@ fn ignore_dirty_worktree_reuses_a_prior_dirty_scan() {
     let path = format!("/api/v1/scan/{PRIOR_SCAN}");
     let api = ApiStub::start(vec![
         verify_request(),
+        scan_settings_request(PROJECT),
         commit_lookup(&project.sha, vec![prior]),
         expected_request(
             "confirm the dirty scan being reused",
@@ -446,12 +451,12 @@ fn ignore_dirty_worktree_still_uploads_dirty_when_nothing_is_reused() {
     let project = git_project();
     std::fs::write(project.path().join("main.py"), "print('dirty')\n")
         .expect("modify tracked file");
-    // blast_upload_plan already holds verify then the include-rule lookup; the
-    // baselines follow it and the reuse lookup precedes it.
+    // blast_upload_plan already holds verify then the include-rule lookup. The
+    // reuse lookup follows those, then the baselines.
     let mut plan = blast_upload_plan(&project.sha, true, false);
-    plan.insert(2, baseline_lookup_for_branch("master", vec![]));
-    plan.insert(2, baseline_lookup_for_branch("main", vec![]));
-    plan.insert(1, commit_lookup(&project.sha, vec![]));
+    plan.insert(2, commit_lookup(&project.sha, vec![]));
+    plan.insert(3, baseline_lookup_for_branch("main", vec![]));
+    plan.insert(4, baseline_lookup_for_branch("master", vec![]));
     let api = ApiStub::start(plan);
     let (mut command, _home) = cloud_command(&api, project.path());
     command.args([
@@ -486,11 +491,11 @@ fn a_degraded_prior_scan_is_not_reused() {
     let project = git_project();
     let mut plan = blast_upload_plan(&project.sha, false, false);
     plan.insert(
-        1,
+        2,
         commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
     );
     plan.insert(
-        2,
+        3,
         reused_scan_detail(
             &project.sha,
             json!([{
@@ -529,7 +534,9 @@ fn a_degraded_prior_scan_is_not_reused() {
 fn no_resolvable_commit_fails_before_anything_is_uploaded() {
     let project = TempDir::new().expect("create non-git project");
     std::fs::write(project.path().join("main.py"), "print('hi')\n").expect("write source");
-    let api = ApiStub::start(vec![verify_request()]);
+    // Include rules are read before the reuse decision, so the lookup happens
+    // even on a run that then refuses for want of a commit.
+    let api = ApiStub::start(vec![verify_request(), scan_settings_request(PROJECT)]);
     let (mut command, _home) = cloud_command(&api, project.path());
     command.args([
         "scan",
@@ -626,6 +633,7 @@ fn excluding_files_warns_but_still_reuses_the_commits_scan() {
     let project = git_project();
     let api = ApiStub::start(vec![
         verify_request(),
+        scan_settings_request(PROJECT),
         commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
         clean_detail(&project.sha),
         reused_scan_issues(),
@@ -674,6 +682,42 @@ fn the_window_cannot_be_set_without_the_skip_flag() {
         stderr.contains("--skip-if-commit-scanned-recently"),
         "{context}"
     );
+}
+
+/// The primary SAST-01 path is a rule configured in the web app, with no flag
+/// on the command line — so clap cannot refuse it and the check has to happen
+/// after the rules are read. Retrying a commit after adding a rule must scan,
+/// not reuse a scan that never packaged the files the rule forces in.
+#[test]
+fn a_project_include_rule_refuses_reuse_and_starts_a_new_scan() {
+    let project = git_project();
+    // The full new-scan contract, with the settings lookup answering with a
+    // rule. No commit lookup in it: the rules take reuse off the table before
+    // resolve_reusable_scan is ever asked.
+    let mut plan = blast_upload_plan(&project.sha, false, false);
+    plan[1] = scan_settings_request_with(PROJECT, &["vendor/our-fork/**"]);
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--skip-if-commit-scanned-recently",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains("Scanning instead of reusing a previous scan"),
+        "{context}"
+    );
+    assert!(stdout.contains("CORGEA_SCAN_SKIPPED=false"), "{context}");
+    assert!(stdout.contains("Scanning with BLAST"), "{context}");
 }
 
 /// A force-include rule widens what gets scanned, and the reused candidate was
@@ -735,7 +779,7 @@ fn a_scan_of_another_commit_is_never_reused() {
     let other_commit = "ffffffffffffffffffffffffffffffffffffffff";
     let mut plan = blast_upload_plan(&project.sha, false, false);
     plan.insert(
-        1,
+        2,
         commit_lookup(&project.sha, vec![prior_scan(other_commit, &ago(1))]),
     );
     let api = ApiStub::start(plan);

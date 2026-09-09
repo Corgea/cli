@@ -510,6 +510,28 @@ pub fn extract_repo_host(url: &str) -> Option<String> {
     Some(split_remote(url)?[0].to_lowercase())
 }
 
+/// A git remote with any embedded credential removed.
+///
+/// `https://oauth2:glpat-xxx@gitlab.com/org/repo` becomes
+/// `https://gitlab.com/org/repo`. Only URLs with a `://` scheme are touched:
+/// scp-style `git@github.com:org/repo` carries no secret, and stripping its
+/// `git@` would stop the server recognising it as scp-style, so it would no
+/// longer normalize to the same stored URL.
+///
+/// This is the same userinfo strip the server applies before storing a
+/// `repo_url`, so a redacted value still resolves to the same project — while
+/// keeping the token out of query strings, proxy logs and `--verbose` output.
+pub fn strip_remote_credentials(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let host_end = rest.find('/').unwrap_or(rest.len());
+    match rest[..host_end].rfind('@') {
+        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
+        None => url.to_string(),
+    }
+}
+
 /// Split a git remote into `[host, path segments…]`, dropping scheme, userinfo
 /// and port. None when fewer than two path segments follow the host, or when
 /// nothing marks the value as a network remote.
@@ -952,6 +974,35 @@ mod tests {
             !added.iter().any(|p| p.ends_with("node_modules/x.js")),
             "node_modules file should be excluded: {:?}",
             added
+        );
+    }
+
+    /// A git origin can embed a token, and the settings lookup puts the remote
+    /// in a query string and the debug log.
+    #[test]
+    fn strip_remote_credentials_removes_userinfo_from_scheme_urls() {
+        assert_eq!(
+            strip_remote_credentials("https://oauth2:glpat-secret@gitlab.com/org/repo"),
+            "https://gitlab.com/org/repo"
+        );
+        assert_eq!(
+            strip_remote_credentials("https://token@github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+        assert_eq!(
+            strip_remote_credentials("https://github.com/org/repo"),
+            "https://github.com/org/repo"
+        );
+        // scp-style carries no secret, and stripping `git@` would stop the
+        // server recognising the shape and normalizing it to the stored URL.
+        assert_eq!(
+            strip_remote_credentials("git@github.com:org/repo.git"),
+            "git@github.com:org/repo.git"
+        );
+        // An `@` in the path is not userinfo.
+        assert_eq!(
+            strip_remote_credentials("https://github.com/org/re@po"),
+            "https://github.com/org/re@po"
         );
     }
 

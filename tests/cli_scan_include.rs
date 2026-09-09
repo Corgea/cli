@@ -213,6 +213,58 @@ fn an_include_rule_overrides_exclude_patterns() {
     assert!(uploaded_text(&uploads).contains("generated/Payments.java"));
 }
 
+/// A force-included file is a complete payload on its own, like an exported
+/// image: a target that matches nothing must not abort the run when an include
+/// rule did match something.
+#[test]
+fn a_target_matching_nothing_still_scans_the_force_included_files() {
+    let (base_url, uploads) = spawn_scan_stub("scan-include-empty-target", "[]");
+    let project = stub_project();
+
+    let output = scan(
+        &base_url,
+        &project,
+        &[
+            "--target",
+            "no/such/dir/**",
+            "--include",
+            "node_modules/internal-sdk/index.js",
+        ],
+    );
+
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("the force-included file(s)"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(uploaded_text(&uploads).contains("node_modules/internal-sdk/index.js"));
+}
+
+#[test]
+fn a_repo_wide_include_pattern_is_refused_before_the_scan() {
+    let (base_url, uploads) = spawn_scan_stub("scan-include-broad", "[]");
+    let project = stub_project();
+
+    for pattern in ["**", "["] {
+        let (mut cmd, _home) = corgea_isolated();
+        cmd.current_dir(project.path())
+            .env("CORGEA_URL", &base_url)
+            .env("CORGEA_TOKEN", "test-token")
+            .args(["scan", "--include", pattern]);
+        let output = cmd.output().expect("run corgea scan");
+
+        assert_eq!(output.status.code(), Some(1), "{pattern} should be refused");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("--include"),
+            "stderr should name the flag for {pattern}"
+        );
+    }
+    assert!(
+        uploads.lock().unwrap().is_empty(),
+        "nothing should be packaged for a pattern that was refused"
+    );
+}
+
 #[test]
 fn an_include_rule_that_matches_nothing_warns_and_still_scans() {
     let (base_url, uploads) = spawn_scan_stub("scan-include-nomatch", "[]");

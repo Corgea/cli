@@ -291,6 +291,15 @@ fn confirm_reusable_scan(config: &Config, scan_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Report that this run is scanning, for a refusal decided before
+/// `resolve_reusable_scan` is reached.
+///
+/// The flag promises the marker on every run so a pipeline can branch on it, so
+/// a caller that declines reuse on its own still has to emit it.
+pub fn report_scan_not_skipped() {
+    print_skipped_marker(None);
+}
+
 /// `CORGEA_SCAN_SKIPPED=true|false`, plus the reused scan id when there is one.
 /// Shell-assignment shaped so a pipeline can `eval` or `grep` it.
 fn print_skipped_marker(reused_scan_id: Option<&str>) {
