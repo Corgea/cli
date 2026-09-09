@@ -459,6 +459,28 @@ fn a_directory_that_is_not_a_git_repository_scans_everything() {
 /// analyzed. No flag — CI worktrees are dirty far more often than not.
 #[test]
 fn a_dirty_worktree_diffs_the_working_tree_rather_than_scanning_everything() {
+    let output = scan_a_dirty_worktree(&[]);
+    assert!(output.contains("and your uncommitted changes"), "{output}");
+}
+
+/// Pipelines pass --ignore-dirty-worktree to get exactly the behaviour above,
+/// which it no longer governs. Same scan either way, plus a warning, because a
+/// flag that silently governs nothing is how a pipeline ends up believing it
+/// asked for something.
+#[test]
+fn ignore_dirty_worktree_alone_warns_and_scans_incrementally_anyway() {
+    let output = scan_a_dirty_worktree(&["--ignore-dirty-worktree"]);
+    assert!(output.contains("and your uncommitted changes"), "{output}");
+    assert!(
+        output.contains("--ignore-dirty-worktree has no effect without"),
+        "{output}"
+    );
+}
+
+/// Scan a tree with one uncommitted edit against a baseline at HEAD, asserting
+/// the upload carries a worktree-covering diff. Returns stdout, stderr and the
+/// API transcript, so a caller can assert on whichever stream it cares about.
+fn scan_a_dirty_worktree(extra_args: &[&str]) -> String {
     let project = git_project();
     let base_sha = project.sha.clone();
     std::fs::write(project.path().join("main.py"), "print('uncommitted')\n")
@@ -496,12 +518,12 @@ fn a_dirty_worktree_diffs_the_working_tree_rather_than_scanning_everything() {
     let api = ApiStub::start(plan);
     let (mut command, _home) = cloud_command(&api, project.path());
     command.args(["scan", "blast", "--project-name", PROJECT]);
+    command.args(extra_args);
 
     let output = run_with_timeout(command, &api);
     let transcript = api.assert_finished();
     let context = output_context(&output, &transcript);
-    let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert_eq!(output.status.code(), Some(0), "{context}");
-    assert!(stdout.contains("and your uncommitted changes"), "{context}");
+    context
 }

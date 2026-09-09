@@ -91,6 +91,19 @@ pub fn run(
 
     let project_name = utils::generic::determine_project_name(project_name.as_deref());
 
+    // 1.11.1 gave the flag a `requires` clause, 1.12.0 dropped it to let the
+    // flag also put incremental back on the table for a dirty tree, and nothing
+    // needs it for that any more. So a run can still pass it alone, where it now
+    // governs nothing -- and someone passing it to get an incremental scan would
+    // otherwise get full scans with no idea why.
+    if *ignore_dirty_worktree && skip_recent.is_none() {
+        log::warn!(
+            "--ignore-dirty-worktree has no effect without --skip-if-commit-scanned-recently. \
+             Incremental scans do not need it: a dirty worktree is diffed against the working \
+             tree, so uncommitted and untracked files are analyzed."
+        );
+    }
+
     // A reused scan stands in for the new one: everything below this point —
     // the results table, the blocking-rule gate, the report file — runs against
     // whichever scan id this resolves to.
