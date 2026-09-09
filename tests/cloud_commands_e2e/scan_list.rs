@@ -169,7 +169,7 @@ fn scan_clean_target_upload_sends_dirty_true_without_worktree_notice() {
         .trim()
         .to_string();
 
-    let scan_api = ApiStub::start(blast_upload_plan(&sha, true, false));
+    let scan_api = ApiStub::start(narrowed_blast_upload_plan(&sha));
     let (mut scan_command, _scan_home) = cloud_command(&scan_api, project.path());
     scan_command.args([
         "scan",
@@ -203,7 +203,7 @@ fn scan_clean_exclude_upload_sends_dirty_true_without_worktree_notice() {
         .trim()
         .to_string();
 
-    let scan_api = ApiStub::start(blast_upload_plan(&sha, true, false));
+    let scan_api = ApiStub::start(narrowed_blast_upload_plan(&sha));
     let (mut scan_command, _scan_home) = cloud_command(&scan_api, project.path());
     scan_command.args([
         "scan",

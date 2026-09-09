@@ -809,18 +809,34 @@ pub(crate) fn blast_plan(sha: &str) -> Vec<ExpectedRequest> {
 
 /// BLAST upload contract. `include_sca` covers `--fail-on malicious` (SCA fetch).
 pub(crate) fn blast_upload_plan(sha: &str, dirty: bool, include_sca: bool) -> Vec<ExpectedRequest> {
+    blast_upload_plan_inner(sha, dirty, include_sca, true)
+}
+
+/// BLAST upload contract for a run that never looks for a baseline, because
+/// `--target`/`--exclude` narrowed the archive and findings cannot be carried
+/// forward for files it no longer holds.
+pub(crate) fn narrowed_blast_upload_plan(sha: &str) -> Vec<ExpectedRequest> {
+    blast_upload_plan_inner(sha, true, false, false)
+}
+
+fn blast_upload_plan_inner(
+    sha: &str,
+    dirty: bool,
+    include_sca: bool,
+    baseline_lookups: bool,
+) -> Vec<ExpectedRequest> {
     let patch_sha = sha.to_string();
     let dirty_value = if dirty { "true" } else { "false" }.to_string();
     let patch_path = "/api/v1/start-scan/transfer-123/".to_string();
     let detail_path = "/api/v1/scan/blast-scan-123".to_string();
     let issue_path = "/api/v1/scan/blast-scan-123/issues".to_string();
     let mut plan = vec![verify_request()];
-    // Scans are incremental by default, so every clean-tree run looks for a
-    // baseline before uploading -- once per trunk branch, since the fixture
-    // records no origin/HEAD. Answering with no scans keeps this the full-scan
-    // contract: nothing to diff from, no incremental fields on the upload. A
-    // dirty tree never asks.
-    if !dirty {
+    // Scans are incremental by default, so a run looks for a baseline before
+    // uploading -- once per trunk branch, since the fixture records no
+    // origin/HEAD. A dirty tree asks too: its diff moves to the working tree
+    // rather than giving up. Answering with no scans keeps this the full-scan
+    // contract: nothing to diff from, no incremental fields on the upload.
+    if baseline_lookups {
         for branch in ["main", "master"] {
             plan.push(expected_request(
                 "look up a baseline scan to diff against",

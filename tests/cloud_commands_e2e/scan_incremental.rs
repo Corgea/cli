@@ -453,11 +453,12 @@ fn a_directory_that_is_not_a_git_repository_scans_everything() {
     );
 }
 
-/// `--ignore-dirty-worktree` does not pretend the tree is clean: it moves the
-/// far side of the diff to the working tree, so the edited file is named and
-/// rescanned rather than keeping findings nothing analyzed.
+/// A dirty tree does not pretend to be clean, and does not give up on
+/// incremental either: the far side of the diff moves to the working tree, so
+/// the edited file is named and rescanned rather than keeping findings nothing
+/// analyzed. No flag — CI worktrees are dirty far more often than not.
 #[test]
-fn ignore_dirty_worktree_diffs_the_working_tree_instead_of_refusing() {
+fn a_dirty_worktree_diffs_the_working_tree_rather_than_scanning_everything() {
     let project = git_project();
     let base_sha = project.sha.clone();
     std::fs::write(project.path().join("main.py"), "print('uncommitted')\n")
@@ -494,57 +495,6 @@ fn ignore_dirty_worktree_diffs_the_working_tree_instead_of_refusing() {
 
     let api = ApiStub::start(plan);
     let (mut command, _home) = cloud_command(&api, project.path());
-    command.args([
-        "scan",
-        "blast",
-        "--ignore-dirty-worktree",
-        "--project-name",
-        PROJECT,
-    ]);
-
-    let output = run_with_timeout(command, &api);
-    let transcript = api.assert_finished();
-    let context = output_context(&output, &transcript);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert_eq!(output.status.code(), Some(0), "{context}");
-    assert!(stdout.contains("and your uncommitted changes"), "{context}");
-}
-
-/// The server refuses a dirty tree too, and the refusal must come before the
-/// baseline lookup: a commit-to-commit diff cannot see uncommitted edits, so no
-/// baseline makes the list correct.
-#[test]
-fn a_dirty_worktree_skips_the_baseline_lookup_and_scans_everything() {
-    let project = git_project();
-    let head_sha = second_commit(&project);
-    std::fs::write(project.path().join("main.py"), "print('uncommitted')\n")
-        .expect("dirty the tree");
-
-    let patch_sha = head_sha.clone();
-    let mut plan = vec![
-        verify_request(),
-        start_upload(),
-        expected_request(
-            "upload BLAST archive with no diff",
-            move |request| {
-                assert_authenticated_request(
-                    request,
-                    Method::PATCH,
-                    "/api/v1/start-scan/transfer-123/",
-                )?;
-                assert_multipart_text_field(request, "sha", &patch_sha)?;
-                assert_multipart_text_field(request, "dirty", "true")?;
-                assert_no_multipart_field(request, "incremental_base_sha")?;
-                assert_no_multipart_field(request, "incremental_changed_files")
-            },
-            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
-        ),
-    ];
-    plan.extend(scan_tail());
-
-    let api = ApiStub::start(plan);
-    let (mut command, _home) = cloud_command(&api, project.path());
     command.args(["scan", "blast", "--project-name", PROJECT]);
 
     let output = run_with_timeout(command, &api);
@@ -553,8 +503,5 @@ fn a_dirty_worktree_skips_the_baseline_lookup_and_scans_everything() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert_eq!(output.status.code(), Some(0), "{context}");
-    assert!(
-        stdout.contains("Scanning every file: this worktree has uncommitted changes"),
-        "{context}"
-    );
+    assert!(stdout.contains("and your uncommitted changes"), "{context}");
 }
