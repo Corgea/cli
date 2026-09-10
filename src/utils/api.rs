@@ -3,11 +3,11 @@ use crate::log::debug;
 use crate::utils;
 use corgea::vuln_api::{auth_header, source};
 use reqwest::header::HeaderMap;
-use reqwest::StatusCode;
 use reqwest::{
     blocking::multipart,
     blocking::multipart::{Form, Part},
 };
+use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
@@ -161,6 +161,17 @@ impl DebugRequestBuilder {
             None => debug("  Cookie: (none in jar for this URL)"),
         }
 
+        if !is_replayable(request.method()) {
+            debug(&format!(
+                "  Sending once: a {} is not safe to replay.",
+                request.method()
+            ));
+            let response = client.execute(request)?;
+            debug(&format!("← {} {}", response.status(), response.url()));
+            debug(&format!("  Response headers: {:?}", response.headers()));
+            return Ok(response);
+        }
+
         let mut retries =
             GatewayRetries::new(format!("{} {}", request.method(), request.url().path()));
         loop {
@@ -192,6 +203,28 @@ impl DebugRequestBuilder {
 /// produces these, the retry succeeds where failing the pipeline would not.
 pub fn is_gateway_error(status: StatusCode) -> bool {
     status == StatusCode::BAD_GATEWAY
+}
+
+/// Whether a gateway error can be answered by sending the same request again.
+///
+/// A 502 comes from the proxy, not from Corgea, so it says nothing about
+/// whether the API handled the request: it is equally the answer for "the
+/// request never arrived" and for "the request was processed and the reply was
+/// lost coming back". Replaying is therefore only safe where the second copy
+/// lands on top of the first, which is a property of the method:
+///
+/// - `GET` and the other safe methods change nothing, and they are also the
+///   volume — one scan wait is thousands of status reads against a handful of
+///   writes, so this is where retrying earns its keep.
+/// - `PATCH` replays. Every `PATCH` the CLI sends is an upload chunk carrying
+///   the byte range it fills in `Upload-Offset`, so a re-sent chunk writes over
+///   the range it already wrote instead of appending a second copy.
+/// - `POST` does not replay. These are the creates: `POST /start-scan` mints a
+///   new transfer and `POST /scan-upload` takes a whole report. When the API
+///   commits one of those and the proxy loses the reply, sending it again does
+///   not finish the first scan — it starts a second one.
+fn is_replayable(method: &Method) -> bool {
+    method.is_safe() || method == Method::PATCH
 }
 
 /// Pauses before each replay of a request the gateway rejected: a 502 has to
@@ -336,13 +369,23 @@ impl Drop for GatewayRetryGuard {
 /// `send` replays a request it can clone; a multipart body is a stream with
 /// nothing to clone, so the upload call sites come through here and build a
 /// fresh form each time. `operation` names the request in the retry logs.
+///
+/// `method` is the one the closure sends. `send` reads the method off the
+/// request it built, but a closure is opaque, so the call site has to say which
+/// method it is for `is_replayable` to rule on. A method that may not be
+/// replayed still gets the network-error retries, where the request never
+/// reached Corgea at all.
 pub fn send_with_retries<F>(
     operation: &str,
+    method: &Method,
     mut make_request: F,
 ) -> reqwest::Result<reqwest::blocking::Response>
 where
     F: FnMut() -> reqwest::Result<reqwest::blocking::Response>,
 {
+    if !is_replayable(method) {
+        return retry_on_network_error(operation, make_request);
+    }
     let _guard = GatewayRetryGuard::enter();
     let mut retries = GatewayRetries::new(operation);
     loop {
@@ -453,7 +496,7 @@ pub fn upload_zip(
 
     // The form is built per attempt: a multipart body is a stream, so a retry
     // has nothing to replay unless the whole request is made again.
-    let response_object = send_with_retries("the scan start request", || {
+    let response_object = send_with_retries("the scan start request", &Method::POST, || {
         let form = reqwest::blocking::multipart::Form::new()
             .part(
                 "files",
@@ -535,95 +578,98 @@ pub fn upload_zip(
 
         // Rebuilt per attempt: a multipart body is a stream, so a retry has
         // nothing to replay unless the whole request is made again.
-        let response = match send_with_retries("a scan archive chunk upload", || {
-            let mut form = Form::new()
-                .part(
-                    "chunk_data",
-                    Part::bytes(chunk.to_vec())
-                        .file_name(file_name.to_string())
-                        .mime_str("application/octet-stream")?,
-                )
-                .part(
-                    "project_name",
-                    multipart::Part::text(project_name.to_string()),
-                )
-                .part("file_size", multipart::Part::text(file_size.to_string()));
-            if let Some(ref info) = repo_info {
-                if let Some(branch) = &info.branch {
-                    form = form.part("branch", multipart::Part::text(branch.to_string()));
-                }
-                if let Some(repo_url) = &info.repo_url {
-                    form = form.part("repo_url", multipart::Part::text(repo_url.to_string()));
-                }
-                if let Some(sha) = &info.sha {
-                    form = form.part("sha", multipart::Part::text(sha.to_string()));
-                }
-                // Always send: omitted = old CLI; false = clean HEAD snapshot.
-                form = form.part(
-                    "dirty",
-                    multipart::Part::text(if info.dirty { DIRTY_TRUE } else { DIRTY_FALSE }),
-                );
-            }
-            if let Some(scan_type) = scan_type.clone() {
-                let scan_type = if scan_type.contains("blast") {
-                    "base".to_string()
-                } else {
-                    scan_type
-                };
-                form = form.part("scan_configs", multipart::Part::text(scan_type.to_string()));
-            }
-            if let Some(policy) = policy.clone() {
-                form = form.part("target_policies", multipart::Part::text(policy.to_string()));
-            }
-            if let Some(meta) = &metadata {
-                form = form.part("metadata", multipart::Part::text(meta.clone()));
-            }
-            // Both fields or neither: the list is only safe next to the commit
-            // it was measured from, and a server seeing one without the other
-            // would guess a baseline. A list that will not serialize drops
-            // both, leaving a full scan.
-            if let Some(plan) = &incremental {
-                match serde_json::to_string(&plan.changed_files) {
-                    Ok(changed_files) => {
-                        form = form.part(
-                            "incremental_base_sha",
-                            multipart::Part::text(plan.base_sha.clone()),
-                        );
-                        form = form.part(
-                            "incremental_changed_files",
-                            multipart::Part::text(changed_files),
-                        );
-                        // Tells the server the list describes the working tree,
-                        // not just a commit range, which is the only way it can
-                        // accept a diff from a dirty upload.
-                        if plan.covers_worktree {
-                            form = form
-                                .part("incremental_covers_worktree", multipart::Part::text("true"));
-                        }
+        let response =
+            match send_with_retries("a scan archive chunk upload", &Method::PATCH, || {
+                let mut form = Form::new()
+                    .part(
+                        "chunk_data",
+                        Part::bytes(chunk.to_vec())
+                            .file_name(file_name.to_string())
+                            .mime_str("application/octet-stream")?,
+                    )
+                    .part(
+                        "project_name",
+                        multipart::Part::text(project_name.to_string()),
+                    )
+                    .part("file_size", multipart::Part::text(file_size.to_string()));
+                if let Some(ref info) = repo_info {
+                    if let Some(branch) = &info.branch {
+                        form = form.part("branch", multipart::Part::text(branch.to_string()));
                     }
-                    Err(e) => debug(&format!(
+                    if let Some(repo_url) = &info.repo_url {
+                        form = form.part("repo_url", multipart::Part::text(repo_url.to_string()));
+                    }
+                    if let Some(sha) = &info.sha {
+                        form = form.part("sha", multipart::Part::text(sha.to_string()));
+                    }
+                    // Always send: omitted = old CLI; false = clean HEAD snapshot.
+                    form = form.part(
+                        "dirty",
+                        multipart::Part::text(if info.dirty { DIRTY_TRUE } else { DIRTY_FALSE }),
+                    );
+                }
+                if let Some(scan_type) = scan_type.clone() {
+                    let scan_type = if scan_type.contains("blast") {
+                        "base".to_string()
+                    } else {
+                        scan_type
+                    };
+                    form = form.part("scan_configs", multipart::Part::text(scan_type.to_string()));
+                }
+                if let Some(policy) = policy.clone() {
+                    form = form.part("target_policies", multipart::Part::text(policy.to_string()));
+                }
+                if let Some(meta) = &metadata {
+                    form = form.part("metadata", multipart::Part::text(meta.clone()));
+                }
+                // Both fields or neither: the list is only safe next to the commit
+                // it was measured from, and a server seeing one without the other
+                // would guess a baseline. A list that will not serialize drops
+                // both, leaving a full scan.
+                if let Some(plan) = &incremental {
+                    match serde_json::to_string(&plan.changed_files) {
+                        Ok(changed_files) => {
+                            form = form.part(
+                                "incremental_base_sha",
+                                multipart::Part::text(plan.base_sha.clone()),
+                            );
+                            form = form.part(
+                                "incremental_changed_files",
+                                multipart::Part::text(changed_files),
+                            );
+                            // Tells the server the list describes the working tree,
+                            // not just a commit range, which is the only way it can
+                            // accept a diff from a dirty upload.
+                            if plan.covers_worktree {
+                                form = form.part(
+                                    "incremental_covers_worktree",
+                                    multipart::Part::text("true"),
+                                );
+                            }
+                        }
+                        Err(e) => debug(&format!(
                         "Could not serialize the incremental file list, scanning every file: {e}"
                     )),
+                    }
                 }
-            }
 
-            client
-                .patch(format!("{}{}/start-scan/{}/", url, API_BASE, transfer_id))
-                .header("Upload-Offset", offset.to_string())
-                .header("Upload-Length", file_size.to_string())
-                .header("Upload-Name", file_name)
-                .query(&[("scan_type", "blast")])
-                .multipart(form)
-                .send()
-        }) {
-            Ok(response) => {
-                check_for_warnings(response.headers(), response.status());
-                response
-            }
-            Err(e) => {
-                return Err(format!("Failed to send request: {}", e).into());
-            }
-        };
+                client
+                    .patch(format!("{}{}/start-scan/{}/", url, API_BASE, transfer_id))
+                    .header("Upload-Offset", offset.to_string())
+                    .header("Upload-Length", file_size.to_string())
+                    .header("Upload-Name", file_name)
+                    .query(&[("scan_type", "blast")])
+                    .multipart(form)
+                    .send()
+            }) {
+                Ok(response) => {
+                    check_for_warnings(response.headers(), response.status());
+                    response
+                }
+                Err(e) => {
+                    return Err(format!("Failed to send request: {}", e).into());
+                }
+            };
         if !response.status().is_success() {
             let status_code = response.status();
             let response_text = response
@@ -2757,17 +2803,78 @@ mod tests {
     }
 
     #[test]
+    fn only_reads_and_offset_addressed_chunk_uploads_may_be_replayed() {
+        for method in [
+            Method::GET,
+            Method::HEAD,
+            Method::OPTIONS,
+            Method::TRACE,
+            Method::PATCH,
+        ] {
+            assert!(is_replayable(&method), "{method} should be replayed");
+        }
+        // A create sent twice is a second scan, so no 502 is worth a second
+        // send: the proxy cannot tell us whether the first one was committed.
+        for method in [Method::POST, Method::PUT, Method::DELETE] {
+            assert!(!is_replayable(&method), "{method} must be sent once");
+        }
+    }
+
+    #[test]
+    fn send_leaves_a_post_at_one_attempt() {
+        let (base, hits) = spawn_gateway_stub(usize::MAX);
+
+        let response = http_client().post(&base).body("{}").send().expect("send");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a 502 on a create has to reach the caller, not be sent again"
+        );
+    }
+
+    #[test]
+    fn send_replays_a_patch() {
+        // The chunk uploads name the byte range they fill, so the retry that a
+        // create must not get is exactly the one a chunk should.
+        let (base, hits) = spawn_gateway_stub(2);
+
+        let response = http_client().patch(&base).body("{}").send().expect("send");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "two 502s, then the answer");
+    }
+
+    #[test]
     fn send_with_retries_replays_a_multipart_body_send_cannot_clone() {
         let (base, hits) = spawn_gateway_stub(2);
 
-        let response = send_with_retries("a multipart upload", || {
+        let response = send_with_retries("a chunk upload", &Method::PATCH, || {
             let form = reqwest::blocking::multipart::Form::new().text("field", "value");
-            http_client().post(&base).multipart(form).send()
+            http_client().patch(&base).multipart(form).send()
         })
         .expect("send");
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn send_with_retries_leaves_a_post_at_one_attempt() {
+        // The archive and report uploads rebuild their multipart form per
+        // attempt, so this is the path that turned one `corgea scan` into
+        // several scans; the rebuilding must not become a licence to replay.
+        let (base, hits) = spawn_gateway_stub(usize::MAX);
+
+        let response = send_with_retries("a scan upload", &Method::POST, || {
+            let form = reqwest::blocking::multipart::Form::new().text("field", "value");
+            http_client().post(&base).multipart(form).send()
+        })
+        .expect("send");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -2777,8 +2884,8 @@ mod tests {
         // and six minutes of waiting.
         let (base, hits) = spawn_gateway_stub(usize::MAX);
 
-        let response = send_with_retries("a retryable body", || {
-            http_client().post(&base).body("{}").send()
+        let response = send_with_retries("a retryable body", &Method::PATCH, || {
+            http_client().patch(&base).body("{}").send()
         })
         .expect("send");
 

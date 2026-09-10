@@ -1,6 +1,9 @@
 //! The CLI's answer to intermittent `502 Bad Gateway` from the proxy in front
 //! of Corgea: replay the request on a fixed schedule instead of failing the
-//! pipeline, and exit non-zero only once the retries are spent.
+//! pipeline, and exit non-zero only once the retries are spent — but only for
+//! the requests a second copy of is harmless. A `POST` is a create, and the
+//! proxy cannot say whether the API committed the first one, so those are sent
+//! once and the 502 goes to the caller.
 //!
 //! The stub's plan is ordered and rejects unexpected requests, so these tests
 //! pin the exact attempt count as well as the outcome — a retry loop that runs
@@ -97,51 +100,51 @@ fn wait_exits_unclean_once_the_retries_are_spent() {
 }
 
 #[test]
-fn a_source_upload_is_not_retried_past_the_schedule() {
-    // `corgea upload` retries a failed source upload three times of its own
-    // accord. Those attempts must not each spend the gateway schedule again:
-    // that is 12 requests and four and a half minutes for one file.
-    let project = report_project();
+fn a_rejected_scan_start_is_not_sent_again() {
+    // The incident this guards: `POST /start-scan` mints a transfer, and the
+    // 502 the proxy returns is also what it returns after the API committed one
+    // and the reply was lost. Replaying it was turning a single `corgea scan`
+    // into a scan per attempt in the project.
+    let project = git_project();
     let mut plan = vec![verify_request()];
-    for _ in 0..ATTEMPTS {
+    for branch in ["main", "master"] {
         plan.push(expected_request(
-            "reject the source upload with a gateway error",
-            |request| assert_authenticated_request(request, Method::POST, "/api/v1/code-upload"),
-            bad_gateway(),
+            "look up a baseline scan to diff against",
+            move |request| assert_baseline_lookup_request(request, "cloud-e2e", branch),
+            json_response(scans_response(Vec::new())),
         ));
     }
+    plan.push(expected_request(
+        "reject the scan start with a gateway error",
+        |request| assert_authenticated_request(request, Method::POST, "/api/v1/start-scan"),
+        bad_gateway(),
+    ));
     let api = ApiStub::start(plan);
     let (mut command, _home) = cloud_command(&api, project.path());
     command.env(FAST_RETRIES.0, FAST_RETRIES.1);
-    command.args([
-        "upload",
-        project.report_path().to_str().expect("UTF-8 report path"),
-        "--project-name",
-        "upload-contract",
-    ]);
+    command.args(["scan", "blast", "--project-name", "cloud-e2e"]);
 
     let output = run_with_timeout(command, &api);
+    // A second start-scan would be an unexpected request, and the stub fails
+    // the plan on it.
     let transcript = api.assert_finished();
     let context = output_context(&output, &transcript);
-    assert_eq!(output.status.code(), Some(1), "{context}");
+    assert_ne!(output.status.code(), Some(0), "{context}");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Giving up"), "{context}");
-    assert!(
-        stderr.contains("Failed to upload any files for the scan"),
-        "{context}"
-    );
+    assert!(!stderr.contains("Retrying in"), "{context}");
 }
 
 #[test]
-fn an_exhausted_gateway_stops_the_whole_source_upload_walk() {
-    // The schedule is spent on the platform being unavailable, not on one file,
-    // so the paths behind the failed one must not each start a fresh 90s of
-    // retries. With two referenced sources, a walk that kept going would ask
-    // for eight uploads instead of four.
+fn a_rejected_source_upload_stops_the_whole_upload_walk() {
+    // A source upload is a `POST`, so the 502 is the answer rather than the
+    // start of a schedule. It is also the platform being unavailable rather
+    // than something wrong with this one file, so the paths behind it must not
+    // each collect the same answer: with two referenced sources, a walk that
+    // kept going would ask for two uploads instead of one.
     let project = two_source_report_project();
-    let mut plan = vec![verify_request()];
-    for _ in 0..ATTEMPTS {
-        plan.push(expected_request(
+    let plan = vec![
+        verify_request(),
+        expected_request(
             "reject the source upload with a gateway error",
             |request| {
                 assert_authenticated_request(request, Method::POST, "/api/v1/code-upload")?;
@@ -154,8 +157,8 @@ fn an_exhausted_gateway_stops_the_whole_source_upload_walk() {
                 Ok(())
             },
             bad_gateway(),
-        ));
-    }
+        ),
+    ];
     let api = ApiStub::start(plan);
     let (mut command, _home) = cloud_command(&api, project.path());
     command.env(FAST_RETRIES.0, FAST_RETRIES.1);
@@ -167,8 +170,8 @@ fn an_exhausted_gateway_stops_the_whole_source_upload_walk() {
     ]);
 
     let output = run_with_timeout(command, &api);
-    // A fifth upload would be the second file starting the schedule again, and
-    // the stub rejects it as unexpected.
+    // A second upload would be either a replay of the first file or the walk
+    // reaching the next one, and the stub rejects it as unexpected.
     let transcript = api.assert_finished();
     let context = output_context(&output, &transcript);
     assert_eq!(output.status.code(), Some(1), "{context}");
