@@ -1,9 +1,9 @@
 //! The CLI's answer to intermittent `502 Bad Gateway` from the proxy in front
-//! of Corgea: replay the request on a fixed schedule instead of failing the
-//! pipeline, and exit non-zero only once the retries are spent — but only for
-//! the requests a second copy of is harmless. A `POST` is a create, and the
-//! proxy cannot say whether the API committed the first one, so those are sent
-//! once and the 502 goes to the caller.
+//! of Corgea: replay the read on a fixed schedule instead of failing the
+//! pipeline, and exit non-zero only once the retries are spent. Writes are sent
+//! once — the proxy cannot say whether the API committed the first copy, and
+//! every write the CLI sends creates something — so their 502 goes straight to
+//! the caller.
 //!
 //! The stub's plan is ordered and rejects unexpected requests, so these tests
 //! pin the exact attempt count as well as the outcome — a retry loop that runs
@@ -186,40 +186,37 @@ fn a_rejected_source_upload_stops_the_whole_upload_walk() {
 }
 
 #[test]
-fn blast_upload_replays_an_archive_chunk_the_gateway_rejects() {
-    // The upload bodies are streamed multipart forms, which cannot be replayed
-    // from a built request — this is what proves the form is rebuilt, since the
-    // planned chunk request that follows asserts every field of it.
+fn a_rejected_archive_chunk_is_not_sent_again() {
+    // The archive chunk names the byte range it fills, so a replay would not
+    // double the bytes. It is excluded anyway: the chunk that fills the last of
+    // `Upload-Length` is the one that answers with `scan_id`, and an archive
+    // under the 50 MB chunk size — which this fixture, and most repos, is — has
+    // only that one chunk. Replaying it risks the second scan.
     let project = git_project();
-    let mut plan = blast_upload_plan(&project.sha, false, false);
     // `blast_upload_plan` order: verify, two baseline lookups, the start-scan
-    // POST, then the chunk PATCH this rejects once before letting it through.
+    // POST, then the chunk PATCH. Everything from the chunk on is dropped,
+    // since the rejected chunk ends the command.
+    let mut plan = blast_upload_plan(&project.sha, false, false);
     const ARCHIVE_UPLOAD: usize = 4;
-    plan.insert(
-        ARCHIVE_UPLOAD,
-        expected_request(
-            "reject the archive chunk with a gateway error",
-            |request| {
-                assert_authenticated_request(
-                    request,
-                    Method::PATCH,
-                    "/api/v1/start-scan/transfer-123/",
-                )
-            },
-            bad_gateway(),
-        ),
-    );
+    plan.truncate(ARCHIVE_UPLOAD);
+    plan.push(expected_request(
+        "reject the archive chunk with a gateway error",
+        |request| {
+            assert_authenticated_request(request, Method::PATCH, "/api/v1/start-scan/transfer-123/")
+        },
+        bad_gateway(),
+    ));
     let api = ApiStub::start(plan);
     let (mut command, _home) = cloud_command(&api, project.path());
     command.env(FAST_RETRIES.0, FAST_RETRIES.1);
     command.args(["scan", "blast", "--project-name", "cloud-e2e"]);
 
     let output = run_with_timeout(command, &api);
+    // A second chunk would be an unexpected request, and the stub fails the
+    // plan on it.
     let transcript = api.assert_finished();
     let context = output_context(&output, &transcript);
-    assert_eq!(output.status.code(), Some(0), "{context}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Scan Completed Successfully"), "{context}");
+    assert_ne!(output.status.code(), Some(0), "{context}");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("502 Bad Gateway"), "{context}");
+    assert!(!stderr.contains("Retrying in"), "{context}");
 }

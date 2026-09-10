@@ -48,31 +48,27 @@ evaluated; override with `CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS`.
 trips: both are written before `--fail`/`--block-on` are evaluated, so a scan
 that exits 1 on a blocking rule still leaves its report behind to ingest.
 
-### Gateway errors are retried where a second copy is harmless
+### Gateway errors are retried on reads, never on writes
 
 A read that the platform's proxy answers `502 Bad Gateway` replays itself,
 waiting 10s, then 30s, then 50s, so a pipeline rides out the blips a busy
-platform produces under parallel scans instead of failing on them. This covers
-every `GET` — including the status reads a scan wait is almost entirely made of
-— and the chunk uploads, which carry the byte range they fill in `Upload-Offset`
-and so overwrite that range rather than appending a second copy. A request still
-answered 502 after those three retries fails the command in the usual way, so a
-real outage still exits non-zero. Each retry is logged, and the count belongs to
-a single request: any successful call starts the next one with the full three
+platform produces under parallel scans instead of failing on them. That covers
+the status reads a scan wait is almost entirely made of. A read still answered
+502 after those three retries fails the command in the usual way, so a real
+outage still exits non-zero. Each retry is logged, and the count belongs to a
+single request: any successful call starts the next one with the full three
 retries again.
 
-The chunk that fills the last of an upload is also the one that answers with the
-new scan's id, so retrying it relies on Corgea keying that scan to the transfer
-it completes rather than minting one per completing request.
+Writes are sent once. A 502 comes from the proxy rather than from Corgea, so it
+is equally the answer for "the request never arrived" and for "the request was
+processed and the reply was lost coming back", and every write the CLI sends
+creates something — a scan, a report, an uploaded source file. Sending one again
+does not finish the first scan, it starts a second one. Writes keep the retries
+for network errors, where nothing reached Corgea at all.
 
-Requests that create something — starting a scan, and uploading a report or a
-source file — are sent once. A 502 comes from the proxy rather than from Corgea,
-so it is equally the answer for "the request never arrived" and for "the request
-was processed and the reply was lost coming back"; sending a create again does
-not finish the first scan, it starts a second one. `corgea upload` treats a 502
-on a source upload as the platform being unavailable rather than one bad file
-and reports the remaining paths as unsent instead of collecting the same answer
-once per path.
+`corgea upload` treats a 502 on a source upload as the platform being
+unavailable rather than one bad file, and reports the remaining paths as unsent
+instead of collecting the same answer once per path.
 
 ### Skipping a re-scan of the same commit
 
