@@ -1,9 +1,12 @@
-//! The CLI's answer to intermittent `502 Bad Gateway` from the proxy in front
-//! of Corgea: replay the read on a fixed schedule instead of failing the
-//! pipeline, and exit non-zero only once the retries are spent. Writes are sent
-//! once — the proxy cannot say whether the API committed the first copy, and
-//! every write the CLI sends creates something — so their 502 goes straight to
-//! the caller.
+//! The CLI's answer to the two statuses that are not Corgea rejecting a request
+//! on its merits: retry on a fixed schedule instead of failing the pipeline, and
+//! exit non-zero only once the retries are spent.
+//!
+//! Which requests get that retry depends on which status it is. A `429` is the
+//! rate limiter declining the request before the API sees it, so every method is
+//! sent again, writes included. A `502` comes from the proxy, which cannot say
+//! whether the API acted, so only reads are replayed and a write's 502 goes
+//! straight to the caller.
 //!
 //! The stub's plan is ordered and rejects unexpected requests, so these tests
 //! pin the exact attempt count as well as the outcome — a retry loop that runs
@@ -26,6 +29,13 @@ fn bad_gateway() -> (StatusCode, String) {
         StatusCode::BAD_GATEWAY,
         "<html><head><title>502 Bad Gateway</title></head><body>502 Bad Gateway</body></html>"
             .to_string(),
+    )
+}
+
+fn too_many_requests() -> (StatusCode, String) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        r#"{"message":"rate limit exceeded"}"#.to_string(),
     )
 }
 
@@ -97,6 +107,92 @@ fn wait_exits_unclean_once_the_retries_are_spent() {
         stderr.contains(&format!("Unable to read scan '{scan_id}'")),
         "{context}"
     );
+}
+
+#[test]
+fn a_rate_limited_scan_start_goes_through_on_a_retry() {
+    // The upload bodies are streamed multipart forms, which cannot be replayed
+    // from a request that was already built — so this also proves the form is
+    // rebuilt per attempt, since the planned start-scan that follows asserts
+    // every field of it.
+    let project = git_project();
+    let mut plan = blast_upload_plan(&project.sha, false, false);
+    // `blast_upload_plan` order: verify, two baseline lookups, the start-scan
+    // POST this rate-limits twice before letting through, then the chunk PATCH.
+    const SCAN_START: usize = 3;
+    for _ in 0..2 {
+        plan.insert(
+            SCAN_START,
+            expected_request(
+                "rate-limit the scan start",
+                |request| assert_authenticated_request(request, Method::POST, "/api/v1/start-scan"),
+                too_many_requests(),
+            ),
+        );
+    }
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.env(FAST_RETRIES.0, FAST_RETRIES.1);
+    command.args(["scan", "blast", "--project-name", "cloud-e2e"]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    // A rate limit never reached the API, so re-sending the create finishes the
+    // one scan rather than starting another.
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Scan Completed Successfully"), "{context}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("429 Too Many Requests"), "{context}");
+    assert!(stderr.contains("Retrying in"), "{context}");
+    assert!(!stderr.contains("Giving up"), "{context}");
+}
+
+#[test]
+fn an_exhausted_rate_limit_stops_the_whole_source_upload_walk() {
+    // The retries are spent on the platform declining to take uploads, not on
+    // one file, so the paths behind it must not each spend the schedule again:
+    // with two referenced sources that would be eight uploads instead of four.
+    let project = two_source_report_project();
+    let mut plan = vec![verify_request()];
+    for _ in 0..ATTEMPTS {
+        plan.push(expected_request(
+            "rate-limit the source upload",
+            |request| {
+                assert_authenticated_request(request, Method::POST, "/api/v1/code-upload")?;
+                // Whichever of the two sources is walked first: the point is
+                // how many uploads are attempted, not their order.
+                let path = query_value(request, "path")?;
+                if !path.starts_with("src/") {
+                    return Err(format!("unexpected upload path {path}"));
+                }
+                Ok(())
+            },
+            too_many_requests(),
+        ));
+    }
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.env(FAST_RETRIES.0, FAST_RETRIES.1);
+    command.args([
+        "upload",
+        project.report_path().to_str().expect("UTF-8 report path"),
+        "--project-name",
+        "upload-contract",
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    // A fifth upload would be the second file starting the schedule again, and
+    // the stub rejects it as unexpected.
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    assert_eq!(output.status.code(), Some(1), "{context}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Giving up"), "{context}");
+    // The file that was never attempted is still reported as unsent, so the
+    // summary cannot read as a single bad file.
+    assert!(stderr.contains("2 of 2 files were not sent"), "{context}");
 }
 
 #[test]
