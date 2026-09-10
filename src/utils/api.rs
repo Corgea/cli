@@ -218,7 +218,13 @@ pub fn is_gateway_error(status: StatusCode) -> bool {
 ///   writes, so this is where retrying earns its keep.
 /// - `PATCH` replays. Every `PATCH` the CLI sends is an upload chunk carrying
 ///   the byte range it fills in `Upload-Offset`, so a re-sent chunk writes over
-///   the range it already wrote instead of appending a second copy.
+///   the range it already wrote instead of appending a second copy. That covers
+///   the archive bytes but not the transfer's completion: the chunk that fills
+///   the last of `Upload-Length` is the one that answers with `scan_id`, and an
+///   archive under `CHUNK_SIZE` is a single chunk, so on most repos this is
+///   also the request that creates the scan. Replaying it is only free while
+///   the API keys that scan to the `transfer_id` already in the URL instead of
+///   creating one per completing request.
 /// - `POST` does not replay. These are the creates: `POST /start-scan` mints a
 ///   new transfer and `POST /scan-upload` takes a whole report. When the API
 ///   commits one of those and the proxy loses the reply, sending it again does

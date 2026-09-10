@@ -61,6 +61,10 @@ real outage still exits non-zero. Each retry is logged, and the count belongs to
 a single request: any successful call starts the next one with the full three
 retries again.
 
+The chunk that fills the last of an upload is also the one that answers with the
+new scan's id, so retrying it relies on Corgea keying that scan to the transfer
+it completes rather than minting one per completing request.
+
 Requests that create something — starting a scan, and uploading a report or a
 source file — are sent once. A 502 comes from the proxy rather than from Corgea,
 so it is equally the answer for "the request never arrived" and for "the request
