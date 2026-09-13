@@ -68,21 +68,14 @@ pub fn resolve_incremental_plan(
     branch: Option<&str>,
     head_sha: Option<&str>,
     worktree_dirty: bool,
-    ignore_dirty_worktree: bool,
 ) -> Option<IncrementalPlan> {
     // A commit-to-commit diff cannot see uncommitted edits, so on a dirty tree
-    // it leaves modified files off the list and their old findings are copied
-    // forward as current. --ignore-dirty-worktree does not paper over that; it
-    // switches the diff to measure the working tree, so those files are named
-    // and rescanned like any other change.
+    // it would leave modified files off the list and their old findings would be
+    // copied forward as current. Diff the working tree instead, which is what
+    // this run uploads: modified and untracked files are named and rescanned
+    // like any other change. Gitignored files are absent from both the diff and
+    // the archive, so nothing unnamed is left to go stale.
     let covers_worktree = worktree_dirty;
-    if worktree_dirty && !ignore_dirty_worktree {
-        explain_full_scan(
-            "this worktree has uncommitted changes, and a commit-to-commit diff cannot \
-             see them. Pass --ignore-dirty-worktree to diff the working tree instead",
-        );
-        return None;
-    }
 
     // Nothing to diff from. Covers a non-git directory, a repo with no commit,
     // a detached HEAD, and a scan started below the repo root — none of which
@@ -324,9 +317,6 @@ fn is_usable_baseline(scan: &ScanResponse) -> bool {
 /// findings in a tree no longer holding it; a rename is a delete plus an add
 /// whose old path needs the same. `--target`'s `git:diff=` selector wants the
 /// opposite — paths still on disk, to archive — hence no reuse.
-///
-/// Untracked files are not a gap: they make the worktree dirty, already
-/// refused above.
 ///
 /// Submodules are the one thing this cannot describe. A committed pointer bump
 /// is one gitlink delta naming the submodule directory, while packaging walks
@@ -638,6 +628,21 @@ mod tests {
         let files = changed_files_since(&repo, &base, "unused", true).expect("diff");
 
         assert_eq!(files, vec!["added.txt", "edit.txt", "gone.txt", "keep.txt"]);
+    }
+
+    #[test]
+    fn a_worktree_diff_leaves_gitignored_files_out() {
+        // Build output is what makes a CI worktree dirty, and packaging applies
+        // the same ignore rules, so an unnamed ignored file is not in the
+        // archive either and has no findings to carry forward.
+        let (dir, repo, _base, head) = repo_with_history();
+        fs::write(dir.path().join(".gitignore"), "build/\n").expect("ignore");
+        fs::create_dir(dir.path().join("build")).expect("mkdir");
+        fs::write(dir.path().join("build/out.js"), "generated").expect("build output");
+
+        let files = changed_files_since(&repo, &head, &head, true).expect("diff");
+
+        assert_eq!(files, vec![".gitignore"]);
     }
 
     /// Commit whose tree carries a `vendor` gitlink pointing at `target`.
