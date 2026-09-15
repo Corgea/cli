@@ -1,6 +1,7 @@
 use crate::cicd::*;
 use crate::log::debug;
 use crate::scanners::parsers::ScanParserFactory;
+use crate::scanners::report_paths;
 use crate::{utils, Config};
 use reqwest::header;
 use reqwest::Method;
@@ -58,14 +59,46 @@ fn find_corgea_policy_files(root: &Path) -> Vec<String> {
     found
 }
 
-fn merge_corgea_policy_files(mut paths: Vec<String>, root: &Path) -> Vec<String> {
+/// One file to send to `code-upload`.
+struct SourceUpload {
+    /// Sent as `path=`, exactly as the report wrote it. The engine matches the
+    /// report's paths against this, so it stays as written even when the file
+    /// itself was found somewhere else.
+    report_path: String,
+    /// Where the file actually is on this machine.
+    local_path: PathBuf,
+}
+
+/// Pair every path a report names with the file to read for it, and append the
+/// repo's `corgea.yaml` policy files.
+///
+/// The prefix search runs on the report's paths alone, before the policy files
+/// are added: those are found by walking `root`, so they always resolve, and
+/// one of them counting as a path that "already resolves" would call off the
+/// search for a report that matches nothing.
+fn plan_source_uploads(root: &Path, report_paths: &[String]) -> Vec<SourceUpload> {
+    let prefix = report_paths::find_report_path_prefix(root, report_paths);
+
+    let mut uploads: Vec<SourceUpload> = report_paths
+        .iter()
+        .map(|path| SourceUpload {
+            report_path: path.clone(),
+            local_path: report_paths::local_report_path(root, path, &prefix),
+        })
+        .collect();
+
     for yaml in find_corgea_policy_files(root) {
-        if !paths.iter().any(|path| path == &yaml) {
-            debug(&format!("Including repo policy file: {yaml}"));
-            paths.push(yaml);
+        if uploads.iter().any(|upload| upload.report_path == yaml) {
+            continue;
         }
+        debug(&format!("Including repo policy file: {yaml}"));
+        uploads.push(SourceUpload {
+            local_path: root.join(&yaml),
+            report_path: yaml,
+        });
     }
-    paths
+
+    uploads
 }
 
 pub fn run_command(base_cmd: &String, mut command: Command) -> String {
@@ -281,7 +314,7 @@ pub fn upload_scan(
     project_name: Option<String>,
 ) -> Option<ScanUploadResult> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let paths = merge_corgea_policy_files(paths, &cwd);
+    let uploads = plan_source_uploads(&cwd, &paths);
     let in_ci = running_in_ci();
     let ci_platform = which_ci();
     let github_env_vars = get_github_env_vars();
@@ -331,11 +364,23 @@ pub fn upload_scan(
     let mut upload_error_count = 0;
     let mut platform_declined = false;
 
-    'files: for path in &paths {
-        if !Path::new(&path).exists() {
+    'files: for upload in &uploads {
+        let path = &upload.report_path;
+        let fp = upload.local_path.as_path();
+
+        if !fp.exists() {
+            // Name where the file was looked for whenever that is not the path
+            // in the report, so a prefix that resolved most of the report but
+            // not this path is visible rather than mystifying.
+            let looked_in = if fp.as_os_str() == path.as_str() {
+                String::new()
+            } else {
+                format!(" (looked for it at '{}')", fp.display())
+            };
             log::error!(
-                "Required file {} not found which is required for the scan, exiting.",
-                path
+                "Required file {}{} not found which is required for the scan, exiting.",
+                path,
+                looked_in
             );
             std::process::exit(1);
         }
@@ -349,7 +394,6 @@ pub fn upload_scan(
             base_url, api_base, run_id, path
         );
         debug(&format!("Uploading file: {}", path));
-        let fp = Path::new(&path);
 
         let mut attempts = 0;
         let mut success = false;
@@ -419,7 +463,7 @@ pub fn upload_scan(
     // Everything the aborted walk never attempted still counts as unsent, or
     // the closing summary would report one failure for a whole skipped tree.
     if platform_declined {
-        let distinct: HashSet<&String> = paths.iter().collect();
+        let distinct: HashSet<&String> = uploads.iter().map(|upload| &upload.report_path).collect();
         let unsent = distinct.len() - uploaded_paths.len();
         upload_error_count += unsent;
         log::warn!(
@@ -788,21 +832,109 @@ mod tests {
         );
     }
 
+    fn planned(root: &Path, report_paths: &[&str]) -> Vec<(String, String)> {
+        plan_source_uploads(
+            root,
+            &report_paths
+                .iter()
+                .map(|path| path.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(|upload| {
+            (
+                upload.report_path,
+                upload.local_path.to_string_lossy().into_owned(),
+            )
+        })
+        .collect()
+    }
+
     #[test]
-    fn merge_corgea_policy_files_appends_missing_and_skips_duplicates() {
+    fn plan_source_uploads_appends_policy_files_and_skips_duplicates() {
         let root = tempfile::tempdir().unwrap();
         write_policy(&root.path().join("corgea.yaml"));
+        let policy = root
+            .path()
+            .join("corgea.yaml")
+            .to_string_lossy()
+            .into_owned();
 
         assert_eq!(
-            merge_corgea_policy_files(vec!["src/source.py".into()], root.path()),
-            vec!["src/source.py".to_string(), "corgea.yaml".to_string()]
+            planned(root.path(), &["src/source.py"]),
+            vec![
+                ("src/source.py".to_string(), "src/source.py".to_string()),
+                ("corgea.yaml".to_string(), policy.clone()),
+            ]
         );
         assert_eq!(
-            merge_corgea_policy_files(
-                vec!["src/source.py".into(), "corgea.yaml".into()],
-                root.path()
+            planned(root.path(), &["src/source.py", "corgea.yaml"]),
+            vec![
+                ("src/source.py".to_string(), "src/source.py".to_string()),
+                ("corgea.yaml".to_string(), "corgea.yaml".to_string()),
+            ]
+        );
+    }
+
+    /// Only the file read from disk is rebased. `path=` keeps the report's own
+    /// path, because that is what the engine matches the report against.
+    #[test]
+    fn plan_source_uploads_rebases_the_local_file_but_not_the_uploaded_path() {
+        let root = tempfile::tempdir().unwrap();
+        for path in ["src/a.py", "src/b.py"] {
+            std::fs::create_dir_all(root.path().join(path).parent().unwrap()).unwrap();
+            std::fs::write(root.path().join(path), "x = 1\n").unwrap();
+        }
+
+        assert_eq!(
+            planned(
+                root.path(),
+                &["/builds/acme/repo/src/a.py", "/builds/acme/repo/src/b.py"]
             ),
-            vec!["src/source.py".to_string(), "corgea.yaml".to_string()]
+            vec![
+                (
+                    "/builds/acme/repo/src/a.py".to_string(),
+                    root.path().join("src/a.py").to_string_lossy().into_owned(),
+                ),
+                (
+                    "/builds/acme/repo/src/b.py".to_string(),
+                    root.path().join("src/b.py").to_string_lossy().into_owned(),
+                ),
+            ]
+        );
+    }
+
+    /// A policy file found by walking the root always exists, so letting one
+    /// into the prefix search would report the whole report as already
+    /// matching and call the search off.
+    #[test]
+    fn plan_source_uploads_settles_the_prefix_before_adding_policy_files() {
+        let root = tempfile::tempdir().unwrap();
+        write_policy(&root.path().join("corgea.yaml"));
+        for path in ["src/a.py", "src/b.py"] {
+            std::fs::create_dir_all(root.path().join(path).parent().unwrap()).unwrap();
+            std::fs::write(root.path().join(path), "x = 1\n").unwrap();
+        }
+
+        let plan = planned(root.path(), &["ci/src/a.py", "ci/src/b.py"]);
+
+        assert_eq!(
+            plan[0],
+            (
+                "ci/src/a.py".to_string(),
+                root.path().join("src/a.py").to_string_lossy().into_owned(),
+            )
+        );
+        assert_eq!(
+            plan[2],
+            (
+                "corgea.yaml".to_string(),
+                root.path()
+                    .join("corgea.yaml")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            "the policy file is read from the root, never through the report's prefix"
         );
     }
 }

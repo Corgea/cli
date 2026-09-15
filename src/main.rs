@@ -16,6 +16,7 @@ mod scanners {
     pub mod blast;
     pub mod fortify;
     pub mod parsers;
+    pub mod report_paths;
 }
 mod utils {
     pub mod api;
