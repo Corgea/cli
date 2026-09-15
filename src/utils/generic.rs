@@ -1,3 +1,4 @@
+use crate::manifest::{Manifest, TeeWriter};
 use crate::utils::terminal::{set_text_color, TerminalColor};
 use git2::{Repository, StatusOptions};
 use globset::{Glob, GlobSetBuilder};
@@ -61,6 +62,28 @@ const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
     "**/corgea-image-scanning-*.tar",
 ];
 
+/// Files packed into the archive, and what they contained.
+pub struct ArchiveContents {
+    /// Source paths of everything added, in the order they were written.
+    pub added_files: Vec<PathBuf>,
+    /// Digest of every archived file, keyed by its zip entry name.
+    ///
+    /// Only built for a whole-project archive. A `--target`, `--exclude` or
+    /// `--only-uncommitted` run packs a subset, and a manifest of a subset
+    /// reads to the server as every other file having been deleted.
+    pub manifest: Option<Manifest>,
+}
+
+/// Whether an archive built with these options holds the whole project.
+///
+/// Only such an archive may carry a file manifest. A manifest is subtracted
+/// from the baseline scan's, so a path missing from it is a deletion — and
+/// every finding for a file this run merely left out would be dropped without
+/// anything having looked at it.
+fn archives_whole_project(target: Option<&str>, user_exclude: Option<&str>) -> bool {
+    target.is_none() && user_exclude.is_none()
+}
+
 /// Create a zip file from a target specification or full repository scan.
 ///
 /// - If `target` is `None`, performs a full repository scan (equivalent to scanning all files).
@@ -76,7 +99,7 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     exclude_globs: Option<&[&str]>,
     user_exclude: Option<&str>,
     extra_files: &[(PathBuf, String)],
-) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+) -> Result<ArchiveContents, Box<dyn std::error::Error>> {
     let exclude_globs = exclude_globs.unwrap_or(DEFAULT_EXCLUDE_GLOBS);
 
     let mut glob_builder = GlobSetBuilder::new();
@@ -141,6 +164,9 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
 
     let mut added_files = Vec::new();
     let mut excluded_files = Vec::new();
+    // Hashing rides along on the copy that compresses each file, so the archive
+    // is still read once.
+    let mut manifest = archives_whole_project(target, user_exclude).then(Manifest::new);
 
     for (path, relative_path) in files_to_zip {
         // Match repo-relative paths so abs `/tmp/...` targets don't hit `**/tmp/**`.
@@ -148,9 +174,19 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
 
         if (path.is_file() || path.is_dir()) && !is_excluded {
             if path.is_file() {
-                zip.start_file(relative_path.to_string_lossy(), options)?;
+                let entry_name = relative_path.to_string_lossy().into_owned();
+                zip.start_file(entry_name.as_str(), options)?;
                 let mut file = File::open(&path)?;
-                io::copy(&mut file, &mut zip)?;
+                match manifest.as_mut() {
+                    Some(manifest) => {
+                        let mut tee = TeeWriter::new(&mut zip);
+                        io::copy(&mut file, &mut tee)?;
+                        manifest.insert(entry_name, tee.finish());
+                    }
+                    None => {
+                        io::copy(&mut file, &mut zip)?;
+                    }
+                }
                 added_files.push(path);
             } else if path.is_dir() {
                 zip.add_directory(relative_path.to_string_lossy(), options)?;
@@ -165,6 +201,9 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     let large_file_options: FileOptions<()> = options.large_file(true);
 
     for (path, entry_name) in extra_files {
+        // Left out of the manifest deliberately. `docker save` output is not
+        // byte-reproducible, so an image archive would differ on every run and
+        // report the upload as changed when the project had not.
         zip.start_file(entry_name.as_str(), large_file_options)?;
         let mut file = File::open(path)?;
         io::copy(&mut file, &mut zip)?;
@@ -198,7 +237,10 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     }
 
     zip.finish()?;
-    Ok(added_files)
+    Ok(ArchiveContents {
+        added_files,
+        manifest,
+    })
 }
 
 /// Create a staging directory under the system temp directory, readable only by
@@ -918,8 +960,9 @@ mod tests {
         // which would exclude *everything*. The filter + warn path under test
         // is identical either way.
         let excludes: &[&str] = &["**/node_modules/**"];
-        let added = create_zip_from_target(Some(&target), &output_zip, Some(excludes), None, &[])
+        let archive = create_zip_from_target(Some(&target), &output_zip, Some(excludes), None, &[])
             .expect("zip creation should succeed");
+        let added = archive.added_files;
 
         assert!(
             added.iter().any(|p| p.ends_with("src/main.py")),
@@ -931,6 +974,22 @@ mod tests {
             "node_modules file should be excluded: {:?}",
             added
         );
+        // A targeted archive holds a subset of the project, and a manifest of a
+        // subset reads to the server as every other file having been deleted.
+        assert!(archive.manifest.is_none());
+    }
+
+    #[test]
+    fn only_a_whole_project_archive_carries_a_manifest() {
+        // --exclude narrows the archive without narrowing `target`, so the
+        // files it holds back would read to the server as deletions.
+        assert!(archives_whole_project(None, None));
+        assert!(!archives_whole_project(Some("src/app.py"), None));
+        assert!(!archives_whole_project(None, Some("**/vendor/**")));
+        assert!(!archives_whole_project(
+            Some("git:staged"),
+            Some("**/vendor/**")
+        ));
     }
 
     /// The staging directory holds the project zip and exported images, so other
@@ -969,7 +1028,8 @@ mod tests {
             None,
             &extra_files,
         )
-        .expect("zip creation should succeed");
+        .expect("zip creation should succeed")
+        .added_files;
 
         assert!(added.contains(&staged), "staged archive should be added");
 
@@ -1011,7 +1071,8 @@ mod tests {
             None,
             &extra_files,
         )
-        .expect("a >4 GiB entry needs ZIP64, not an error");
+        .expect("a >4 GiB entry needs ZIP64, not an error")
+        .added_files;
 
         assert!(added.contains(&staged));
     }
