@@ -45,6 +45,21 @@ const BLAST_ENGINE: &str = "corgea-blast";
 /// This only avoids building a multi-megabyte form field to be refused.
 const MAX_CHANGED_FILES: usize = 5_000;
 
+/// What this run worked out about its own scope, and what to say about it.
+///
+/// The message is returned rather than printed because it is not always the
+/// last word. An upload carrying a file manifest is scoped by the server, which
+/// holds the baseline manifest this clone does not, so whatever was concluded
+/// here may not be what happened. The caller prints the server's verdict when
+/// it gets one and this only when it does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncrementalDecision {
+    /// The diff to upload, or `None` to leave the scan at every file.
+    pub plan: Option<IncrementalPlan>,
+    /// One line describing the scope this resolved to, ready to print.
+    pub message: String,
+}
+
 /// A diff the server can turn into an incremental scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncrementalPlan {
@@ -60,8 +75,7 @@ pub struct IncrementalPlan {
     pub covers_worktree: bool,
 }
 
-/// What an incremental scan of this commit would cover, or `None` to scan
-/// everything.
+/// What an incremental scan of this commit would cover, and how to describe it.
 pub fn resolve_incremental_plan(
     config: &Config,
     project_name: &str,
@@ -69,7 +83,37 @@ pub fn resolve_incremental_plan(
     head_sha: Option<&str>,
     worktree_dirty: bool,
     ignore_dirty_worktree: bool,
-) -> Option<IncrementalPlan> {
+) -> IncrementalDecision {
+    match plan_diff(
+        config,
+        project_name,
+        branch,
+        head_sha,
+        worktree_dirty,
+        ignore_dirty_worktree,
+    ) {
+        Ok((plan, summary)) => IncrementalDecision {
+            plan: Some(plan),
+            message: summary,
+        },
+        // Never fatal — a full scan is correct, only slower, so the run
+        // continues and only says why.
+        Err(reason) => IncrementalDecision {
+            plan: None,
+            message: format!("Scanning every file: {reason}."),
+        },
+    }
+}
+
+/// The diff and a line describing it, or why there is no diff to send.
+fn plan_diff(
+    config: &Config,
+    project_name: &str,
+    branch: Option<&str>,
+    head_sha: Option<&str>,
+    worktree_dirty: bool,
+    ignore_dirty_worktree: bool,
+) -> Result<(IncrementalPlan, String), String> {
     // A commit-to-commit diff cannot see uncommitted edits, so on a dirty tree
     // it leaves modified files off the list and their old findings are copied
     // forward as current. --ignore-dirty-worktree does not paper over that; it
@@ -77,67 +121,53 @@ pub fn resolve_incremental_plan(
     // and rescanned like any other change.
     let covers_worktree = worktree_dirty;
     if worktree_dirty && !ignore_dirty_worktree {
-        explain_full_scan(
+        return Err(
             "this worktree has uncommitted changes, and a commit-to-commit diff cannot \
-             see them. Pass --ignore-dirty-worktree to diff the working tree instead",
+             see them. Pass --ignore-dirty-worktree to diff the working tree instead"
+                .to_string(),
         );
-        return None;
     }
 
     // Nothing to diff from. Covers a non-git directory, a repo with no commit,
     // a detached HEAD, and a scan started below the repo root — none of which
     // report RepoInfo to the upload either.
     let (Some(_branch), Some(head_sha)) = (branch, head_sha) else {
-        explain_full_scan(
+        return Err(
             "no git branch and commit to diff from (not a git repository, no commit \
-             yet, a detached HEAD, or a scan started below the repository root)",
+             yet, a detached HEAD, or a scan started below the repository root)"
+                .to_string(),
         );
-        return None;
     };
 
-    let repo = match Repository::discover(".") {
-        Ok(repo) => repo,
-        Err(e) => {
-            explain_full_scan(&format!("this directory is not a git repository ({e})"));
-            return None;
-        }
-    };
+    let repo = Repository::discover(".")
+        .map_err(|e| format!("this directory is not a git repository ({e})"))?;
 
     let trunks = baseline_branches(&repo);
     let base_sha = match find_baseline_sha(config, project_name, &trunks) {
         Baseline::Found(sha) => sha,
         Baseline::NotFound => {
-            explain_full_scan(&format!(
+            return Err(format!(
                 "project '{project_name}' has no completed scan of a clean worktree on \
                  {}, so there is nothing stable to diff against",
                 join_or(&trunks)
-            ));
-            return None;
+            ))
         }
         Baseline::LookupFailed => {
-            explain_full_scan(&format!(
+            return Err(format!(
                 "the earlier scans of project '{project_name}' could not be looked up, \
                  so there is nothing to diff against. Run with --verbose for the error"
-            ));
-            return None;
+            ))
         }
     };
 
-    let changed_files = match changed_files_since(&repo, &base_sha, head_sha, covers_worktree) {
-        Ok(files) => files,
-        Err(reason) => {
-            explain_full_scan(&reason);
-            return None;
-        }
-    };
+    let changed_files = changed_files_since(&repo, &base_sha, head_sha, covers_worktree)?;
 
     if changed_files.len() > MAX_CHANGED_FILES {
-        explain_full_scan(&format!(
+        return Err(format!(
             "{} files changed since {}, which is more than an incremental scan is worth",
             changed_files.len(),
             short_sha(&base_sha)
         ));
-        return None;
     }
 
     let since = if covers_worktree {
@@ -148,23 +178,20 @@ pub fn resolve_incremental_plan(
     } else {
         format!("commit {}", short_sha(&base_sha))
     };
-    match changed_files.len() {
-        0 => println!("Incremental scan: nothing changed since {since}."),
-        1 => println!("Incremental scan: 1 file changed since {since}."),
-        count => println!("Incremental scan: {count} files changed since {since}."),
-    }
+    let summary = match changed_files.len() {
+        0 => format!("Incremental scan: nothing changed since {since}."),
+        1 => format!("Incremental scan: 1 file changed since {since}."),
+        count => format!("Incremental scan: {count} files changed since {since}."),
+    };
 
-    Some(IncrementalPlan {
-        base_sha,
-        changed_files,
-        covers_worktree,
-    })
-}
-
-/// Say why this run scans everything. Never fatal — a full scan is correct,
-/// only slower, so the run continues.
-fn explain_full_scan(reason: &str) {
-    println!("Scanning every file: {reason}.");
+    Ok((
+        IncrementalPlan {
+            base_sha,
+            changed_files,
+            covers_worktree,
+        },
+        summary,
+    ))
 }
 
 /// Outcome of looking for a scan to diff against.

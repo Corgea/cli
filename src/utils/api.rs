@@ -1,5 +1,6 @@
 use crate::incremental::IncrementalPlan;
 use crate::log::debug;
+use crate::manifest::EncodedManifest;
 use crate::utils;
 use corgea::vuln_api::{auth_header, source};
 use reqwest::header::HeaderMap;
@@ -506,6 +507,28 @@ fn check_for_warnings(headers: &HeaderMap, status: StatusCode) {
 pub struct UploadZipResult {
     pub scan_id: String,
     pub project_id: Option<String>,
+    /// How the server scoped the scan, when it said. Absent from a deployment
+    /// predating the field and from an upload that deduplicated onto a scan
+    /// someone else started.
+    pub incremental: Option<IncrementalVerdict>,
+    /// Why the server is analyzing every file, when it scoped nothing down and
+    /// had a reason to name.
+    pub incremental_reason: Option<String>,
+}
+
+/// The server's account of what an incremental scan ended up covering.
+///
+/// Authoritative in a way the client's own decision is not: the diff may have
+/// been taken from a file manifest this clone cannot compare against, from a
+/// different baseline than the one looked for here, or refused for a reason
+/// only the server can see.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct IncrementalVerdict {
+    /// Files differing from the baseline scan.
+    pub changed_files: u64,
+    /// Files actually analyzed, which is the changed set plus anything whose
+    /// context they were part of.
+    pub files_to_scan: u64,
 }
 
 /// Per-scan settings travelling with the archive without being part of it.
@@ -517,6 +540,28 @@ pub struct UploadOptions {
     /// Set when this run resolved a diff for the server to analyze instead of
     /// the whole project.
     pub incremental: Option<IncrementalPlan>,
+    /// Digests of everything in the archive, for the server to subtract from
+    /// the baseline scan's. Set only when the archive is the whole project.
+    pub file_manifest: Option<EncodedManifest>,
+}
+
+/// What the upload response says about the scan's scope.
+///
+/// Silent on anything it cannot read. The scan has started either way, so a
+/// field a newer server added, or one an older server never sent, is not worth
+/// a warning — it only costs this run a line of output.
+fn parse_incremental_verdict(
+    body: &HashMap<String, Value>,
+) -> (Option<IncrementalVerdict>, Option<String>) {
+    let verdict = body
+        .get("incremental")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    let reason = body
+        .get("incremental_reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
+        .map(str::to_string);
+    (verdict, reason)
 }
 
 pub fn upload_zip(
@@ -531,6 +576,7 @@ pub fn upload_zip(
         policy,
         metadata,
         incremental,
+        file_manifest,
     } = options;
     let client = http_client();
     let file_size = std::fs::metadata(file_path)?.len();
@@ -621,6 +667,11 @@ pub fn upload_zip(
         }
 
         let chunk = &buffer[..bytes_read];
+        // The scan is registered on the chunk that completes the archive, and
+        // that is the only request whose fields the server reads. Sending the
+        // manifest with every chunk would re-upload it once per 50 MB for a
+        // server that discards all but the last copy.
+        let final_chunk = offset + bytes_read as u64 >= file_size;
 
         // Rebuilt per attempt: a multipart body is a stream, so a retry has
         // nothing to replay unless the whole request is made again.
@@ -698,6 +749,27 @@ pub fn upload_zip(
                     )),
                     }
                 }
+                // Root and version travel beside the bytes rather than inside
+                // them: the server recomputes the root from what it
+                // decompressed and refuses a mismatch, so a truncated manifest
+                // costs a full scan instead of reading as a tree that shrank.
+                if let (true, Some(manifest)) = (final_chunk, &file_manifest) {
+                    form = form
+                        .part(
+                            "file_manifest",
+                            Part::bytes(manifest.body.clone())
+                                .file_name("file_manifest.txt.gz")
+                                .mime_str("application/gzip")?,
+                        )
+                        .part(
+                            "file_manifest_root",
+                            multipart::Part::text(manifest.root.clone()),
+                        )
+                        .part(
+                            "file_manifest_version",
+                            multipart::Part::text(crate::manifest::MANIFEST_VERSION),
+                        );
+                }
 
                 client
                     .patch(format!("{}{}/start-scan/{}/", url, API_BASE, transfer_id))
@@ -759,9 +831,12 @@ pub fn upload_zip(
                         .map(|s| s.to_string())
                         .or_else(|| v.as_i64().map(|n| n.to_string()))
                 });
+                let (incremental, incremental_reason) = parse_incremental_verdict(&body);
                 return Ok(UploadZipResult {
                     scan_id,
                     project_id,
+                    incremental,
+                    incremental_reason,
                 });
             } else {
                 return Err("Failed to get scan_id from response".into());
@@ -3008,6 +3083,59 @@ mod tests {
             3,
             "two rate limits, then the upload goes through"
         );
+    }
+
+    fn response_body(json: &str) -> HashMap<String, Value> {
+        serde_json::from_str(json).expect("test json")
+    }
+
+    #[test]
+    fn the_upload_response_reports_how_the_scan_was_scoped() {
+        let (verdict, reason) = parse_incremental_verdict(&response_body(
+            r#"{"incremental": {"source": "manifest", "baseline_scan_id": "abc",
+                "changed_files": 4, "files_to_scan": 7}}"#,
+        ));
+
+        assert_eq!(
+            verdict,
+            Some(IncrementalVerdict {
+                changed_files: 4,
+                files_to_scan: 7
+            })
+        );
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn a_full_scan_comes_back_as_the_reason_for_one() {
+        let (verdict, reason) = parse_incremental_verdict(&response_body(
+            r#"{"incremental": null, "incremental_reason": "corgea.yaml changed"}"#,
+        ));
+
+        assert_eq!(verdict, None);
+        assert_eq!(reason.as_deref(), Some("corgea.yaml changed"));
+    }
+
+    #[test]
+    fn a_response_without_a_verdict_reports_none_rather_than_failing() {
+        // A deployment predating the field, a scan that deduplicated onto one
+        // already running, and a field shaped differently by a newer server all
+        // land here. The scan has started either way, so the only thing at
+        // stake is a line of output.
+        for body in [
+            r#"{"scan_id": "s"}"#,
+            r#"{"incremental": null, "incremental_reason": null}"#,
+            r#"{"incremental": null, "incremental_reason": ""}"#,
+            r#"{"incremental": {"changed_files": "four"}}"#,
+            r#"{"incremental": {"files_to_scan": 7}}"#,
+            r#"{"incremental": true}"#,
+        ] {
+            assert_eq!(
+                parse_incremental_verdict(&response_body(body)),
+                (None, None),
+                "{body}"
+            );
+        }
     }
 
     #[test]
