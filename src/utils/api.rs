@@ -1202,32 +1202,41 @@ pub fn query_scan_list(
 /// one. A backend predating them ignores the unknown parameters and returns
 /// scans of every kind, so the caller must still re-check each scan it acts on
 /// — see `incremental::is_usable_baseline`.
+///
+/// `branch` is `None` for a caller that cannot say which branch is trunk,
+/// which is also the caller whose baseline may name no branch at all. Asking
+/// for one would then exclude exactly the scans it is looking for.
+///
+/// `require_clean` likewise excludes what a git diff cannot use and a checksum
+/// diff can: a scan that reported no dirty flag has unknown scope for a commit
+/// comparison, but its stored checksums describe its contents exactly.
 pub fn query_baseline_scans(
     url: &str,
     project: &str,
     engine: &str,
-    branch: &str,
+    branch: Option<&str>,
+    require_clean: bool,
     page: u16,
     page_size: u16,
 ) -> Result<ScansResponse, Box<dyn Error>> {
-    request_scan_list(
-        url,
-        vec![
-            ("page", page.to_string()),
-            ("page_size", page_size.to_string()),
-            ("project", project.to_string()),
-            ("engine", engine.to_string()),
-            ("branch", branch.to_string()),
-            ("status", "complete".to_string()),
-            ("exclude_pull_requests", "true".to_string()),
-            // A partial scan's findings cover only the files it was pointed at,
-            // so copying forward from one would drop everything else.
-            ("full_project_state", "true".to_string()),
-            // Explicitly clean only. A scan that never reported the flag is
-            // unknown scope, which the server rejects as a baseline.
-            ("worktree_dirty", "false".to_string()),
-        ],
-    )
+    let mut query_params = vec![
+        ("page", page.to_string()),
+        ("page_size", page_size.to_string()),
+        ("project", project.to_string()),
+        ("engine", engine.to_string()),
+        ("status", "complete".to_string()),
+        ("exclude_pull_requests", "true".to_string()),
+        // A partial scan's findings cover only the files it was pointed at,
+        // so copying forward from one would drop everything else.
+        ("full_project_state", "true".to_string()),
+    ];
+    if let Some(branch) = branch {
+        query_params.push(("branch", branch.to_string()));
+    }
+    if require_clean {
+        query_params.push(("worktree_dirty", "false".to_string()));
+    }
+    request_scan_list(url, query_params)
 }
 
 /// One page of the project's scans at exactly `sha`, newest first.

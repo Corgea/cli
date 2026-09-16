@@ -139,17 +139,23 @@ fn plan_diff(
     // Optional, because a checksum diff needs no repository. Only the git diff
     // below does, and it reports its absence by its real name.
     let repo = Repository::discover(".").ok();
-    let trunks = repo
-        .as_ref()
-        .map_or_else(|| fallback_trunks().to_vec(), baseline_branches);
+    // Trunk is only meaningful where there is a clone to read it from. Without
+    // one, take the project's newest usable scan whatever branch it names --
+    // including none, which is what a scan uploaded from a directory with no
+    // git records, and so what the earlier runs of *this* pipeline recorded.
+    let trunks = repo.as_ref().map(baseline_branches);
 
-    let baseline = match find_baseline(config, project_name, &trunks) {
+    let baseline = match find_baseline(config, project_name, trunks.as_deref(), manifest.is_some())
+    {
         BaselineLookup::Found(scan) => scan,
         BaselineLookup::NotFound => {
             return Err(format!(
-                "project '{project_name}' has no completed scan of a clean worktree on \
-                 {}, so there is nothing stable to diff against",
-                join_or(&trunks)
+                "project '{project_name}' has no completed scan {} that could be diffed \
+                 against, so there is nothing to compare this one to",
+                match &trunks {
+                    Some(trunks) => format!("on {}", join_or(trunks)),
+                    None => "of its whole state".to_string(),
+                }
             ))
         }
         BaselineLookup::LookupFailed => {
@@ -205,7 +211,9 @@ fn plan_diff(
     // Nothing to diff from. Covers a non-git directory, a repo with no commit,
     // a detached HEAD, and a scan started below the repo root — none of which
     // report RepoInfo to the upload either.
-    let (Some(_branch), Some(head_sha), Some(repo)) = (branch, head_sha, repo.as_ref()) else {
+    let (Some(_branch), Some(head_sha), Some(repo), Some(base_sha)) =
+        (branch, head_sha, repo.as_ref(), baseline.sha.as_deref())
+    else {
         return Err(
             "no git branch and commit to diff from (not a git repository, no commit \
              yet, a detached HEAD, or a scan started below the repository root), and \
@@ -214,20 +222,20 @@ fn plan_diff(
         );
     };
 
-    let changed_files = changed_files_since(repo, &baseline.sha, head_sha, covers_worktree)?;
+    let changed_files = changed_files_since(repo, base_sha, head_sha, covers_worktree)?;
     let since = if covers_worktree {
         format!(
             "commit {} and your uncommitted changes",
-            short_sha(&baseline.sha)
+            short_sha(base_sha)
         )
     } else {
-        format!("commit {}", short_sha(&baseline.sha))
+        format!("commit {}", short_sha(base_sha))
     };
     let summary = summarize(&changed_files, &since)?;
 
     Ok((
         IncrementalPlan {
-            base: BaselineRef::Commit(baseline.sha),
+            base: BaselineRef::Commit(base_sha.to_string()),
             changed_files,
             covers_worktree,
         },
@@ -278,9 +286,9 @@ fn changed_files_against(
 struct BaselineScan {
     /// What the upload names when the diff came from this scan's checksums.
     id: String,
-    /// Commit it covered, which the git diff measures from. Never empty:
-    /// `is_usable_baseline` requires it.
-    sha: String,
+    /// Commit it covered, which the git diff measures from. `None` for a scan
+    /// uploaded without git, which only a checksum diff can use.
+    sha: Option<String>,
     /// Branch it ran on, for saying what this run is being compared to.
     branch: Option<String>,
     /// Digest of the file manifest it stored, `None` when it stored none.
@@ -291,9 +299,13 @@ struct BaselineScan {
 impl BaselineScan {
     /// How to refer to this scan in the one line the run prints.
     fn describe(&self) -> String {
-        match &self.branch {
-            Some(branch) => format!("last scan of {branch} ({})", short_sha(&self.sha)),
-            None => format!("last scan of this project ({})", short_sha(&self.sha)),
+        let what = match &self.branch {
+            Some(branch) => format!("last scan of {branch}"),
+            None => "last scan of this project".to_string(),
+        };
+        match &self.sha {
+            Some(sha) => format!("{what} ({})", short_sha(sha)),
+            None => what,
         }
     }
 }
@@ -358,17 +370,30 @@ fn join_or(branches: &[String]) -> String {
     }
 }
 
-/// The newest scan on the first trunk branch that has one.
+/// The newest scan that can be diffed against, on the first trunk branch that
+/// has one.
 ///
 /// One query per branch, because the branch filter is server-side: a project
 /// with heavy feature-branch traffic can push trunk's newest scan far past any
 /// page limit, and asking for trunk directly cannot miss it that way. The page
 /// budget is shared across branches so the worst case stays bounded.
-fn find_baseline(config: &Config, project_name: &str, branches: &[String]) -> BaselineLookup {
+///
+/// `branches` is `None` when this clone cannot name a trunk, which makes it one
+/// query for the project's newest usable scan on any branch.
+fn find_baseline(
+    config: &Config,
+    project_name: &str,
+    branches: Option<&[String]>,
+    checksums_usable: bool,
+) -> BaselineLookup {
     let url = config.get_url();
     let mut budget = SCAN_LOOKUP_MAX_PAGES;
 
-    for branch in branches {
+    let searches: Vec<Option<&str>> = match branches {
+        Some(branches) => branches.iter().map(|b| Some(b.as_str())).collect(),
+        None => vec![None],
+    };
+    for branch in searches {
         let mut page = 1;
         while budget > 0 {
             budget -= 1;
@@ -377,6 +402,10 @@ fn find_baseline(config: &Config, project_name: &str, branches: &[String]) -> Ba
                 project_name,
                 BLAST_ENGINE,
                 branch,
+                // Letting the server drop everything but known-clean scans
+                // would drop the git-less ones, which report no dirty flag at
+                // all and are the whole point of a checksum diff.
+                !checksums_usable,
                 page,
                 SCAN_LOOKUP_PAGE_SIZE,
             ) {
@@ -400,7 +429,7 @@ fn find_baseline(config: &Config, project_name: &str, branches: &[String]) -> Ba
             // available and no later page can improve on it. Matched
             // client-side too: a backend that ignored the branch filter would
             // otherwise hand back another branch's scan.
-            if let Some(scan) = branch_baseline(&scans, branch) {
+            if let Some(scan) = branch_baseline(&scans, branch, checksums_usable) {
                 return BaselineLookup::Found(scan);
             }
             if response
@@ -416,12 +445,20 @@ fn find_baseline(config: &Config, project_name: &str, branches: &[String]) -> Ba
     BaselineLookup::NotFound
 }
 
-/// Newest usable scan of `branch` on this page.
-fn branch_baseline(scans: &[ScanResponse], branch: &str) -> Option<BaselineScan> {
-    let scan = usable_baselines(scans).find(|scan| scan.branch.as_deref() == Some(branch))?;
+/// Newest usable scan of `branch` on this page, or of any branch when `branch`
+/// is `None`.
+fn branch_baseline(
+    scans: &[ScanResponse],
+    branch: Option<&str>,
+    checksums_usable: bool,
+) -> Option<BaselineScan> {
+    let scan = scans
+        .iter()
+        .filter(|scan| is_usable_baseline(scan, checksums_usable))
+        .find(|scan| branch.is_none_or(|branch| scan.branch.as_deref() == Some(branch)))?;
     Some(BaselineScan {
         id: scan.id.clone(),
-        sha: scan.git_sha.clone()?,
+        sha: scan.git_sha.clone().filter(|sha| !sha.is_empty()),
         branch: scan.branch.clone(),
         manifest_root: scan
             .file_manifest_root
@@ -431,28 +468,49 @@ fn branch_baseline(scans: &[ScanResponse], branch: &str) -> Option<BaselineScan>
     })
 }
 
-/// Scans on one page that can serve as a baseline, newest first.
-fn usable_baselines(scans: &[ScanResponse]) -> impl Iterator<Item = &ScanResponse> {
-    scans.iter().filter(|scan| is_usable_baseline(scan))
+/// Whether `scan` may be diffed against, given what this run can diff with.
+///
+/// Client-side half of the filter doghouse applies picking a baseline itself,
+/// and `query_baseline_scans` asks the server for exactly these, which keeps
+/// the page walk from iterating. This stays because a backend predating those
+/// parameters ignores them.
+///
+/// Three requirements are unconditional: completed, this engine's own analysis,
+/// and not a pull request. The other two depend on how the diff will be
+/// measured.
+///
+/// A git diff is measured from the scan's *commit*, so the scan needs one, and
+/// it needs to have been clean — a dirty scan's commit does not describe what
+/// that scan actually analyzed, so files it had edited but not committed would
+/// keep findings taken from content in neither tree. `worktree_dirty` must be
+/// an explicit `false`, since never-reported is not known-clean.
+///
+/// A checksum diff is measured from the scan's *contents*, which is what its
+/// manifest records. Neither requirement survives that: a commit is not needed
+/// because nothing is looked up by one, and dirtiness does not matter because
+/// the manifest describes the files as they were scanned however they got that
+/// way. Insisting on either would rule out every scan uploaded without git,
+/// which reports no commit, no branch and no dirty flag — the scans this
+/// exists to diff against.
+fn is_usable_baseline(scan: &ScanResponse, checksums_usable: bool) -> bool {
+    if classify_scan_status(&scan.status) != ScanState::Completed
+        || !scan.engine.eq_ignore_ascii_case(BLAST_ENGINE)
+        || scan.pull_request_id.is_some()
+    {
+        return false;
+    }
+    if checksums_usable && has_readable_checksums(scan) {
+        return true;
+    }
+    scan.worktree_dirty == Some(false) && scan.git_sha.as_deref().is_some_and(|sha| !sha.is_empty())
 }
 
-/// Whether `scan` may be diffed against.
-///
-/// Client-side half of the filter doghouse applies picking a baseline itself: a
-/// completed blast scan of a whole, clean, non-pull-request commit.
-/// `worktree_dirty` must be an explicit `false` — `None` means never reported,
-/// and unknown scope is not clean, so the server rejects it as a baseline too.
-///
-/// `query_baseline_scans` asks the server for exactly these, which keeps the
-/// page walk from iterating. This stays because a backend predating those
-/// parameters ignores them, and a dirty or pull-request scan's commit would
-/// diff against the wrong tree.
-fn is_usable_baseline(scan: &ScanResponse) -> bool {
-    classify_scan_status(&scan.status) == ScanState::Completed
-        && scan.engine.eq_ignore_ascii_case(BLAST_ENGINE)
-        && scan.pull_request_id.is_none()
-        && scan.worktree_dirty == Some(false)
-        && scan.git_sha.as_deref().is_some_and(|sha| !sha.is_empty())
+/// Whether `scan` stored checksums this client can read.
+fn has_readable_checksums(scan: &ScanResponse) -> bool {
+    scan.file_manifest_root
+        .as_deref()
+        .is_some_and(|root| !root.is_empty())
+        && scan.file_manifest_version.as_deref() == Some(MANIFEST_VERSION)
 }
 
 /// Every repo-relative path differing from the baseline commit.
@@ -581,10 +639,27 @@ mod tests {
         }
     }
 
+    /// A scan uploaded with no git at all: no branch, no commit, no dirty
+    /// flag. Only its stored checksums make it a baseline.
+    fn scan_without_git(id: &str) -> ScanResponse {
+        let mut scan = scan("main", "unused");
+        scan.id = id.to_string();
+        scan.branch = None;
+        scan.git_sha = None;
+        scan.worktree_dirty = None;
+        with_checksums(scan)
+    }
+
+    fn with_checksums(mut scan: ScanResponse) -> ScanResponse {
+        scan.file_manifest_root = Some("a".repeat(64));
+        scan.file_manifest_version = Some(MANIFEST_VERSION.to_string());
+        scan
+    }
+
     /// The sha of the scan `branch_baseline` picked, for the cases that only
-    /// care which one it was.
+    /// care which one it was. Checksums off, so this is the git-diff rule.
     fn baseline_sha(scans: &[ScanResponse], branch: &str) -> Option<String> {
-        branch_baseline(scans, branch).map(|scan| scan.sha)
+        branch_baseline(scans, Some(branch), false).and_then(|scan| scan.sha)
     }
 
     #[test]
@@ -597,38 +672,85 @@ mod tests {
     }
 
     #[test]
-    fn a_completed_clean_blast_scan_is_a_baseline() {
-        assert!(is_usable_baseline(&scan("main", "abc")));
+    fn a_completed_clean_blast_scan_is_a_baseline_for_either_kind_of_diff() {
+        assert!(is_usable_baseline(&scan("main", "abc"), false));
+        assert!(is_usable_baseline(&scan("main", "abc"), true));
     }
 
     #[test]
-    fn scans_that_cannot_describe_a_whole_clean_commit_are_rejected() {
+    fn what_no_diff_can_use_is_rejected_whichever_one_is_available() {
         // The server refuses each of these too, so diffing against them narrows
         // a scan the server then widens.
-        let mut running = scan("main", "abc");
+        let mut running = with_checksums(scan("main", "abc"));
         running.status = "processing".to_string();
-        assert!(!is_usable_baseline(&running));
 
-        let mut third_party = scan("main", "abc");
+        let mut third_party = with_checksums(scan("main", "abc"));
         third_party.engine = "semgrep".to_string();
-        assert!(!is_usable_baseline(&third_party));
 
-        let mut pr = scan("main", "abc");
+        let mut pr = with_checksums(scan("main", "abc"));
         pr.pull_request_id = Some("42".to_string());
-        assert!(!is_usable_baseline(&pr));
 
+        for rejected in [running, third_party, pr] {
+            assert!(!is_usable_baseline(&rejected, false));
+            assert!(!is_usable_baseline(&rejected, true));
+        }
+    }
+
+    #[test]
+    fn a_git_diff_needs_a_commit_that_was_clean_when_it_was_scanned() {
+        // A dirty scan's commit does not describe what it analyzed, so files it
+        // had edited but not committed would keep findings taken from content
+        // in neither tree.
         let mut dirty = scan("main", "abc");
         dirty.worktree_dirty = Some(true);
-        assert!(!is_usable_baseline(&dirty));
+        assert!(!is_usable_baseline(&dirty, false));
 
         // Never reported is not known clean.
         let mut unknown = scan("main", "abc");
         unknown.worktree_dirty = None;
-        assert!(!is_usable_baseline(&unknown));
+        assert!(!is_usable_baseline(&unknown, false));
 
         let mut no_commit = scan("main", "abc");
         no_commit.git_sha = None;
-        assert!(!is_usable_baseline(&no_commit));
+        assert!(!is_usable_baseline(&no_commit, false));
+    }
+
+    #[test]
+    fn a_checksum_diff_needs_neither_a_commit_nor_a_clean_one() {
+        // Its manifest records the files as they were scanned, so how they came
+        // to be that way changes nothing -- and insisting otherwise would rule
+        // out every scan uploaded without git, which is what this is for.
+        let mut dirty = with_checksums(scan("main", "abc"));
+        dirty.worktree_dirty = Some(true);
+        assert!(is_usable_baseline(&dirty, true));
+        assert!(!is_usable_baseline(&dirty, false));
+
+        assert!(is_usable_baseline(&scan_without_git("no-git"), true));
+        assert!(!is_usable_baseline(&scan_without_git("no-git"), false));
+    }
+
+    #[test]
+    fn checksums_this_client_cannot_read_do_not_make_a_scan_a_baseline() {
+        let mut future = scan_without_git("no-git");
+        future.file_manifest_version = Some("99".to_string());
+        assert!(!is_usable_baseline(&future, true));
+
+        let mut empty_root = scan_without_git("no-git");
+        empty_root.file_manifest_root = Some(String::new());
+        assert!(!is_usable_baseline(&empty_root, true));
+    }
+
+    #[test]
+    fn a_clone_with_no_trunk_to_name_accepts_a_scan_that_names_no_branch() {
+        // Every scan of a project with no git records no branch, so asking for
+        // one would rule out the whole project's history.
+        let scans = vec![scan_without_git("newest"), scan_without_git("older")];
+
+        let picked = branch_baseline(&scans, None, true).expect("a baseline");
+
+        assert_eq!(picked.id, "newest");
+        assert_eq!(picked.sha, None);
+        assert_eq!(picked.describe(), "last scan of this project");
     }
 
     #[test]

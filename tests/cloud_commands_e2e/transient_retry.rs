@@ -207,7 +207,7 @@ fn a_rejected_scan_start_is_not_sent_again() {
     for branch in ["main", "master"] {
         plan.push(expected_request(
             "look up a baseline scan to diff against",
-            move |request| assert_baseline_lookup_request(request, "cloud-e2e", branch),
+            move |request| assert_baseline_lookup_request(request, "cloud-e2e", Some(branch)),
             json_response(scans_response(Vec::new())),
         ));
     }

@@ -337,18 +337,34 @@ pub(crate) fn assert_scan_list_request(
 ///
 /// Asserting the filters is the point: they keep this to one request per trunk
 /// branch instead of a page walk, and a server dropping them silently returns
-/// pull-request and dirty scans for the client to reject. `branch` is asserted
-/// because a baseline may only come from trunk.
+/// pull-request scans for the client to reject. `branch` is asserted because a
+/// baseline may only come from trunk; pass `None` for the lookup a clone with
+/// no git makes, which cannot say which branch that is.
+///
+/// No `worktree_dirty`, and that absence is asserted: a run carrying its own
+/// file checksums can diff against a scan that reported no dirty flag, and
+/// every scan uploaded without git reports none. Filtering them out server-side
+/// would hide exactly the history such a project has.
 pub(crate) fn assert_baseline_lookup_request(
     request: &CapturedRequest,
     project: &str,
-    branch: &str,
+    branch: Option<&str>,
 ) -> Result<(), String> {
     assert_scan_list_request(request, project)?;
     assert_query(request, "engine", "corgea-blast")?;
     assert_query(request, "status", "complete")?;
     assert_query(request, "exclude_pull_requests", "true")?;
-    assert_query(request, "worktree_dirty", "false")?;
+    if query_value(request, "worktree_dirty").is_ok() {
+        return Err("baseline lookup must not filter on worktree_dirty".to_string());
+    }
+    let Some(branch) = branch else {
+        return match query_value(request, "branch") {
+            Ok(branch) => Err(format!(
+                "baseline lookup without a trunk to name must not ask for branch {branch}"
+            )),
+            Err(_) => Ok(()),
+        };
+    };
     assert_query(request, "full_project_state", "true")?;
     assert_query(request, "branch", branch)
 }
@@ -882,7 +898,7 @@ fn blast_plan_for(
         for branch in ["main", "master"] {
             plan.push(expected_request(
                 "look up a baseline scan to diff against",
-                move |request| assert_baseline_lookup_request(request, "cloud-e2e", branch),
+                move |request| assert_baseline_lookup_request(request, "cloud-e2e", Some(branch)),
                 json_response(scans_response(Vec::new())),
             ));
         }

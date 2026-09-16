@@ -67,6 +67,16 @@ fn baseline_scan_with_checksums(sha: &str, files: &[(&str, &str)]) -> (Value, Ve
     (scan, encoder.finish().expect("gzip"))
 }
 
+/// A baseline as it looks when the scan that produced it had no git either: no
+/// branch, no commit, no dirty flag. Only its checksums make it usable, and a
+/// project scanned this way has no other kind of history to offer.
+fn without_git(mut scan: Value) -> Value {
+    scan["branch"] = json!(null);
+    scan["git_sha"] = json!(null);
+    scan["worktree_dirty"] = json!(null);
+    scan
+}
+
 fn checksum_download(body: Vec<u8>) -> ExpectedRequest {
     let path = format!("/api/v1/scan/{BASELINE_SCAN}/file-manifest");
     expected_request(
@@ -79,7 +89,17 @@ fn checksum_download(body: Vec<u8>) -> ExpectedRequest {
 fn baseline_lookup(branch: &'static str, scans: Vec<Value>) -> ExpectedRequest {
     expected_request(
         "look up a baseline scan to diff against",
-        move |request| assert_baseline_lookup_request(request, PROJECT, branch),
+        move |request| assert_baseline_lookup_request(request, PROJECT, Some(branch)),
+        json_response(scans_response(scans)),
+    )
+}
+
+/// The single lookup a clone with no git makes. It cannot say which branch is
+/// trunk, and the scans it is looking for name none either.
+fn branchless_baseline_lookup(scans: Vec<Value>) -> ExpectedRequest {
+    expected_request(
+        "look up a baseline scan on any branch",
+        move |request| assert_baseline_lookup_request(request, PROJECT, None),
         json_response(scans_response(scans)),
     )
 }
@@ -224,17 +244,20 @@ fn the_baselines_stored_checksums_are_used_in_preference_to_a_git_diff() {
 /// The case this exists for. A pipeline that unpacks a tarball has no commit to
 /// diff from and used to analyze every file on every run, forever; checksums
 /// need no history, so it scans only what changed.
+///
+/// Every scan of such a project records no branch, no commit and no dirty flag,
+/// so the lookup must ask for none of them: a baseline that has to be a clean
+/// commit on trunk describes nothing this project has ever uploaded.
 #[test]
 fn a_directory_with_no_git_scans_incrementally_from_the_stored_checksums() {
     let project = tempfile::TempDir::new().expect("create project");
     std::fs::write(project.path().join("main.py"), "print('edited')\n").expect("write source");
     std::fs::write(project.path().join("helper.py"), "print('helper')\n").expect("write helper");
 
-    let (scan, manifest) =
-        baseline_scan_with_checksums("0".repeat(40).as_str(), &[("main.py", "print('hi')\n")]);
+    let (scan, manifest) = baseline_scan_with_checksums("unused", &[("main.py", "print('hi')\n")]);
     let mut plan = vec![
         verify_request(),
-        baseline_lookup("main", vec![scan]),
+        branchless_baseline_lookup(vec![without_git(scan)]),
         checksum_download(manifest),
         start_upload(),
         expected_request(
@@ -269,7 +292,7 @@ fn a_directory_with_no_git_scans_incrementally_from_the_stored_checksums() {
 
     assert_eq!(output.status.code(), Some(0), "{context}");
     assert!(
-        stdout.contains("Incremental scan: 2 files changed since the last scan of main"),
+        stdout.contains("Incremental scan: 2 files changed since the last scan of this project."),
         "{context}"
     );
 }
@@ -474,7 +497,7 @@ fn a_project_with_no_baseline_scan_uploads_without_a_diff() {
 
     assert_eq!(output.status.code(), Some(0), "{context}");
     assert!(
-        stdout.contains("has no completed scan of a clean worktree on main or master"),
+        stdout.contains("has no completed scan on main or master that could be diffed against"),
         "{context}"
     );
 }
@@ -535,7 +558,7 @@ fn a_failed_lookup_is_not_reported_as_a_missing_baseline() {
         verify_request(),
         expected_request(
             "fail the baseline lookup",
-            |request| assert_baseline_lookup_request(request, PROJECT, "main"),
+            |request| assert_baseline_lookup_request(request, PROJECT, Some("main")),
             json_response_with_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "boom"})),
         ),
         start_upload(),
@@ -567,7 +590,7 @@ fn a_failed_lookup_is_not_reported_as_a_missing_baseline() {
     assert_eq!(output.status.code(), Some(0), "{context}");
     assert!(stdout.contains("could not be looked up"), "{context}");
     assert!(
-        !stdout.contains("no completed scan of a clean worktree"),
+        !stdout.contains("has no completed scan"),
         "a lookup failure must not claim the project has no scan history\n{context}"
     );
 }
@@ -680,7 +703,7 @@ fn a_directory_that_is_not_a_git_repository_scans_everything() {
 
     let mut plan = vec![
         verify_request(),
-        baseline_lookup("main", vec![baseline_scan(&"a".repeat(40))]),
+        branchless_baseline_lookup(vec![without_git(baseline_scan("unused"))]),
         start_upload(),
         expected_request(
             "upload BLAST archive with no repo metadata",
@@ -710,7 +733,10 @@ fn a_directory_that_is_not_a_git_repository_scans_everything() {
 
     assert_eq!(output.status.code(), Some(0), "{context}");
     assert!(
-        stdout.contains("Scanning every file: no git branch and commit to diff from"),
+        stdout.contains(
+            "Scanning every file: project 'cloud-e2e' has no completed scan of its whole \
+             state that could be diffed against"
+        ),
         "{context}"
     );
 }
