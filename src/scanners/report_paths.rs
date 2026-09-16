@@ -139,7 +139,9 @@ fn resolves_under(root: &Path, remainder: &str) -> bool {
 /// Returns `""` as soon as any sampled path resolves as written, so a report
 /// that already matches this working tree is left alone. Otherwise one
 /// directory at a time is dropped from the shared prefix, shallowest first, and
-/// the first prefix whose remainder resolves under `root` wins.
+/// the shallowest prefix that resolves the whole sample wins -- shallowest so
+/// the least of the report's own paths is rewritten, whole-sample so a prefix
+/// is never trusted on the strength of a few coincidental filenames.
 pub fn find_report_path_prefix(root: &Path, report_paths: &[String]) -> String {
     let sample = sample_paths(report_paths);
 
@@ -171,16 +173,25 @@ pub fn find_report_path_prefix(root: &Path, report_paths: &[String]) -> String {
             .filter(|relative| root.join(relative).is_file())
             .collect();
 
-        // A real offset resolves the report broadly. A lone hit that is also a
-        // bare basename is more likely a same-named file elsewhere in the tree
-        // than evidence of the prefix, and accepting it would upload one file's
-        // contents for a finding about another.
-        if hits.len() >= 2 || (hits.len() == 1 && hits[0].contains('/')) {
+        // The whole sample has to resolve, not just some of it. The upload
+        // aborts on the first path it cannot find, so a prefix that resolves
+        // part of the report cannot produce a successful upload -- it can only
+        // upload whatever happens to sit at the paths that did resolve before
+        // dying on the rest. Fusion accepts two hits because it skips the
+        // findings it cannot resolve and keeps the remainder of the report; if
+        // this ever stops being all-or-nothing, revisit this with it.
+        //
+        // A lone hit that is also a bare basename stays refused on top of that:
+        // a one-path report always resolves "all" of its sample, and a bare
+        // basename is more likely a same-named file elsewhere in the tree than
+        // evidence of the prefix.
+        let complete = hits.len() == relatives.len();
+
+        if complete && (hits.len() >= 2 || hits[0].contains('/')) {
             log::warn!(
-                "The report's paths are not relative to this directory. Dropping '{}' from them resolves {} of {} sampled path(s); uploading those files under the paths the report uses.",
+                "The report's paths are not relative to this directory. Dropping '{}' from them resolves all {} sampled path(s); uploading those files under the paths the report uses.",
                 prefix,
-                hits.len(),
-                relatives.len()
+                hits.len()
             );
             return prefix;
         }
@@ -374,6 +385,57 @@ mod tests {
         assert_eq!(
             find_report_path_prefix(&root, &report(&["src/utils/index.ts", "src/utils/x.ts"])),
             ""
+        );
+    }
+
+    #[test]
+    fn a_prefix_that_resolves_only_part_of_the_report_is_refused() {
+        // Another repo's report, sharing two filenames with this working tree
+        // and nothing else. Both of those resolve once 'build/other/' is
+        // dropped, which is the whole of the evidence for that prefix.
+        let root = tempfile::tempdir().unwrap();
+        let root = tree(root.path(), &["src/main.py", "src/utils.py"]);
+
+        assert_eq!(
+            find_report_path_prefix(
+                &root,
+                &report(&[
+                    "build/other/src/main.py",
+                    "build/other/src/utils.py",
+                    "build/other/src/billing.py",
+                    "build/other/src/tenants.py",
+                ])
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_deeper_prefix_that_resolves_everything_beats_a_shallow_partial_one() {
+        let root = tempfile::tempdir().unwrap();
+        let root = tree(
+            root.path(),
+            &[
+                "proj/src/a.ts",
+                "proj/src/b.ts",
+                "src/a.ts",
+                "src/b.ts",
+                "src/c.ts",
+            ],
+        );
+
+        // 'build/' resolves a.ts and b.ts through proj/src/ but not c.ts, so
+        // shallowest-first does not get to stop there.
+        assert_eq!(
+            find_report_path_prefix(
+                &root,
+                &report(&[
+                    "build/proj/src/a.ts",
+                    "build/proj/src/b.ts",
+                    "build/proj/src/c.ts",
+                ])
+            ),
+            "build/proj/"
         );
     }
 
