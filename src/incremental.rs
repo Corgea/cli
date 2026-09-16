@@ -386,14 +386,40 @@ fn find_baseline(
     branches: Option<&[String]>,
     checksums_usable: bool,
 ) -> BaselineLookup {
-    let url = config.get_url();
-    let mut budget = SCAN_LOOKUP_MAX_PAGES;
-
     let searches: Vec<Option<&str>> = match branches {
         Some(branches) => branches.iter().map(|b| Some(b.as_str())).collect(),
         None => vec![None],
     };
-    for branch in searches {
+
+    // Pass one will take a baseline of either kind, so it cannot ask the server
+    // to drop what is not known-clean: that is how a git-less scan reports
+    // itself, and those are the ones carrying checksums.
+    let found = search_baseline(config, project_name, &searches, checksums_usable, false);
+    if !checksums_usable || branches.is_none() || !matches!(found, BaselineLookup::NotFound) {
+        return found;
+    }
+
+    // Nothing usable came back unfiltered. A project can have more dirty trunk
+    // scans than the page budget covers -- every project does, in the window
+    // before any of its scans has stored checksums -- and a clean one behind
+    // them is a baseline this would otherwise report as not existing. A
+    // checksum baseline is already ruled out, so nothing is left for the
+    // filter to wrongly exclude.
+    search_baseline(config, project_name, &searches, checksums_usable, true)
+}
+
+/// One walk of the project's scans, newest first, over `searches` in order.
+fn search_baseline(
+    config: &Config,
+    project_name: &str,
+    searches: &[Option<&str>],
+    checksums_usable: bool,
+    require_clean: bool,
+) -> BaselineLookup {
+    let url = config.get_url();
+    let mut budget = SCAN_LOOKUP_MAX_PAGES;
+
+    for &branch in searches {
         let mut page = 1;
         while budget > 0 {
             budget -= 1;
@@ -402,10 +428,7 @@ fn find_baseline(
                 project_name,
                 BLAST_ENGINE,
                 branch,
-                // Letting the server drop everything but known-clean scans
-                // would drop the git-less ones, which report no dirty flag at
-                // all and are the whole point of a checksum diff.
-                !checksums_usable,
+                require_clean,
                 page,
                 SCAN_LOOKUP_PAGE_SIZE,
             ) {

@@ -118,12 +118,13 @@ fn a_rate_limited_scan_start_goes_through_on_a_retry() {
     // every field of it.
     let project = git_project();
     let mut plan = blast_upload_plan(&project.sha, false, false);
-    // `blast_upload_plan` order: verify, two baseline lookups, the start-scan
-    // POST this rate-limits twice before letting through, then the chunk PATCH.
-    const SCAN_START: usize = 3;
+    // Rate-limited twice before the planned start-scan is let through. Found by
+    // label rather than counted, since the baseline lookups ahead of it are the
+    // incremental scan's business and change with it.
+    let scan_start = plan_step(&plan, "start BLAST upload");
     for _ in 0..2 {
         plan.insert(
-            SCAN_START,
+            scan_start,
             expected_request(
                 "rate-limit the scan start",
                 |request| assert_authenticated_request(request, Method::POST, "/api/v1/start-scan"),
@@ -204,13 +205,7 @@ fn a_rejected_scan_start_is_not_sent_again() {
     // into a scan per attempt in the project.
     let project = git_project();
     let mut plan = vec![verify_request()];
-    for branch in ["main", "master"] {
-        plan.push(expected_request(
-            "look up a baseline scan to diff against",
-            move |request| assert_baseline_lookup_request(request, "cloud-e2e", Some(branch)),
-            json_response(scans_response(Vec::new())),
-        ));
-    }
+    plan.extend(baseline_lookups_finding_nothing("cloud-e2e"));
     plan.push(expected_request(
         "reject the scan start with a gateway error",
         |request| assert_authenticated_request(request, Method::POST, "/api/v1/start-scan"),
@@ -290,12 +285,10 @@ fn a_rejected_archive_chunk_is_not_sent_again() {
     // under the 50 MB chunk size — which this fixture, and most repos, is — has
     // only that one chunk. Replaying it risks the second scan.
     let project = git_project();
-    // `blast_upload_plan` order: verify, two baseline lookups, the start-scan
-    // POST, then the chunk PATCH. Everything from the chunk on is dropped,
-    // since the rejected chunk ends the command.
+    // Everything from the chunk PATCH on is dropped, since the rejected chunk
+    // ends the command.
     let mut plan = blast_upload_plan(&project.sha, false, false);
-    const ARCHIVE_UPLOAD: usize = 4;
-    plan.truncate(ARCHIVE_UPLOAD);
+    plan.truncate(plan_step(&plan, "upload BLAST archive"));
     plan.push(expected_request(
         "reject the archive chunk with a gateway error",
         |request| {

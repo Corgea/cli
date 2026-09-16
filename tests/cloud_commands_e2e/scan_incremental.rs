@@ -89,7 +89,7 @@ fn checksum_download(body: Vec<u8>) -> ExpectedRequest {
 fn baseline_lookup(branch: &'static str, scans: Vec<Value>) -> ExpectedRequest {
     expected_request(
         "look up a baseline scan to diff against",
-        move |request| assert_baseline_lookup_request(request, PROJECT, Some(branch)),
+        move |request| assert_baseline_lookup_request(request, PROJECT, Some(branch), false),
         json_response(scans_response(scans)),
     )
 }
@@ -99,18 +99,18 @@ fn baseline_lookup(branch: &'static str, scans: Vec<Value>) -> ExpectedRequest {
 fn branchless_baseline_lookup(scans: Vec<Value>) -> ExpectedRequest {
     expected_request(
         "look up a baseline scan on any branch",
-        move |request| assert_baseline_lookup_request(request, PROJECT, None),
+        move |request| assert_baseline_lookup_request(request, PROJECT, None, false),
         json_response(scans_response(scans)),
     )
 }
 
-/// The lookups a fixture repo makes when no trunk branch has a baseline. It
-/// records no origin/HEAD, so the candidates are `main` then `master`.
-fn baseline_lookups_finding_nothing() -> Vec<ExpectedRequest> {
-    vec![
-        baseline_lookup("main", vec![]),
-        baseline_lookup("master", vec![]),
-    ]
+/// The second walk, which does let the server drop what is not known-clean.
+fn clean_baseline_lookup(branch: &'static str, scans: Vec<Value>) -> ExpectedRequest {
+    expected_request(
+        "look up a clean baseline scan to diff against",
+        move |request| assert_baseline_lookup_request(request, PROJECT, Some(branch), true),
+        json_response(scans_response(scans)),
+    )
 }
 
 /// One page of the baseline lookup, for the walk an old backend forces.
@@ -464,7 +464,7 @@ fn a_project_with_no_baseline_scan_uploads_without_a_diff() {
 
     let patch_sha = head_sha.clone();
     let mut plan = vec![verify_request()];
-    plan.extend(baseline_lookups_finding_nothing());
+    plan.extend(baseline_lookups_finding_nothing(PROJECT));
     plan.extend([
         start_upload(),
         expected_request(
@@ -558,7 +558,7 @@ fn a_failed_lookup_is_not_reported_as_a_missing_baseline() {
         verify_request(),
         expected_request(
             "fail the baseline lookup",
-            |request| assert_baseline_lookup_request(request, PROJECT, Some("main")),
+            |request| assert_baseline_lookup_request(request, PROJECT, Some("main"), false),
             json_response_with_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "boom"})),
         ),
         start_upload(),
@@ -692,6 +692,62 @@ fn a_narrowed_archive_skips_incremental_without_claiming_a_full_scan() {
 
     assert_eq!(output.status.code(), Some(0), "{context}");
     assert!(!stdout.contains("Scanning every file:"), "{context}");
+}
+
+/// A clean baseline behind a page of dirty scans is still found.
+///
+/// The first walk cannot ask the server for clean scans only, because that is
+/// how a git-less scan reports itself and those are the ones worth having. The
+/// cost is that dirty scans now reach the client, and a project with enough of
+/// them could bury the clean scan it does have past the page budget. Every
+/// project looks like that in the window before any of its scans has stored
+/// checksums, so the second walk asks for what the first could not.
+#[test]
+fn a_clean_baseline_is_found_even_when_dirty_scans_come_back_first() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    let head_sha = second_commit(&project);
+
+    let mut dirty = baseline_scan(&"d".repeat(40));
+    dirty["worktree_dirty"] = json!(true);
+
+    let expected_base = base_sha.clone();
+    let mut plan = vec![
+        verify_request(),
+        baseline_lookup("main", vec![dirty]),
+        baseline_lookup("master", vec![]),
+        clean_baseline_lookup("main", vec![baseline_scan(&base_sha)]),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with the diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_multipart_text_field(request, "incremental_base_sha", &expected_base)
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert_ne!(head_sha, base_sha);
+    assert!(
+        stdout.contains("Incremental scan: 2 files changed since commit"),
+        "{context}"
+    );
 }
 
 /// No git repository and a baseline that stored no checksums leaves nothing to

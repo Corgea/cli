@@ -2203,6 +2203,30 @@ mod tests {
     use reqwest::header::{HeaderMap, HeaderValue};
 
     #[test]
+    fn a_scan_from_a_deployment_without_manifests_parses_as_having_none() {
+        // The fields are absent, not null, on a backend predating them. Without
+        // a default that is a parse error, which would take out the whole
+        // baseline lookup -- including the git diff, which needs nothing new.
+        let legacy = r#"{
+            "id": "scan-1",
+            "project": "proj",
+            "repo": null,
+            "branch": "main",
+            "status": "complete",
+            "engine": "corgea-blast",
+            "created_at": "2026-01-01T00:00:00Z",
+            "git_sha": "abc123",
+            "worktree_dirty": false
+        }"#;
+
+        let parsed: ScanResponse = serde_json::from_str(legacy).unwrap();
+
+        assert_eq!(parsed.file_manifest_root, None);
+        assert_eq!(parsed.file_manifest_version, None);
+        assert_eq!(parsed.git_sha.as_deref(), Some("abc123"));
+    }
+
+    #[test]
     fn blocking_rule_response_defaults_status_when_missing() {
         let legacy = r#"{"block":false,"blocking_issues":[],"total_pages":1}"#;
         let parsed: BlockingRuleResponse = serde_json::from_str(legacy).unwrap();

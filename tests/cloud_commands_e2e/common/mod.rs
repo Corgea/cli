@@ -341,21 +341,58 @@ pub(crate) fn assert_scan_list_request(
 /// baseline may only come from trunk; pass `None` for the lookup a clone with
 /// no git makes, which cannot say which branch that is.
 ///
-/// No `worktree_dirty`, and that absence is asserted: a run carrying its own
-/// file checksums can diff against a scan that reported no dirty flag, and
-/// every scan uploaded without git reports none. Filtering them out server-side
-/// would hide exactly the history such a project has.
+/// `require_clean` says which of the two walks this is, and is asserted either
+/// way. A run carrying its own file checksums can diff against a scan that
+/// reported no dirty flag -- every scan uploaded without git reports none -- so
+/// the first walk must not let the server drop them. The second must, or a
+/// clean scan sitting behind a page budget's worth of dirty ones is a baseline
+/// the project has and this never finds.
+/// Every baseline lookup a fixture repo makes when nothing turns up.
+///
+/// Two walks over the two trunk candidates, since the fixture records no
+/// origin/HEAD. The first takes a baseline of either kind, so it cannot let the
+/// server drop scans that are not known-clean; the second asks for exactly
+/// those once no checksums have been found, so a clean scan behind a page
+/// budget's worth of dirty ones is still reachable.
+pub(crate) fn plan_step(plan: &[ExpectedRequest], label: &str) -> usize {
+    plan.iter()
+        .position(|step| step.label == label)
+        .unwrap_or_else(|| panic!("no {label:?} step in this plan"))
+}
+
+pub(crate) fn baseline_lookups_finding_nothing(project: &'static str) -> Vec<ExpectedRequest> {
+    let mut lookups = Vec::new();
+    for require_clean in [false, true] {
+        for branch in ["main", "master"] {
+            lookups.push(expected_request(
+                "look up a baseline scan to diff against",
+                move |request| {
+                    assert_baseline_lookup_request(request, project, Some(branch), require_clean)
+                },
+                json_response(scans_response(Vec::new())),
+            ));
+        }
+    }
+    lookups
+}
+
 pub(crate) fn assert_baseline_lookup_request(
     request: &CapturedRequest,
     project: &str,
     branch: Option<&str>,
+    require_clean: bool,
 ) -> Result<(), String> {
     assert_scan_list_request(request, project)?;
     assert_query(request, "engine", "corgea-blast")?;
     assert_query(request, "status", "complete")?;
     assert_query(request, "exclude_pull_requests", "true")?;
-    if query_value(request, "worktree_dirty").is_ok() {
-        return Err("baseline lookup must not filter on worktree_dirty".to_string());
+    match (require_clean, query_value(request, "worktree_dirty")) {
+        (true, Ok(value)) if value == "false" => {}
+        (true, _) => return Err("the second walk must ask for clean scans only".to_string()),
+        (false, Ok(_)) => {
+            return Err("the first walk must not filter on worktree_dirty".to_string())
+        }
+        (false, Err(_)) => {}
     }
     let Some(branch) = branch else {
         return match query_value(request, "branch") {
@@ -895,13 +932,7 @@ fn blast_plan_for(
     // keeps this the full-scan contract: nothing to diff from, no incremental
     // fields on the upload.
     if look_for_baseline {
-        for branch in ["main", "master"] {
-            plan.push(expected_request(
-                "look up a baseline scan to diff against",
-                move |request| assert_baseline_lookup_request(request, "cloud-e2e", Some(branch)),
-                json_response(scans_response(Vec::new())),
-            ));
-        }
+        plan.extend(baseline_lookups_finding_nothing("cloud-e2e"));
     }
     plan.extend([
         expected_request(
