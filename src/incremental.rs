@@ -3,13 +3,29 @@
 //! The server already does this, but it derives the diff through the project's
 //! SCM integration, which leaves out every project that integration cannot
 //! answer for: zip-only projects, unreachable self-hosted hosts, unpushed
-//! commits. This module diffs in the clone the scan already reads from.
+//! commits. This module works the diff out where the scan is run.
+//!
+//! Finding what to diff *against* is the same in both directions: ask the
+//! server for the newest completed scan of a clean trunk worktree. What
+//! changed since it can then be measured two ways.
+//!
+//! The first is the file checksums that scan uploaded, fetched and subtracted
+//! from this run's. It needs no git history, so it is the only one that works
+//! in a shallow clone, on a detached HEAD, or in a directory unpacked from a
+//! tarball — the cases that used to analyze every file on every run, forever.
+//! It also measures the right thing: the archive, not the repository, so
+//! ignored paths, excluded globs and uncommitted edits cannot make the list
+//! disagree with what the scanner will read.
+//!
+//! The second is `git diff` against the baseline's commit. It is the fallback,
+//! for a baseline scan predating manifests or one whose manifest cannot be
+//! read, and it needs the history a shallow clone does not have.
 //!
 //! Runs by default, so it must be safe on a repo never set up for it. Every
 //! refusal falls through to the full scan that run would have done anyway.
 //! `--disable-incremental` forces it.
 //!
-//! `base_sha` travels with the file list because the server carries findings
+//! The baseline travels with the file list because the server carries findings
 //! forward for every file the list omits. Copy from a different baseline than
 //! the one diffed here and files changed between the two keep stale findings,
 //! reported as current. The server copies from exactly this scan, or refuses.
@@ -19,6 +35,7 @@
 //! holds. Analysis shrinks, not the upload.
 
 use crate::config::Config;
+use crate::manifest::{Manifest, MANIFEST_VERSION};
 use crate::scanners::blast::{classify_scan_status, ScanState};
 use crate::utils::api::{self, ScanResponse};
 use git2::Repository;
@@ -45,29 +62,27 @@ const BLAST_ENGINE: &str = "corgea-blast";
 /// This only avoids building a multi-megabyte form field to be refused.
 const MAX_CHANGED_FILES: usize = 5_000;
 
-/// What this run worked out about its own scope, and what to say about it.
+/// How an upload names the scan its diff was measured from.
 ///
-/// The message is returned rather than printed because it is not always the
-/// last word. An upload carrying a file manifest is scoped by the server, which
-/// holds the baseline manifest this clone does not, so whatever was concluded
-/// here may not be what happened. The caller prints the server's verdict when
-/// it gets one and this only when it does not.
+/// Two forms because the two diffs know different things. A git diff is
+/// measured from a commit and says so. A checksum diff is measured from one
+/// specific scan's stored manifest, and that scan is what has to be copied
+/// from — it may have been uploaded with no commit at all, and where several
+/// scans share a commit, naming it would leave the server to pick between them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IncrementalDecision {
-    /// The diff to upload, or `None` to leave the scan at every file.
-    pub plan: Option<IncrementalPlan>,
-    /// One line describing the scope this resolved to, ready to print.
-    pub message: String,
+pub enum BaselineRef {
+    Commit(String),
+    Scan(String),
 }
 
 /// A diff the server can turn into an incremental scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncrementalPlan {
-    /// Commit this diff was measured from. The server carries its findings
+    /// The scan this diff was measured from. The server carries its findings
     /// forward for every file the diff does not name.
-    pub base_sha: String,
-    /// Repo-relative paths differing from `base_sha`, including deletions and
-    /// both sides of a rename.
+    pub base: BaselineRef,
+    /// Repo-relative paths differing from the baseline, including deletions
+    /// and both sides of a rename.
     pub changed_files: Vec<String>,
     /// Whether the diff measured the working tree rather than a commit. The
     /// server refuses a dirty upload otherwise, because a commit-to-commit diff
@@ -75,7 +90,11 @@ pub struct IncrementalPlan {
     pub covers_worktree: bool,
 }
 
-/// What an incremental scan of this commit would cover, and how to describe it.
+/// What an incremental scan of this upload would cover.
+///
+/// Prints one line either way: the scope it resolved to, or why the scan is
+/// analyzing everything. `manifest` is this archive's checksums, absent when
+/// the archive is not the whole project.
 pub fn resolve_incremental_plan(
     config: &Config,
     project_name: &str,
@@ -83,7 +102,8 @@ pub fn resolve_incremental_plan(
     head_sha: Option<&str>,
     worktree_dirty: bool,
     ignore_dirty_worktree: bool,
-) -> IncrementalDecision {
+    manifest: Option<&Manifest>,
+) -> Option<IncrementalPlan> {
     match plan_diff(
         config,
         project_name,
@@ -91,17 +111,18 @@ pub fn resolve_incremental_plan(
         head_sha,
         worktree_dirty,
         ignore_dirty_worktree,
+        manifest,
     ) {
-        Ok((plan, summary)) => IncrementalDecision {
-            plan: Some(plan),
-            message: summary,
-        },
+        Ok((plan, summary)) => {
+            println!("{summary}");
+            Some(plan)
+        }
         // Never fatal — a full scan is correct, only slower, so the run
         // continues and only says why.
-        Err(reason) => IncrementalDecision {
-            plan: None,
-            message: format!("Scanning every file: {reason}."),
-        },
+        Err(reason) => {
+            println!("Scanning every file: {reason}.");
+            None
+        }
     }
 }
 
@@ -113,7 +134,60 @@ fn plan_diff(
     head_sha: Option<&str>,
     worktree_dirty: bool,
     ignore_dirty_worktree: bool,
+    manifest: Option<&Manifest>,
 ) -> Result<(IncrementalPlan, String), String> {
+    // Optional, because a checksum diff needs no repository. Only the git diff
+    // below does, and it reports its absence by its real name.
+    let repo = Repository::discover(".").ok();
+    let trunks = repo
+        .as_ref()
+        .map_or_else(|| fallback_trunks().to_vec(), baseline_branches);
+
+    let baseline = match find_baseline(config, project_name, &trunks) {
+        BaselineLookup::Found(scan) => scan,
+        BaselineLookup::NotFound => {
+            return Err(format!(
+                "project '{project_name}' has no completed scan of a clean worktree on \
+                 {}, so there is nothing stable to diff against",
+                join_or(&trunks)
+            ))
+        }
+        BaselineLookup::LookupFailed => {
+            return Err(format!(
+                "the earlier scans of project '{project_name}' could not be looked up, \
+                 so there is nothing to diff against. Run with --verbose for the error"
+            ))
+        }
+    };
+
+    // Checksums first. They describe the archive rather than the repository, so
+    // they are exact where a git diff has to be argued about, and they work in
+    // a clone that cannot reach the baseline commit — or has no commits.
+    if let Some(local) = manifest {
+        match changed_files_against(config, &baseline, local) {
+            Ok(changed_files) => {
+                let summary = summarize(&changed_files, &format!("the {}", baseline.describe()))?;
+                return Ok((
+                    IncrementalPlan {
+                        // Checksums are taken over the files as they sit on
+                        // disk, so uncommitted edits are named in the list like
+                        // any other change rather than missing from it.
+                        base: BaselineRef::Scan(baseline.id),
+                        changed_files,
+                        covers_worktree: true,
+                    },
+                    summary,
+                ));
+            }
+            // Not fatal on its own: git may still be able to answer, and this
+            // is the expected path for a baseline that predates manifests.
+            Err(reason) => crate::log::debug(&format!(
+                "Cannot diff against the checksums of scan {}: {reason}. Trying git.",
+                baseline.id
+            )),
+        }
+    }
+
     // A commit-to-commit diff cannot see uncommitted edits, so on a dirty tree
     // it leaves modified files off the list and their old findings are copied
     // forward as current. --ignore-dirty-worktree does not paper over that; it
@@ -131,67 +205,97 @@ fn plan_diff(
     // Nothing to diff from. Covers a non-git directory, a repo with no commit,
     // a detached HEAD, and a scan started below the repo root — none of which
     // report RepoInfo to the upload either.
-    let (Some(_branch), Some(head_sha)) = (branch, head_sha) else {
+    let (Some(_branch), Some(head_sha), Some(repo)) = (branch, head_sha, repo.as_ref()) else {
         return Err(
             "no git branch and commit to diff from (not a git repository, no commit \
-             yet, a detached HEAD, or a scan started below the repository root)"
+             yet, a detached HEAD, or a scan started below the repository root), and \
+             the last scan stored no file checksums to compare against instead"
                 .to_string(),
         );
     };
 
-    let repo = Repository::discover(".")
-        .map_err(|e| format!("this directory is not a git repository ({e})"))?;
-
-    let trunks = baseline_branches(&repo);
-    let base_sha = match find_baseline_sha(config, project_name, &trunks) {
-        Baseline::Found(sha) => sha,
-        Baseline::NotFound => {
-            return Err(format!(
-                "project '{project_name}' has no completed scan of a clean worktree on \
-                 {}, so there is nothing stable to diff against",
-                join_or(&trunks)
-            ))
-        }
-        Baseline::LookupFailed => {
-            return Err(format!(
-                "the earlier scans of project '{project_name}' could not be looked up, \
-                 so there is nothing to diff against. Run with --verbose for the error"
-            ))
-        }
-    };
-
-    let changed_files = changed_files_since(&repo, &base_sha, head_sha, covers_worktree)?;
-
-    if changed_files.len() > MAX_CHANGED_FILES {
-        return Err(format!(
-            "{} files changed since {}, which is more than an incremental scan is worth",
-            changed_files.len(),
-            short_sha(&base_sha)
-        ));
-    }
-
+    let changed_files = changed_files_since(repo, &baseline.sha, head_sha, covers_worktree)?;
     let since = if covers_worktree {
         format!(
             "commit {} and your uncommitted changes",
-            short_sha(&base_sha)
+            short_sha(&baseline.sha)
         )
     } else {
-        format!("commit {}", short_sha(&base_sha))
+        format!("commit {}", short_sha(&baseline.sha))
     };
-    let summary = match changed_files.len() {
-        0 => format!("Incremental scan: nothing changed since {since}."),
-        1 => format!("Incremental scan: 1 file changed since {since}."),
-        count => format!("Incremental scan: {count} files changed since {since}."),
-    };
+    let summary = summarize(&changed_files, &since)?;
 
     Ok((
         IncrementalPlan {
-            base_sha,
+            base: BaselineRef::Commit(baseline.sha),
             changed_files,
             covers_worktree,
         },
         summary,
     ))
+}
+
+/// One line for a diff of this size, or why it is too big to be worth sending.
+fn summarize(changed_files: &[String], since: &str) -> Result<String, String> {
+    if changed_files.len() > MAX_CHANGED_FILES {
+        return Err(format!(
+            "{} files changed since {since}, which is more than an incremental scan \
+             is worth",
+            changed_files.len()
+        ));
+    }
+    Ok(match changed_files.len() {
+        0 => format!("Incremental scan: nothing changed since {since}."),
+        1 => format!("Incremental scan: 1 file changed since {since}."),
+        count => format!("Incremental scan: {count} files changed since {since}."),
+    })
+}
+
+/// Files differing from the checksums `baseline` stored, by fetching them.
+fn changed_files_against(
+    config: &Config,
+    baseline: &BaselineScan,
+    local: &Manifest,
+) -> Result<Vec<String>, String> {
+    let Some(root) = baseline.manifest_root.as_deref() else {
+        return Err("it stored none".to_string());
+    };
+    // A manifest is only comparable to one written the same way. Rather than
+    // guess at a format a later client introduced, leave it to git.
+    if baseline.manifest_version.as_deref() != Some(MANIFEST_VERSION) {
+        return Err(format!(
+            "they are version {}, and this client reads version {MANIFEST_VERSION}",
+            baseline.manifest_version.as_deref().unwrap_or("unknown")
+        ));
+    }
+    let body = api::download_scan_file_manifest(&config.get_url(), &baseline.id)
+        .map_err(|e| format!("they could not be downloaded ({e})"))?;
+    Ok(Manifest::decode(&body, root)?.changed_paths(local))
+}
+
+/// A scan that can be diffed against, and what it offers to diff with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BaselineScan {
+    /// What the upload names when the diff came from this scan's checksums.
+    id: String,
+    /// Commit it covered, which the git diff measures from. Never empty:
+    /// `is_usable_baseline` requires it.
+    sha: String,
+    /// Branch it ran on, for saying what this run is being compared to.
+    branch: Option<String>,
+    /// Digest of the file manifest it stored, `None` when it stored none.
+    manifest_root: Option<String>,
+    manifest_version: Option<String>,
+}
+
+impl BaselineScan {
+    /// How to refer to this scan in the one line the run prints.
+    fn describe(&self) -> String {
+        match &self.branch {
+            Some(branch) => format!("last scan of {branch} ({})", short_sha(&self.sha)),
+            None => format!("last scan of this project ({})", short_sha(&self.sha)),
+        }
+    }
 }
 
 /// Outcome of looking for a scan to diff against.
@@ -200,8 +304,8 @@ fn plan_diff(
 /// things to tell someone: one says this project has no scan history to build
 /// on, the other says we could not read the history it may well have.
 #[derive(Debug, PartialEq, Eq)]
-enum Baseline {
-    Found(String),
+enum BaselineLookup {
+    Found(BaselineScan),
     NotFound,
     LookupFailed,
 }
@@ -220,12 +324,19 @@ enum Baseline {
 /// follow it rather than replace it.
 fn baseline_branches(repo: &Repository) -> Vec<String> {
     let mut branches: Vec<String> = default_branch(repo).into_iter().collect();
-    for fallback in ["main", "master"] {
+    for fallback in fallback_trunks() {
         if !branches.iter().any(|branch| branch == fallback) {
-            branches.push(fallback.to_string());
+            branches.push((*fallback).to_string());
         }
     }
     branches
+}
+
+/// Trunk names to try when this clone cannot say which one it descends from,
+/// including when there is no clone to ask.
+fn fallback_trunks() -> &'static [String; 2] {
+    static TRUNKS: std::sync::OnceLock<[String; 2]> = std::sync::OnceLock::new();
+    TRUNKS.get_or_init(|| ["main".to_string(), "master".to_string()])
 }
 
 /// Default branch this clone recorded, or None when it recorded none.
@@ -247,13 +358,13 @@ fn join_or(branches: &[String]) -> String {
     }
 }
 
-/// Commit of the newest scan on the first trunk branch that has one.
+/// The newest scan on the first trunk branch that has one.
 ///
 /// One query per branch, because the branch filter is server-side: a project
 /// with heavy feature-branch traffic can push trunk's newest scan far past any
 /// page limit, and asking for trunk directly cannot miss it that way. The page
 /// budget is shared across branches so the worst case stays bounded.
-fn find_baseline_sha(config: &Config, project_name: &str, branches: &[String]) -> Baseline {
+fn find_baseline(config: &Config, project_name: &str, branches: &[String]) -> BaselineLookup {
     let url = config.get_url();
     let mut budget = SCAN_LOOKUP_MAX_PAGES;
 
@@ -277,7 +388,7 @@ fn find_baseline_sha(config: &Config, project_name: &str, branches: &[String]) -
                     // Whatever failed is the endpoint, not the branch, so the
                     // remaining candidates would fail the same way.
                     crate::log::debug(&format!("Baseline scan lookup failed: {e}"));
-                    return Baseline::LookupFailed;
+                    return BaselineLookup::LookupFailed;
                 }
             };
 
@@ -289,8 +400,8 @@ fn find_baseline_sha(config: &Config, project_name: &str, branches: &[String]) -
             // available and no later page can improve on it. Matched
             // client-side too: a backend that ignored the branch filter would
             // otherwise hand back another branch's scan.
-            if let Some(sha) = branch_baseline(&scans, branch) {
-                return Baseline::Found(sha);
+            if let Some(scan) = branch_baseline(&scans, branch) {
+                return BaselineLookup::Found(scan);
             }
             if response
                 .total_pages
@@ -302,14 +413,22 @@ fn find_baseline_sha(config: &Config, project_name: &str, branches: &[String]) -
         }
     }
 
-    Baseline::NotFound
+    BaselineLookup::NotFound
 }
 
 /// Newest usable scan of `branch` on this page.
-fn branch_baseline(scans: &[ScanResponse], branch: &str) -> Option<String> {
-    usable_baselines(scans)
-        .find(|scan| scan.branch.as_deref() == Some(branch))
-        .and_then(|scan| scan.git_sha.clone())
+fn branch_baseline(scans: &[ScanResponse], branch: &str) -> Option<BaselineScan> {
+    let scan = usable_baselines(scans).find(|scan| scan.branch.as_deref() == Some(branch))?;
+    Some(BaselineScan {
+        id: scan.id.clone(),
+        sha: scan.git_sha.clone()?,
+        branch: scan.branch.clone(),
+        manifest_root: scan
+            .file_manifest_root
+            .clone()
+            .filter(|root| !root.is_empty()),
+        manifest_version: scan.file_manifest_version.clone(),
+    })
 }
 
 /// Scans on one page that can serve as a baseline, newest first.
@@ -457,7 +576,15 @@ mod tests {
             metadata: None,
             failed_reason: None,
             scan_errors: Vec::new(),
+            file_manifest_root: None,
+            file_manifest_version: None,
         }
+    }
+
+    /// The sha of the scan `branch_baseline` picked, for the cases that only
+    /// care which one it was.
+    fn baseline_sha(scans: &[ScanResponse], branch: &str) -> Option<String> {
+        branch_baseline(scans, branch).map(|scan| scan.sha)
     }
 
     #[test]
@@ -507,7 +634,7 @@ mod tests {
     #[test]
     fn the_newest_usable_scan_on_the_branch_wins() {
         let scans = vec![scan("main", "newest"), scan("main", "older")];
-        assert_eq!(branch_baseline(&scans, "main").as_deref(), Some("newest"));
+        assert_eq!(baseline_sha(&scans, "main").as_deref(), Some("newest"));
     }
 
     #[test]
@@ -515,7 +642,7 @@ mod tests {
         // A backend that ignored the branch filter would otherwise hand back a
         // feature branch's scan as trunk's.
         let scans = vec![scan("feature", "on-feature")];
-        assert_eq!(branch_baseline(&scans, "main"), None);
+        assert_eq!(baseline_sha(&scans, "main"), None);
     }
 
     #[test]
@@ -523,14 +650,14 @@ mod tests {
         let mut dirty = scan("main", "dirty");
         dirty.worktree_dirty = Some(true);
         let scans = vec![dirty, scan("main", "clean")];
-        assert_eq!(branch_baseline(&scans, "main").as_deref(), Some("clean"));
+        assert_eq!(baseline_sha(&scans, "main").as_deref(), Some("clean"));
     }
 
     #[test]
     fn a_page_of_nothing_usable_yields_no_baseline() {
         let mut pr = scan("main", "pr");
         pr.pull_request_id = Some("42".to_string());
-        assert_eq!(branch_baseline(&[pr], "main"), None);
+        assert_eq!(baseline_sha(&[pr], "main"), None);
     }
 
     #[test]

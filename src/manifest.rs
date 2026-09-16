@@ -1,23 +1,28 @@
-//! File manifest: what this upload contains, addressed by content.
+//! File manifest: what an upload contains, addressed by content.
 //!
-//! Incremental scans need a list of changed files, and `incremental.rs` gets
-//! one by diffing two commits in this clone. That needs history the clone may
-//! not have: a shallow checkout cannot reach the commit the last scan covered,
-//! a detached HEAD names no branch, and a pipeline that unpacks a tarball has
-//! no `.git` at all. Each of those falls back to analyzing every file, on every
-//! run, forever.
+//! Incremental scans need a list of changed files, and `incremental.rs` works
+//! one out by diffing this clone against the commit the last trunk scan
+//! covered. That needs history the clone may not have: a shallow checkout
+//! cannot reach that commit, a detached HEAD names no branch, and a pipeline
+//! that unpacks a tarball has no `.git` at all. Each of those analyzes every
+//! file, on every run, forever.
 //!
-//! A manifest answers the same question from content. Every file that goes into
-//! the archive is hashed on the way in, and the server subtracts this manifest
-//! from the one the baseline scan uploaded. No commit has to be reachable, or
-//! to exist.
+//! A manifest answers the same question from content. Every file that goes
+//! into the archive is hashed on the way in, and the result is uploaded beside
+//! it. The next scan fetches the baseline's and subtracts one from the other.
+//! No commit has to be reachable, or to exist.
 //!
-//! It also describes a different thing from a git diff: the archive, not the
-//! repository. Ignored paths, excluded globs, untracked files and uncommitted
-//! edits all make the two disagree, and the archive is what the scanner reads.
-//! That is why the server prefers a manifest diff when it has one, and why this
-//! is built from the same walk that writes the zip rather than from a second
-//! pass over the worktree.
+//! The server stores these and hands them back; it never reads one. Both ends
+//! of the comparison are this code, which is why `encode` and `decode` are
+//! sides of the same coin and why the root is checked on the way in -- a
+//! manifest that arrives damaged has to read as "no baseline" rather than as a
+//! tree that lost every file it could not parse.
+//!
+//! A manifest also describes something different from a git diff: the archive,
+//! not the repository. Ignored paths, excluded globs, untracked files and
+//! uncommitted edits all make the two disagree, and the archive is what the
+//! scanner reads. Hence building it from the same walk that writes the zip
+//! rather than from a second pass over the worktree.
 //!
 //! The archive has to be the whole project. A `--target` or `--only-uncommitted`
 //! run uploads a subset, and a manifest of a subset reads as every other file
@@ -25,23 +30,30 @@
 //! having looked at them. Those runs build no manifest, which is the same
 //! reason they already skip incremental.
 
+use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
-/// Serialization this manifest speaks. The server refuses a version it does not
-/// read rather than guessing, so a newer client's scans analyze every file
-/// until the deployment catches up.
+/// Serialization this manifest speaks. A manifest tagged with anything else is
+/// left alone rather than guessed at, so a client meeting a newer format
+/// analyzes every file instead of misreading a tree.
 pub const MANIFEST_VERSION: &str = "1";
 
 /// First line of the canonical form, naming the format and the digest.
 const MANIFEST_HEADER: &str = "corgea-file-manifest/1 sha256";
 
-/// Ceiling on entries, matching the server's. A manifest above it is refused
-/// there, so building and uploading one would only waste the transfer.
+/// Ceiling on entries. A project with more files than this is one where the
+/// diff is unlikely to be small enough to matter, and the cap keeps a
+/// downloaded manifest from expanding without limit.
 const MAX_ENTRIES: usize = 100_000;
+
+/// Ceiling on the decompressed form, applied while decompressing. The bytes
+/// arrive gzipped over the network, and a small body can unpack into an
+/// arbitrarily large one.
+const MAX_DECODED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Every archived path and the digest of its contents.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -163,8 +175,8 @@ impl Manifest {
     /// Pack for upload, or `None` when this manifest cannot be one.
     ///
     /// Empty is not a manifest of nothing, it is the absence of one: an archive
-    /// with no files is not a project state to carry findings forward from.
-    /// Above the entry ceiling the server refuses it anyway.
+    /// with no files is not a project state to carry findings forward from, and
+    /// the next scan would read it as a project where everything was deleted.
     pub fn encode(&self) -> Option<EncodedManifest> {
         if self.entries.is_empty() || self.entries.len() > MAX_ENTRIES {
             return None;
@@ -175,6 +187,102 @@ impl Manifest {
         encoder.write_all(&canonical).ok()?;
         let body = encoder.finish().ok()?;
         Some(EncodedManifest { body, root })
+    }
+
+    /// Read back a manifest packed by `encode`, or say why it cannot be read.
+    ///
+    /// `expected_root` is what the server recorded when the manifest was
+    /// uploaded, and it is checked against the bytes that actually arrived.
+    /// Without that check a truncated download parses as a smaller tree, and
+    /// every file missing from it reads as deleted -- findings dropped for
+    /// files nobody touched.
+    ///
+    /// Every failure is a refusal, never a partial answer, for the same
+    /// reason: a manifest that is half understood describes a project that
+    /// never existed. The caller falls back to a full scan.
+    pub fn decode(body: &[u8], expected_root: &str) -> Result<Self, String> {
+        let mut canonical = Vec::new();
+        // Capped during the read, not after: this is compressed input, so the
+        // size that matters is not knowable until it has been expanded.
+        GzDecoder::new(body)
+            .take(MAX_DECODED_BYTES + 1)
+            .read_to_end(&mut canonical)
+            .map_err(|e| format!("it could not be decompressed ({e})"))?;
+        if canonical.len() as u64 > MAX_DECODED_BYTES {
+            return Err(format!("it unpacks to more than {MAX_DECODED_BYTES} bytes"));
+        }
+
+        let root = format!("{:x}", Sha256::digest(&canonical));
+        if !root.eq_ignore_ascii_case(expected_root) {
+            return Err(
+                "its contents do not match the digest recorded for it, so it arrived \
+                 damaged or truncated"
+                    .to_string(),
+            );
+        }
+
+        let text = String::from_utf8(canonical).map_err(|_| "it is not valid UTF-8".to_string())?;
+        let mut lines = text.lines();
+        match lines.next() {
+            Some(MANIFEST_HEADER) => {}
+            Some(other) => {
+                return Err(format!(
+                    "it is in a format this version does not read ({})",
+                    other.chars().take(40).collect::<String>()
+                ))
+            }
+            None => return Err("it is empty".to_string()),
+        }
+
+        let mut entries = BTreeMap::new();
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            // One space, and paths may contain more, so split once from the
+            // left and treat everything after as the path.
+            let Some((digest, path)) = line.split_once(' ') else {
+                return Err("one of its lines is not a digest and a path".to_string());
+            };
+            if digest.is_empty() || path.is_empty() {
+                return Err("one of its lines names an empty digest or path".to_string());
+            }
+            entries.insert(path.to_string(), digest.to_string());
+            if entries.len() > MAX_ENTRIES {
+                return Err(format!("it describes more than {MAX_ENTRIES} files"));
+            }
+        }
+        if entries.is_empty() {
+            return Err("it describes no files".to_string());
+        }
+        Ok(Self { entries })
+    }
+
+    /// Paths that differ between this manifest and `newer`: added, removed, and
+    /// same-path-different-contents.
+    ///
+    /// Both sides, including removals, because the list decides which findings
+    /// are *not* carried forward. A deleted file left off keeps its findings in
+    /// a tree that no longer holds it.
+    ///
+    /// Sorted, and each path named once, matching what the git diff produces so
+    /// the two are interchangeable to everything downstream.
+    pub fn changed_paths(&self, newer: &Manifest) -> Vec<String> {
+        let mut changed: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(path, digest)| newer.entries.get(*path) != Some(digest))
+            .map(|(path, _)| path.clone())
+            .collect();
+        changed.extend(
+            newer
+                .entries
+                .keys()
+                .filter(|path| !self.entries.contains_key(*path))
+                .cloned(),
+        );
+        changed.sort();
+        changed
     }
 }
 
@@ -287,6 +395,75 @@ mod tests {
         }
 
         assert!(manifest.encode().is_none());
+    }
+
+    #[test]
+    fn a_manifest_survives_the_round_trip_through_the_server() {
+        let original = manifest(&[("a.py", "one"), ("dir/b with space.py", "two")]);
+        let encoded = original.encode().expect("encode");
+
+        let read_back = Manifest::decode(&encoded.body, &encoded.root).expect("decode");
+
+        assert_eq!(read_back, original);
+    }
+
+    #[test]
+    fn a_manifest_that_does_not_match_its_digest_is_refused() {
+        // A truncated download parses as a smaller tree, and every file missing
+        // from it would read as deleted.
+        let encoded = manifest(&[("a.py", "one")]).encode().expect("encode");
+
+        let err = Manifest::decode(&encoded.body, &"0".repeat(64)).expect_err("must refuse");
+
+        assert!(err.contains("damaged or truncated"), "{err}");
+    }
+
+    #[test]
+    fn a_body_that_is_not_a_manifest_is_refused_rather_than_read_as_an_empty_tree() {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"corgea-file-manifest/9 blake3\n").ok();
+        let body = encoder.finish().expect("gzip");
+        let root = format!("{:x}", Sha256::digest(b"corgea-file-manifest/9 blake3\n"));
+
+        let err = Manifest::decode(&body, &root).expect_err("must refuse");
+
+        assert!(err.contains("format this version does not read"), "{err}");
+    }
+
+    #[test]
+    fn bytes_that_are_not_gzip_are_refused() {
+        let err = Manifest::decode(b"not gzip at all", "irrelevant").expect_err("must refuse");
+        assert!(err.contains("decompressed"), "{err}");
+    }
+
+    #[test]
+    fn the_diff_names_added_edited_and_deleted_files_but_not_untouched_ones() {
+        let baseline = manifest(&[("keep.py", "same"), ("edit.py", "before"), ("gone.py", "x")]);
+        let current = manifest(&[("keep.py", "same"), ("edit.py", "after"), ("added.py", "y")]);
+
+        assert_eq!(
+            baseline.changed_paths(&current),
+            vec!["added.py", "edit.py", "gone.py"]
+        );
+    }
+
+    #[test]
+    fn two_identical_trees_report_nothing_changed() {
+        let tree = manifest(&[("a.py", "one"), ("b.py", "two")]);
+        assert!(tree.changed_paths(&tree).is_empty());
+    }
+
+    #[test]
+    fn a_file_that_moved_is_named_on_both_sides() {
+        // The old path has to be there, or its findings are carried into a tree
+        // that no longer holds it.
+        let baseline = manifest(&[("old/a.py", "same")]);
+        let current = manifest(&[("new/a.py", "same")]);
+
+        assert_eq!(
+            baseline.changed_paths(&current),
+            vec!["new/a.py", "old/a.py"]
+        );
     }
 
     #[test]

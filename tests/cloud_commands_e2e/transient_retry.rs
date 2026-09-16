@@ -14,6 +14,7 @@
 
 use crate::common::*;
 use hyper::{Method, StatusCode};
+use serde_json::json;
 
 /// The pauses are 10s/30s/50s in production; a run under test cannot spend 90
 /// seconds, so it retries on the same schedule compressed to milliseconds.
@@ -24,18 +25,18 @@ const ATTEMPTS: usize = 4;
 
 /// What a gateway returns when it cannot reach the API: HTML, not the JSON
 /// envelope the endpoints parse.
-fn bad_gateway() -> (StatusCode, String) {
-    (
+fn bad_gateway() -> StubResponse {
+    raw_response(
         StatusCode::BAD_GATEWAY,
-        "<html><head><title>502 Bad Gateway</title></head><body>502 Bad Gateway</body></html>"
-            .to_string(),
+        "text/html",
+        "<html><head><title>502 Bad Gateway</title></head><body>502 Bad Gateway</body></html>",
     )
 }
 
-fn too_many_requests() -> (StatusCode, String) {
-    (
+fn too_many_requests() -> StubResponse {
+    json_response_with_status(
         StatusCode::TOO_MANY_REQUESTS,
-        r#"{"message":"rate limit exceeded"}"#.to_string(),
+        json!({"message": "rate limit exceeded"}),
     )
 }
 

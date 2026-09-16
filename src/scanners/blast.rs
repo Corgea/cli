@@ -4,7 +4,7 @@ use crate::manifest::Manifest;
 use crate::scan::build_scan_url;
 use crate::targets;
 use crate::utils;
-use crate::utils::api::{SCAIssue, UploadZipResult};
+use crate::utils::api::SCAIssue;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -536,13 +536,13 @@ fn start_new_scan(
     // the archive no longer holds would be wrong, but those runs are not
     // "scanning every file" either, so no message is honest.
     let narrowed_archive = target_str.is_some() || exclude.is_some();
-    let incremental_decision = if *disable_incremental || narrowed_archive {
+    let incremental = if *disable_incremental || narrowed_archive {
         None
     } else {
         // Reconciled repo info, so a tree that turned out dirty — or a HEAD
         // that moved mid-packaging — refuses rather than diffing against a
         // commit this upload is not a snapshot of.
-        Some(crate::incremental::resolve_incremental_plan(
+        crate::incremental::resolve_incremental_plan(
             config,
             project_name,
             repo_info.as_ref().and_then(|info| info.branch.as_deref()),
@@ -551,12 +551,14 @@ fn start_new_scan(
             // branch/commit the resolver reports next, by its real name.
             repo_info.as_ref().is_some_and(|info| info.dirty),
             *ignore_dirty_worktree,
-        ))
+            archive_contents.manifest.as_ref(),
+        )
     };
-    // Withheld under --disable-incremental: the server would otherwise scope
-    // the scan from it, which is the one thing that flag is asked for. Skipping
-    // a run leaves no gap, since a baseline is the newest scan carrying a
-    // manifest rather than the immediately preceding one.
+    // Stored with the scan for a later run to diff against, so it is worth
+    // uploading even when this run scans everything. Withheld under
+    // --disable-incremental, which asks for exactly that and nothing carried
+    // forward; skipping a run leaves no gap, since a baseline is the newest
+    // scan carrying a manifest rather than the immediately preceding one.
     let file_manifest = if *disable_incremental {
         None
     } else {
@@ -565,12 +567,6 @@ fn start_new_scan(
             .as_ref()
             .and_then(Manifest::encode)
     };
-    // A manifest is diffed on the server against a baseline this clone does not
-    // hold, so what was worked out above is a guess until the upload answers.
-    let local_verdict = incremental_decision.as_ref().map(|d| d.message.clone());
-    if let (None, Some(message)) = (&file_manifest, &local_verdict) {
-        println!("{message}");
-    }
     println!("\n\nSubmitting scan to Corgea:");
     let upload_result = match utils::api::upload_zip(
         &zip_path,
@@ -581,7 +577,7 @@ fn start_new_scan(
             scan_type,
             policy,
             metadata,
-            incremental: incremental_decision.and_then(|decision| decision.plan),
+            incremental,
             file_manifest,
         },
     ) {
@@ -606,10 +602,6 @@ fn start_new_scan(
         }
     };
 
-    if let Some(scope) = describe_scan_scope(&upload_result, local_verdict.as_deref()) {
-        println!("{scope}");
-    }
-
     let scan_id = upload_result.scan_id;
     let scan_url = build_scan_url(
         &config.get_url(),
@@ -632,40 +624,6 @@ fn start_new_scan(
 
     wait_for_scan(config, &scan_id, WaitBudget::start());
     (scan_id, upload_result.project_id)
-}
-
-/// One line saying how much of the project this scan will analyze.
-///
-/// The server's answer wins wherever it gave one. It is the side that picked
-/// the baseline and, for a manifest diff, the only side holding both trees, so
-/// what this run worked out before uploading may describe a comparison that
-/// never happened. `local` is what to fall back on when the response says
-/// nothing — a deployment predating the field, or an upload that deduplicated
-/// onto a scan someone else had already started.
-fn describe_scan_scope(upload: &UploadZipResult, local: Option<&str>) -> Option<String> {
-    if let Some(verdict) = &upload.incremental {
-        if verdict.changed_files == 0 {
-            return Some(
-                "Incremental scan: nothing changed since the last scan of this project."
-                    .to_string(),
-            );
-        }
-        let changed = match verdict.changed_files {
-            1 => "1 file changed".to_string(),
-            count => format!("{count} files changed"),
-        };
-        // The two counts differ when a changed file is context for a finding in
-        // another file, which then has to be looked at again as well. Saying
-        // only the first would understate what the scan is about to do.
-        return Some(format!(
-            "Incremental scan: {changed} since the last scan of this project, {} to analyze.",
-            verdict.files_to_scan
-        ));
-    }
-    if let Some(reason) = &upload.incremental_reason {
-        return Some(format!("Scanning every file: {reason}."));
-    }
-    local.map(str::to_string)
 }
 
 /// Write the `--out-format` report for a completed scan to `--out-file`.
@@ -1375,72 +1333,6 @@ mod tests {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
     }
 
-    fn upload(
-        incremental: Option<(u64, u64)>,
-        incremental_reason: Option<&str>,
-    ) -> UploadZipResult {
-        UploadZipResult {
-            scan_id: "scan-1".to_string(),
-            project_id: None,
-            incremental: incremental.map(|(changed_files, files_to_scan)| {
-                crate::utils::api::IncrementalVerdict {
-                    changed_files,
-                    files_to_scan,
-                }
-            }),
-            incremental_reason: incremental_reason.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn the_scope_reports_both_what_changed_and_what_that_pulls_in() {
-        // The counts differ when a changed file is context for a finding
-        // elsewhere, and only saying "2 files changed" would understate the run.
-        assert_eq!(
-            describe_scan_scope(&upload(Some((2, 5)), None), None).as_deref(),
-            Some("Incremental scan: 2 files changed since the last scan of this project, 5 to analyze.")
-        );
-        assert_eq!(
-            describe_scan_scope(&upload(Some((1, 1)), None), None).as_deref(),
-            Some("Incremental scan: 1 file changed since the last scan of this project, 1 to analyze.")
-        );
-        assert_eq!(
-            describe_scan_scope(&upload(Some((0, 0)), None), None).as_deref(),
-            Some("Incremental scan: nothing changed since the last scan of this project.")
-        );
-    }
-
-    #[test]
-    fn the_servers_answer_replaces_the_one_this_run_guessed() {
-        // A manifest is diffed against a baseline the client never sees, so
-        // the local decision can be both confident and wrong.
-        let local = Some("Incremental scan: 3 files changed since commit abc1234.");
-        assert_eq!(
-            describe_scan_scope(&upload(Some((9, 9)), None), local).as_deref(),
-            Some("Incremental scan: 9 files changed since the last scan of this project, 9 to analyze.")
-        );
-        assert_eq!(
-            describe_scan_scope(
-                &upload(None, Some("scanning policies changed since the last scan")),
-                local
-            )
-            .as_deref(),
-            Some("Scanning every file: scanning policies changed since the last scan.")
-        );
-    }
-
-    #[test]
-    fn a_server_that_says_nothing_leaves_the_local_decision_standing() {
-        // Deployments predating the field, and uploads that deduplicated onto
-        // a scan someone else started, report no verdict at all.
-        assert_eq!(
-            describe_scan_scope(&upload(None, None), Some("Scanning every file: no git."))
-                .as_deref(),
-            Some("Scanning every file: no git.")
-        );
-        assert_eq!(describe_scan_scope(&upload(None, None), None), None);
-    }
-
     fn sample_rules(status: &str, block: bool) -> BlockingRuleResponse {
         BlockingRuleResponse {
             block,
@@ -1842,6 +1734,8 @@ mod tests {
             metadata: None,
             failed_reason: failed_reason.map(|r| r.to_string()),
             scan_errors,
+            file_manifest_root: None,
+            file_manifest_version: None,
         }
     }
 

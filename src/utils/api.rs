@@ -1,4 +1,4 @@
-use crate::incremental::IncrementalPlan;
+use crate::incremental::{BaselineRef, IncrementalPlan};
 use crate::log::debug;
 use crate::manifest::EncodedManifest;
 use crate::utils;
@@ -507,28 +507,6 @@ fn check_for_warnings(headers: &HeaderMap, status: StatusCode) {
 pub struct UploadZipResult {
     pub scan_id: String,
     pub project_id: Option<String>,
-    /// How the server scoped the scan, when it said. Absent from a deployment
-    /// predating the field and from an upload that deduplicated onto a scan
-    /// someone else started.
-    pub incremental: Option<IncrementalVerdict>,
-    /// Why the server is analyzing every file, when it scoped nothing down and
-    /// had a reason to name.
-    pub incremental_reason: Option<String>,
-}
-
-/// The server's account of what an incremental scan ended up covering.
-///
-/// Authoritative in a way the client's own decision is not: the diff may have
-/// been taken from a file manifest this clone cannot compare against, from a
-/// different baseline than the one looked for here, or refused for a reason
-/// only the server can see.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct IncrementalVerdict {
-    /// Files differing from the baseline scan.
-    pub changed_files: u64,
-    /// Files actually analyzed, which is the changed set plus anything whose
-    /// context they were part of.
-    pub files_to_scan: u64,
 }
 
 /// Per-scan settings travelling with the archive without being part of it.
@@ -540,28 +518,9 @@ pub struct UploadOptions {
     /// Set when this run resolved a diff for the server to analyze instead of
     /// the whole project.
     pub incremental: Option<IncrementalPlan>,
-    /// Digests of everything in the archive, for the server to subtract from
-    /// the baseline scan's. Set only when the archive is the whole project.
+    /// Digests of everything in the archive, stored with the scan for a later
+    /// run to diff against. Set only when the archive is the whole project.
     pub file_manifest: Option<EncodedManifest>,
-}
-
-/// What the upload response says about the scan's scope.
-///
-/// Silent on anything it cannot read. The scan has started either way, so a
-/// field a newer server added, or one an older server never sent, is not worth
-/// a warning — it only costs this run a line of output.
-fn parse_incremental_verdict(
-    body: &HashMap<String, Value>,
-) -> (Option<IncrementalVerdict>, Option<String>) {
-    let verdict = body
-        .get("incremental")
-        .and_then(|value| serde_json::from_value(value.clone()).ok());
-    let reason = body
-        .get("incremental_reason")
-        .and_then(Value::as_str)
-        .filter(|reason| !reason.is_empty())
-        .map(str::to_string);
-    (verdict, reason)
 }
 
 pub fn upload_zip(
@@ -726,10 +685,16 @@ pub fn upload_zip(
                 if let Some(plan) = &incremental {
                     match serde_json::to_string(&plan.changed_files) {
                         Ok(changed_files) => {
-                            form = form.part(
-                                "incremental_base_sha",
-                                multipart::Part::text(plan.base_sha.clone()),
-                            );
+                            // Which scan the diff was measured from. A commit
+                            // when git produced it, and the scan itself when
+                            // its stored checksums did -- that upload may have
+                            // had no commit to name, and naming the scan is
+                            // exact where a commit several scans share is not.
+                            let (field, value) = match &plan.base {
+                                BaselineRef::Commit(sha) => ("incremental_base_sha", sha),
+                                BaselineRef::Scan(id) => ("incremental_base_scan_id", id),
+                            };
+                            form = form.part(field, multipart::Part::text(value.clone()));
                             form = form.part(
                                 "incremental_changed_files",
                                 multipart::Part::text(changed_files),
@@ -831,12 +796,9 @@ pub fn upload_zip(
                         .map(|s| s.to_string())
                         .or_else(|| v.as_i64().map(|n| n.to_string()))
                 });
-                let (incremental, incremental_reason) = parse_incremental_verdict(&body);
                 return Ok(UploadZipResult {
                     scan_id,
                     project_id,
-                    incremental,
-                    incremental_reason,
                 });
             } else {
                 return Err("Failed to get scan_id from response".into());
@@ -1289,6 +1251,26 @@ pub fn query_scans_for_commit(
             ("sha", sha.to_string()),
         ],
     )
+}
+
+/// The gzipped file manifest stored with `scan_id`.
+///
+/// Returned as bytes rather than parsed here: the server keeps them verbatim
+/// and never reads them, so the only thing that can tell whether they survived
+/// is the digest check `Manifest::decode` does against the root the scan list
+/// reported.
+pub fn download_scan_file_manifest(url: &str, scan_id: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    let url = format!("{}{}/scan/{}/file-manifest", url, API_BASE, scan_id);
+    debug(&format!("Sending request to URL: {}", url));
+    let response = http_client()
+        .get(url)
+        .send()
+        .map_err(|e| format!("API request failed: {}", e))?;
+    check_for_warnings(response.headers(), response.status());
+    if !response.status().is_success() {
+        return Err(format!("API request failed with status: {}", response.status()).into());
+    }
+    Ok(response.bytes()?.to_vec())
 }
 
 fn request_scan_list(
@@ -1910,6 +1892,15 @@ pub struct ScanResponse {
     /// build. Carried by the scan list only; `GET /scan/{id}` omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request_id: Option<String>,
+    /// Digest of the file manifest stored with this scan, `None` when it has
+    /// none — an older client, a partial upload, or a deployment predating the
+    /// field. Its presence is what says the manifest is there to download.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_manifest_root: Option<String>,
+    /// Serialization of that manifest. A version this client does not read is
+    /// left alone rather than guessed at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_manifest_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
     /// Why a scan ended without finishing. Only set for failed scans.
@@ -3083,59 +3074,6 @@ mod tests {
             3,
             "two rate limits, then the upload goes through"
         );
-    }
-
-    fn response_body(json: &str) -> HashMap<String, Value> {
-        serde_json::from_str(json).expect("test json")
-    }
-
-    #[test]
-    fn the_upload_response_reports_how_the_scan_was_scoped() {
-        let (verdict, reason) = parse_incremental_verdict(&response_body(
-            r#"{"incremental": {"source": "manifest", "baseline_scan_id": "abc",
-                "changed_files": 4, "files_to_scan": 7}}"#,
-        ));
-
-        assert_eq!(
-            verdict,
-            Some(IncrementalVerdict {
-                changed_files: 4,
-                files_to_scan: 7
-            })
-        );
-        assert_eq!(reason, None);
-    }
-
-    #[test]
-    fn a_full_scan_comes_back_as_the_reason_for_one() {
-        let (verdict, reason) = parse_incremental_verdict(&response_body(
-            r#"{"incremental": null, "incremental_reason": "corgea.yaml changed"}"#,
-        ));
-
-        assert_eq!(verdict, None);
-        assert_eq!(reason.as_deref(), Some("corgea.yaml changed"));
-    }
-
-    #[test]
-    fn a_response_without_a_verdict_reports_none_rather_than_failing() {
-        // A deployment predating the field, a scan that deduplicated onto one
-        // already running, and a field shaped differently by a newer server all
-        // land here. The scan has started either way, so the only thing at
-        // stake is a line of output.
-        for body in [
-            r#"{"scan_id": "s"}"#,
-            r#"{"incremental": null, "incremental_reason": null}"#,
-            r#"{"incremental": null, "incremental_reason": ""}"#,
-            r#"{"incremental": {"changed_files": "four"}}"#,
-            r#"{"incremental": {"files_to_scan": 7}}"#,
-            r#"{"incremental": true}"#,
-        ] {
-            assert_eq!(
-                parse_incremental_verdict(&response_body(body)),
-                (None, None),
-                "{body}"
-            );
-        }
     }
 
     #[test]
