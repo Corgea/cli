@@ -43,7 +43,6 @@ const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
     "**/specs/**",
     "**/node_modules/**",
     "**/tmp/**",
-    "**/migrations/**",
     "**/python*/site-packages/**",
     "**/*.mmdb",
     "**/*.css",
