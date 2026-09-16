@@ -84,6 +84,28 @@ fn leading_dirs(path: &str) -> Vec<&str> {
     dirs
 }
 
+/// A report path with its shared prefix already dropped, as a path relative to
+/// the working tree, or `None` when it cannot be confined there.
+///
+/// This is the one place that decides how a report path maps onto the tree, and
+/// both the prefix search and the upload go through it. A remainder is not
+/// necessarily a clean relative path -- the shared prefix is built from the
+/// report's own segments, so dropping it can leave leading slashes
+/// (`file:///src/a.py` minus `file:/`) or a `..`. `Path::join` treats a leading
+/// slash as absolute and discards the root, so a remainder joined on raw
+/// escapes the project: the search would accept a prefix on the strength of
+/// files that are not in the upload, and the upload would then die on the first
+/// of them.
+fn confine(remainder: &str) -> Option<String> {
+    let relative = normalize(remainder);
+
+    if relative.is_empty() || relative.split('/').any(|segment| segment == "..") {
+        return None;
+    }
+
+    Some(relative)
+}
+
 /// Leading directories every path agrees on.
 ///
 /// Candidate prefixes are built from these, so one path's coincidental suffix
@@ -107,6 +129,11 @@ fn shared_dirs<'a>(paths: &[&'a str]) -> Vec<&'a str> {
     shared
 }
 
+/// Whether a report path remainder names a file inside the working tree.
+fn resolves_under(root: &Path, remainder: &str) -> bool {
+    confine(remainder).is_some_and(|relative| root.join(relative).is_file())
+}
+
 /// Return the leading prefix to drop from a report's paths, or `""`.
 ///
 /// Returns `""` as soon as any sampled path resolves as written, so a report
@@ -127,7 +154,7 @@ pub fn find_report_path_prefix(root: &Path, report_paths: &[String]) -> String {
     // is about.
     if sample
         .iter()
-        .any(|path| root.join(&path.relative).is_file() || Path::new(&path.raw).is_file())
+        .any(|path| resolves_under(root, &path.relative) || Path::new(&path.raw).is_file())
     {
         return String::new();
     }
@@ -137,10 +164,11 @@ pub fn find_report_path_prefix(root: &Path, report_paths: &[String]) -> String {
 
     for depth in 1..=shared.len().min(MAX_REPORT_PATH_PREFIX_DEPTH) {
         let prefix = format!("{}/", shared[..depth].join("/"));
-        let hits: Vec<&str> = relatives
+        let hits: Vec<String> = relatives
             .iter()
             .filter_map(|path| path.strip_prefix(prefix.as_str()))
-            .filter(|remainder| root.join(remainder).is_file())
+            .filter_map(confine)
+            .filter(|relative| root.join(relative).is_file())
             .collect();
 
         // A real offset resolves the report broadly. A lone hit that is also a
@@ -177,35 +205,31 @@ pub fn strip_report_prefix(path: &str, prefix: &str) -> String {
 
 /// Where to read a report's file from on this machine.
 ///
-/// This has to resolve a path the same way [`find_report_path_prefix`] checked
-/// it, or the search proves one file present and the upload opens another. The
-/// search reads every path both as written and slash-normalized under `root`, so
-/// both are tried here, in that order:
+/// This goes through [`confine`], the same resolver [`find_report_path_prefix`]
+/// probes with, so the file the search proved present is the file that gets
+/// opened. The two resolving a path differently is how a report passes the
+/// search and then dies on its first upload.
 ///
 /// * The path as the report wrote it wins when it names a real file. A report
 ///   generated on this machine can carry absolute paths, and those are the files
 ///   its findings are about -- not same-named ones in the working tree.
-/// * Otherwise the prefix is dropped, the remainder normalized, and the result
-///   read under `root`. This covers a rooted path whose slash-stripped form is
-///   already in the tree (`/src/a.py`), which needs no prefix but does need
-///   rebasing, and a Windows-style path, which needs its separators fixed.
+/// * Otherwise the confined remainder is read under `root`. This covers a rooted
+///   path whose slash-stripped form is already in the tree (`/src/a.py`), which
+///   needs no prefix but does need rebasing, and a Windows-style path, which
+///   needs its separators fixed.
 ///
 /// A path that is already relative and carries no prefix is returned untouched,
 /// so a report that matches resolves against the process directory exactly as it
-/// always has. So is one whose remainder holds a `..`: the prefix search only
-/// samples paths, and an unsampled one must not walk out of the project.
+/// always has. So is one that cannot be confined: the prefix search only samples
+/// paths, and an unsampled one must not walk out of the project.
 pub fn local_report_path(root: &Path, report_path: &str, prefix: &str) -> PathBuf {
     let as_written = PathBuf::from(report_path);
-    let relative = normalize(&strip_report_prefix(report_path, prefix));
 
-    if relative == report_path
-        || relative.is_empty()
-        || relative.split('/').any(|segment| segment == "..")
-    {
+    let Some(relative) = confine(&strip_report_prefix(report_path, prefix)) else {
         return as_written;
-    }
+    };
 
-    if as_written.is_file() {
+    if relative == report_path || as_written.is_file() {
         return as_written;
     }
 
@@ -393,6 +417,41 @@ mod tests {
         ]);
 
         assert_eq!(find_report_path_prefix(&cwd, &paths), "");
+    }
+
+    /// SARIF permits a `file:///` URI. The shared prefix is built from the
+    /// report's own segments, so dropping it leaves a remainder that still
+    /// carries leading slashes, and a probe that joins that onto the root
+    /// silently escapes it -- `Path::join` treats a leading slash as absolute
+    /// and discards the root. The prefix would then be accepted on the strength
+    /// of files that are not in the project at all, and the upload, which reads
+    /// under the root, dies on the first one.
+    #[test]
+    fn a_file_uri_pointing_outside_the_project_resolves_nothing() {
+        let outside = tempfile::tempdir().unwrap();
+        let outside = tree(outside.path(), &["src/a.py", "src/b.py"]);
+        let root = tempfile::tempdir().unwrap();
+        let paths = report(&[
+            &format!("file://{}/src/a.py", outside.display()),
+            &format!("file://{}/src/b.py", outside.display()),
+        ]);
+
+        assert_eq!(find_report_path_prefix(root.path(), &paths), "");
+    }
+
+    /// The same URI shape, but the files really are in the project.
+    #[test]
+    fn a_file_uri_probes_and_reads_the_same_file() {
+        let root = tempfile::tempdir().unwrap();
+        let root = tree(root.path(), &["src/a.py", "src/b.py"]);
+        let paths = report(&["file:///src/a.py", "file:///src/b.py"]);
+
+        let prefix = find_report_path_prefix(&root, &paths);
+
+        assert_eq!(
+            local_report_path(&root, "file:///src/a.py", &prefix),
+            root.join("src/a.py")
+        );
     }
 
     #[test]
