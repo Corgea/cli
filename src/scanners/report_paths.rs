@@ -177,19 +177,39 @@ pub fn strip_report_prefix(path: &str, prefix: &str) -> String {
 
 /// Where to read a report's file from on this machine.
 ///
-/// Without a prefix this is the path as the report wrote it, which is how the
-/// CLI has always resolved it, so a report that already matches is untouched.
-/// With one, the remainder is joined onto `root`; a `..` in it falls back to the
-/// report's own path, because the prefix search only samples paths and an
-/// unsampled one must not be able to walk out of the project.
+/// This has to resolve a path the same way [`find_report_path_prefix`] checked
+/// it, or the search proves one file present and the upload opens another. The
+/// search reads every path both as written and slash-normalized under `root`, so
+/// both are tried here, in that order:
+///
+/// * The path as the report wrote it wins when it names a real file. A report
+///   generated on this machine can carry absolute paths, and those are the files
+///   its findings are about -- not same-named ones in the working tree.
+/// * Otherwise the prefix is dropped, the remainder normalized, and the result
+///   read under `root`. This covers a rooted path whose slash-stripped form is
+///   already in the tree (`/src/a.py`), which needs no prefix but does need
+///   rebasing, and a Windows-style path, which needs its separators fixed.
+///
+/// A path that is already relative and carries no prefix is returned untouched,
+/// so a report that matches resolves against the process directory exactly as it
+/// always has. So is one whose remainder holds a `..`: the prefix search only
+/// samples paths, and an unsampled one must not walk out of the project.
 pub fn local_report_path(root: &Path, report_path: &str, prefix: &str) -> PathBuf {
-    let stripped = strip_report_prefix(report_path, prefix);
+    let as_written = PathBuf::from(report_path);
+    let relative = normalize(&strip_report_prefix(report_path, prefix));
 
-    if stripped == report_path || stripped.split('/').any(|segment| segment == "..") {
-        return PathBuf::from(report_path);
+    if relative == report_path
+        || relative.is_empty()
+        || relative.split('/').any(|segment| segment == "..")
+    {
+        return as_written;
     }
 
-    root.join(stripped)
+    if as_written.is_file() {
+        return as_written;
+    }
+
+    root.join(relative)
 }
 
 #[cfg(test)]
@@ -399,20 +419,83 @@ mod tests {
         );
     }
 
+    /// A scanner that ran with the repo mounted at `/src` reports `/src/a.py`
+    /// while the file is at `src/a.py`. `find_report_path_prefix` counts that as
+    /// already matching -- it checks the slash-stripped form under the root --
+    /// so the file that is opened has to be the one it checked, not the
+    /// absolute path, which is nothing on this machine.
     #[test]
-    fn local_report_path_leaves_unprefixed_and_unmatched_paths_as_written() {
-        let root = Path::new("/work/repo");
+    fn a_rooted_path_resolves_under_the_root_that_matched_it() {
+        let root = tempfile::tempdir().unwrap();
+        let root = tree(root.path(), &["src/a.py", "src/b.py"]);
+        let paths = report(&["/src/a.py", "/src/b.py"]);
 
-        // No prefix: resolved relative to the process directory, as always.
+        let prefix = find_report_path_prefix(&root, &paths);
+
         assert_eq!(
-            local_report_path(root, "src/a.ts", ""),
+            prefix, "",
+            "the slash-stripped paths are already in the tree"
+        );
+        assert_eq!(
+            local_report_path(&root, "/src/a.py", &prefix),
+            root.join("src/a.py")
+        );
+    }
+
+    #[test]
+    fn windows_separators_resolve_under_the_root_without_a_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let root = tree(root.path(), &["src/a.cs", "src/b.cs"]);
+        let paths = report(&["src\\a.cs", "src\\b.cs"]);
+
+        let prefix = find_report_path_prefix(&root, &paths);
+
+        assert_eq!(prefix, "");
+        assert_eq!(
+            local_report_path(&root, "src\\a.cs", &prefix),
+            root.join("src/a.cs")
+        );
+    }
+
+    /// An already-relative path carrying no prefix is left completely alone, so
+    /// a report that matches resolves against the process directory as always.
+    #[test]
+    fn local_report_path_leaves_a_matching_relative_path_untouched() {
+        assert_eq!(
+            local_report_path(Path::new("/work/repo"), "src/a.ts", ""),
             PathBuf::from("src/a.ts")
         );
-        // A path from another tree entirely keeps its own resolution rather
-        // than being forced under the root.
+    }
+
+    /// A report generated on this machine names files absolutely. Those are the
+    /// files its findings are about, so an absolute path that exists is read
+    /// where it is rather than rebased onto a same-named file under the root.
+    #[test]
+    fn local_report_path_reads_an_absolute_path_that_exists_where_it_is() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let elsewhere = tree(elsewhere.path(), &["lib/fs.d.ts"]);
+        let reported = elsewhere.join("lib/fs.d.ts");
+        let root = tempfile::tempdir().unwrap();
+        let root = tree(root.path(), &["lib/fs.d.ts"]);
+
         assert_eq!(
-            local_report_path(root, "/opt/tool/lib/fs.d.ts", "Downloads/"),
-            PathBuf::from("/opt/tool/lib/fs.d.ts")
+            local_report_path(&root, reported.to_str().unwrap(), "Downloads/"),
+            reported
+        );
+    }
+
+    /// Nothing else can be done with a path that neither exists as written nor
+    /// carries the report's prefix, and the root is the only other place it
+    /// could be, so the error names where it was looked for.
+    #[test]
+    fn local_report_path_falls_back_to_the_root_for_a_path_that_is_not_there() {
+        assert_eq!(
+            local_report_path(
+                Path::new("/work/repo"),
+                "/opt/tool/lib/fs.d.ts",
+                "Downloads/"
+            ),
+            PathBuf::from("/work/repo/opt/tool/lib/fs.d.ts")
         );
     }
 
