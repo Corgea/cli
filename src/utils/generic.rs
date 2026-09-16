@@ -1141,4 +1141,81 @@ mod tests {
         assert_eq!(extract_repo_path("group/subgroup/repo"), None);
         assert_eq!(extract_repo_path("my.group/sub/repo"), None);
     }
+
+    /// Writes the archive doghouse's compatibility test reads, and checks it
+    /// still describes what that test expects.
+    ///
+    /// Doghouse rebuilds the manifest of scans uploaded before this CLI
+    /// existed by reading the archive they uploaded, so its code encodes what
+    /// a Corgea archive looks like: which entries are files, how their names
+    /// are spelled, and which ones the manifest leaves out. A fixture written
+    /// by this function is the only thing that holds those assumptions to a
+    /// real archive rather than to a hand-built imitation of one.
+    ///
+    /// Ignored because it has to run in the directory being packaged, and
+    /// changing that is process-wide. Regenerate with:
+    ///
+    /// ```text
+    /// CORGEA_MANIFEST_FIXTURE_OUT=../doghouse/heeler/tests/fixtures/cli_upload_manifest.zip \
+    ///     cargo test --bin corgea emit_the_archive_fixture -- --ignored
+    /// ```
+    ///
+    /// Then regenerate `tests/fixtures/rebuilt_manifest.gz`, which is the
+    /// other end of the same loop, by running doghouse's
+    /// `backfill_file_manifests` over the new archive.
+    ///
+    /// A failure here means the archive layout changed, so every manifest
+    /// doghouse rebuilt from the old layout describes a different tree than
+    /// the CLI would now report. Regenerate both fixtures and work out whether
+    /// the rebuilt manifests need discarding.
+    #[test]
+    #[ignore = "packages the current directory, so it cannot share a process"]
+    fn emit_the_archive_fixture_doghouse_rebuilds_a_manifest_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // The same files the shared vector names, so both sides are asserting
+        // one root over one set of contents.
+        for (path, contents) in [
+            ("a.py", "print('hi')\n"),
+            ("dir.py", "x\n"),
+            ("dir/b.py", ""),
+            ("dir/c with space.py", "two\nlines\n"),
+            ("zzé.py", "café\n"),
+        ] {
+            let file = root.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, contents).unwrap();
+        }
+
+        // Staged the way `--include-image` stages one: written outside the
+        // project, added to the archive, and left out of the manifest. That
+        // exclusion is what doghouse has to reproduce.
+        let staging = tempfile::tempdir().unwrap();
+        let staged = staging.path().join("image.tar");
+        fs::write(&staged, "not byte reproducible").unwrap();
+        let extra_files = vec![(staged, "corgea-image-scanning-app-1.0.tar".to_string())];
+
+        let output_zip = root.join("out.zip");
+        let previous = env::current_dir().unwrap();
+        env::set_current_dir(root).unwrap();
+        let contents = create_zip_from_target(None, "out.zip", None, None, &extra_files);
+        env::set_current_dir(previous).unwrap();
+
+        let manifest = contents
+            .expect("zip creation should succeed")
+            .manifest
+            .expect("a whole-project archive carries a manifest")
+            .encode()
+            .expect("encode");
+        assert_eq!(
+            manifest.root,
+            crate::manifest::tests::SHARED_VECTOR_ROOT,
+            "the archive no longer describes the tree doghouse expects"
+        );
+
+        if let Ok(destination) = env::var("CORGEA_MANIFEST_FIXTURE_OUT") {
+            fs::copy(&output_zip, &destination).expect("write fixture");
+        }
+    }
 }

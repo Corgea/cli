@@ -287,7 +287,7 @@ impl Manifest {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use flate2::read::GzDecoder;
     use std::io::Read;
@@ -306,6 +306,81 @@ mod tests {
             .read_to_string(&mut text)
             .expect("gunzip");
         text
+    }
+
+    /// Files whose manifest doghouse must reproduce byte for byte.
+    ///
+    /// Scans uploaded before this CLI carry no manifest, so doghouse rebuilds
+    /// theirs from the archive they uploaded
+    /// (`doghouse/util/file_manifest.py`). Two implementations of one format
+    /// only stay one format if something compares them, and this vector is
+    /// what does: doghouse asserts the same root for the same files.
+    ///
+    /// It holds every part of the format the two could disagree on. A nested
+    /// path and a path containing a space, because the line format is one
+    /// space and the path may hold more. Non-ASCII in both a path and a file's
+    /// contents. An empty file, which still has a digest. And `dir.py` beside
+    /// `dir/b.py`, which order by byte -- `.` before `/` -- rather than by
+    /// path component, so an implementation sorting on anything else lands in
+    /// a different order and hashes to a different root.
+    const SHARED_VECTOR: &[(&str, &str)] = &[
+        ("a.py", "print('hi')\n"),
+        ("dir.py", "x\n"),
+        ("dir/b.py", ""),
+        ("dir/c with space.py", "two\nlines\n"),
+        ("zzé.py", "café\n"),
+    ];
+
+    /// What `SHARED_VECTOR` hashes to. Changing this invalidates every
+    /// manifest doghouse has already rebuilt, so a diff here is a migration.
+    pub const SHARED_VECTOR_ROOT: &str =
+        "3286544738ed3d00b70540c63d077aae943ad352dcdf623050ecec82ed539e33";
+
+    /// A manifest doghouse rebuilt, read by the client that has to use it.
+    ///
+    /// The backfill turns an archive uploaded before manifests existed into a
+    /// baseline, and the run that benefits is a client calling `decode` on
+    /// what it downloads. Agreeing on the root is not enough for that: the
+    /// body is gzipped by a different library, and a body this cannot
+    /// decompress reads as no baseline, which silently leaves every
+    /// backfilled project on full scans.
+    ///
+    /// Produced by `manage.py backfill_file_manifests` from the archive in
+    /// `doghouse/heeler/tests/fixtures/cli_upload_manifest.zip`, which is the
+    /// tree `SHARED_VECTOR` names.
+    #[test]
+    fn a_manifest_doghouse_rebuilt_reads_back_as_the_tree_it_describes() {
+        let body = include_bytes!("../tests/fixtures/rebuilt_manifest.gz");
+
+        let manifest = Manifest::decode(body, SHARED_VECTOR_ROOT).expect("decode");
+
+        let expected: Vec<(String, String)> = SHARED_VECTOR
+            .iter()
+            .map(|(path, contents)| {
+                (
+                    (*path).to_string(),
+                    format!("{:x}", Sha256::digest(contents)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            manifest.entries.into_iter().collect::<Vec<_>>(),
+            expected,
+            "doghouse rebuilt a different tree than the CLI packaged"
+        );
+    }
+
+    #[test]
+    fn the_shared_vector_hashes_to_the_root_doghouse_rebuilds() {
+        let mut manifest = Manifest::new();
+        for (path, contents) in SHARED_VECTOR {
+            manifest.insert(
+                (*path).to_string(),
+                format!("{:x}", Sha256::digest(contents)),
+            );
+        }
+
+        assert_eq!(manifest.encode().expect("encode").root, SHARED_VECTOR_ROOT);
     }
 
     #[test]
