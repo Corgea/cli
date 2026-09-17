@@ -482,6 +482,8 @@ mod tests {
             metadata: None,
             failed_reason: None,
             scan_errors: vec![],
+            file_manifest_root: None,
+            file_manifest_version: None,
         }
     }
 

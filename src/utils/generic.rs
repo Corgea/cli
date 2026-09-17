@@ -1,3 +1,4 @@
+use crate::manifest::{Manifest, TeeWriter};
 use crate::utils::terminal::{set_text_color, TerminalColor};
 use git2::{Repository, StatusOptions};
 use globset::{Glob, GlobSetBuilder};
@@ -61,6 +62,28 @@ const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
     "**/corgea-image-scanning-*.tar",
 ];
 
+/// Files packed into the archive, and what they contained.
+pub struct ArchiveContents {
+    /// Source paths of everything added, in the order they were written.
+    pub added_files: Vec<PathBuf>,
+    /// Digest of every archived file, keyed by its zip entry name.
+    ///
+    /// Only built for a whole-project archive. A `--target`, `--exclude` or
+    /// `--only-uncommitted` run packs a subset, and a manifest of a subset
+    /// reads to the server as every other file having been deleted.
+    pub manifest: Option<Manifest>,
+}
+
+/// Whether an archive built with these options holds the whole project.
+///
+/// Only such an archive may carry a file manifest. A manifest is subtracted
+/// from the baseline scan's, so a path missing from it is a deletion — and
+/// every finding for a file this run merely left out would be dropped without
+/// anything having looked at it.
+fn archives_whole_project(target: Option<&str>, user_exclude: Option<&str>) -> bool {
+    target.is_none() && user_exclude.is_none()
+}
+
 /// Create a zip file from a target specification or full repository scan.
 ///
 /// - If `target` is `None`, performs a full repository scan (equivalent to scanning all files).
@@ -76,7 +99,7 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     exclude_globs: Option<&[&str]>,
     user_exclude: Option<&str>,
     extra_files: &[(PathBuf, String)],
-) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+) -> Result<ArchiveContents, Box<dyn std::error::Error>> {
     let exclude_globs = exclude_globs.unwrap_or(DEFAULT_EXCLUDE_GLOBS);
 
     let mut glob_builder = GlobSetBuilder::new();
@@ -141,6 +164,9 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
 
     let mut added_files = Vec::new();
     let mut excluded_files = Vec::new();
+    // Hashing rides along on the copy that compresses each file, so the archive
+    // is still read once.
+    let mut manifest = archives_whole_project(target, user_exclude).then(Manifest::new);
 
     for (path, relative_path) in files_to_zip {
         // Match repo-relative paths so abs `/tmp/...` targets don't hit `**/tmp/**`.
@@ -148,9 +174,19 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
 
         if (path.is_file() || path.is_dir()) && !is_excluded {
             if path.is_file() {
-                zip.start_file(relative_path.to_string_lossy(), options)?;
+                let entry_name = relative_path.to_string_lossy().into_owned();
+                zip.start_file(entry_name.as_str(), options)?;
                 let mut file = File::open(&path)?;
-                io::copy(&mut file, &mut zip)?;
+                match manifest.as_mut() {
+                    Some(manifest) => {
+                        let mut tee = TeeWriter::new(&mut zip);
+                        io::copy(&mut file, &mut tee)?;
+                        manifest.insert(entry_name, tee.finish());
+                    }
+                    None => {
+                        io::copy(&mut file, &mut zip)?;
+                    }
+                }
                 added_files.push(path);
             } else if path.is_dir() {
                 zip.add_directory(relative_path.to_string_lossy(), options)?;
@@ -165,6 +201,9 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     let large_file_options: FileOptions<()> = options.large_file(true);
 
     for (path, entry_name) in extra_files {
+        // Left out of the manifest deliberately. `docker save` output is not
+        // byte-reproducible, so an image archive would differ on every run and
+        // report the upload as changed when the project had not.
         zip.start_file(entry_name.as_str(), large_file_options)?;
         let mut file = File::open(path)?;
         io::copy(&mut file, &mut zip)?;
@@ -198,7 +237,10 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     }
 
     zip.finish()?;
-    Ok(added_files)
+    Ok(ArchiveContents {
+        added_files,
+        manifest,
+    })
 }
 
 /// Create a staging directory under the system temp directory, readable only by
@@ -918,8 +960,9 @@ mod tests {
         // which would exclude *everything*. The filter + warn path under test
         // is identical either way.
         let excludes: &[&str] = &["**/node_modules/**"];
-        let added = create_zip_from_target(Some(&target), &output_zip, Some(excludes), None, &[])
+        let archive = create_zip_from_target(Some(&target), &output_zip, Some(excludes), None, &[])
             .expect("zip creation should succeed");
+        let added = archive.added_files;
 
         assert!(
             added.iter().any(|p| p.ends_with("src/main.py")),
@@ -931,6 +974,22 @@ mod tests {
             "node_modules file should be excluded: {:?}",
             added
         );
+        // A targeted archive holds a subset of the project, and a manifest of a
+        // subset reads to the server as every other file having been deleted.
+        assert!(archive.manifest.is_none());
+    }
+
+    #[test]
+    fn only_a_whole_project_archive_carries_a_manifest() {
+        // --exclude narrows the archive without narrowing `target`, so the
+        // files it holds back would read to the server as deletions.
+        assert!(archives_whole_project(None, None));
+        assert!(!archives_whole_project(Some("src/app.py"), None));
+        assert!(!archives_whole_project(None, Some("**/vendor/**")));
+        assert!(!archives_whole_project(
+            Some("git:staged"),
+            Some("**/vendor/**")
+        ));
     }
 
     /// The staging directory holds the project zip and exported images, so other
@@ -969,7 +1028,8 @@ mod tests {
             None,
             &extra_files,
         )
-        .expect("zip creation should succeed");
+        .expect("zip creation should succeed")
+        .added_files;
 
         assert!(added.contains(&staged), "staged archive should be added");
 
@@ -1011,7 +1071,8 @@ mod tests {
             None,
             &extra_files,
         )
-        .expect("a >4 GiB entry needs ZIP64, not an error");
+        .expect("a >4 GiB entry needs ZIP64, not an error")
+        .added_files;
 
         assert!(added.contains(&staged));
     }
@@ -1079,5 +1140,82 @@ mod tests {
         assert_eq!(extract_repo_path("org/repo"), None);
         assert_eq!(extract_repo_path("group/subgroup/repo"), None);
         assert_eq!(extract_repo_path("my.group/sub/repo"), None);
+    }
+
+    /// Writes the archive doghouse's compatibility test reads, and checks it
+    /// still describes what that test expects.
+    ///
+    /// Doghouse rebuilds the manifest of scans uploaded before this CLI
+    /// existed by reading the archive they uploaded, so its code encodes what
+    /// a Corgea archive looks like: which entries are files, how their names
+    /// are spelled, and which ones the manifest leaves out. A fixture written
+    /// by this function is the only thing that holds those assumptions to a
+    /// real archive rather than to a hand-built imitation of one.
+    ///
+    /// Ignored because it has to run in the directory being packaged, and
+    /// changing that is process-wide. Regenerate with:
+    ///
+    /// ```text
+    /// CORGEA_MANIFEST_FIXTURE_OUT=../doghouse/heeler/tests/fixtures/cli_upload_manifest.zip \
+    ///     cargo test --bin corgea emit_the_archive_fixture -- --ignored
+    /// ```
+    ///
+    /// Then regenerate `tests/fixtures/rebuilt_manifest.gz`, which is the
+    /// other end of the same loop, by running doghouse's
+    /// `backfill_file_manifests` over the new archive.
+    ///
+    /// A failure here means the archive layout changed, so every manifest
+    /// doghouse rebuilt from the old layout describes a different tree than
+    /// the CLI would now report. Regenerate both fixtures and work out whether
+    /// the rebuilt manifests need discarding.
+    #[test]
+    #[ignore = "packages the current directory, so it cannot share a process"]
+    fn emit_the_archive_fixture_doghouse_rebuilds_a_manifest_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // The same files the shared vector names, so both sides are asserting
+        // one root over one set of contents.
+        for (path, contents) in [
+            ("a.py", "print('hi')\n"),
+            ("dir.py", "x\n"),
+            ("dir/b.py", ""),
+            ("dir/c with space.py", "two\nlines\n"),
+            ("zzé.py", "café\n"),
+        ] {
+            let file = root.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, contents).unwrap();
+        }
+
+        // Staged the way `--include-image` stages one: written outside the
+        // project, added to the archive, and left out of the manifest. That
+        // exclusion is what doghouse has to reproduce.
+        let staging = tempfile::tempdir().unwrap();
+        let staged = staging.path().join("image.tar");
+        fs::write(&staged, "not byte reproducible").unwrap();
+        let extra_files = vec![(staged, "corgea-image-scanning-app-1.0.tar".to_string())];
+
+        let output_zip = root.join("out.zip");
+        let previous = env::current_dir().unwrap();
+        env::set_current_dir(root).unwrap();
+        let contents = create_zip_from_target(None, "out.zip", None, None, &extra_files);
+        env::set_current_dir(previous).unwrap();
+
+        let manifest = contents
+            .expect("zip creation should succeed")
+            .manifest
+            .expect("a whole-project archive carries a manifest")
+            .encode()
+            .expect("encode");
+        assert_eq!(
+            manifest.root,
+            crate::manifest::tests::SHARED_VECTOR_ROOT,
+            "the archive no longer describes the tree doghouse expects"
+        );
+
+        if let Ok(destination) = env::var("CORGEA_MANIFEST_FIXTURE_OUT") {
+            fs::copy(&output_zip, &destination).expect("write fixture");
+        }
     }
 }
