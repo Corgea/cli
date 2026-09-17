@@ -40,10 +40,20 @@ const SCAN_LOOKUP_MAX_PAGES: u16 = 3;
 /// someone else's analysis and cannot be a baseline for ours.
 const BLAST_ENGINE: &str = "corgea-blast";
 
-/// Payload guard, not policy. The server applies the real ceiling
-/// (`INCREMENTAL_SCAN_MAX_FILES`, 300) and falls back to a full scan above it.
-/// This only avoids building a multi-megabyte form field to be refused.
+/// Payload guard, not policy. The server applies the real ceiling and falls
+/// back to a full scan past it. This only avoids building a multi-megabyte form
+/// field to be refused.
 const MAX_CHANGED_FILES: usize = 5_000;
+
+/// The server's default ceiling on a changed-file list
+/// (`INCREMENTAL_SCAN_MAX_FILES`), which it refuses *at* rather than above, so
+/// 300 paths is already too many.
+///
+/// Not enforced here, because it is a server setting a deployment can raise and
+/// no API reports it — refusing locally would lose incremental scans the server
+/// would have accepted. It is only used to stop announcing an incremental scan
+/// this many changes will almost certainly not get.
+const SERVER_DEFAULT_MAX_CHANGED_FILES: usize = 300;
 
 /// A diff the server can turn into an incremental scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,19 +150,10 @@ pub fn resolve_incremental_plan(
         return None;
     }
 
-    let since = if covers_worktree {
-        format!(
-            "commit {} and your uncommitted changes",
-            short_sha(&base_sha)
-        )
-    } else {
-        format!("commit {}", short_sha(&base_sha))
-    };
-    match changed_files.len() {
-        0 => println!("Incremental scan: nothing changed since {since}."),
-        1 => println!("Incremental scan: 1 file changed since {since}."),
-        count => println!("Incremental scan: {count} files changed since {since}."),
-    }
+    println!(
+        "{}",
+        describe_plan(changed_files.len(), &base_sha, covers_worktree)
+    );
 
     Some(IncrementalPlan {
         base_sha,
@@ -165,6 +166,38 @@ pub fn resolve_incremental_plan(
 /// only slower, so the run continues.
 fn explain_full_scan(reason: &str) {
     println!("Scanning every file: {reason}.");
+}
+
+/// What to tell someone about the diff this run is sending.
+///
+/// The server decides, and it refuses a list of
+/// `SERVER_DEFAULT_MAX_CHANGED_FILES` or more by default, so past that
+/// "Incremental scan:" would promise a narrowing this run is not going to get.
+/// Said as the likelihood it is, because the ceiling is a server setting this
+/// run cannot read: a deployment that raised it will scan incrementally after
+/// all, and nothing here is worth refusing over.
+fn describe_plan(changed: usize, base_sha: &str, covers_worktree: bool) -> String {
+    let since = if covers_worktree {
+        format!(
+            "commit {} and your uncommitted changes",
+            short_sha(base_sha)
+        )
+    } else {
+        format!("commit {}", short_sha(base_sha))
+    };
+    match changed {
+        0 => format!("Incremental scan: nothing changed since {since}."),
+        1 => format!("Incremental scan: 1 file changed since {since}."),
+        count if count < SERVER_DEFAULT_MAX_CHANGED_FILES => {
+            format!("Incremental scan: {count} files changed since {since}.")
+        }
+        count => format!(
+            "{count} files changed since {since}, at or past the \
+             {SERVER_DEFAULT_MAX_CHANGED_FILES} an incremental scan covers by default, so \
+             Corgea will most likely analyze every file. Scanning from a more recent commit \
+             narrows the diff."
+        ),
+    }
 }
 
 /// Outcome of looking for a scan to diff against.
@@ -440,6 +473,33 @@ mod tests {
         assert_eq!(short_sha("abc"), "abc");
         assert_eq!(short_sha(""), "");
         assert_eq!(short_sha("ααααααααα"), "ααααααα");
+    }
+
+    #[test]
+    fn a_diff_the_server_will_refuse_is_not_announced_as_an_incremental_scan() {
+        // The CLI carries a much larger payload guard than the server's
+        // ceiling, so it happily sends a list the server drops -- and used to
+        // print "Incremental scan: 4000 files changed", which is the opposite
+        // of what that run gets.
+        assert!(describe_plan(1, "abc1234def", false).starts_with("Incremental scan: 1 file"));
+        assert!(
+            describe_plan(SERVER_DEFAULT_MAX_CHANGED_FILES - 1, "abc1234def", false)
+                .starts_with("Incremental scan: 299 files")
+        );
+
+        // The server refuses *at* the ceiling, not above it.
+        let at_ceiling = describe_plan(SERVER_DEFAULT_MAX_CHANGED_FILES, "abc1234def", false);
+        assert!(!at_ceiling.contains("Incremental scan"), "{at_ceiling}");
+        assert!(at_ceiling.contains("analyze every file"), "{at_ceiling}");
+    }
+
+    #[test]
+    fn a_worktree_diff_says_uncommitted_changes_are_covered() {
+        let message = describe_plan(2, "abc1234def", true);
+        assert!(
+            message.contains("commit abc1234 and your uncommitted changes"),
+            "{message}"
+        );
     }
 
     #[test]
