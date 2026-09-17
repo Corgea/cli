@@ -1,8 +1,9 @@
 use crate::scan::{upload_scan, ScanUploadResult};
 use crate::Config;
-use quick_xml::events::Event;
+use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 use quick_xml::XmlVersion;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io;
 use std::io::{BufReader, Read};
@@ -68,6 +69,15 @@ pub fn parse(
     result
 }
 
+/// The raw FVDL and the source files the engine will look up for it.
+///
+/// A vulnerability can carry several `SourceLocation`s, where the earlier ones
+/// are the enclosing scope and only the last is the finding itself, and the
+/// engine reads that last one only. The earlier ones can sit in an unrelated
+/// tree -- Fortify records its own bundled libraries under
+/// `AppData/Local/Fortify/.../_fortify_libraries_/` -- which is not on the
+/// machine running the CLI, so collecting them aborted the upload of a report
+/// whose real files were all present.
 fn extract_file_path(scan_file: PathBuf) -> (String, Vec<String>) {
     let mut paths: Vec<String> = Vec::new();
 
@@ -84,6 +94,9 @@ fn extract_file_path(scan_file: PathBuf) -> (String, Vec<String>) {
 
     let mut buf = Vec::new();
     let mut in_vulnerability = false;
+    let mut seen = HashSet::new();
+    // The last SourceLocation seen in the current Vulnerability.
+    let mut selected: Option<String> = None;
 
     loop {
         match xml_reader.read_event_into(&mut buf) {
@@ -94,48 +107,15 @@ fn extract_file_path(scan_file: PathBuf) -> (String, Vec<String>) {
                 if tag_name == b"Vulnerability" {
                     in_vulnerability = true;
                 } else if tag_name == b"SourceLocation" && in_vulnerability {
-                    for attr_result in e.attributes() {
-                        match attr_result {
-                            Ok(attr) => {
-                                let attr_key = attr.key.as_ref();
-                                if attr_key == b"path" {
-                                    if let Ok(value) =
-                                        attr.normalized_value(XmlVersion::Implicit1_0)
-                                    {
-                                        let path_str = value.to_string();
-                                        if !paths.contains(&path_str) {
-                                            paths.push(path_str);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => println!("Error processing attribute: {}", e),
-                        }
+                    if let Some(path) = source_location_path(e) {
+                        selected = Some(path);
                     }
                 }
             }
             Ok(Event::Empty(ref e)) => {
-                let e_name = e.name();
-                let tag_name = e_name.as_ref();
-
-                if tag_name == b"SourceLocation" && in_vulnerability {
-                    for attr_result in e.attributes() {
-                        match attr_result {
-                            Ok(attr) => {
-                                let attr_key = attr.key.as_ref();
-                                if attr_key == b"path" {
-                                    if let Ok(value) =
-                                        attr.normalized_value(XmlVersion::Implicit1_0)
-                                    {
-                                        let path_str = value.to_string();
-                                        if !paths.contains(&path_str) {
-                                            paths.push(path_str);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => println!("Error processing attribute: {}", e),
-                        }
+                if e.name().as_ref() == b"SourceLocation" && in_vulnerability {
+                    if let Some(path) = source_location_path(e) {
+                        selected = Some(path);
                     }
                 }
             }
@@ -145,6 +125,12 @@ fn extract_file_path(scan_file: PathBuf) -> (String, Vec<String>) {
 
                 if tag_name == b"Vulnerability" {
                     in_vulnerability = false;
+
+                    if let Some(path) = selected.take() {
+                        if seen.insert(path.clone()) {
+                            paths.push(path);
+                        }
+                    }
                 }
             }
             Ok(Event::Eof) => break,
@@ -155,6 +141,23 @@ fn extract_file_path(scan_file: PathBuf) -> (String, Vec<String>) {
     }
 
     (contents, paths)
+}
+
+/// The `path` attribute of a `SourceLocation`, with XML entities resolved.
+fn source_location_path(element: &BytesStart) -> Option<String> {
+    for attr_result in element.attributes() {
+        match attr_result {
+            Ok(attr) if attr.key.as_ref() == b"path" => {
+                if let Ok(value) = attr.normalized_value(XmlVersion::Implicit1_0) {
+                    return Some(value.to_string());
+                }
+            }
+            Ok(_) => {}
+            Err(e) => println!("Error processing attribute: {}", e),
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -176,6 +179,8 @@ mod tests {
   <Vulnerabilities>
     <Vulnerability>
       <SourceLocation path="src/start/a&amp;b.java"></SourceLocation>
+    </Vulnerability>
+    <Vulnerability>
       <SourceLocation path="src/empty/App.java" line="42"/>
     </Vulnerability>
     <Vulnerability>
@@ -203,5 +208,30 @@ mod tests {
             "extracts in-Vulnerability SourceLocation paths, unescapes entities, \
              ignores the out-of-scope SourceLocation, and de-duplicates"
         );
+    }
+
+    /// The engine reads the last SourceLocation of a vulnerability and no
+    /// other, so the earlier ones must not be uploaded: they can name Fortify's
+    /// own bundled libraries, which are not on the machine running the CLI and
+    /// used to abort the upload before any file was sent.
+    #[test]
+    fn extract_file_path_keeps_only_the_location_the_finding_is_reported_at() {
+        let fvdl = r#"<?xml version="1.0" encoding="UTF-8"?>
+<FVDL>
+  <Vulnerabilities>
+    <Vulnerability>
+      <SourceLocation path="C:/Users/dev/AppData/Local/Fortify/_fortify_libraries_/node/fs.d.ts" line="1"/>
+      <SourceLocation path="src/App.java" line="42"/>
+    </Vulnerability>
+  </Vulnerabilities>
+</FVDL>"#;
+
+        let mut tmp = tempfile::NamedTempFile::new().expect("create temp fvdl");
+        tmp.write_all(fvdl.as_bytes()).expect("write fvdl");
+        tmp.flush().expect("flush fvdl");
+
+        let (_, paths) = extract_file_path(tmp.path().to_path_buf());
+
+        assert_eq!(paths, vec!["src/App.java".to_string()]);
     }
 }
