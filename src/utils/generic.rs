@@ -42,7 +42,6 @@ const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
     "**/specs/**",
     "**/node_modules/**",
     "**/tmp/**",
-    "**/migrations/**",
     "**/python*/site-packages/**",
     "**/*.mmdb",
     "**/*.css",
@@ -1027,6 +1026,8 @@ mod tests {
         assert!(set.is_match(Path::new("/tmp/proj/app.py")));
         assert!(!set.is_match(Path::new("app.py")));
         assert!(!set.is_match(Path::new("src/app.py")));
+        assert!(!set.is_match(Path::new("migrations/0001_initial.py")));
+        assert!(!set.is_match(Path::new("app/migrations/0001_initial.py")));
     }
 
     #[test]
