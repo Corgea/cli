@@ -21,7 +21,7 @@ classifiers = [
     "Programming Language :: Rust",
 ]
 authors = [
-    { name = "Adam Bronte", email = "adam@corgea.com" }
+    { name = "Corgea Security", email = "security@corgea.com" }
 ]
 dynamic = ["version"]
 
