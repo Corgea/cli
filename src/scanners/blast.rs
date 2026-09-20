@@ -418,7 +418,7 @@ fn start_new_scan(
         // default excludes (which cover `**/*.env` among others), so whoever
         // reads the log needs to see what actually went into the archive.
         println!(
-            "Force-including {} file(s) Corgea would otherwise skip:",
+            "\nForce-including {} file(s) Corgea would otherwise skip:",
             force_included.len()
         );
         for path in force_included.iter().take(FORCE_INCLUDE_PREVIEW) {

@@ -218,7 +218,7 @@ pub fn resolve(
             }
             if !patterns.is_empty() {
                 println!(
-                    "Applying {} project include rule(s) from Corgea: {}.",
+                    "\n\nApplying {} project include rule(s) from Corgea: {}.",
                     patterns.len(),
                     patterns.join(", ")
                 );
