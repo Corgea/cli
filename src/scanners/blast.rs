@@ -12,11 +12,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Overrides how long `wait_for_scan` polls before giving up.
 /// How many force-included paths to name before collapsing the rest to a count.
 /// Same shape as the `--target` file preview.
 const FORCE_INCLUDE_PREVIEW: usize = 20;
 
+/// Overrides how long `wait_for_scan` polls before giving up.
 const SCAN_TIMEOUT_ENV: &str = "CORGEA_SCAN_TIMEOUT_SECONDS";
 const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(10 * 60 * 60);
 
@@ -114,7 +114,7 @@ pub fn run(
     let include_rules = crate::include_rules::resolve(
         config,
         &project_name,
-        utils::generic::get_repo_info_for_scan("./")
+        utils::generic::get_repo_info("./")
             .unwrap_or_default()
             .and_then(|info| info.repo_url)
             .as_deref(),
