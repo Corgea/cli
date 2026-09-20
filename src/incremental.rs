@@ -6,8 +6,9 @@
 //! commits. This module works the diff out where the scan is run.
 //!
 //! Finding what to diff *against* is the same in both directions: ask the
-//! server for the newest completed scan of a clean trunk worktree. What
-//! changed since it can then be measured two ways.
+//! server for the newest completed scan of this branch, then of trunk if this
+//! branch has never been scanned. What changed since it can then be measured
+//! two ways.
 //!
 //! The first is the file checksums that scan uploaded, fetched and subtracted
 //! from this run's. It needs no git history, so it is the only one that works
@@ -139,21 +140,29 @@ fn plan_diff(
     // Optional, because a checksum diff needs no repository. Only the git diff
     // below does, and it reports its absence by its real name.
     let repo = Repository::discover(".").ok();
-    // Trunk is only meaningful where there is a clone to read it from. Without
-    // one, take the project's newest usable scan whatever branch it names --
-    // including none, which is what a scan uploaded from a directory with no
-    // git records, and so what the earlier runs of *this* pipeline recorded.
-    let trunks = repo.as_ref().map(baseline_branches);
+    // Branch names are only meaningful where there is a clone to read them
+    // from. Without one, take the project's newest usable scan whatever branch
+    // it names -- including none, which is what a scan uploaded from a
+    // directory with no git records, and so what the earlier runs of *this*
+    // pipeline recorded.
+    let candidates = repo
+        .as_ref()
+        .map(|repo| baseline_branches(repo, branch.filter(|name| !name.is_empty())));
 
-    let baseline = match find_baseline(config, project_name, trunks.as_deref(), manifest.is_some())
-    {
+    let lookup = find_baseline(
+        config,
+        project_name,
+        candidates.as_deref(),
+        manifest.is_some(),
+    );
+    let baseline = match lookup {
         BaselineLookup::Found(scan) => scan,
         BaselineLookup::NotFound => {
             return Err(format!(
                 "project '{project_name}' has no completed scan {} that could be diffed \
                  against, so there is nothing to compare this one to",
-                match &trunks {
-                    Some(trunks) => format!("on {}", join_or(trunks)),
+                match &candidates {
+                    Some(candidates) => format!("on {}", join_or(candidates)),
                     None => "of its whole state".to_string(),
                 }
             ))
@@ -324,21 +333,31 @@ enum BaselineLookup {
 
 /// The branches a baseline may come from, best first.
 ///
-/// Only trunk qualifies. Any completed clean scan is a *correct* thing to diff
-/// against, but not a *stable* one: a scan of someone else's feature branch is
-/// a baseline whose contents nobody can predict, and the findings copied
-/// forward from it would be that branch's, not this project's. Trunk is the
-/// line every branch descends from, so it is the only shared reference point.
+/// The branch being scanned leads. Its last scan is the nearest ancestor of
+/// this one that exists, so the diff against it is the smallest honest one and
+/// the findings carried forward are this branch's own. A long-lived branch that
+/// has diverged from trunk gets the biggest reduction: against trunk every file
+/// it has touched since it forked is "changed", against its own last scan only
+/// what moved since that scan is.
+///
+/// Trunk follows, because a branch on its first scan has no history of its own
+/// and trunk is the line it descends from. *Other* branches never qualify: a
+/// scan of someone else's feature branch is a baseline whose contents nobody
+/// can predict, and the findings copied forward would be that branch's.
 ///
 /// `origin/HEAD` records what the remote advertised as its default when this
 /// clone was made. It is absent from single-branch and `actions/checkout`
 /// checkouts and is never refreshed after a rename, so `main` and `master`
-/// follow it rather than replace it.
-fn baseline_branches(repo: &Repository) -> Vec<String> {
-    let mut branches: Vec<String> = default_branch(repo).into_iter().collect();
-    for fallback in fallback_trunks() {
-        if !branches.iter().any(|branch| branch == fallback) {
-            branches.push((*fallback).to_string());
+/// follow it rather than replace it. Scanning trunk itself is the ordinary
+/// case, and there the first entry already is trunk, so nothing repeats.
+fn baseline_branches(repo: &Repository, scanning: Option<&str>) -> Vec<String> {
+    let mut branches: Vec<String> = scanning.map(str::to_string).into_iter().collect();
+    let trunks = default_branch(repo)
+        .into_iter()
+        .chain(fallback_trunks().iter().cloned());
+    for trunk in trunks {
+        if !branches.contains(&trunk) {
+            branches.push(trunk);
         }
     }
     branches
@@ -370,16 +389,15 @@ fn join_or(branches: &[String]) -> String {
     }
 }
 
-/// The newest scan that can be diffed against, on the first trunk branch that
-/// has one.
+/// The newest scan that can be diffed against, on the first candidate branch
+/// that has one.
 ///
 /// One query per branch, because the branch filter is server-side: a project
-/// with heavy feature-branch traffic can push trunk's newest scan far past any
-/// page limit, and asking for trunk directly cannot miss it that way. The page
-/// budget is shared across branches so the worst case stays bounded.
+/// with heavy feature-branch traffic can push the branch's newest scan far past
+/// any page limit, and asking for it directly cannot miss it that way.
 ///
-/// `branches` is `None` when this clone cannot name a trunk, which makes it one
-/// query for the project's newest usable scan on any branch.
+/// `branches` is `None` when this clone can name no branch at all, which makes
+/// it one query for the project's newest usable scan on any branch.
 fn find_baseline(
     config: &Config,
     project_name: &str,
@@ -417,7 +435,12 @@ fn search_baseline(
     require_clean: bool,
 ) -> BaselineLookup {
     let url = config.get_url();
-    let mut budget = SCAN_LOOKUP_MAX_PAGES;
+    // Shared, so a project whose first candidate has pages of unusable scans
+    // cannot make this walk the whole history -- but never smaller than the
+    // candidate list, or the last branch in it would be one this asks about
+    // only when the earlier ones answered in fewer pages than they were
+    // allowed.
+    let mut budget = SCAN_LOOKUP_MAX_PAGES.max(searches.len().try_into().unwrap_or(u16::MAX));
 
     for &branch in searches {
         let mut page = 1;
@@ -811,7 +834,33 @@ mod tests {
         let repo = Repository::init(dir.path()).expect("init");
         // No origin/HEAD: single-branch and actions/checkout clones have none.
         assert_eq!(default_branch(&repo), None);
-        assert_eq!(baseline_branches(&repo), vec!["main", "master"]);
+        assert_eq!(baseline_branches(&repo, None), vec!["main", "master"]);
+    }
+
+    #[test]
+    fn the_branch_being_scanned_is_asked_about_before_trunk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(dir.path()).expect("init");
+        assert_eq!(
+            baseline_branches(&repo, Some("release/24.4")),
+            vec!["release/24.4", "main", "master"]
+        );
+    }
+
+    /// The ordinary case: scanning trunk itself, where the branch being scanned
+    /// and the branch we would fall back to are the same one.
+    #[test]
+    fn scanning_trunk_does_not_ask_about_it_twice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(dir.path()).expect("init");
+        assert_eq!(
+            baseline_branches(&repo, Some("main")),
+            vec!["main", "master"]
+        );
+        assert_eq!(
+            baseline_branches(&repo, Some("master")),
+            vec!["master", "main"]
+        );
     }
 
     #[test]
@@ -827,7 +876,18 @@ mod tests {
         .expect("set origin/HEAD");
 
         assert_eq!(default_branch(&repo).as_deref(), Some("trunk"));
-        assert_eq!(baseline_branches(&repo), vec!["trunk", "main", "master"]);
+        assert_eq!(
+            baseline_branches(&repo, None),
+            vec!["trunk", "main", "master"]
+        );
+        assert_eq!(
+            baseline_branches(&repo, Some("trunk")),
+            vec!["trunk", "main", "master"]
+        );
+        assert_eq!(
+            baseline_branches(&repo, Some("feature")),
+            vec!["feature", "trunk", "main", "master"]
+        );
 
         repo.reference_symbolic(
             "refs/remotes/origin/HEAD",
@@ -836,7 +896,7 @@ mod tests {
             "test",
         )
         .expect("set origin/HEAD");
-        assert_eq!(baseline_branches(&repo), vec!["main", "master"]);
+        assert_eq!(baseline_branches(&repo, None), vec!["main", "master"]);
     }
 
     /// Two commits: three files, then one that adds, edits and deletes.

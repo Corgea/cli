@@ -26,12 +26,14 @@ use std::io::Write;
 const PROJECT: &str = "cloud-e2e";
 const BASELINE_SCAN: &str = "baseline-scan-123";
 
+/// A scan of the branch the fixture is on, which is the first place a baseline
+/// is looked for and so the one most of these cases answer with.
 fn baseline_scan(sha: &str) -> Value {
     json!({
         "id": BASELINE_SCAN,
         "project": PROJECT,
         "repo": null,
-        "branch": "main",
+        "branch": FIXTURE_BRANCH,
         "status": "complete",
         "engine": "corgea-blast",
         "created_at": "2026-07-30T12:00:00Z",
@@ -196,7 +198,7 @@ fn the_baselines_stored_checksums_are_used_in_preference_to_a_git_diff() {
     let (scan, manifest) = baseline_scan_with_checksums(&base_sha, &[("main.py", SOURCE_BODY)]);
     let mut plan = vec![
         verify_request(),
-        baseline_lookup("main", vec![scan]),
+        baseline_lookup(FIXTURE_BRANCH, vec![scan]),
         checksum_download(manifest),
         start_upload(),
         expected_request(
@@ -236,7 +238,9 @@ fn the_baselines_stored_checksums_are_used_in_preference_to_a_git_diff() {
 
     assert_eq!(output.status.code(), Some(0), "{context}");
     assert!(
-        stdout.contains("Incremental scan: 2 files changed since the last scan of main"),
+        stdout.contains(&format!(
+            "Incremental scan: 2 files changed since the last scan of {FIXTURE_BRANCH}"
+        )),
         "{context}"
     );
 }
@@ -310,7 +314,7 @@ fn a_dirty_worktree_is_scanned_incrementally_from_the_stored_checksums() {
     let (scan, manifest) = baseline_scan_with_checksums(&base_sha, &[("main.py", SOURCE_BODY)]);
     let mut plan = vec![
         verify_request(),
-        baseline_lookup("main", vec![scan]),
+        baseline_lookup(FIXTURE_BRANCH, vec![scan]),
         checksum_download(manifest),
         start_upload(),
         expected_request(
@@ -348,7 +352,9 @@ fn a_dirty_worktree_is_scanned_incrementally_from_the_stored_checksums() {
 
     assert_eq!(output.status.code(), Some(0), "{context}");
     assert!(
-        stdout.contains("Incremental scan: 1 file changed since the last scan of main"),
+        stdout.contains(&format!(
+            "Incremental scan: 1 file changed since the last scan of {FIXTURE_BRANCH}"
+        )),
         "{context}"
     );
 }
@@ -368,7 +374,7 @@ fn checksums_that_do_not_match_their_digest_fall_back_to_the_git_diff() {
     let expected_base = base_sha.clone();
     let mut plan = vec![
         verify_request(),
-        baseline_lookup("main", vec![scan]),
+        baseline_lookup(FIXTURE_BRANCH, vec![scan]),
         checksum_download(manifest),
         start_upload(),
         expected_request(
@@ -413,7 +419,7 @@ fn the_upload_carries_the_baseline_commit_and_the_files_that_changed_since_it() 
     let expected_base = base_sha.clone();
     let mut plan = vec![
         verify_request(),
-        baseline_lookup("main", vec![baseline_scan(&base_sha)]),
+        baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
         start_upload(),
         expected_request(
             "upload BLAST archive with the diff",
@@ -497,9 +503,67 @@ fn a_project_with_no_baseline_scan_uploads_without_a_diff() {
 
     assert_eq!(output.status.code(), Some(0), "{context}");
     assert!(
-        stdout.contains("has no completed scan on main or master that could be diffed against"),
+        stdout.contains(&format!(
+            "has no completed scan on {FIXTURE_BRANCH}, main or master that could be diffed \
+             against"
+        )),
         "{context}"
     );
+}
+
+/// The branch being scanned is asked about first, and its own last scan wins
+/// over trunk's.
+///
+/// A branch that has been scanned before has a nearer ancestor than trunk does:
+/// everything it changed before that scan was already analyzed, so diffing
+/// against trunk would list those files again on every run until the branch
+/// merges. Trunk is only reached when this branch has no scan of its own, which
+/// the second half of this case covers.
+#[test]
+fn the_branch_being_scanned_is_preferred_over_trunk_and_falls_back_to_it() {
+    for baseline_branch in [FIXTURE_BRANCH, "main"] {
+        let project = git_project();
+        let base_sha = project.sha.clone();
+        second_commit(&project);
+
+        let mut scan = baseline_scan(&base_sha);
+        scan["branch"] = json!(baseline_branch);
+        // The branch being scanned is asked about first either way. When the
+        // baseline is trunk's, that lookup comes back empty and the next one
+        // finds it -- so the plan is the assertion that the order is what it is.
+        let mut plan = vec![verify_request()];
+        if baseline_branch != FIXTURE_BRANCH {
+            plan.push(baseline_lookup(FIXTURE_BRANCH, vec![]));
+        }
+        let expected_base = base_sha.clone();
+        plan.extend([
+            baseline_lookup(baseline_branch, vec![scan]),
+            start_upload(),
+            expected_request(
+                "upload BLAST archive with the diff",
+                move |request| {
+                    assert_authenticated_request(
+                        request,
+                        Method::PATCH,
+                        "/api/v1/start-scan/transfer-123/",
+                    )?;
+                    assert_multipart_text_field(request, "incremental_base_sha", &expected_base)
+                },
+                json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+            ),
+        ]);
+        plan.extend(scan_tail());
+
+        let api = ApiStub::start(plan);
+        let (mut command, _home) = cloud_command(&api, project.path());
+        command.args(["scan", "blast", "--project-name", PROJECT]);
+
+        let output = run_with_timeout(command, &api);
+        let transcript = api.assert_finished();
+        let context = output_context(&output, &transcript);
+
+        assert_eq!(output.status.code(), Some(0), "{context}");
+    }
 }
 
 /// A backend predating the server-side filters returns scans of every kind, so
@@ -517,8 +581,8 @@ fn a_baseline_on_a_later_page_is_still_found() {
 
     let mut plan = vec![
         verify_request(),
-        baseline_lookup_page("main", 1, 2, vec![unusable]),
-        baseline_lookup_page("main", 2, 2, vec![baseline_scan(&base_sha)]),
+        baseline_lookup_page(FIXTURE_BRANCH, 1, 2, vec![unusable]),
+        baseline_lookup_page(FIXTURE_BRANCH, 2, 2, vec![baseline_scan(&base_sha)]),
         start_upload(),
         expected_request(
             "upload BLAST archive with the diff",
@@ -558,7 +622,7 @@ fn a_failed_lookup_is_not_reported_as_a_missing_baseline() {
         verify_request(),
         expected_request(
             "fail the baseline lookup",
-            |request| assert_baseline_lookup_request(request, PROJECT, Some("main"), false),
+            |request| assert_baseline_lookup_request(request, PROJECT, Some(FIXTURE_BRANCH), false),
             json_response_with_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "boom"})),
         ),
         start_upload(),
@@ -714,9 +778,10 @@ fn a_clean_baseline_is_found_even_when_dirty_scans_come_back_first() {
     let expected_base = base_sha.clone();
     let mut plan = vec![
         verify_request(),
-        baseline_lookup("main", vec![dirty]),
+        baseline_lookup(FIXTURE_BRANCH, vec![dirty]),
+        baseline_lookup("main", vec![]),
         baseline_lookup("master", vec![]),
-        clean_baseline_lookup("main", vec![baseline_scan(&base_sha)]),
+        clean_baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
         start_upload(),
         expected_request(
             "upload BLAST archive with the diff",
@@ -810,7 +875,7 @@ fn ignore_dirty_worktree_diffs_the_working_tree_instead_of_refusing() {
     let expected_base = base_sha.clone();
     let mut plan = vec![
         verify_request(),
-        baseline_lookup("main", vec![baseline_scan(&base_sha)]),
+        baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
         start_upload(),
         expected_request(
             "upload BLAST archive with a worktree diff",
@@ -869,7 +934,7 @@ fn a_dirty_worktree_with_no_stored_checksums_scans_everything() {
     let patch_sha = head_sha.clone();
     let mut plan = vec![
         verify_request(),
-        baseline_lookup("main", vec![baseline_scan(&base_sha)]),
+        baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
         start_upload(),
         expected_request(
             "upload BLAST archive with no diff",

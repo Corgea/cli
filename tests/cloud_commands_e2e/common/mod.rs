@@ -333,37 +333,26 @@ pub(crate) fn assert_scan_list_request(
     assert_query(request, "project", project)
 }
 
-/// One baseline lookup an incremental scan makes before uploading.
-///
-/// Asserting the filters is the point: they keep this to one request per trunk
-/// branch instead of a page walk, and a server dropping them silently returns
-/// pull-request scans for the client to reject. `branch` is asserted because a
-/// baseline may only come from trunk; pass `None` for the lookup a clone with
-/// no git makes, which cannot say which branch that is.
-///
-/// `require_clean` says which of the two walks this is, and is asserted either
-/// way. A run carrying its own file checksums can diff against a scan that
-/// reported no dirty flag -- every scan uploaded without git reports none -- so
-/// the first walk must not let the server drop them. The second must, or a
-/// clean scan sitting behind a page budget's worth of dirty ones is a baseline
-/// the project has and this never finds.
-/// Every baseline lookup a fixture repo makes when nothing turns up.
-///
-/// Two walks over the two trunk candidates, since the fixture records no
-/// origin/HEAD. The first takes a baseline of either kind, so it cannot let the
-/// server drop scans that are not known-clean; the second asks for exactly
-/// those once no checksums have been found, so a clean scan behind a page
-/// budget's worth of dirty ones is still reachable.
+/// Where a labelled step sits in a plan, for a test that has to answer one of
+/// them differently from the rest.
 pub(crate) fn plan_step(plan: &[ExpectedRequest], label: &str) -> usize {
     plan.iter()
         .position(|step| step.label == label)
         .unwrap_or_else(|| panic!("no {label:?} step in this plan"))
 }
 
+/// Every baseline lookup a fixture repo makes when nothing turns up.
+///
+/// Two walks over the branch candidates: the one being scanned, whose last scan
+/// is the nearest baseline there could be, then the two trunk names, since the
+/// fixture records no origin/HEAD. The first walk takes a baseline of either
+/// kind, so it cannot let the server drop scans that are not known-clean; the
+/// second asks for exactly those once no checksums have been found, so a clean
+/// scan behind a page budget's worth of dirty ones is still reachable.
 pub(crate) fn baseline_lookups_finding_nothing(project: &'static str) -> Vec<ExpectedRequest> {
     let mut lookups = Vec::new();
     for require_clean in [false, true] {
-        for branch in ["main", "master"] {
+        for branch in BASELINE_BRANCH_ORDER {
             lookups.push(expected_request(
                 "look up a baseline scan to diff against",
                 move |request| {
@@ -376,6 +365,21 @@ pub(crate) fn baseline_lookups_finding_nothing(project: &'static str) -> Vec<Exp
     lookups
 }
 
+/// One baseline lookup an incremental scan makes before uploading.
+///
+/// Asserting the filters is the point: they keep this to one request per
+/// candidate branch instead of a page walk, and a server dropping them silently
+/// returns pull-request scans for the client to reject. `branch` is asserted
+/// because a baseline may only come from the branch being scanned or from
+/// trunk; pass `None` for the lookup a clone with no git makes, which can name
+/// neither.
+///
+/// `require_clean` says which of the two walks this is, and is asserted either
+/// way. A run carrying its own file checksums can diff against a scan that
+/// reported no dirty flag -- every scan uploaded without git reports none -- so
+/// the first walk must not let the server drop them. The second must, or a
+/// clean scan sitting behind a page budget's worth of dirty ones is a baseline
+/// the project has and this never finds.
 pub(crate) fn assert_baseline_lookup_request(
     request: &CapturedRequest,
     project: &str,
@@ -582,6 +586,15 @@ pub(crate) struct ReportProject {
     report_path: PathBuf,
 }
 
+/// The fixture repo's branch. Deliberately neither `main` nor `master`, so a
+/// lookup that asked about trunk when it should have asked about the branch
+/// being scanned shows up as a failure rather than agreeing by coincidence.
+pub(crate) const FIXTURE_BRANCH: &str = "e2e-main";
+
+/// Branches the fixture repo's scans ask about, in order: the one being
+/// scanned, then the trunk names, since the fixture records no origin/HEAD.
+pub(crate) const BASELINE_BRANCH_ORDER: [&str; 3] = [FIXTURE_BRANCH, "main", "master"];
+
 pub(crate) struct GitProject {
     root: TempDir,
     pub(crate) sha: String,
@@ -637,7 +650,7 @@ pub(crate) fn git_project() -> GitProject {
         vec!["init"],
         vec!["config", "user.email", "cloud-e2e@example.com"],
         vec!["config", "user.name", "Cloud E2E"],
-        vec!["checkout", "-b", "e2e-main"],
+        vec!["checkout", "-b", FIXTURE_BRANCH],
         vec![
             "remote",
             "add",
@@ -926,11 +939,10 @@ fn blast_plan_for(
     let issue_path = "/api/v1/scan/blast-scan-123/issues".to_string();
     let mut plan = vec![verify_request()];
     // Scans are incremental by default, so every run looks for a baseline
-    // before uploading -- once per trunk branch, since the fixture records no
-    // origin/HEAD. A dirty tree asks too: the baseline's stored checksums
-    // describe the files on disk, so they can diff one. Answering with no scans
-    // keeps this the full-scan contract: nothing to diff from, no incremental
-    // fields on the upload.
+    // before uploading -- once per candidate branch. A dirty tree asks too: the
+    // baseline's stored checksums describe the files on disk, so they can diff
+    // one. Answering with no scans keeps this the full-scan contract: nothing
+    // to diff from, no incremental fields on the upload.
     if look_for_baseline {
         plan.extend(baseline_lookups_finding_nothing("cloud-e2e"));
     }
@@ -962,7 +974,7 @@ fn blast_plan_for(
                 }
                 assert_multipart_text_field(request, "file_size", upload_length)?;
                 assert_multipart_text_field(request, "project_name", "cloud-e2e")?;
-                assert_multipart_text_field(request, "branch", "e2e-main")?;
+                assert_multipart_text_field(request, "branch", FIXTURE_BRANCH)?;
                 assert_multipart_text_field(
                     request,
                     "repo_url",
