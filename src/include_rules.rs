@@ -144,19 +144,21 @@ fn matches_whole_repo(pattern: &str) -> bool {
 /// must not stop a scan.
 pub fn validate_cli_patterns(patterns: &[String]) -> Result<(), String> {
     for pattern in patterns {
-        let trimmed = pattern.trim();
-        if trimmed.is_empty() {
+        let original = pattern.trim();
+        let Some(normalized) = strip_leading_dot_slash(pattern) else {
             return Err("--include needs a path, directory or glob pattern.".to_string());
-        }
-        if matches_whole_repo(trimmed) {
+        };
+        if matches_whole_repo(&normalized) {
             return Err(format!(
-                "--include '{trimmed}' matches the whole repository, which would \
+                "--include '{original}' matches the whole repository, which would \
                  override every exclude rule including .gitignore. Name a directory \
                  or file instead, e.g. --include vendor/our-fork/**."
             ));
         }
-        if let Err(e) = Glob::new(trimmed) {
-            return Err(format!("--include '{trimmed}' is not a valid pattern: {e}"));
+        if let Err(e) = Glob::new(&normalized) {
+            return Err(format!(
+                "--include '{original}' is not a valid pattern: {e}"
+            ));
         }
     }
     Ok(())
@@ -243,13 +245,31 @@ pub fn resolve(
     }
 }
 
+fn strip_leading_dot_slash(pattern: &str) -> Option<String> {
+    let mut stripped = pattern.trim();
+    while let Some(rest) = stripped.strip_prefix("./") {
+        stripped = rest;
+    }
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped.to_string())
+    }
+}
+
 fn normalize_patterns(patterns: &[String]) -> Vec<String> {
     let mut normalized = Vec::new();
     for pattern in patterns {
-        let trimmed = pattern.trim();
-        if !trimmed.is_empty() {
-            push_unique(&mut normalized, trimmed.to_string());
+        let Some(stripped) = strip_leading_dot_slash(pattern) else {
+            continue;
+        };
+        // `./**` used to match nothing (walk paths have no `./`). Stripping it
+        // to `**` would force every excluded file in. Drop that expansion;
+        // a pattern that was already repo-wide is unchanged.
+        if matches_whole_repo(&stripped) && !matches_whole_repo(pattern.trim()) {
+            continue;
         }
+        push_unique(&mut normalized, stripped);
     }
     normalized
 }
@@ -286,6 +306,41 @@ mod tests {
     }
 
     #[test]
+    fn normalize_strips_a_leading_dot_slash() {
+        let input = [
+            "./vendor/our-fork/**".to_string(),
+            "././src/A.java".to_string(),
+            "./".to_string(),
+        ];
+        assert_eq!(
+            normalize_patterns(&input),
+            vec!["vendor/our-fork/**".to_string(), "src/A.java".to_string()]
+        );
+        // `./**` is not a whole-repo glob until the `./` is stripped. Drop it
+        // rather than turn a no-match into `**`. A pattern that was already
+        // repo-wide is left as-is.
+        assert!(normalize_patterns(&["./**".to_string()]).is_empty());
+        assert_eq!(
+            normalize_patterns(&["**".to_string()]),
+            vec!["**".to_string()]
+        );
+    }
+
+    #[test]
+    fn matching_files_accepts_dot_slash_patterns() {
+        let root = TempDir::new().unwrap();
+        write(&root, "vendor/our-fork/Pay.java");
+        write(&root, "src/App.java");
+        let patterns = normalize_patterns(&["./vendor/our-fork/**".to_string()]);
+        let matched = IncludeRules {
+            patterns,
+            ..Default::default()
+        }
+        .matching_files(root.path());
+        assert_eq!(matched, vec![PathBuf::from("vendor/our-fork/Pay.java")]);
+    }
+
+    #[test]
     fn no_patterns_matches_nothing() {
         let root = TempDir::new().unwrap();
         write(&root, "src/App.java");
@@ -317,12 +372,17 @@ mod tests {
 
     #[test]
     fn repo_wide_cli_patterns_are_rejected_before_the_scan() {
-        for pattern in ["**", "*", "/**", "**/*", " ", "/"] {
+        for pattern in ["**", "*", "/**", "**/*", " ", "/", "./**", "./"] {
             assert!(
                 validate_cli_patterns(&[pattern.to_string()]).is_err(),
                 "{pattern:?} should be refused"
             );
         }
+        let err = validate_cli_patterns(&["./**".to_string()]).unwrap_err();
+        assert!(
+            err.contains("./**"),
+            "error should quote the value that was passed: {err}"
+        );
         assert!(validate_cli_patterns(&["[".to_string()]).is_err());
         assert!(validate_cli_patterns(&[
             "vendor/our-fork/**".to_string(),
