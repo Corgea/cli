@@ -178,8 +178,8 @@ fn plan_diff(
     // Checksums first. They describe the archive rather than the repository, so
     // they are exact where a git diff has to be argued about, and they work in
     // a clone that cannot reach the baseline commit — or has no commits.
-    if let Some(local) = manifest {
-        match changed_files_against(config, &baseline, local) {
+    let checksum_refusal = match manifest {
+        Some(local) => match changed_files_against(config, &baseline, local) {
             Ok(changed_files) => {
                 let summary = summarize(&changed_files, &format!("the {}", baseline.describe()))?;
                 return Ok((
@@ -196,13 +196,44 @@ fn plan_diff(
             }
             // Not fatal on its own: git may still be able to answer, and this
             // is the expected path for a baseline that predates manifests.
-            Err(reason) => crate::log::debug(&format!(
-                "Cannot diff against the checksums of scan {}: {reason}. Trying git.",
-                baseline.id
-            )),
-        }
-    }
+            Err(reason) => {
+                crate::log::debug(&format!("{reason}. Trying git."));
+                Some(reason)
+            }
+        },
+        None => None,
+    };
 
+    // Whichever way this run would have preferred to measure the diff, what it
+    // ends up reporting has to name every reason it could not. Printing only
+    // git's leaves someone looking at a full scan they expected to be
+    // incremental with no idea the checksums were tried at all, let alone why
+    // they did not apply.
+    plan_git_diff(
+        &baseline,
+        repo.as_ref(),
+        branch,
+        head_sha,
+        worktree_dirty,
+        ignore_dirty_worktree,
+    )
+    .map_err(|reason| match &checksum_refusal {
+        Some(refusal) => format!("{refusal}, and {reason}"),
+        None => reason,
+    })
+}
+
+/// The diff `git` can measure from the baseline's commit, and a line describing
+/// it. The fallback, for a baseline predating checksums or one whose checksums
+/// could not be read.
+fn plan_git_diff(
+    baseline: &BaselineScan,
+    repo: Option<&Repository>,
+    branch: Option<&str>,
+    head_sha: Option<&str>,
+    worktree_dirty: bool,
+    ignore_dirty_worktree: bool,
+) -> Result<(IncrementalPlan, String), String> {
     // A commit-to-commit diff cannot see uncommitted edits, so on a dirty tree
     // it leaves modified files off the list and their old findings are copied
     // forward as current. --ignore-dirty-worktree does not paper over that; it
@@ -211,8 +242,8 @@ fn plan_diff(
     let covers_worktree = worktree_dirty;
     if worktree_dirty && !ignore_dirty_worktree {
         return Err(
-            "this worktree has uncommitted changes, and a commit-to-commit diff cannot \
-             see them. Pass --ignore-dirty-worktree to diff the working tree instead"
+            "this worktree has uncommitted changes that a commit-to-commit diff cannot \
+             see. Pass --ignore-dirty-worktree to diff the working tree instead"
                 .to_string(),
         );
     }
@@ -221,12 +252,12 @@ fn plan_diff(
     // a detached HEAD, and a scan started below the repo root — none of which
     // report RepoInfo to the upload either.
     let (Some(_branch), Some(head_sha), Some(repo), Some(base_sha)) =
-        (branch, head_sha, repo.as_ref(), baseline.sha.as_deref())
+        (branch, head_sha, repo, baseline.sha.as_deref())
     else {
         return Err(
-            "no git branch and commit to diff from (not a git repository, no commit \
-             yet, a detached HEAD, or a scan started below the repository root), and \
-             the last scan stored no file checksums to compare against instead"
+            "there is no git branch and commit to diff from either (not a git \
+             repository, no commit yet, a detached HEAD, or a scan started below the \
+             repository root)"
                 .to_string(),
         );
     };
@@ -269,25 +300,37 @@ fn summarize(changed_files: &[String], since: &str) -> Result<String, String> {
 }
 
 /// Files differing from the checksums `baseline` stored, by fetching them.
+///
+/// Every refusal names the baseline and reads as a whole clause, because it is
+/// what the run prints when git cannot answer either. "It stored none" is the
+/// ordinary one and is not a fault: it is what every scan uploaded before
+/// checksums existed says, and what a deployment that does not store them yet
+/// says about all of them.
 fn changed_files_against(
     config: &Config,
     baseline: &BaselineScan,
     local: &Manifest,
 ) -> Result<Vec<String>, String> {
+    let what = baseline.describe();
     let Some(root) = baseline.manifest_root.as_deref() else {
-        return Err("it stored none".to_string());
+        return Err(format!(
+            "the {what} stored no file checksums to diff against"
+        ));
     };
     // A manifest is only comparable to one written the same way. Rather than
     // guess at a format a later client introduced, leave it to git.
     if baseline.manifest_version.as_deref() != Some(MANIFEST_VERSION) {
         return Err(format!(
-            "they are version {}, and this client reads version {MANIFEST_VERSION}",
+            "the file checksums of the {what} are version {}, which this client does \
+             not read (it reads version {MANIFEST_VERSION})",
             baseline.manifest_version.as_deref().unwrap_or("unknown")
         ));
     }
     let body = api::download_scan_file_manifest(&config.get_url(), &baseline.id)
-        .map_err(|e| format!("they could not be downloaded ({e})"))?;
-    Ok(Manifest::decode(&body, root)?.changed_paths(local))
+        .map_err(|e| format!("the file checksums of the {what} could not be downloaded ({e})"))?;
+    let decoded = Manifest::decode(&body, root)
+        .map_err(|e| format!("the file checksums of the {what} could not be read ({e})"))?;
+    Ok(decoded.changed_paths(local))
 }
 
 /// A scan that can be diffed against, and what it offers to diff with.

@@ -923,6 +923,12 @@ fn ignore_dirty_worktree_diffs_the_working_tree_instead_of_refusing() {
 /// Without checksums to fall back on, a dirty tree still scans everything: a
 /// commit-to-commit diff cannot see uncommitted edits, so their old findings
 /// would be carried forward over content nothing analyzed.
+///
+/// Both reasons are printed, and this is the case that shows why. Someone who
+/// edits a file and reruns expects the checksum diff to handle it -- it is
+/// built to -- so a message naming only the dirty tree sends them looking for a
+/// bug in the dirty-tree rule, when what actually happened is that the baseline
+/// has no checksums to diff against.
 #[test]
 fn a_dirty_worktree_with_no_stored_checksums_scans_everything() {
     let project = git_project();
@@ -965,7 +971,12 @@ fn a_dirty_worktree_with_no_stored_checksums_scans_everything() {
 
     assert_eq!(output.status.code(), Some(0), "{context}");
     assert!(
-        stdout.contains("Scanning every file: this worktree has uncommitted changes"),
+        stdout.contains(&format!(
+            "Scanning every file: the last scan of {FIXTURE_BRANCH} ({}) stored no file \
+             checksums to diff against, and this worktree has uncommitted changes that a \
+             commit-to-commit diff cannot see.",
+            &base_sha[..7]
+        )),
         "{context}"
     );
 }
