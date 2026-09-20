@@ -121,6 +121,20 @@ fn zip_entry_name(relative_path: &Path) -> String {
         .join("/")
 }
 
+/// The same name with the trailing slash that marks a zip entry as a directory.
+///
+/// Carried here rather than left to the writer, which appends one only when the
+/// name does not already end in `/` *or* `\`. On Windows that second case is a
+/// separator; on Unix it is an ordinary filename byte, so a directory named
+/// `foo\` is stored as `foo\` — a name nothing reading the archive can tell from
+/// a file's. Extracting it writes an empty file where a directory belongs and
+/// the first entry beneath it fails with `NotADirectoryError`, so the scan loses
+/// the upload rather than one path. A manifest rebuilt from the archive counts
+/// it as a file the CLI's own manifest does not have.
+fn directory_entry_name(relative_path: &Path) -> String {
+    format!("{}/", zip_entry_name(relative_path))
+}
+
 /// Create a zip file from a target specification or full repository scan.
 ///
 /// - If `target` is `None`, performs a full repository scan (equivalent to scanning all files).
@@ -233,7 +247,7 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
                 }
                 added_files.push(path);
             } else if path.is_dir() {
-                zip.add_directory(zip_entry_name(&relative_path), options)?;
+                zip.add_directory(directory_entry_name(&relative_path), options)?;
             }
         } else if is_excluded && path.is_file() && target.is_some() {
             excluded_files.push(relative_path);
@@ -1090,6 +1104,28 @@ mod tests {
         }
     }
 
+    /// The writer appends the slash that marks a directory only when the name
+    /// does not already end in `/` or `\`, and on Unix that backslash is a
+    /// filename byte. Left to it, a directory named `slash\` is stored under a
+    /// name that reads back as a file: extracting the archive writes an empty
+    /// file where the directory belongs and the first entry beneath it fails,
+    /// losing the whole upload rather than one path.
+    #[test]
+    fn a_directory_entry_ends_in_a_slash_however_its_name_ends() {
+        let plain: PathBuf = ["src", "pkg"].iter().collect();
+        assert_eq!(directory_entry_name(&plain), "src/pkg/");
+
+        #[cfg(unix)]
+        {
+            let trailing_backslash: PathBuf = ["src", r"slash\"].iter().collect();
+            assert_eq!(directory_entry_name(&trailing_backslash), r"src/slash\/");
+        }
+
+        // The walk names its own root with the empty path, which already
+        // carries the slash once the suffix is on.
+        assert_eq!(directory_entry_name(Path::new("")), "/");
+    }
+
     /// The staging directory holds the project zip and exported images, so other
     /// local users must not be able to read it.
     #[cfg(unix)]
@@ -1317,5 +1353,260 @@ mod tests {
         if let Ok(destination) = env::var("CORGEA_MANIFEST_FIXTURE_OUT") {
             fs::copy(&output_zip, &destination).expect("write fixture");
         }
+    }
+
+    /// Writes one archive per differential case, with the root this CLI
+    /// computed for it, for doghouse to rebuild and compare against.
+    ///
+    /// ```text
+    /// CORGEA_DIFFERENTIAL_OUT=/tmp/differential \
+    ///     cargo test --bin corgea emit_differential -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "packages the current directory, so it cannot share a process"]
+    fn emit_differential_archives() {
+        let Ok(out) = env::var("CORGEA_DIFFERENTIAL_OUT") else {
+            return;
+        };
+        let out = PathBuf::from(out);
+        fs::create_dir_all(&out).expect("create output directory");
+
+        let mut index = String::new();
+        for case in differential_cases() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            for (path, contents) in &case.files {
+                let file = root.join(path);
+                fs::create_dir_all(file.parent().unwrap()).unwrap();
+                fs::write(&file, contents).unwrap();
+            }
+
+            let staging = tempfile::tempdir().unwrap();
+            let extra_files: Vec<(PathBuf, String)> = case
+                .staged
+                .iter()
+                .map(|name| {
+                    let source = staging.path().join(name);
+                    fs::write(&source, b"not byte reproducible").unwrap();
+                    (source, name.to_string())
+                })
+                .collect();
+
+            let previous = env::current_dir().unwrap();
+            env::set_current_dir(root).unwrap();
+            let contents = create_zip_from_target(None, "out.zip", None, None, &extra_files, true);
+            env::set_current_dir(previous).unwrap();
+
+            let archive = contents.expect("zip creation should succeed");
+            let recorded = archive
+                .manifest
+                .expect("a whole-project archive carries a manifest")
+                .encode()
+                .map(|encoded| encoded.root)
+                .unwrap_or_else(|| "refused".to_string());
+
+            let name = &case.name;
+            fs::copy(root.join("out.zip"), out.join(format!("{name}.zip"))).expect("copy");
+            index.push_str(&format!("{name} {recorded}\n"));
+        }
+        fs::write(out.join("index.txt"), index).expect("write index");
+    }
+
+    /// One tree to package, and the archives to stage alongside it.
+    struct DifferentialCase {
+        name: String,
+        files: Vec<(String, Vec<u8>)>,
+        staged: Vec<String>,
+    }
+
+    /// Everything the two implementations could read differently out of one
+    /// archive: how a name is spelled, which entries count as files, and where
+    /// the byte order of two paths disagrees with their character order.
+    fn differential_cases() -> Vec<DifferentialCase> {
+        fn case(name: &str, paths: &[(&str, &[u8])], staged: &[&str]) -> DifferentialCase {
+            DifferentialCase {
+                name: name.to_string(),
+                files: paths
+                    .iter()
+                    .map(|(path, body)| ((*path).to_string(), body.to_vec()))
+                    .collect(),
+                staged: staged.iter().map(|name| (*name).to_string()).collect(),
+            }
+        }
+
+        let mut cases: Vec<DifferentialCase> = vec![
+            case(
+                "plain",
+                &[("a.py", b"one"), ("b/c.py", b"two"), ("b/d/e.py", b"three")],
+                &[],
+            ),
+            // `-` `.` `/` ` ` are 0x2D 0x2E 0x2F 0x20, so these five sort
+            // one way by byte and another by path component.
+            case(
+                "separator_sort",
+                &[
+                    ("a.py", b"1"),
+                    ("a/b.py", b"2"),
+                    ("a-b.py", b"3"),
+                    ("a b.py", b"4"),
+                    ("a!b.py", b"5"),
+                ],
+                &[],
+            ),
+            case(
+                "unicode",
+                &[
+                    ("café.py", "caf\u{e9}".as_bytes()),
+                    ("cafe\u{301}.py", "cafe\u{301}".as_bytes()),
+                    ("中文/文件.py", "\u{4e2d}".as_bytes()),
+                    ("emoji\u{1f600}.py", b"grin"),
+                    ("\u{200b}zero-width.py", b"zw"),
+                ],
+                &[],
+            ),
+            case(
+                "case_only",
+                &[("Readme.py", b"upper"), ("readme.py", b"lower")],
+                &[],
+            ),
+            case(
+                "shell_metacharacters",
+                &[
+                    ("a'b.py", b"quote"),
+                    ("a\"b.py", b"double"),
+                    ("a$b.py", b"dollar"),
+                    ("a#b.py", b"hash"),
+                    ("a%b.py", b"percent"),
+                    ("a*b.py", b"star"),
+                    ("a[b].py", b"bracket"),
+                    ("a\\b.py", b"backslash"),
+                    ("a\tb.py", b"tab"),
+                ],
+                &[],
+            ),
+            case(
+                "empty_and_binary",
+                &[
+                    ("empty.py", b""),
+                    ("nul.py", b"a\0b"),
+                    ("crlf.py", b"a\r\nb"),
+                    ("high.py", &[0xff, 0xfe, 0x00, 0x80]),
+                ],
+                &[],
+            ),
+            case(
+                "dotfiles",
+                &[(".hidden.py", b"h"), (".config/app.py", b"c")],
+                &[],
+            ),
+            // Both implementations have to leave these out, from the same
+            // set of entries: excluded ones never reach the archive, the
+            // staged one reaches it and not the manifest.
+            case(
+                "excluded_and_staged",
+                &[
+                    ("keep.py", b"k"),
+                    ("style.css", b"css"),
+                    ("test/t.py", b"t"),
+                    ("node_modules/x.py", b"n"),
+                    ("corgea-image-scanning-repo-copy.tar", b"repo copy"),
+                    ("nested/corgea-image-scanning-deep.tar", b"deep copy"),
+                ],
+                &["corgea-image-scanning-staged-1.0.tar"],
+            ),
+            DifferentialCase {
+                // Crosses the 1 MiB chunk both sides hash in, and lands one
+                // file exactly on the boundary.
+                name: "chunk_boundary".to_string(),
+                files: vec![
+                    ("exact.py".to_string(), vec![b'x'; 1024 * 1024]),
+                    ("over.py".to_string(), vec![b'y'; 1024 * 1024 + 1]),
+                    ("under.py".to_string(), vec![b'z'; 1024 * 1024 - 1]),
+                ],
+                staged: vec![],
+            },
+            case("long_name", &[("x".repeat(200).as_str(), b"long")], &[]),
+            // A directory name the writer reads as already ending in a
+            // separator. On Unix that backslash is a filename byte.
+            case(
+                "backslash_directory",
+                &[
+                    ("plain/a.py", b"in a plain directory"),
+                    ("slash\\/b.py", b"in one whose name ends in a backslash"),
+                    ("slash\\.py", b"not a directory at all"),
+                ],
+                &[],
+            ),
+        ];
+
+        // Plus randomized trees, so the cases above are a floor rather than
+        // the whole of what is checked.
+        let alphabet: Vec<&str> = vec![
+            "a",
+            "B",
+            " ",
+            "-",
+            ".",
+            "_",
+            "'",
+            "$",
+            "#",
+            "%",
+            "\\",
+            "é",
+            "中",
+            "\u{1f600}",
+            "~",
+            "@",
+            "+",
+            "=",
+            "(",
+            ")",
+            "&",
+            ";",
+            "!",
+        ];
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for tree in 0..40 {
+            let mut paths: Vec<(String, Vec<u8>)> = Vec::new();
+            for _ in 0..(next() % 12 + 1) {
+                let depth = next() % 3;
+                let mut name = String::new();
+                for level in 0..=depth {
+                    for _ in 0..(next() % 6 + 1) {
+                        name.push_str(alphabet[(next() % alphabet.len() as u64) as usize]);
+                    }
+                    if level < depth {
+                        name.push('/');
+                    }
+                }
+                // A path component that is only dots is the walk's own
+                // parent, not a file, and a trailing space or dot is a name
+                // the filesystem may not keep verbatim.
+                if name
+                    .split('/')
+                    .any(|part| part.chars().all(|c| c == '.') || part.ends_with([' ', '.']))
+                {
+                    continue;
+                }
+                let body = vec![(next() % 256) as u8; (next() % 500) as usize];
+                paths.push((format!("{name}.py"), body));
+            }
+            if paths.is_empty() {
+                continue;
+            }
+            cases.push(DifferentialCase {
+                name: format!("random_{tree}"),
+                files: paths,
+                staged: vec![],
+            });
+        }
+        cases
     }
 }
