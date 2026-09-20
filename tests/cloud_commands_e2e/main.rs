@@ -7,4 +7,6 @@ mod inspect;
 mod scan_incremental;
 mod scan_list;
 mod scan_skip;
+mod transient_retry;
+mod upload_report_paths;
 mod upload_wait;

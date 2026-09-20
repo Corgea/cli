@@ -53,8 +53,19 @@ fn spawn_scan_api(
     reason: &'static str,
     errors: &'static str,
 ) -> String {
+    spawn_counted_scan_api(statuses, reason, errors).0
+}
+
+/// As `spawn_scan_api`, and also hands back the scan-read counter, so a test
+/// whose point is that the wait kept polling can prove the reads happened.
+fn spawn_counted_scan_api(
+    statuses: &'static [&'static str],
+    reason: &'static str,
+    errors: &'static str,
+) -> (String, Arc<AtomicUsize>) {
     let reads = Arc::new(AtomicUsize::new(0));
-    common::spawn_http_stub(move |path| {
+    let counter = Arc::clone(&reads);
+    let url = common::spawn_http_stub(move |path| {
         if path.contains("/issues") {
             return ("200 OK", issues_json());
         }
@@ -64,7 +75,8 @@ fn spawn_scan_api(
             return ("200 OK", scan_json(status, reason, errors));
         }
         ("200 OK", String::from(r#"{"status":"ok"}"#))
-    })
+    });
+    (url, counter)
 }
 
 /// Run `corgea wait <SCAN_ID>` against `url`, failing rather than blocking
@@ -229,15 +241,25 @@ fn already_completed_scan_reports_missing_scanner_results() {
 #[test]
 fn wait_stops_polling_a_scan_that_never_finishes() {
     // Guards the timeout: without it, a scan stuck in a non-terminal status
-    // polls forever.
-    let url = spawn_scan_api(&["processing"], "", "");
+    // polls forever. The budget has to span several poll intervals, or the wait
+    // would expire before making a single poll and prove nothing.
+    let (url, reads) = spawn_counted_scan_api(&["processing"], "", "");
 
-    let (code, output) = run_wait(&url, &[("CORGEA_SCAN_TIMEOUT_SECONDS", "3")]);
+    let (code, output) = run_wait(&url, &[("CORGEA_SCAN_TIMEOUT_SECONDS", "7")]);
 
     assert_eq!(code, Some(1), "a timeout must fail the command: {output}");
     assert!(
         output.contains("Stopped waiting"),
         "timeout must explain itself: {output}"
+    );
+    // The initial read plus at least one poll. A poll interval that outgrew the
+    // budget would time out without polling and pass this test for the wrong
+    // reason.
+    assert!(
+        reads.load(Ordering::SeqCst) > 1,
+        "the wait polled {} times on a 7s budget, so it never exercised the \
+         poll loop: {output}",
+        reads.load(Ordering::SeqCst)
     );
 }
 
@@ -273,7 +295,10 @@ fn wait_honors_the_timeout_when_a_status_read_stalls() {
     // The budget has to bound the whole wait, not just the gaps between reads.
     // Each read carries the client's 150s timeout, so a server that accepts the
     // connection and never answers used to hold the CLI far past the budget.
+    // The budget must outlast one poll interval, or the stalling read below is
+    // never reached.
     let reads = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&reads);
     let url = common::spawn_http_stub(move |path| {
         if path.starts_with("/api/v1/scan/") {
             if reads.fetch_add(1, Ordering::SeqCst) > 0 {
@@ -287,7 +312,7 @@ fn wait_honors_the_timeout_when_a_status_read_stalls() {
     });
 
     let started = Instant::now();
-    let (code, output) = run_wait(&url, &[("CORGEA_SCAN_TIMEOUT_SECONDS", "3")]);
+    let (code, output) = run_wait(&url, &[("CORGEA_SCAN_TIMEOUT_SECONDS", "5")]);
     let elapsed = started.elapsed();
 
     assert_eq!(code, Some(1), "a timeout must fail the command: {output}");
@@ -297,6 +322,12 @@ fn wait_honors_the_timeout_when_a_status_read_stalls() {
     );
     assert!(
         elapsed < Duration::from_secs(15),
-        "waited {elapsed:?} on a 3s budget: {output}"
+        "waited {elapsed:?} on a 5s budget: {output}"
+    );
+    // The stalling read is the second one, so a budget that expired during the
+    // first poll interval would never reach the behavior under test.
+    assert!(
+        counter.load(Ordering::SeqCst) > 1,
+        "the stalling read was never reached: {output}"
     );
 }

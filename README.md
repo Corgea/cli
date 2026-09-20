@@ -39,13 +39,45 @@ third-party report.
 
 All three exit 1 if the scan fails, printing the reason and the scanners that hit
 problems. A scan that completes with a scanner missing exits 0 with a warning.
-Waiting gives up after 10 hours; override with `CORGEA_SCAN_TIMEOUT_SECONDS`.
+While waiting, the scan's status is read every 3 seconds. Waiting gives up after
+10 hours; override with `CORGEA_SCAN_TIMEOUT_SECONDS`.
 `--fail`/`--block-on` then wait up to 15 minutes for blocking rules to be
 evaluated; override with `CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS`.
 
 `--out-format`/`--out-file` and `--sbom` are honored whether or not a gate
 trips: both are written before `--fail`/`--block-on` are evaluated, so a scan
 that exits 1 on a blocking rule still leaves its report behind to ingest.
+
+### Rate limits and gateway errors are retried
+
+Neither `429 Too Many Requests` nor `502 Bad Gateway` is Corgea rejecting a
+request on its merits, so both are retried rather than failed: the CLI waits
+10s, then 30s, then 50s, and a pipeline rides out the blips a busy platform
+produces under parallel scans instead of failing on them. A request still
+answered the same way after those three retries fails the command in the usual
+way, so a real outage still exits non-zero. Each retry is logged, and the count
+belongs to a single request: any other answer starts the next one with the full
+three retries again. A `429` that names a `Retry-After` in seconds is honored,
+up to two minutes for any one pause, and never shortens the pause below the
+schedule.
+
+Which requests get retried depends on which of the two it is:
+
+- A `429` retries everything, `POST` and `PATCH` included. The rate limiter
+  declines the request before the API sees it, so nothing was created and
+  sending it again finishes the same work.
+- A `502` retries reads only. It comes from the proxy rather than from Corgea,
+  so it is equally the answer for "the request never arrived" and for "the
+  request was processed and the reply was lost coming back" — and every write
+  the CLI sends creates something, so re-sending one does not finish the first
+  scan, it starts a second. A write's 502 goes straight to the caller.
+
+Writes still retry network errors, where nothing reached Corgea at all.
+
+`corgea upload` treats either status on a source upload — a 502, or a rate limit
+that outlived its retries — as the platform being unavailable rather than one bad
+file, and reports the remaining paths as unsent instead of collecting the same
+answer once per path.
 
 ### Skipping a re-scan of the same commit
 
