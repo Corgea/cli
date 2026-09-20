@@ -1,6 +1,6 @@
 [package]
 name = "corgea"
-version = "1.14.2"
+version = "1.15.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -57,6 +57,8 @@ url = "2.5"
 open = "5.0"
 urlencoding = "2.1"
 serde_yaml_ng = "0.10"
+sha2 = "0.10"
+flate2 = "1.1"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }

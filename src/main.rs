@@ -6,6 +6,7 @@ mod incremental;
 mod inspect;
 mod list;
 mod log;
+mod manifest;
 mod mcp;
 mod scan;
 mod setup_hooks;

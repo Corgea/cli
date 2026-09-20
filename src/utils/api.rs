@@ -1,5 +1,6 @@
-use crate::incremental::IncrementalPlan;
+use crate::incremental::{BaselineRef, IncrementalPlan};
 use crate::log::debug;
+use crate::manifest::EncodedManifest;
 use crate::utils;
 use corgea::vuln_api::{auth_header, source};
 use reqwest::header::HeaderMap;
@@ -517,6 +518,9 @@ pub struct UploadOptions {
     /// Set when this run resolved a diff for the server to analyze instead of
     /// the whole project.
     pub incremental: Option<IncrementalPlan>,
+    /// Digests of everything in the archive, stored with the scan for a later
+    /// run to diff against. Set only when the archive is the whole project.
+    pub file_manifest: Option<EncodedManifest>,
 }
 
 pub fn upload_zip(
@@ -531,6 +535,7 @@ pub fn upload_zip(
         policy,
         metadata,
         incremental,
+        file_manifest,
     } = options;
     let client = http_client();
     let file_size = std::fs::metadata(file_path)?.len();
@@ -621,6 +626,11 @@ pub fn upload_zip(
         }
 
         let chunk = &buffer[..bytes_read];
+        // The scan is registered on the chunk that completes the archive, and
+        // that is the only request whose fields the server reads. Sending the
+        // manifest with every chunk would re-upload it once per 50 MB for a
+        // server that discards all but the last copy.
+        let final_chunk = offset + bytes_read as u64 >= file_size;
 
         // Rebuilt per attempt: a multipart body is a stream, so a retry has
         // nothing to replay unless the whole request is made again.
@@ -675,10 +685,16 @@ pub fn upload_zip(
                 if let Some(plan) = &incremental {
                     match serde_json::to_string(&plan.changed_files) {
                         Ok(changed_files) => {
-                            form = form.part(
-                                "incremental_base_sha",
-                                multipart::Part::text(plan.base_sha.clone()),
-                            );
+                            // Which scan the diff was measured from. A commit
+                            // when git produced it, and the scan itself when
+                            // its stored checksums did -- that upload may have
+                            // had no commit to name, and naming the scan is
+                            // exact where a commit several scans share is not.
+                            let (field, value) = match &plan.base {
+                                BaselineRef::Commit(sha) => ("incremental_base_sha", sha),
+                                BaselineRef::Scan(id) => ("incremental_base_scan_id", id),
+                            };
+                            form = form.part(field, multipart::Part::text(value.clone()));
                             form = form.part(
                                 "incremental_changed_files",
                                 multipart::Part::text(changed_files),
@@ -697,6 +713,27 @@ pub fn upload_zip(
                         "Could not serialize the incremental file list, scanning every file: {e}"
                     )),
                     }
+                }
+                // Root and version travel beside the bytes rather than inside
+                // them: the server recomputes the root from what it
+                // decompressed and refuses a mismatch, so a truncated manifest
+                // costs a full scan instead of reading as a tree that shrank.
+                if let (true, Some(manifest)) = (final_chunk, &file_manifest) {
+                    form = form
+                        .part(
+                            "file_manifest",
+                            Part::bytes(manifest.body.clone())
+                                .file_name("file_manifest.txt.gz")
+                                .mime_str("application/gzip")?,
+                        )
+                        .part(
+                            "file_manifest_root",
+                            multipart::Part::text(manifest.root.clone()),
+                        )
+                        .part(
+                            "file_manifest_version",
+                            multipart::Part::text(crate::manifest::MANIFEST_VERSION),
+                        );
                 }
 
                 client
@@ -1165,32 +1202,41 @@ pub fn query_scan_list(
 /// one. A backend predating them ignores the unknown parameters and returns
 /// scans of every kind, so the caller must still re-check each scan it acts on
 /// — see `incremental::is_usable_baseline`.
+///
+/// `branch` is `None` for a caller that cannot say which branch is trunk,
+/// which is also the caller whose baseline may name no branch at all. Asking
+/// for one would then exclude exactly the scans it is looking for.
+///
+/// `require_clean` likewise excludes what a git diff cannot use and a checksum
+/// diff can: a scan that reported no dirty flag has unknown scope for a commit
+/// comparison, but its stored checksums describe its contents exactly.
 pub fn query_baseline_scans(
     url: &str,
     project: &str,
     engine: &str,
-    branch: &str,
+    branch: Option<&str>,
+    require_clean: bool,
     page: u16,
     page_size: u16,
 ) -> Result<ScansResponse, Box<dyn Error>> {
-    request_scan_list(
-        url,
-        vec![
-            ("page", page.to_string()),
-            ("page_size", page_size.to_string()),
-            ("project", project.to_string()),
-            ("engine", engine.to_string()),
-            ("branch", branch.to_string()),
-            ("status", "complete".to_string()),
-            ("exclude_pull_requests", "true".to_string()),
-            // A partial scan's findings cover only the files it was pointed at,
-            // so copying forward from one would drop everything else.
-            ("full_project_state", "true".to_string()),
-            // Explicitly clean only. A scan that never reported the flag is
-            // unknown scope, which the server rejects as a baseline.
-            ("worktree_dirty", "false".to_string()),
-        ],
-    )
+    let mut query_params = vec![
+        ("page", page.to_string()),
+        ("page_size", page_size.to_string()),
+        ("project", project.to_string()),
+        ("engine", engine.to_string()),
+        ("status", "complete".to_string()),
+        ("exclude_pull_requests", "true".to_string()),
+        // A partial scan's findings cover only the files it was pointed at,
+        // so copying forward from one would drop everything else.
+        ("full_project_state", "true".to_string()),
+    ];
+    if let Some(branch) = branch {
+        query_params.push(("branch", branch.to_string()));
+    }
+    if require_clean {
+        query_params.push(("worktree_dirty", "false".to_string()));
+    }
+    request_scan_list(url, query_params)
 }
 
 /// One page of the project's scans at exactly `sha`, newest first.
@@ -1214,6 +1260,26 @@ pub fn query_scans_for_commit(
             ("sha", sha.to_string()),
         ],
     )
+}
+
+/// The gzipped file manifest stored with `scan_id`.
+///
+/// Returned as bytes rather than parsed here: the server keeps them verbatim
+/// and never reads them, so the only thing that can tell whether they survived
+/// is the digest check `Manifest::decode` does against the root the scan list
+/// reported.
+pub fn download_scan_file_manifest(url: &str, scan_id: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    let url = format!("{}{}/scan/{}/file-manifest", url, API_BASE, scan_id);
+    debug(&format!("Sending request to URL: {}", url));
+    let response = http_client()
+        .get(url)
+        .send()
+        .map_err(|e| format!("API request failed: {}", e))?;
+    check_for_warnings(response.headers(), response.status());
+    if !response.status().is_success() {
+        return Err(format!("API request failed with status: {}", response.status()).into());
+    }
+    Ok(response.bytes()?.to_vec())
 }
 
 fn request_scan_list(
@@ -1835,6 +1901,15 @@ pub struct ScanResponse {
     /// build. Carried by the scan list only; `GET /scan/{id}` omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request_id: Option<String>,
+    /// Digest of the file manifest stored with this scan, `None` when it has
+    /// none — an older client, a partial upload, or a deployment predating the
+    /// field. Its presence is what says the manifest is there to download.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_manifest_root: Option<String>,
+    /// Serialization of that manifest. A version this client does not read is
+    /// left alone rather than guessed at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_manifest_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
     /// Why a scan ended without finishing. Only set for failed scans.
@@ -2126,6 +2201,30 @@ pub struct SCAIssuesResponse {
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn a_scan_from_a_deployment_without_manifests_parses_as_having_none() {
+        // The fields are absent, not null, on a backend predating them. Without
+        // a default that is a parse error, which would take out the whole
+        // baseline lookup -- including the git diff, which needs nothing new.
+        let legacy = r#"{
+            "id": "scan-1",
+            "project": "proj",
+            "repo": null,
+            "branch": "main",
+            "status": "complete",
+            "engine": "corgea-blast",
+            "created_at": "2026-01-01T00:00:00Z",
+            "git_sha": "abc123",
+            "worktree_dirty": false
+        }"#;
+
+        let parsed: ScanResponse = serde_json::from_str(legacy).unwrap();
+
+        assert_eq!(parsed.file_manifest_root, None);
+        assert_eq!(parsed.file_manifest_version, None);
+        assert_eq!(parsed.git_sha.as_deref(), Some("abc123"));
+    }
 
     #[test]
     fn blocking_rule_response_defaults_status_when_missing() {

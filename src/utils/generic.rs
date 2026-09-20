@@ -1,3 +1,4 @@
+use crate::manifest::{Manifest, TeeWriter};
 use crate::utils::terminal::{set_text_color, TerminalColor};
 use git2::{Repository, StatusOptions};
 use globset::{Glob, GlobSetBuilder};
@@ -61,6 +62,79 @@ const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
     "**/corgea-image-scanning-*.tar",
 ];
 
+/// Files packed into the archive, and what they contained.
+pub struct ArchiveContents {
+    /// Source paths of everything added, in the order they were written.
+    pub added_files: Vec<PathBuf>,
+    /// Digest of every archived file, keyed by its zip entry name.
+    ///
+    /// Only built for a whole-project archive. A `--target`, `--exclude` or
+    /// `--only-uncommitted` run packs a subset, and a manifest of a subset
+    /// reads to the server as every other file having been deleted.
+    pub manifest: Option<Manifest>,
+}
+
+/// Whether an archive built with these options holds the whole project.
+///
+/// Only such an archive may carry a file manifest. A manifest is subtracted
+/// from the baseline scan's, so a path missing from it is a deletion — and
+/// every finding for a file this run merely left out would be dropped without
+/// anything having looked at it.
+///
+/// `--target` and `--exclude` are the explicit subsets. The implicit one is
+/// packaging run from below the worktree root: the walk starts at `.` and keys
+/// entries relative to it, so `backend/` uploads `{app.py, …}` where the next
+/// root-level scan reports `{backend/app.py, …}` — two spellings of the same
+/// files that subtract to "everything was deleted, everything was added". A
+/// tree with no git at all is not a subset of anything and keeps its manifest;
+/// that case is the reason this exists.
+///
+/// `walked` is the directory packaging starts from, which is how the caller
+/// says what "the project" meant.
+fn archives_whole_project(walked: &str, target: Option<&str>, user_exclude: Option<&str>) -> bool {
+    if target.is_some() || user_exclude.is_some() {
+        return false;
+    }
+    match Repository::discover(Path::new(walked)) {
+        Ok(_) => is_at_repo_root(walked),
+        Err(_) => true,
+    }
+}
+
+/// A zip entry name for `relative_path`, always `/`-separated.
+///
+/// Zip stores whatever string it is handed, and `to_string_lossy` on a Windows
+/// path hands it `src\app.py`. The archive is read on Linux and the manifest is
+/// keyed by the same string, so a scan from a Windows laptop and one from Linux
+/// CI describe the same file under two names: every path in one is absent from
+/// the other, which subtracts to every file deleted and every file added.
+///
+/// Joining components rather than replacing `\` keeps a Unix file literally
+/// named `foo\bar` as one component — on Linux that backslash is a filename
+/// byte, not a separator, and `changed_files_since` relies on the same
+/// distinction for git's always-`/` paths.
+fn zip_entry_name(relative_path: &Path) -> String {
+    relative_path
+        .iter()
+        .map(|component| component.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The same name with the trailing slash that marks a zip entry as a directory.
+///
+/// Carried here rather than left to the writer, which appends one only when the
+/// name does not already end in `/` *or* `\`. On Windows that second case is a
+/// separator; on Unix it is an ordinary filename byte, so a directory named
+/// `foo\` is stored as `foo\` — a name nothing reading the archive can tell from
+/// a file's. Extracting it writes an empty file where a directory belongs and
+/// the first entry beneath it fails with `NotADirectoryError`, so the scan loses
+/// the upload rather than one path. A manifest rebuilt from the archive counts
+/// it as a file the CLI's own manifest does not have.
+fn directory_entry_name(relative_path: &Path) -> String {
+    format!("{}/", zip_entry_name(relative_path))
+}
+
 /// Create a zip file from a target specification or full repository scan.
 ///
 /// - If `target` is `None`, performs a full repository scan (equivalent to scanning all files).
@@ -70,13 +144,17 @@ const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
 /// - `extra_files` are staged files added to the root of the zip as
 ///   `(source path, zip entry name)`. They come from explicit flags such as
 ///   `--include-image`, so exclude rules don't apply to them.
+/// - `want_manifest` is the caller saying it has a use for the digests. A run
+///   that cannot scan incrementally should pass `false` and not pay to hash
+///   every file it packs.
 pub fn create_zip_from_target<P: AsRef<Path>>(
     target: Option<&str>,
     output_zip: P,
     exclude_globs: Option<&[&str]>,
     user_exclude: Option<&str>,
     extra_files: &[(PathBuf, String)],
-) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    want_manifest: bool,
+) -> Result<ArchiveContents, Box<dyn std::error::Error>> {
     let exclude_globs = exclude_globs.unwrap_or(DEFAULT_EXCLUDE_GLOBS);
 
     let mut glob_builder = GlobSetBuilder::new();
@@ -141,6 +219,12 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
 
     let mut added_files = Vec::new();
     let mut excluded_files = Vec::new();
+    // Hashing rides along on the copy that compresses each file, so the archive
+    // is still read once. Skipped outright when the caller has already decided
+    // it wants no manifest, rather than hashing every file in the project for
+    // a value that is then dropped.
+    let mut manifest =
+        (want_manifest && archives_whole_project(".", target, user_exclude)).then(Manifest::new);
 
     for (path, relative_path) in files_to_zip {
         // Match repo-relative paths so abs `/tmp/...` targets don't hit `**/tmp/**`.
@@ -148,12 +232,22 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
 
         if (path.is_file() || path.is_dir()) && !is_excluded {
             if path.is_file() {
-                zip.start_file(relative_path.to_string_lossy(), options)?;
+                let entry_name = zip_entry_name(&relative_path);
+                zip.start_file(entry_name.as_str(), options)?;
                 let mut file = File::open(&path)?;
-                io::copy(&mut file, &mut zip)?;
+                match manifest.as_mut() {
+                    Some(manifest) => {
+                        let mut tee = TeeWriter::new(&mut zip);
+                        io::copy(&mut file, &mut tee)?;
+                        manifest.insert(entry_name, tee.finish());
+                    }
+                    None => {
+                        io::copy(&mut file, &mut zip)?;
+                    }
+                }
                 added_files.push(path);
             } else if path.is_dir() {
-                zip.add_directory(relative_path.to_string_lossy(), options)?;
+                zip.add_directory(directory_entry_name(&relative_path), options)?;
             }
         } else if is_excluded && path.is_file() && target.is_some() {
             excluded_files.push(relative_path);
@@ -165,6 +259,12 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     let large_file_options: FileOptions<()> = options.large_file(true);
 
     for (path, entry_name) in extra_files {
+        // Left out of the manifest deliberately. `docker save` output is not
+        // byte-reproducible, so an image archive would differ on every run and
+        // report the upload as changed when the project had not. That does not
+        // leave a new image unscanned: fusion scans a bundled archive whether
+        // or not the changed-file list mentions it, since asking for one with
+        // --include-image is explicit in a way a diff does not override.
         zip.start_file(entry_name.as_str(), large_file_options)?;
         let mut file = File::open(path)?;
         io::copy(&mut file, &mut zip)?;
@@ -198,7 +298,10 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     }
 
     zip.finish()?;
-    Ok(added_files)
+    Ok(ArchiveContents {
+        added_files,
+        manifest,
+    })
 }
 
 /// Create a staging directory under the system temp directory, readable only by
@@ -918,8 +1021,10 @@ mod tests {
         // which would exclude *everything*. The filter + warn path under test
         // is identical either way.
         let excludes: &[&str] = &["**/node_modules/**"];
-        let added = create_zip_from_target(Some(&target), &output_zip, Some(excludes), None, &[])
-            .expect("zip creation should succeed");
+        let archive =
+            create_zip_from_target(Some(&target), &output_zip, Some(excludes), None, &[], true)
+                .expect("zip creation should succeed");
+        let added = archive.added_files;
 
         assert!(
             added.iter().any(|p| p.ends_with("src/main.py")),
@@ -931,6 +1036,94 @@ mod tests {
             "node_modules file should be excluded: {:?}",
             added
         );
+        // A targeted archive holds a subset of the project, and a manifest of a
+        // subset reads to the server as every other file having been deleted.
+        assert!(archive.manifest.is_none());
+    }
+
+    #[test]
+    fn only_a_whole_project_archive_carries_a_manifest() {
+        // Not a git repo, so nothing says this is part of something larger.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+
+        // --exclude narrows the archive without narrowing `target`, so the
+        // files it holds back would read to the server as deletions.
+        assert!(archives_whole_project(root, None, None));
+        assert!(!archives_whole_project(root, Some("src/app.py"), None));
+        assert!(!archives_whole_project(root, None, Some("**/vendor/**")));
+        assert!(!archives_whole_project(
+            root,
+            Some("git:staged"),
+            Some("**/vendor/**")
+        ));
+    }
+
+    /// Packaging from `backend/` walks `.` and keys entries relative to it, so
+    /// it uploads `{app.py}` where the next root-level scan reports
+    /// `{backend/app.py}`. Subtracting those two says every file in the project
+    /// was deleted and every file was added, and the findings for the ones this
+    /// run never looked at go with them.
+    #[test]
+    fn a_subdirectory_of_a_repository_is_not_the_whole_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).expect("init repo");
+        let worktree = repo.workdir().unwrap().to_path_buf();
+        let nested = worktree.join("backend");
+        fs::create_dir_all(&nested).unwrap();
+
+        assert!(archives_whole_project(
+            worktree.to_str().unwrap(),
+            None,
+            None
+        ));
+        assert!(!archives_whole_project(
+            nested.to_str().unwrap(),
+            None,
+            None
+        ));
+    }
+
+    /// Zip stores the string it is handed, and the manifest is keyed by the
+    /// same one. A Windows `to_string_lossy` hands over `src\app.py` where
+    /// Linux hands over `src/app.py`, so a laptop scan and a CI scan of one
+    /// tree describe every file under a name the other does not have: the
+    /// subtraction says every file was deleted and every file was added.
+    #[test]
+    fn an_entry_name_is_slash_separated_whatever_the_platform_spells() {
+        let nested: PathBuf = ["src", "pkg", "app.py"].iter().collect();
+        assert_eq!(zip_entry_name(&nested), "src/pkg/app.py");
+
+        // On Linux a backslash is a filename byte rather than a separator, so
+        // joining components has to leave it inside the one it belongs to --
+        // which a blind `\` to `/` replace would not.
+        #[cfg(unix)]
+        {
+            let literal: PathBuf = ["dir", r"odd\name.py"].iter().collect();
+            assert_eq!(zip_entry_name(&literal), r"dir/odd\name.py");
+        }
+    }
+
+    /// The writer appends the slash that marks a directory only when the name
+    /// does not already end in `/` or `\`, and on Unix that backslash is a
+    /// filename byte. Left to it, a directory named `slash\` is stored under a
+    /// name that reads back as a file: extracting the archive writes an empty
+    /// file where the directory belongs and the first entry beneath it fails,
+    /// losing the whole upload rather than one path.
+    #[test]
+    fn a_directory_entry_ends_in_a_slash_however_its_name_ends() {
+        let plain: PathBuf = ["src", "pkg"].iter().collect();
+        assert_eq!(directory_entry_name(&plain), "src/pkg/");
+
+        #[cfg(unix)]
+        {
+            let trailing_backslash: PathBuf = ["src", r"slash\"].iter().collect();
+            assert_eq!(directory_entry_name(&trailing_backslash), r"src/slash\/");
+        }
+
+        // The walk names its own root with the empty path, which already
+        // carries the slash once the suffix is on.
+        assert_eq!(directory_entry_name(Path::new("")), "/");
     }
 
     /// The staging directory holds the project zip and exported images, so other
@@ -968,8 +1161,10 @@ mod tests {
             Some(&[]),
             None,
             &extra_files,
+            true,
         )
-        .expect("zip creation should succeed");
+        .expect("zip creation should succeed")
+        .added_files;
 
         assert!(added.contains(&staged), "staged archive should be added");
 
@@ -1010,8 +1205,10 @@ mod tests {
             Some(&[]),
             None,
             &extra_files,
+            true,
         )
-        .expect("a >4 GiB entry needs ZIP64, not an error");
+        .expect("a >4 GiB entry needs ZIP64, not an error")
+        .added_files;
 
         assert!(added.contains(&staged));
     }
@@ -1079,5 +1276,337 @@ mod tests {
         assert_eq!(extract_repo_path("org/repo"), None);
         assert_eq!(extract_repo_path("group/subgroup/repo"), None);
         assert_eq!(extract_repo_path("my.group/sub/repo"), None);
+    }
+
+    /// Writes the archive doghouse's compatibility test reads, and checks it
+    /// still describes what that test expects.
+    ///
+    /// Doghouse rebuilds the manifest of scans uploaded before this CLI
+    /// existed by reading the archive they uploaded, so its code encodes what
+    /// a Corgea archive looks like: which entries are files, how their names
+    /// are spelled, and which ones the manifest leaves out. A fixture written
+    /// by this function is the only thing that holds those assumptions to a
+    /// real archive rather than to a hand-built imitation of one.
+    ///
+    /// Ignored because it has to run in the directory being packaged, and
+    /// changing that is process-wide. Regenerate with:
+    ///
+    /// ```text
+    /// CORGEA_MANIFEST_FIXTURE_OUT=../doghouse/heeler/tests/fixtures/cli_upload_manifest.zip \
+    ///     cargo test --bin corgea emit_the_archive_fixture -- --ignored
+    /// ```
+    ///
+    /// Then regenerate `tests/fixtures/rebuilt_manifest.gz`, which is the
+    /// other end of the same loop, by running doghouse's
+    /// `backfill_file_manifests` over the new archive.
+    ///
+    /// A failure here means the archive layout changed, so every manifest
+    /// doghouse rebuilt from the old layout describes a different tree than
+    /// the CLI would now report. Regenerate both fixtures and work out whether
+    /// the rebuilt manifests need discarding.
+    #[test]
+    #[ignore = "packages the current directory, so it cannot share a process"]
+    fn emit_the_archive_fixture_doghouse_rebuilds_a_manifest_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // The same files the shared vector names, so both sides are asserting
+        // one root over one set of contents.
+        for (path, contents) in [
+            ("a.py", "print('hi')\n"),
+            ("dir.py", "x\n"),
+            ("dir/b.py", ""),
+            ("dir/c with space.py", "two\nlines\n"),
+            ("zzé.py", "café\n"),
+        ] {
+            let file = root.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, contents).unwrap();
+        }
+
+        // Staged the way `--include-image` stages one: written outside the
+        // project, added to the archive, and left out of the manifest. That
+        // exclusion is what doghouse has to reproduce.
+        let staging = tempfile::tempdir().unwrap();
+        let staged = staging.path().join("image.tar");
+        fs::write(&staged, "not byte reproducible").unwrap();
+        let extra_files = vec![(staged, "corgea-image-scanning-app-1.0.tar".to_string())];
+
+        let output_zip = root.join("out.zip");
+        let previous = env::current_dir().unwrap();
+        env::set_current_dir(root).unwrap();
+        let contents = create_zip_from_target(None, "out.zip", None, None, &extra_files, true);
+        env::set_current_dir(previous).unwrap();
+
+        let manifest = contents
+            .expect("zip creation should succeed")
+            .manifest
+            .expect("a whole-project archive carries a manifest")
+            .encode()
+            .expect("encode");
+        assert_eq!(
+            manifest.root,
+            crate::manifest::tests::SHARED_VECTOR_ROOT,
+            "the archive no longer describes the tree doghouse expects"
+        );
+
+        if let Ok(destination) = env::var("CORGEA_MANIFEST_FIXTURE_OUT") {
+            fs::copy(&output_zip, &destination).expect("write fixture");
+        }
+    }
+
+    /// Writes one archive per differential case, with the root this CLI
+    /// computed for it, for doghouse to rebuild and compare against.
+    ///
+    /// ```text
+    /// CORGEA_DIFFERENTIAL_OUT=/tmp/differential \
+    ///     cargo test --bin corgea emit_differential -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "packages the current directory, so it cannot share a process"]
+    fn emit_differential_archives() {
+        let Ok(out) = env::var("CORGEA_DIFFERENTIAL_OUT") else {
+            return;
+        };
+        let out = PathBuf::from(out);
+        fs::create_dir_all(&out).expect("create output directory");
+
+        let mut index = String::new();
+        for case in differential_cases() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            for (path, contents) in &case.files {
+                let file = root.join(path);
+                fs::create_dir_all(file.parent().unwrap()).unwrap();
+                fs::write(&file, contents).unwrap();
+            }
+
+            let staging = tempfile::tempdir().unwrap();
+            let extra_files: Vec<(PathBuf, String)> = case
+                .staged
+                .iter()
+                .map(|name| {
+                    let source = staging.path().join(name);
+                    fs::write(&source, b"not byte reproducible").unwrap();
+                    (source, name.to_string())
+                })
+                .collect();
+
+            let previous = env::current_dir().unwrap();
+            env::set_current_dir(root).unwrap();
+            let contents = create_zip_from_target(None, "out.zip", None, None, &extra_files, true);
+            env::set_current_dir(previous).unwrap();
+
+            let archive = contents.expect("zip creation should succeed");
+            let recorded = archive
+                .manifest
+                .expect("a whole-project archive carries a manifest")
+                .encode()
+                .map(|encoded| encoded.root)
+                .unwrap_or_else(|| "refused".to_string());
+
+            let name = &case.name;
+            fs::copy(root.join("out.zip"), out.join(format!("{name}.zip"))).expect("copy");
+            index.push_str(&format!("{name} {recorded}\n"));
+        }
+        fs::write(out.join("index.txt"), index).expect("write index");
+    }
+
+    /// One tree to package, and the archives to stage alongside it.
+    struct DifferentialCase {
+        name: String,
+        files: Vec<(String, Vec<u8>)>,
+        staged: Vec<String>,
+    }
+
+    /// Everything the two implementations could read differently out of one
+    /// archive: how a name is spelled, which entries count as files, and where
+    /// the byte order of two paths disagrees with their character order.
+    fn differential_cases() -> Vec<DifferentialCase> {
+        fn case(name: &str, paths: &[(&str, &[u8])], staged: &[&str]) -> DifferentialCase {
+            DifferentialCase {
+                name: name.to_string(),
+                files: paths
+                    .iter()
+                    .map(|(path, body)| ((*path).to_string(), body.to_vec()))
+                    .collect(),
+                staged: staged.iter().map(|name| (*name).to_string()).collect(),
+            }
+        }
+
+        let mut cases: Vec<DifferentialCase> = vec![
+            case(
+                "plain",
+                &[("a.py", b"one"), ("b/c.py", b"two"), ("b/d/e.py", b"three")],
+                &[],
+            ),
+            // `-` `.` `/` ` ` are 0x2D 0x2E 0x2F 0x20, so these five sort
+            // one way by byte and another by path component.
+            case(
+                "separator_sort",
+                &[
+                    ("a.py", b"1"),
+                    ("a/b.py", b"2"),
+                    ("a-b.py", b"3"),
+                    ("a b.py", b"4"),
+                    ("a!b.py", b"5"),
+                ],
+                &[],
+            ),
+            case(
+                "unicode",
+                &[
+                    ("café.py", "caf\u{e9}".as_bytes()),
+                    ("cafe\u{301}.py", "cafe\u{301}".as_bytes()),
+                    ("中文/文件.py", "\u{4e2d}".as_bytes()),
+                    ("emoji\u{1f600}.py", b"grin"),
+                    ("\u{200b}zero-width.py", b"zw"),
+                ],
+                &[],
+            ),
+            case(
+                "case_only",
+                &[("Readme.py", b"upper"), ("readme.py", b"lower")],
+                &[],
+            ),
+            case(
+                "shell_metacharacters",
+                &[
+                    ("a'b.py", b"quote"),
+                    ("a\"b.py", b"double"),
+                    ("a$b.py", b"dollar"),
+                    ("a#b.py", b"hash"),
+                    ("a%b.py", b"percent"),
+                    ("a*b.py", b"star"),
+                    ("a[b].py", b"bracket"),
+                    ("a\\b.py", b"backslash"),
+                    ("a\tb.py", b"tab"),
+                ],
+                &[],
+            ),
+            case(
+                "empty_and_binary",
+                &[
+                    ("empty.py", b""),
+                    ("nul.py", b"a\0b"),
+                    ("crlf.py", b"a\r\nb"),
+                    ("high.py", &[0xff, 0xfe, 0x00, 0x80]),
+                ],
+                &[],
+            ),
+            case(
+                "dotfiles",
+                &[(".hidden.py", b"h"), (".config/app.py", b"c")],
+                &[],
+            ),
+            // Both implementations have to leave these out, from the same
+            // set of entries: excluded ones never reach the archive, the
+            // staged one reaches it and not the manifest.
+            case(
+                "excluded_and_staged",
+                &[
+                    ("keep.py", b"k"),
+                    ("style.css", b"css"),
+                    ("test/t.py", b"t"),
+                    ("node_modules/x.py", b"n"),
+                    ("corgea-image-scanning-repo-copy.tar", b"repo copy"),
+                    ("nested/corgea-image-scanning-deep.tar", b"deep copy"),
+                ],
+                &["corgea-image-scanning-staged-1.0.tar"],
+            ),
+            DifferentialCase {
+                // Crosses the 1 MiB chunk both sides hash in, and lands one
+                // file exactly on the boundary.
+                name: "chunk_boundary".to_string(),
+                files: vec![
+                    ("exact.py".to_string(), vec![b'x'; 1024 * 1024]),
+                    ("over.py".to_string(), vec![b'y'; 1024 * 1024 + 1]),
+                    ("under.py".to_string(), vec![b'z'; 1024 * 1024 - 1]),
+                ],
+                staged: vec![],
+            },
+            case("long_name", &[("x".repeat(200).as_str(), b"long")], &[]),
+            // A directory name the writer reads as already ending in a
+            // separator. On Unix that backslash is a filename byte.
+            case(
+                "backslash_directory",
+                &[
+                    ("plain/a.py", b"in a plain directory"),
+                    ("slash\\/b.py", b"in one whose name ends in a backslash"),
+                    ("slash\\.py", b"not a directory at all"),
+                ],
+                &[],
+            ),
+        ];
+
+        // Plus randomized trees, so the cases above are a floor rather than
+        // the whole of what is checked.
+        let alphabet: Vec<&str> = vec![
+            "a",
+            "B",
+            " ",
+            "-",
+            ".",
+            "_",
+            "'",
+            "$",
+            "#",
+            "%",
+            "\\",
+            "é",
+            "中",
+            "\u{1f600}",
+            "~",
+            "@",
+            "+",
+            "=",
+            "(",
+            ")",
+            "&",
+            ";",
+            "!",
+        ];
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for tree in 0..40 {
+            let mut paths: Vec<(String, Vec<u8>)> = Vec::new();
+            for _ in 0..(next() % 12 + 1) {
+                let depth = next() % 3;
+                let mut name = String::new();
+                for level in 0..=depth {
+                    for _ in 0..(next() % 6 + 1) {
+                        name.push_str(alphabet[(next() % alphabet.len() as u64) as usize]);
+                    }
+                    if level < depth {
+                        name.push('/');
+                    }
+                }
+                // A path component that is only dots is the walk's own
+                // parent, not a file, and a trailing space or dot is a name
+                // the filesystem may not keep verbatim.
+                if name
+                    .split('/')
+                    .any(|part| part.chars().all(|c| c == '.') || part.ends_with([' ', '.']))
+                {
+                    continue;
+                }
+                let body = vec![(next() % 256) as u8; (next() % 500) as usize];
+                paths.push((format!("{name}.py"), body));
+            }
+            if paths.is_empty() {
+                continue;
+            }
+            cases.push(DifferentialCase {
+                name: format!("random_{tree}"),
+                files: paths,
+                staged: vec![],
+            });
+        }
+        cases
     }
 }

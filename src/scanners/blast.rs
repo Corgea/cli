@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::images;
+use crate::manifest::Manifest;
 use crate::scan::build_scan_url;
 use crate::targets;
 use crate::utils;
@@ -453,15 +454,16 @@ fn start_new_scan(
         }
     }
 
-    match utils::generic::create_zip_from_target(
+    let archive_contents = match utils::generic::create_zip_from_target(
         target_str,
         &zip_path,
         None,
         exclude.as_deref(),
         &extra_zip_files,
+        !*disable_incremental,
     ) {
-        Ok(added_files) => {
-            if added_files.is_empty() {
+        Ok(archive) => {
+            if archive.added_files.is_empty() {
                 *stop_signal.lock().unwrap() = true;
                 let _ = packaging_thread.join();
                 print!(
@@ -478,6 +480,7 @@ fn start_new_scan(
                 let _ = utils::generic::delete_directory(&temp_dir);
                 std::process::exit(1);
             }
+            archive
         }
         Err(e) => {
             *stop_signal.lock().unwrap() = true;
@@ -493,7 +496,7 @@ fn start_new_scan(
             let _ = utils::generic::delete_directory(&temp_dir);
             std::process::exit(1);
         }
-    }
+    };
     *stop_signal.lock().unwrap() = true;
     let _ = packaging_thread.join();
     print!(
@@ -534,7 +537,7 @@ fn start_new_scan(
     // the archive no longer holds would be wrong, but those runs are not
     // "scanning every file" either, so no message is honest.
     let narrowed_archive = target_str.is_some() || exclude.is_some();
-    let incremental_plan = if *disable_incremental || narrowed_archive {
+    let incremental = if *disable_incremental || narrowed_archive {
         None
     } else {
         // Reconciled repo info, so a tree that turned out dirty — or a HEAD
@@ -549,8 +552,18 @@ fn start_new_scan(
             // branch/commit the resolver reports next, by its real name.
             repo_info.as_ref().is_some_and(|info| info.dirty),
             *ignore_dirty_worktree,
+            archive_contents.manifest.as_ref(),
         )
     };
+    // Stored with the scan for a later run to diff against, so it is worth
+    // uploading even when this run scans everything. Under
+    // --disable-incremental packaging was told not to hash at all, so there is
+    // nothing here to encode; skipping a run leaves no gap, since a baseline is
+    // the newest scan carrying a manifest rather than the preceding one.
+    let file_manifest = archive_contents
+        .manifest
+        .as_ref()
+        .and_then(Manifest::encode);
     println!("\n\nSubmitting scan to Corgea:");
     let upload_result = match utils::api::upload_zip(
         &zip_path,
@@ -561,7 +574,8 @@ fn start_new_scan(
             scan_type,
             policy,
             metadata,
-            incremental: incremental_plan,
+            incremental,
+            file_manifest,
         },
     ) {
         Ok(result) => result,
@@ -1717,6 +1731,8 @@ mod tests {
             metadata: None,
             failed_reason: failed_reason.map(|r| r.to_string()),
             scan_errors,
+            file_manifest_root: None,
+            file_manifest_version: None,
         }
     }
 
