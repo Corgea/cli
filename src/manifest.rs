@@ -24,6 +24,15 @@
 //! scanner reads. Hence building it from the same walk that writes the zip
 //! rather than from a second pass over the worktree.
 //!
+//! Which means the exclude set is part of what a manifest says, and a release
+//! that adds a glob makes the next diff disagree with the baseline about files
+//! nobody edited. That resolves correctly rather than quietly: a path in the
+//! baseline and not in this archive is reported as changed, so its findings
+//! are retired instead of being carried over a file this run did not scan and
+//! no later run will -- the same state a full scan under the new exclude set
+//! would leave. A change sweeping enough to move more paths than an
+//! incremental scan carries falls back to a full scan on its own.
+//!
 //! The archive has to be the whole project. A `--target` or `--only-uncommitted`
 //! run uploads a subset, and a manifest of a subset reads as every other file
 //! having been deleted -- every one of their findings dropped without anything
@@ -54,6 +63,19 @@ const MAX_ENTRIES: usize = 100_000;
 /// arrive gzipped over the network, and a small body can unpack into an
 /// arbitrarily large one.
 const MAX_DECODED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Characters a path cannot hold without making the canonical form ambiguous.
+///
+/// The format is one entry per line, and on Unix a filename may legally
+/// contain a newline: `a\n<64 hex> b` is one file that reads back as two. NUL
+/// cannot appear in a Unix filename, and carriage return is here because
+/// `str::lines` silently drops a trailing one, which would read back a
+/// different path than was archived.
+const AMBIGUOUS_IN_PATH: [char; 3] = ['\n', '\r', '\0'];
+
+fn path_is_unambiguous(path: &str) -> bool {
+    !path.contains(AMBIGUOUS_IN_PATH)
+}
 
 /// Every archived path and the digest of its contents.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -177,8 +199,18 @@ impl Manifest {
     /// Empty is not a manifest of nothing, it is the absence of one: an archive
     /// with no files is not a project state to carry findings forward from, and
     /// the next scan would read it as a project where everything was deleted.
+    ///
+    /// A path that cannot be written to a line is the same answer, and for the
+    /// same reason it has to be the whole manifest rather than that one entry:
+    /// a file left out of a manifest is a file the next scan reads as deleted,
+    /// so dropping the one bad path would drop its findings while the file sits
+    /// in the archive unexamined. Refusing the manifest costs this project
+    /// checksum diffing and nothing else.
     pub fn encode(&self) -> Option<EncodedManifest> {
         if self.entries.is_empty() || self.entries.len() > MAX_ENTRIES {
+            return None;
+        }
+        if !self.entries.keys().all(|path| path_is_unambiguous(path)) {
             return None;
         }
         let canonical = self.canonical();
@@ -222,7 +254,10 @@ impl Manifest {
         }
 
         let text = String::from_utf8(canonical).map_err(|_| "it is not valid UTF-8".to_string())?;
-        let mut lines = text.lines();
+        // Split rather than `lines`, which drops a trailing carriage return:
+        // a path ending in one would read back as a different path, and the
+        // point of this format is that the spelling survives the round trip.
+        let mut lines = text.split('\n');
         match lines.next() {
             Some(MANIFEST_HEADER) => {}
             Some(other) => {
@@ -246,6 +281,11 @@ impl Manifest {
             };
             if digest.is_empty() || path.is_empty() {
                 return Err("one of its lines names an empty digest or path".to_string());
+            }
+            if !path_is_unambiguous(path) {
+                return Err(
+                    "one of its paths holds a character this format cannot spell".to_string(),
+                );
             }
             entries.insert(path.to_string(), digest.to_string());
             if entries.len() > MAX_ENTRIES {
@@ -496,7 +536,9 @@ pub mod tests {
     #[test]
     fn a_body_that_is_not_a_manifest_is_refused_rather_than_read_as_an_empty_tree() {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(b"corgea-file-manifest/9 blake3\n").ok();
+        encoder
+            .write_all(b"corgea-file-manifest/9 blake3\n")
+            .expect("gzip write");
         let body = encoder.finish().expect("gzip");
         let root = format!("{:x}", Sha256::digest(b"corgea-file-manifest/9 blake3\n"));
 
@@ -539,6 +581,37 @@ pub mod tests {
             baseline.changed_paths(&current),
             vec!["new/a.py", "old/a.py"]
         );
+    }
+
+    /// A Unix filename may hold a newline, and the canonical form is one entry
+    /// per line: `a\n<64 hex> b` is one archived file that reads back as two.
+    /// Whole manifest rather than the one path, because a file left out of a
+    /// manifest is a file the next scan reads as deleted -- its findings would
+    /// go while the file sat in the archive, never looked at.
+    #[test]
+    fn a_path_that_cannot_be_written_to_a_line_refuses_the_whole_manifest() {
+        for path in ["a\nb.py", "a\rb.py", "a\0b.py"] {
+            let entries = manifest(&[("ordinary.py", "one"), (path, "two")]);
+            assert!(entries.encode().is_none(), "{path:?} encoded");
+        }
+
+        assert!(manifest(&[("ordinary.py", "one")]).encode().is_some());
+    }
+
+    #[test]
+    fn a_downloaded_manifest_naming_an_unspellable_path_is_refused() {
+        // Nothing this client wrote can hold one, so it came from somewhere
+        // that does not agree about the format -- which makes every path in it
+        // suspect, not just this one.
+        let canonical = format!("{MANIFEST_HEADER}\ndigest-a a\rb.py\n");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(canonical.as_bytes()).expect("gzip write");
+        let body = encoder.finish().expect("gzip");
+        let root = format!("{:x}", Sha256::digest(canonical.as_bytes()));
+
+        let err = Manifest::decode(&body, &root).expect_err("must refuse");
+
+        assert!(err.contains("cannot spell"), "{err}");
     }
 
     #[test]

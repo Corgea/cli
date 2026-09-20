@@ -536,15 +536,38 @@ fn search_baseline(
 
 /// Newest usable scan of `branch` on this page, or of any branch when `branch`
 /// is `None`.
+///
+/// Checksums win over recency. The two kinds of baseline are not
+/// interchangeable: a scan with stored checksums can be diffed against from any
+/// clone, while one with only a commit needs history this clone may not have.
+/// Taking whichever is newest lets a manifest-less scan from an hour ago hide
+/// one from yesterday that has a manifest, and the shallow checkout that the
+/// manifest was there for then falls back to a git diff it cannot run. The
+/// older baseline costs a few extra files in the diff; the newer one costs the
+/// whole scan.
+///
+/// Within the page, not across the walk: a page that offers any baseline
+/// answers with one rather than reading the whole history to find out whether
+/// something further back has checksums, which every scan would then pay for.
 fn branch_baseline(
     scans: &[ScanResponse],
     branch: Option<&str>,
     checksums_usable: bool,
 ) -> Option<BaselineScan> {
-    let scan = scans
+    let mut usable = scans
         .iter()
         .filter(|scan| is_usable_baseline(scan, checksums_usable))
-        .find(|scan| branch.is_none_or(|branch| scan.branch.as_deref() == Some(branch)))?;
+        .filter(|scan| branch.is_none_or(|branch| scan.branch.as_deref() == Some(branch)))
+        .peekable();
+    // Peeked, not consumed, so the search for checksums starts here too.
+    let newest = usable.peek().copied();
+    let scan = if checksums_usable {
+        usable
+            .find(|scan| has_readable_checksums(scan))
+            .or(newest)?
+    } else {
+        newest?
+    };
     Some(BaselineScan {
         id: scan.id.clone(),
         sha: scan.git_sha.clone().filter(|sha| !sha.is_empty()),
@@ -846,6 +869,36 @@ mod tests {
     fn the_newest_usable_scan_on_the_branch_wins() {
         let scans = vec![scan("main", "newest"), scan("main", "older")];
         assert_eq!(baseline_sha(&scans, "main").as_deref(), Some("newest"));
+    }
+
+    /// The two kinds of baseline are not interchangeable. A scan with stored
+    /// checksums can be diffed against from any clone; one with only a commit
+    /// needs history this clone may not have. Taking whichever is newest lets a
+    /// manifest-less scan hide one that has a manifest, and the shallow
+    /// checkout the manifest was there for then falls back to a git diff it
+    /// cannot run.
+    #[test]
+    fn a_baseline_with_checksums_beats_a_newer_one_without() {
+        let scans = vec![
+            scan("main", "newest"),
+            with_checksums(scan("main", "has-checksums")),
+            scan("main", "oldest"),
+        ];
+
+        let picked = branch_baseline(&scans, Some("main"), true).expect("a baseline");
+
+        assert_eq!(picked.sha.as_deref(), Some("has-checksums"));
+    }
+
+    #[test]
+    fn with_no_checksums_anywhere_the_newest_scan_is_still_taken() {
+        // Nothing to prefer, and refusing here would cost a git diff that this
+        // clone may well be able to run.
+        let scans = vec![scan("main", "newest"), scan("main", "older")];
+
+        let picked = branch_baseline(&scans, Some("main"), true).expect("a baseline");
+
+        assert_eq!(picked.sha.as_deref(), Some("newest"));
     }
 
     #[test]

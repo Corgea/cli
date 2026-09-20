@@ -460,6 +460,7 @@ fn start_new_scan(
         None,
         exclude.as_deref(),
         &extra_zip_files,
+        !*disable_incremental,
     ) {
         Ok(archive) => {
             if archive.added_files.is_empty() {
@@ -555,18 +556,14 @@ fn start_new_scan(
         )
     };
     // Stored with the scan for a later run to diff against, so it is worth
-    // uploading even when this run scans everything. Withheld under
-    // --disable-incremental, which asks for exactly that and nothing carried
-    // forward; skipping a run leaves no gap, since a baseline is the newest
-    // scan carrying a manifest rather than the immediately preceding one.
-    let file_manifest = if *disable_incremental {
-        None
-    } else {
-        archive_contents
-            .manifest
-            .as_ref()
-            .and_then(Manifest::encode)
-    };
+    // uploading even when this run scans everything. Under
+    // --disable-incremental packaging was told not to hash at all, so there is
+    // nothing here to encode; skipping a run leaves no gap, since a baseline is
+    // the newest scan carrying a manifest rather than the preceding one.
+    let file_manifest = archive_contents
+        .manifest
+        .as_ref()
+        .and_then(Manifest::encode);
     println!("\n\nSubmitting scan to Corgea:");
     let upload_result = match utils::api::upload_zip(
         &zip_path,
