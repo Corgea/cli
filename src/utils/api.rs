@@ -714,10 +714,9 @@ pub fn upload_zip(
                     )),
                     }
                 }
-                // Root and version travel beside the bytes rather than inside
-                // them: the server recomputes the root from what it
-                // decompressed and refuses a mismatch, so a truncated manifest
-                // costs a full scan instead of reading as a tree that shrank.
+                // Root and version travel beside the bytes. A later client
+                // verifies the downloaded canonical bytes against this stored
+                // root and falls back to a full scan if they do not match.
                 if let (true, Some(manifest)) = (final_chunk, &file_manifest) {
                     form = form
                         .part(
