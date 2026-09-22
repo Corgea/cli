@@ -369,13 +369,14 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "corgea"
-version = "1.14.2"
+version = "1.16.0"
 dependencies = [
  "chrono",
  "clap",
  "corgea",
  "dirs",
  "env_logger",
+ "flate2",
  "git2",
  "globset",
  "http",
@@ -394,6 +395,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "serde_yaml_ng",
+ "sha2",
  "tempfile",
  "termcolor",
  "tokio",
@@ -1880,6 +1882,17 @@ name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures",

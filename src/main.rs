@@ -7,6 +7,7 @@ mod incremental;
 mod inspect;
 mod list;
 mod log;
+mod manifest;
 mod mcp;
 mod scan;
 mod setup_hooks;
@@ -100,7 +101,7 @@ enum Commands {
 
         #[arg(
             long = "disable-incremental",
-            help = "Analyze every file, even when Corgea could have analyzed only what changed. Scans are incremental by default: the whole project is still uploaded, but only files that changed since this project's last scan are analyzed, and unchanged files keep their existing findings, so the result is a full picture either way. Use this to force a fresh analysis of every file — after changing scanner configuration outside corgea.yaml, for example. Incremental is skipped on its own, with a reason, when there is no git repository or commit to diff from, when the worktree is dirty, when no earlier scan of a clean worktree exists, or when the last scanned commit is missing from a shallow clone; and silently when --only-uncommitted, --target or --exclude already narrow the upload."
+            help = "Analyze every file, even when Corgea could have analyzed only what changed. Scans are incremental by default: the whole project is still uploaded, but only files that changed since this project's last scan are analyzed, and unchanged files keep their existing findings, so the result is a full picture either way. Use this to force a fresh analysis of every file — after changing scanner configuration outside corgea.yaml, for example. Incremental is skipped on its own, with a reason, when there is no git repository or commit to diff from, when the worktree is dirty, when no earlier scan of a clean worktree exists, or when the last scanned commit is missing from a shallow clone; and silently when --only-uncommitted or --target already narrow the upload to chosen files. With --exclude it still runs, from the stored file checksums of an earlier scan rather than a git diff."
         )]
         disable_incremental: bool,
 

@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::images;
+use crate::manifest::Manifest;
 use crate::scan::build_scan_url;
 use crate::targets;
 use crate::utils;
@@ -533,16 +534,17 @@ fn start_new_scan(
         }
     }
 
-    match utils::generic::create_zip_from_target(
+    let archive_contents = match utils::generic::create_zip_from_target(
         target_str,
         &zip_path,
         None,
         exclude.as_deref(),
         &force_included,
         &extra_zip_files,
+        !*disable_incremental,
     ) {
-        Ok(added_files) => {
-            if added_files.is_empty() {
+        Ok(archive) => {
+            if archive.added_files.is_empty() {
                 *stop_signal.lock().unwrap() = true;
                 let _ = packaging_thread.join();
                 print!(
@@ -559,6 +561,7 @@ fn start_new_scan(
                 let _ = utils::generic::delete_directory(&temp_dir);
                 std::process::exit(1);
             }
+            archive
         }
         Err(e) => {
             *stop_signal.lock().unwrap() = true;
@@ -574,7 +577,7 @@ fn start_new_scan(
             let _ = utils::generic::delete_directory(&temp_dir);
             std::process::exit(1);
         }
-    }
+    };
     *stop_signal.lock().unwrap() = true;
     let _ = packaging_thread.join();
     print!(
@@ -604,18 +607,25 @@ fn start_new_scan(
         }
     }
     let mut repo_info = utils::generic::reconcile_repo_info_for_upload(repo_before, repo_after);
-    // --target/--exclude archives are never an exact HEAD snapshot.
+    // --target/--exclude archives are never an exact HEAD snapshot. For
+    // --exclude that is the whole of what it costs: the flag rules this scan
+    // out as a *commit* baseline, which is right because a git diff from its
+    // commit would describe files it never uploaded, while the checksums it
+    // stores still make it one a later run can subtract from.
     if target_str.is_some() || exclude.is_some() {
         if let Some(ref mut info) = repo_info {
             info.dirty = true;
         }
     }
     // Incremental is the default, so this asks what took it off the table. A
-    // narrowed archive is the silent case: carrying findings forward for files
+    // targeted archive is the silent case: carrying findings forward for files
     // the archive no longer holds would be wrong, but those runs are not
-    // "scanning every file" either, so no message is honest.
-    let narrowed_archive = target_str.is_some() || exclude.is_some();
-    let incremental_plan = if *disable_incremental || narrowed_archive {
+    // "scanning every file" either, so no message is honest. --exclude is not
+    // one of them -- it narrows the same whole-project walk, which the archive's
+    // own checksums describe exactly -- so those runs resolve a plan like any
+    // other and say what came of it.
+    let targeted_archive = target_str.is_some();
+    let incremental = if *disable_incremental || targeted_archive {
         None
     } else {
         // Reconciled repo info, so a tree that turned out dirty — or a HEAD
@@ -624,18 +634,31 @@ fn start_new_scan(
         crate::incremental::resolve_incremental_plan(
             config,
             project_name,
-            repo_info.as_ref().and_then(|info| info.branch.as_deref()),
-            repo_info.as_ref().and_then(|info| info.sha.as_deref()),
-            // Missing repo info is not dirtiness; it is the missing
-            // branch/commit the resolver reports next, by its real name.
-            repo_info.as_ref().is_some_and(|info| info.dirty),
-            *ignore_dirty_worktree,
+            crate::incremental::DiffSources {
+                branch: repo_info.as_ref().and_then(|info| info.branch.as_deref()),
+                head_sha: repo_info.as_ref().and_then(|info| info.sha.as_deref()),
+                // Missing repo info is not dirtiness; it is the missing
+                // branch/commit the resolver reports next, by its real name.
+                worktree_dirty: repo_info.as_ref().is_some_and(|info| info.dirty),
+                ignore_dirty_worktree: *ignore_dirty_worktree,
+                exclude_narrowed: exclude.is_some(),
+                manifest: archive_contents.manifest.as_ref(),
+            },
         )
         // Force-included files are usually unchanged, and the server carries
         // findings forward for whatever the diff omits — so without this an
         // include rule would never get the file looked at on an incremental run.
         .and_then(|plan| plan.including(&repo_relative_strings(&force_included)))
     };
+    // Stored with the scan for a later run to diff against, so it is worth
+    // uploading even when this run scans everything. Under
+    // --disable-incremental packaging was told not to hash at all, so there is
+    // nothing here to encode; skipping a run leaves no gap, since a baseline is
+    // the newest scan carrying a manifest rather than the preceding one.
+    let file_manifest = archive_contents
+        .manifest
+        .as_ref()
+        .and_then(Manifest::encode);
     println!("\n\nSubmitting scan to Corgea:");
     let upload_result = match utils::api::upload_zip(
         &zip_path,
@@ -646,8 +669,9 @@ fn start_new_scan(
             scan_type,
             policy,
             metadata,
-            incremental: incremental_plan,
+            incremental,
             include_paths: include_rules.cli_patterns,
+            file_manifest,
         },
     ) {
         Ok(result) => result,
@@ -1803,6 +1827,8 @@ mod tests {
             metadata: None,
             failed_reason: failed_reason.map(|r| r.to_string()),
             scan_errors,
+            file_manifest_root: None,
+            file_manifest_version: None,
         }
     }
 
