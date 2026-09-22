@@ -33,11 +33,19 @@
 //! would leave. A change sweeping enough to move more paths than an
 //! incremental scan carries falls back to a full scan on its own.
 //!
-//! The archive has to be the whole project. A `--target` or `--only-uncommitted`
-//! run uploads a subset, and a manifest of a subset reads as every other file
-//! having been deleted -- every one of their findings dropped without anything
-//! having looked at them. Those runs build no manifest, which is the same
-//! reason they already skip incremental.
+//! `--exclude` is that same mechanism reached from the command line rather
+//! than from a release, so it resolves the same way and those runs are
+//! manifested like any other. Adding the flag retires the findings of what it
+//! holds back; dropping it reports those files as changed, so they are
+//! analyzed again.
+//!
+//! The archive has to be the whole project under whatever exclude set built
+//! it. A `--target` or `--only-uncommitted` run is not that: it names the files
+//! to pack, so the archive holds what someone pointed at this once, and a
+//! manifest of it reads as every other file having been deleted -- every one
+//! of their findings dropped without anything having looked at them. Those
+//! runs build no manifest, which is the same reason they already skip
+//! incremental.
 
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;

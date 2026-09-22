@@ -919,11 +919,19 @@ pub(crate) fn blast_upload_plan(sha: &str, dirty: bool, include_sca: bool) -> Ve
     blast_plan_for(sha, dirty, include_sca, true)
 }
 
-/// The same contract for `--target` and `--exclude`, which upload a chosen
-/// subset of the project and so never look for a baseline: findings cannot be
-/// carried forward for files the archive no longer holds.
-pub(crate) fn blast_narrowed_upload_plan(sha: &str) -> Vec<ExpectedRequest> {
+/// The same contract for `--target`, which names the files to upload and so
+/// never looks for a baseline: findings cannot be carried forward for files
+/// the archive no longer holds.
+pub(crate) fn blast_targeted_upload_plan(sha: &str) -> Vec<ExpectedRequest> {
     blast_plan_for(sha, true, false, false)
+}
+
+/// The same contract for `--exclude`, which narrows the whole-project walk
+/// rather than choosing what to pack. Its archive is still a project state, so
+/// it looks for a baseline like any other run — and reports dirty, because it
+/// is not an exact snapshot of the commit.
+pub(crate) fn blast_excluded_upload_plan(sha: &str) -> Vec<ExpectedRequest> {
+    blast_plan_for(sha, true, false, true)
 }
 
 fn blast_plan_for(
