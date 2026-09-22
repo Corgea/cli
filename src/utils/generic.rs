@@ -68,9 +68,9 @@ pub struct ArchiveContents {
     pub added_files: Vec<PathBuf>,
     /// Digest of every archived file, keyed by its zip entry name.
     ///
-    /// Only built for a whole-project archive. A `--target`, `--exclude` or
-    /// `--only-uncommitted` run packs a subset, and a manifest of a subset
-    /// reads to the server as every other file having been deleted.
+    /// Only built for a whole-project archive. A `--target` or
+    /// `--only-uncommitted` run packs a chosen handful of files, and a manifest
+    /// of those reads to the server as every other file having been deleted.
     pub manifest: Option<Manifest>,
 }
 
@@ -81,18 +81,33 @@ pub struct ArchiveContents {
 /// every finding for a file this run merely left out would be dropped without
 /// anything having looked at it.
 ///
-/// `--target` and `--exclude` are the explicit subsets. The implicit one is
-/// packaging run from below the worktree root: the walk starts at `.` and keys
-/// entries relative to it, so `backend/` uploads `{app.py, …}` where the next
-/// root-level scan reports `{backend/app.py, …}` — two spellings of the same
-/// files that subtract to "everything was deleted, everything was added". A
-/// tree with no git at all is not a subset of anything and keeps its manifest;
-/// that case is the reason this exists.
+/// `--target` is the explicit subset: it names the files to pack, so the
+/// archive is whatever someone pointed at this time and the next run points
+/// somewhere else. Between two of those, and between one and the whole-project
+/// runs they sit among, the subtraction describes no project state that ever
+/// existed.
+///
+/// `--exclude` is not that. It applies one more glob to the same whole-project
+/// walk, which is what `DEFAULT_EXCLUDE_GLOBS` already does, and the manifest
+/// describes the archive rather than the repository — so what it says is "the
+/// project under this run's exclude set", which is a state. Widening the set
+/// between runs reports the files it no longer holds back as changed, so they
+/// are analyzed; narrowing it reports the ones it now holds back as changed
+/// too, so their findings are retired rather than carried over files this run
+/// did not scan. Both are the state a full scan under the new exclude set
+/// would leave.
+///
+/// The implicit subset is packaging run from below the worktree root: the walk
+/// starts at `.` and keys entries relative to it, so `backend/` uploads
+/// `{app.py, …}` where the next root-level scan reports `{backend/app.py, …}` —
+/// two spellings of the same files that subtract to "everything was deleted,
+/// everything was added". A tree with no git at all is not a subset of anything
+/// and keeps its manifest; that case is the reason this exists.
 ///
 /// `walked` is the directory packaging starts from, which is how the caller
 /// says what "the project" meant.
-fn archives_whole_project(walked: &str, target: Option<&str>, user_exclude: Option<&str>) -> bool {
-    if target.is_some() || user_exclude.is_some() {
+fn archives_whole_project(walked: &str, target: Option<&str>) -> bool {
+    if target.is_some() {
         return false;
     }
     match Repository::discover(Path::new(walked)) {
@@ -223,8 +238,7 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     // is still read once. Skipped outright when the caller has already decided
     // it wants no manifest, rather than hashing every file in the project for
     // a value that is then dropped.
-    let mut manifest =
-        (want_manifest && archives_whole_project(".", target, user_exclude)).then(Manifest::new);
+    let mut manifest = (want_manifest && archives_whole_project(".", target)).then(Manifest::new);
 
     for (path, relative_path) in files_to_zip {
         // Match repo-relative paths so abs `/tmp/...` targets don't hit `**/tmp/**`.
@@ -1047,16 +1061,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
 
-        // --exclude narrows the archive without narrowing `target`, so the
-        // files it holds back would read to the server as deletions.
-        assert!(archives_whole_project(root, None, None));
-        assert!(!archives_whole_project(root, Some("src/app.py"), None));
-        assert!(!archives_whole_project(root, None, Some("**/vendor/**")));
-        assert!(!archives_whole_project(
-            root,
-            Some("git:staged"),
-            Some("**/vendor/**")
-        ));
+        // An --exclude glob narrows the same whole-project walk rather than
+        // choosing what to pack, so it is not one of these: the archive is
+        // still a project state, and `--exclude` is not a parameter here.
+        assert!(archives_whole_project(root, None));
+        assert!(!archives_whole_project(root, Some("src/app.py")));
+        assert!(!archives_whole_project(root, Some("git:staged")));
     }
 
     /// Packaging from `backend/` walks `.` and keys entries relative to it, so
@@ -1072,16 +1082,8 @@ mod tests {
         let nested = worktree.join("backend");
         fs::create_dir_all(&nested).unwrap();
 
-        assert!(archives_whole_project(
-            worktree.to_str().unwrap(),
-            None,
-            None
-        ));
-        assert!(!archives_whole_project(
-            nested.to_str().unwrap(),
-            None,
-            None
-        ));
+        assert!(archives_whole_project(worktree.to_str().unwrap(), None));
+        assert!(!archives_whole_project(nested.to_str().unwrap(), None));
     }
 
     /// Zip stores the string it is handed, and the manifest is keyed by the

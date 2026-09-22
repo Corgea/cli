@@ -359,6 +359,156 @@ fn a_dirty_worktree_is_scanned_incrementally_from_the_stored_checksums() {
     );
 }
 
+/// Commits a file the `--exclude` cases then hold back, so the archive and the
+/// repository disagree about a path that is committed and unmodified — the one
+/// a git diff would leave off the list and copy findings forward for.
+fn commit_vendored_file(project: &GitProject) {
+    let vendor = project.path().join("vendor");
+    std::fs::create_dir(&vendor).expect("create vendor");
+    std::fs::write(vendor.join("lib.py"), VENDORED_BODY).expect("write vendored");
+    run_git(project.path(), &["add", "."]);
+    run_git(project.path(), &["commit", "-m", "vendor"]);
+}
+
+const VENDORED_BODY: &str = "print('vendored')\n";
+
+/// `--exclude` narrows the same whole-project walk the built-in glob list
+/// already narrows, so the archive is still a project state and its checksums
+/// still describe it exactly. The file the flag holds back is absent from this
+/// run's manifest and present in the baseline's, so it is named as changed:
+/// its findings are retired rather than carried over a file nothing scanned,
+/// which is the state a full scan under this exclude set would leave.
+#[test]
+fn an_excluded_run_diffs_its_checksums_and_names_what_it_holds_back() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    commit_vendored_file(&project);
+
+    let (scan, manifest) = baseline_scan_with_checksums(
+        &base_sha,
+        &[("main.py", SOURCE_BODY), ("vendor/lib.py", VENDORED_BODY)],
+    );
+    let mut plan = vec![
+        verify_request(),
+        baseline_lookup(FIXTURE_BRANCH, vec![scan]),
+        checksum_download(manifest),
+        start_upload(),
+        expected_request(
+            "upload an --exclude archive with the checksum diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                // Not an exact snapshot of the commit, so this scan can never
+                // be a *commit* baseline -- only the checksums it stores below
+                // describe what it actually uploaded.
+                assert_multipart_text_field(request, "dirty", "true")?;
+                assert_multipart_text_field(request, "incremental_base_scan_id", BASELINE_SCAN)?;
+                assert_no_multipart_field(request, "incremental_base_sha")?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_changed_files",
+                    r#"["vendor/lib.py"]"#,
+                )?;
+                assert_multipart_text_field(request, "incremental_covers_worktree", "true")?;
+                // Stored for the next run, which is how a pipeline that passes
+                // the same --exclude every time stays incremental.
+                assert_body_contains(request, b"name=\"file_manifest_root\"")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--exclude",
+        "vendor/**",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(&format!(
+            "Incremental scan: 1 file changed since the last scan of {FIXTURE_BRANCH}"
+        )),
+        "{context}"
+    );
+}
+
+/// The git diff is not a fallback for an `--exclude` run. It measures the
+/// repository, so every excluded file it finds unchanged is left off the list
+/// and the server copies that file's findings forward though this upload does
+/// not contain it — and no later run under the same flag will look at it
+/// either. Without checksums to diff, the run scans everything and says so.
+#[test]
+fn an_excluded_run_with_no_checksums_to_diff_scans_everything() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    commit_vendored_file(&project);
+
+    let mut plan = vec![
+        verify_request(),
+        baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
+        start_upload(),
+        expected_request(
+            "upload an --exclude archive with no diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_no_multipart_field(request, "incremental_base_sha")?;
+                assert_no_multipart_field(request, "incremental_base_scan_id")?;
+                assert_no_multipart_field(request, "incremental_changed_files")?;
+                // Still uploaded: this scan cannot diff, but it leaves the
+                // next one something to diff against.
+                assert_body_contains(request, b"name=\"file_manifest_root\"")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--exclude",
+        "vendor/**",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(&format!(
+            "Scanning every file: the last scan of {FIXTURE_BRANCH} ({}) stored no file \
+             checksums to diff against, and --exclude held files back from this archive",
+            &base_sha[..7]
+        )),
+        "{context}"
+    );
+}
+
 /// A manifest that arrives damaged is not a smaller tree. Reading it as one
 /// would report every file it lost as deleted, dropping their findings; the
 /// run falls back to the git diff instead.

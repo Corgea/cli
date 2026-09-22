@@ -22,6 +22,13 @@
 //! for a baseline scan predating manifests or one whose manifest cannot be
 //! read, and it needs the history a shallow clone does not have.
 //!
+//! That difference is what decides an `--exclude` run. Its archive is the whole
+//! project under one more glob, which the checksums describe exactly, so they
+//! diff it like any other. A git diff describes the repository instead: every
+//! excluded file it finds unchanged is left off the list, and the server copies
+//! that file's findings forward though this upload does not contain it. So an
+//! `--exclude` run diffs its checksums or scans everything.
+//!
 //! Runs by default, so it must be safe on a repo never set up for it. Every
 //! refusal falls through to the full scan that run would have done anyway.
 //! `--disable-incremental` forces it.
@@ -91,29 +98,40 @@ pub struct IncrementalPlan {
     pub covers_worktree: bool,
 }
 
+/// What this run can measure a diff with.
+///
+/// Grouped rather than passed alongside each other, because three of these are
+/// booleans and a caller listing them positionally can swap two without the
+/// compiler noticing — which would quietly change how the scan is scoped.
+pub struct DiffSources<'a> {
+    /// Branch the upload reports. Names where a baseline may come from, and
+    /// the git diff needs it to have one at all.
+    pub branch: Option<&'a str>,
+    /// Commit the upload reports, the near side of a git diff.
+    pub head_sha: Option<&'a str>,
+    /// Whether the worktree holds edits a commit-to-commit diff cannot see.
+    pub worktree_dirty: bool,
+    /// `--ignore-dirty-worktree`: move the far side of the git diff to the
+    /// working tree rather than refusing to measure one.
+    pub ignore_dirty_worktree: bool,
+    /// `--exclude` held files back from the archive, so only the checksums
+    /// can account for what it actually contains.
+    pub exclude_narrowed: bool,
+    /// This archive's checksums, absent when the archive is not the whole
+    /// project.
+    pub manifest: Option<&'a Manifest>,
+}
+
 /// What an incremental scan of this upload would cover.
 ///
 /// Prints one line either way: the scope it resolved to, or why the scan is
-/// analyzing everything. `manifest` is this archive's checksums, absent when
-/// the archive is not the whole project.
+/// analyzing everything.
 pub fn resolve_incremental_plan(
     config: &Config,
     project_name: &str,
-    branch: Option<&str>,
-    head_sha: Option<&str>,
-    worktree_dirty: bool,
-    ignore_dirty_worktree: bool,
-    manifest: Option<&Manifest>,
+    sources: DiffSources<'_>,
 ) -> Option<IncrementalPlan> {
-    match plan_diff(
-        config,
-        project_name,
-        branch,
-        head_sha,
-        worktree_dirty,
-        ignore_dirty_worktree,
-        manifest,
-    ) {
+    match plan_diff(config, project_name, &sources) {
         Ok((plan, summary)) => {
             println!("{summary}");
             Some(plan)
@@ -131,11 +149,7 @@ pub fn resolve_incremental_plan(
 fn plan_diff(
     config: &Config,
     project_name: &str,
-    branch: Option<&str>,
-    head_sha: Option<&str>,
-    worktree_dirty: bool,
-    ignore_dirty_worktree: bool,
-    manifest: Option<&Manifest>,
+    sources: &DiffSources<'_>,
 ) -> Result<(IncrementalPlan, String), String> {
     // Optional, because a checksum diff needs no repository. Only the git diff
     // below does, and it reports its absence by its real name.
@@ -147,13 +161,13 @@ fn plan_diff(
     // pipeline recorded.
     let candidates = repo
         .as_ref()
-        .map(|repo| baseline_branches(repo, branch.filter(|name| !name.is_empty())));
+        .map(|repo| baseline_branches(repo, sources.branch.filter(|name| !name.is_empty())));
 
     let lookup = find_baseline(
         config,
         project_name,
         candidates.as_deref(),
-        manifest.is_some(),
+        sources.manifest.is_some(),
     );
     let baseline = match lookup {
         BaselineLookup::Found(scan) => scan,
@@ -178,7 +192,7 @@ fn plan_diff(
     // Checksums first. They describe the archive rather than the repository, so
     // they are exact where a git diff has to be argued about, and they work in
     // a clone that cannot reach the baseline commit — or has no commits.
-    let checksum_refusal = match manifest {
+    let checksum_refusal = match sources.manifest {
         Some(local) => match changed_files_against(config, &baseline, local) {
             Ok(changed_files) => {
                 let summary = summarize(&changed_files, &format!("the {}", baseline.describe()))?;
@@ -209,15 +223,7 @@ fn plan_diff(
     // git's leaves someone looking at a full scan they expected to be
     // incremental with no idea the checksums were tried at all, let alone why
     // they did not apply.
-    plan_git_diff(
-        &baseline,
-        repo.as_ref(),
-        branch,
-        head_sha,
-        worktree_dirty,
-        ignore_dirty_worktree,
-    )
-    .map_err(|reason| match &checksum_refusal {
+    plan_git_diff(&baseline, repo.as_ref(), sources).map_err(|reason| match &checksum_refusal {
         Some(refusal) => format!("{refusal}, and {reason}"),
         None => reason,
     })
@@ -229,18 +235,29 @@ fn plan_diff(
 fn plan_git_diff(
     baseline: &BaselineScan,
     repo: Option<&Repository>,
-    branch: Option<&str>,
-    head_sha: Option<&str>,
-    worktree_dirty: bool,
-    ignore_dirty_worktree: bool,
+    sources: &DiffSources<'_>,
 ) -> Result<(IncrementalPlan, String), String> {
+    // git diffs the repository, and --exclude means the archive is not it. An
+    // excluded file git reports unchanged is left off the list, so the server
+    // copies its findings forward over a file this upload does not contain --
+    // and no later run under the same --exclude will look at it either. First,
+    // because these runs report dirty whatever the worktree holds, so the check
+    // below would otherwise answer for a tree with nothing uncommitted in it.
+    if sources.exclude_narrowed {
+        return Err(
+            "--exclude held files back from this archive, so a git diff of the repository \
+             would not describe it (its stored file checksums would, on the next run)"
+                .to_string(),
+        );
+    }
+
     // A commit-to-commit diff cannot see uncommitted edits, so on a dirty tree
     // it leaves modified files off the list and their old findings are copied
     // forward as current. --ignore-dirty-worktree does not paper over that; it
     // switches the diff to measure the working tree, so those files are named
     // and rescanned like any other change.
-    let covers_worktree = worktree_dirty;
-    if worktree_dirty && !ignore_dirty_worktree {
+    let covers_worktree = sources.worktree_dirty;
+    if sources.worktree_dirty && !sources.ignore_dirty_worktree {
         return Err(
             "this worktree has uncommitted changes that a commit-to-commit diff cannot \
              see. Pass --ignore-dirty-worktree to diff the working tree instead"
@@ -251,9 +268,12 @@ fn plan_git_diff(
     // Nothing to diff from. Covers a non-git directory, a repo with no commit,
     // a detached HEAD, and a scan started below the repo root — none of which
     // report RepoInfo to the upload either.
-    let (Some(_branch), Some(head_sha), Some(repo), Some(base_sha)) =
-        (branch, head_sha, repo, baseline.sha.as_deref())
-    else {
+    let (Some(_branch), Some(head_sha), Some(repo), Some(base_sha)) = (
+        sources.branch,
+        sources.head_sha,
+        repo,
+        baseline.sha.as_deref(),
+    ) else {
         return Err(
             "there is no git branch and commit to diff from either (not a git \
              repository, no commit yet, a detached HEAD, or a scan started below the \
