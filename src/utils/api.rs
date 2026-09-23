@@ -1350,7 +1350,7 @@ struct ScanSettingsResponse {
     settings: ScanSettings,
 }
 
-/// GET /api/v1/scan-settings — the project's ignore and include rules.
+/// GET /api/v1/scan/configs — the project's ignore and include rules.
 ///
 /// `Ok(None)` only for a 404, which is a backend predating the endpoint: it has
 /// no rules to apply, so the caller proceeds with just its own flags. Anything
@@ -1361,7 +1361,7 @@ pub fn query_scan_settings(
     project_name: &str,
     repo_url: Option<&str>,
 ) -> Result<Option<ScanSettings>, Box<dyn Error>> {
-    let request_url = format!("{}{}/scan-settings", url, API_BASE);
+    let request_url = format!("{}{}/scan/configs", url, API_BASE);
     let client = http_client();
     let mut query = vec![("project_name", project_name.to_string())];
     if let Some(repo_url) = repo_url {
@@ -1390,14 +1390,14 @@ pub fn query_scan_settings(
         return Ok(None);
     }
     if !status.is_success() {
-        return Err(format!("/scan-settings request failed: HTTP {}", status).into());
+        return Err(format!("/scan/configs request failed: HTTP {}", status).into());
     }
     let text = response.text()?;
     match serde_json::from_str::<ScanSettingsResponse>(&text) {
         Ok(parsed) => Ok(Some(parsed.settings)),
         Err(e) => {
-            debug(&format!("/scan-settings response body: {}", text));
-            Err(format!("Failed to parse the /scan-settings response: {}", e).into())
+            debug(&format!("/scan/configs response body: {}", text));
+            Err(format!("Failed to parse the /scan/configs response: {}", e).into())
         }
     }
 }

@@ -721,7 +721,7 @@ pub(crate) fn scan_settings_request_with(project: &str, include_paths: &[&str]) 
     expected_request(
         "read project include rules",
         move |request| {
-            assert_authenticated_request(request, Method::GET, "/api/v1/scan-settings")?;
+            assert_authenticated_request(request, Method::GET, "/api/v1/scan/configs")?;
             assert_query(request, "project_name", &project)
         },
         json_response(body),

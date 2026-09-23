@@ -16,7 +16,7 @@ use tempfile::TempDir;
 /// Raw bodies of the chunk uploads the CLI sent.
 type Uploads = Arc<Mutex<Vec<Vec<u8>>>>;
 
-/// The blast scan route table, answering `/scan-settings` with `include_paths`
+/// The blast scan route table, answering `/scan/configs` with `include_paths`
 /// so a test can exercise the platform-configured rules as well as the flag.
 fn spawn_scan_stub(
     scan_id: &'static str,
@@ -41,7 +41,7 @@ fn spawn_scan_stub(
 
             let (status, body) = if path == "/api/v1/verify" {
                 ("200 OK", r#"{"status":"ok"}"#.to_string())
-            } else if path == "/api/v1/scan-settings" {
+            } else if path == "/api/v1/scan/configs" {
                 (
                     "200 OK",
                     format!(
