@@ -30,6 +30,14 @@ const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(10 * 60 * 60);
 /// seconds of extra latency on the final status.
 const SCAN_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
+/// How long a just-created scan may 404 before the wait treats that as real.
+///
+/// Upload returns a `scan_id` before every replica can see the row, so the
+/// first status reads can 404 even though the scan is running. Matching the
+/// HTTP retry budget (90s) is long enough for that lag and short enough that a
+/// genuine miss still fails the pipeline instead of sitting on the 10-hour wait.
+const SCAN_NOT_FOUND_GRACE: Duration = Duration::from_secs(90);
+
 /// Overrides how long the CI gate waits for blocking rules to be evaluated.
 const BLOCKING_RULES_TIMEOUT_ENV: &str = "CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS";
 
@@ -1136,10 +1144,92 @@ fn poll_timed_out(scan_id: &str, budget: &WaitBudget, last_status: &str) -> Stri
     )
 }
 
+/// HTTP status carried by a `get_scan` error, when it named one.
+fn scan_status_http_code(error: &str) -> Option<u16> {
+    error
+        .rsplit_once("Status code: ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .and_then(|code| code.parse().ok())
+}
+
+fn is_scan_not_found_error(error: &str) -> bool {
+    scan_status_http_code(error) == Some(404)
+}
+
+/// Status-poll errors that are worth sending again rather than failing CI.
+///
+/// 404 is the just-created-scan lag: the upload already returned this id, but
+/// a replica has not seen the row yet. 429/5xx and transport failures are the
+/// same blips the blocking-rules wait already rides out. Auth and other 4xx
+/// are the request being rejected, so they stay fail-fast.
+fn is_retryable_scan_status_error(error: &str) -> bool {
+    if let Some(code) = scan_status_http_code(error) {
+        return code == 404 || code == 429 || (500..600).contains(&code);
+    }
+    error.contains("Failed to send request:") || error.contains("Failed to parse response:")
+}
+
+fn last_status_for_poll_error(error: &str) -> String {
+    match scan_status_http_code(error) {
+        Some(404) => String::from("not found"),
+        Some(code) => format!("HTTP {code}"),
+        None if error.contains("Failed to send request:") => String::from("unreachable"),
+        None => String::from("unreadable"),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ScanStatusErrorDecision {
+    Retry { last_status: String },
+    GiveUp,
+}
+
+/// Whether a failed status read should be retried or fail the wait.
+///
+/// `not_found_elapsed` is how long the current 404 streak has lasted, or
+/// `None` on the first miss. Past `SCAN_NOT_FOUND_GRACE` a 404 is a real miss.
+fn decide_scan_status_error(
+    error: &str,
+    not_found_elapsed: Option<Duration>,
+) -> ScanStatusErrorDecision {
+    if is_scan_not_found_error(error) {
+        if not_found_elapsed.is_some_and(|elapsed| elapsed >= SCAN_NOT_FOUND_GRACE) {
+            return ScanStatusErrorDecision::GiveUp;
+        }
+        return ScanStatusErrorDecision::Retry {
+            last_status: last_status_for_poll_error(error),
+        };
+    }
+    if is_retryable_scan_status_error(error) {
+        return ScanStatusErrorDecision::Retry {
+            last_status: last_status_for_poll_error(error),
+        };
+    }
+    ScanStatusErrorDecision::GiveUp
+}
+
+/// The wait could not read status. Distinct from `format_scan_failure`: the
+/// scan itself may still be running, and CI must not be told it finished badly.
+fn format_status_check_failure(scan_id: &str, url: &str, error: &str) -> String {
+    format!(
+        "Unable to check the status of scan '{scan_id}'.\n\
+         This is a status-check failure, not a report that the scan itself failed.\n\
+         The scan may still be running in the Corgea cloud — open the scan page to confirm.\n\
+         Please verify that:\n\
+         - The server URL '{url}' is reachable.\n\
+         - Your authentication token is valid.\n\
+         - The scan ID is correct.\n\n\
+         Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli\n\n\
+         Error details: {error}"
+    )
+}
+
 /// Block until the scan reaches a terminal state, then report it.
 ///
-/// Exits non-zero on failure or poll timeout, so CI cannot mistake a broken
-/// scan for a clean one.
+/// Exits non-zero on a failed scan, a status-check failure, or poll timeout,
+/// so CI cannot mistake a broken wait for a clean scan. A failed status read
+/// is not the same as the scan failing: 404/5xx are retried, and the message
+/// says so when they finally are not.
 pub fn wait_for_scan(config: &Config, scan_id: &str, budget: WaitBudget) {
     let stop_signal = Arc::new(Mutex::new(false));
     let stop_signal_clone = Arc::clone(&stop_signal);
@@ -1151,6 +1241,7 @@ pub fn wait_for_scan(config: &Config, scan_id: &str, budget: WaitBudget) {
     });
 
     let mut last_status = String::from("unknown");
+    let mut not_found_since: Option<Instant> = None;
 
     let result = loop {
         thread::sleep(SCAN_POLL_INTERVAL);
@@ -1161,28 +1252,47 @@ pub fn wait_for_scan(config: &Config, scan_id: &str, budget: WaitBudget) {
             break Err(poll_timed_out(scan_id, &budget, &last_status));
         };
         match utils::api::get_scan(&config.get_url(), scan_id, Some(remaining)) {
-            Ok(scan) => match classify_scan_status(&scan.status) {
-                ScanState::Completed => break Ok(scan),
-                ScanState::Failed => break Err(format_scan_failure(&scan)),
-                ScanState::Running => last_status = scan.status,
-            },
+            Ok(scan) => {
+                not_found_since = None;
+                match classify_scan_status(&scan.status) {
+                    ScanState::Completed => break Ok(scan),
+                    ScanState::Failed => break Err(format_scan_failure(&scan)),
+                    ScanState::Running => last_status = scan.status,
+                }
+            }
             // A read cut short by the deadline is a timeout, not a broken link.
             Err(_) if budget.remaining().is_none() => {
                 break Err(poll_timed_out(scan_id, &budget, &last_status))
             }
             Err(e) => {
-                break Err(format!(
-                    "Unable to check the status of scan '{}'.\n\
-                     Please verify that:\n\
-                     - The server URL '{}' is reachable.\n\
-                     - Your authentication token is valid.\n\
-                     - The scan ID is correct.\n\n\
-                     Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli\n\n\
-                     Error details: {}",
-                    scan_id,
-                    config.get_url(),
-                    e
-                ))
+                let error = e.to_string();
+                match decide_scan_status_error(&error, not_found_since.map(|t| t.elapsed())) {
+                    ScanStatusErrorDecision::Retry {
+                        last_status: status,
+                    } => {
+                        if is_scan_not_found_error(&error) {
+                            if not_found_since.is_none() {
+                                log::warn!(
+                                    "Scan '{}' is not visible yet (HTTP 404). Retrying status checks for up to {}...",
+                                    scan_id,
+                                    format_timeout(SCAN_NOT_FOUND_GRACE)
+                                );
+                                not_found_since = Some(Instant::now());
+                            }
+                        } else {
+                            not_found_since = None;
+                            log::debug!("Transient scan-status error; will retry: {error}");
+                        }
+                        last_status = status;
+                    }
+                    ScanStatusErrorDecision::GiveUp => {
+                        break Err(format_status_check_failure(
+                            scan_id,
+                            &config.get_url(),
+                            &error,
+                        ))
+                    }
+                }
             }
         }
     };
@@ -1513,6 +1623,79 @@ mod tests {
             ),
             BlockingRulesPollDecision::FailClosed { .. }
         ));
+    }
+
+    fn scan_status_error(status: &str) -> String {
+        format!("Error: Unable to fetch scan status. Status code: {status}")
+    }
+
+    #[test]
+    fn status_poll_retries_not_found_until_the_grace_expires() {
+        // The reported shape: upload already returned this id, then GET 404s
+        // until a replica sees the row. Failing the first miss is what made a
+        // running scan look like a failed one in CI.
+        let miss = scan_status_error("404 Not Found");
+        assert_eq!(
+            decide_scan_status_error(&miss, None),
+            ScanStatusErrorDecision::Retry {
+                last_status: String::from("not found"),
+            }
+        );
+        assert_eq!(
+            decide_scan_status_error(&miss, Some(Duration::from_secs(3))),
+            ScanStatusErrorDecision::Retry {
+                last_status: String::from("not found"),
+            }
+        );
+        assert_eq!(
+            decide_scan_status_error(&miss, Some(SCAN_NOT_FOUND_GRACE)),
+            ScanStatusErrorDecision::GiveUp
+        );
+    }
+
+    #[test]
+    fn status_poll_retries_server_errors_and_transport_failures() {
+        for error in [
+            scan_status_error("429 Too Many Requests"),
+            scan_status_error("502 Bad Gateway"),
+            scan_status_error("503 Service Unavailable"),
+            String::from("Failed to send request: connection reset"),
+            String::from("Failed to parse response: expected ident at line 1"),
+        ] {
+            assert!(
+                matches!(
+                    decide_scan_status_error(&error, None),
+                    ScanStatusErrorDecision::Retry { .. }
+                ),
+                "should retry: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_poll_fails_fast_on_auth_errors() {
+        for status in ["401 Unauthorized", "403 Forbidden"] {
+            assert_eq!(
+                decide_scan_status_error(&scan_status_error(status), None),
+                ScanStatusErrorDecision::GiveUp,
+                "must not retry {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_check_failure_is_not_a_scan_failure() {
+        let output = format_status_check_failure(
+            "scan-123",
+            "https://app.corgea.app",
+            "Error: Unable to fetch scan status. Status code: 404 Not Found",
+        );
+        assert!(output.contains("Unable to check the status"));
+        assert!(output.contains("status-check failure"));
+        assert!(
+            !output.contains("did not complete"),
+            "a missed status read must not be worded as the scan failing: {output}"
+        );
     }
 
     #[test]
@@ -1897,6 +2080,11 @@ mod tests {
         // the failure mode worth catching.
         assert_eq!(DEFAULT_SCAN_TIMEOUT, Duration::from_secs(10 * 60 * 60));
         assert_eq!(DEFAULT_BLOCKING_RULES_TIMEOUT, Duration::from_secs(35 * 60));
+        assert_eq!(SCAN_NOT_FOUND_GRACE, Duration::from_secs(90));
+        assert!(
+            SCAN_NOT_FOUND_GRACE < DEFAULT_SCAN_TIMEOUT,
+            "404 grace must be shorter than the wait, or a missing scan sits on the full budget"
+        );
         assert_eq!(format_timeout(DEFAULT_SCAN_TIMEOUT), "10h");
         assert_eq!(format_timeout(DEFAULT_BLOCKING_RULES_TIMEOUT), "35m");
         assert_eq!(format_timeout(Duration::from_secs(90)), "90s");
