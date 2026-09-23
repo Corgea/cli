@@ -204,7 +204,7 @@ fn a_rejected_scan_start_is_not_sent_again() {
     // and the reply was lost. Replaying it was turning a single `corgea scan`
     // into a scan per attempt in the project.
     let project = git_project();
-    let mut plan = vec![verify_request()];
+    let mut plan = vec![verify_request(), scan_settings_request("cloud-e2e")];
     plan.extend(baseline_lookups_finding_nothing("cloud-e2e"));
     plan.push(expected_request(
         "reject the scan start with a gateway error",

@@ -3,6 +3,7 @@ use crate::utils::terminal::{set_text_color, TerminalColor};
 use git2::{Repository, StatusOptions};
 use globset::{Glob, GlobSetBuilder};
 use ignore::WalkBuilder;
+use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File};
 use std::io;
@@ -43,7 +44,6 @@ const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
     "**/specs/**",
     "**/node_modules/**",
     "**/tmp/**",
-    "**/migrations/**",
     "**/python*/site-packages/**",
     "**/*.mmdb",
     "**/*.css",
@@ -156,6 +156,10 @@ fn directory_entry_name(relative_path: &Path) -> String {
 /// - If `target` is `Some(target_str)`, resolves the target using the targets module and creates zip from those files.
 ///   The target string can be a comma-separated list of files, directories, globs, or git selectors.
 /// - `user_exclude` is an optional comma-separated list of glob patterns from `--exclude`.
+/// - `force_include` are repo-relative paths the project's include rules or
+///   `--include` matched. They override every filter here — the default
+///   excludes, `--exclude`, and `.gitignore` — because a file left out of the
+///   archive cannot be scanned whatever the engine later decides about it.
 /// - `extra_files` are staged files added to the root of the zip as
 ///   `(source path, zip entry name)`. They come from explicit flags such as
 ///   `--include-image`, so exclude rules don't apply to them.
@@ -167,6 +171,7 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     output_zip: P,
     exclude_globs: Option<&[&str]>,
     user_exclude: Option<&str>,
+    force_include: &[PathBuf],
     extra_files: &[(PathBuf, String)],
     want_manifest: bool,
 ) -> Result<ArchiveContents, Box<dyn std::error::Error>> {
@@ -181,7 +186,7 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     let user_exclude_glob_set = crate::targets::build_user_exclude_glob_set(user_exclude)
         .map_err(|e| format!("Failed to build exclude patterns: {}", e))?;
 
-    let files_to_zip: Vec<(PathBuf, PathBuf)> = if let Some(target_str) = target {
+    let mut files_to_zip: Vec<(PathBuf, PathBuf)> = if let Some(target_str) = target {
         let current_dir = env::current_dir()?;
         let result = crate::targets::resolve_targets_with_exclude(target_str, user_exclude)
             .map_err(|e| format!("Failed to resolve targets: {}", e))?;
@@ -225,6 +230,20 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
         files
     };
 
+    let forced: HashSet<&Path> = force_include.iter().map(PathBuf::as_path).collect();
+    let already_present: HashSet<PathBuf> = files_to_zip
+        .iter()
+        .map(|(_, relative)| relative.clone())
+        .collect();
+    for relative in force_include {
+        if already_present.contains(relative) {
+            continue;
+        }
+        if relative.is_file() {
+            files_to_zip.push((relative.clone(), relative.clone()));
+        }
+    }
+
     let zip_file = File::create(output_zip.as_ref())?;
     let mut zip = ZipWriter::new(zip_file);
 
@@ -242,7 +261,8 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
 
     for (path, relative_path) in files_to_zip {
         // Match repo-relative paths so abs `/tmp/...` targets don't hit `**/tmp/**`.
-        let is_excluded = glob_set.is_match(&relative_path);
+        let is_excluded =
+            glob_set.is_match(&relative_path) && !forced.contains(relative_path.as_path());
 
         if (path.is_file() || path.is_dir()) && !is_excluded {
             if path.is_file() {
@@ -604,6 +624,28 @@ pub fn extract_repo_path(url: &str) -> Option<String> {
 /// `extract_repo_path` rejects.
 pub fn extract_repo_host(url: &str) -> Option<String> {
     Some(split_remote(url)?[0].to_lowercase())
+}
+
+/// A git remote with any embedded credential removed.
+///
+/// `https://oauth2:glpat-xxx@gitlab.com/org/repo` becomes
+/// `https://gitlab.com/org/repo`. Only URLs with a `://` scheme are touched:
+/// scp-style `git@github.com:org/repo` carries no secret, and stripping its
+/// `git@` would stop the server recognising it as scp-style, so it would no
+/// longer normalize to the same stored URL.
+///
+/// This is the same userinfo strip the server applies before storing a
+/// `repo_url`, so a redacted value still resolves to the same project — while
+/// keeping the token out of query strings, proxy logs and `--verbose` output.
+pub fn strip_remote_credentials(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let host_end = rest.find('/').unwrap_or(rest.len());
+    match rest[..host_end].rfind('@') {
+        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
+        None => url.to_string(),
+    }
 }
 
 /// Split a git remote into `[host, path segments…]`, dropping scheme, userinfo
@@ -1035,9 +1077,16 @@ mod tests {
         // which would exclude *everything*. The filter + warn path under test
         // is identical either way.
         let excludes: &[&str] = &["**/node_modules/**"];
-        let archive =
-            create_zip_from_target(Some(&target), &output_zip, Some(excludes), None, &[], true)
-                .expect("zip creation should succeed");
+        let archive = create_zip_from_target(
+            Some(&target),
+            &output_zip,
+            Some(excludes),
+            None,
+            &[],
+            &[],
+            true,
+        )
+        .expect("zip creation should succeed");
         let added = archive.added_files;
 
         assert!(
@@ -1128,6 +1177,69 @@ mod tests {
         assert_eq!(directory_entry_name(Path::new("")), "/");
     }
 
+    /// A git origin can embed a token, and the settings lookup puts the remote
+    /// in a query string and the debug log.
+    #[test]
+    fn strip_remote_credentials_removes_userinfo_from_scheme_urls() {
+        assert_eq!(
+            strip_remote_credentials("https://oauth2:glpat-secret@gitlab.com/org/repo"),
+            "https://gitlab.com/org/repo"
+        );
+        assert_eq!(
+            strip_remote_credentials("https://token@github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+        assert_eq!(
+            strip_remote_credentials("https://github.com/org/repo"),
+            "https://github.com/org/repo"
+        );
+        // scp-style carries no secret, and stripping `git@` would stop the
+        // server recognising the shape and normalizing it to the stored URL.
+        assert_eq!(
+            strip_remote_credentials("git@github.com:org/repo.git"),
+            "git@github.com:org/repo.git"
+        );
+        // An `@` in the path is not userinfo.
+        assert_eq!(
+            strip_remote_credentials("https://github.com/org/re@po"),
+            "https://github.com/org/re@po"
+        );
+    }
+
+    /// A force-include rule is the customer overruling Corgea's own judgement
+    /// about a file, so it has to beat the default excludes.
+    #[test]
+    fn create_zip_from_target_keeps_force_included_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let node_modules = root.join("node_modules");
+        fs::create_dir_all(&node_modules).unwrap();
+        let forced = node_modules.join("internal-sdk.js");
+        fs::write(&forced, "console.log(1)").unwrap();
+        let excluded = node_modules.join("third-party.js");
+        fs::write(&excluded, "console.log(2)").unwrap();
+
+        let output_zip = root.join("out.zip");
+        let target = format!("{},{}", forced.display(), excluded.display());
+        // Explicit file targets outside the cwd keep their absolute paths as
+        // zip entry names, so that is the shape the exemption check compares.
+        let added = create_zip_from_target(
+            Some(&target),
+            &output_zip,
+            Some(&["**/node_modules/**"]),
+            None,
+            std::slice::from_ref(&forced),
+            &[],
+            false,
+        )
+        .expect("zip creation should succeed")
+        .added_files;
+
+        assert!(added.contains(&forced), "force-included: {:?}", added);
+        assert!(!added.contains(&excluded), "still excluded: {:?}", added);
+    }
+
     /// The staging directory holds the project zip and exported images, so other
     /// local users must not be able to read it.
     #[cfg(unix)]
@@ -1162,6 +1274,7 @@ mod tests {
             &output_zip,
             Some(&[]),
             None,
+            &[],
             &extra_files,
             true,
         )
@@ -1206,6 +1319,7 @@ mod tests {
             &output_zip,
             Some(&[]),
             None,
+            &[],
             &extra_files,
             true,
         )
@@ -1226,6 +1340,8 @@ mod tests {
         assert!(set.is_match(Path::new("/tmp/proj/app.py")));
         assert!(!set.is_match(Path::new("app.py")));
         assert!(!set.is_match(Path::new("src/app.py")));
+        assert!(!set.is_match(Path::new("migrations/0001_initial.py")));
+        assert!(!set.is_match(Path::new("app/migrations/0001_initial.py")));
     }
 
     #[test]
@@ -1337,7 +1453,7 @@ mod tests {
         let output_zip = root.join("out.zip");
         let previous = env::current_dir().unwrap();
         env::set_current_dir(root).unwrap();
-        let contents = create_zip_from_target(None, "out.zip", None, None, &extra_files, true);
+        let contents = create_zip_from_target(None, "out.zip", None, None, &[], &extra_files, true);
         env::set_current_dir(previous).unwrap();
 
         let manifest = contents
@@ -1396,7 +1512,8 @@ mod tests {
 
             let previous = env::current_dir().unwrap();
             env::set_current_dir(root).unwrap();
-            let contents = create_zip_from_target(None, "out.zip", None, None, &extra_files, true);
+            let contents =
+                create_zip_from_target(None, "out.zip", None, None, &[], &extra_files, true);
             env::set_current_dir(previous).unwrap();
 
             let archive = contents.expect("zip creation should succeed");
