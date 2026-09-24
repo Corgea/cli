@@ -7,8 +7,11 @@
 //!
 //! Finding what to diff *against* is the same in both directions: ask the
 //! server for the newest completed scan of this branch, then of trunk if this
-//! branch has never been scanned. What changed since it can then be measured
-//! two ways.
+//! branch has never been scanned. When the checkout names no branch -- the
+//! detached HEAD a CI checkout usually lands on, where earlier runs of the same
+//! pipeline recorded no branch either -- the scan of the nearest commit in this
+//! checkout's own history is tried first, whatever branch it was recorded
+//! under. What changed since the baseline can then be measured two ways.
 //!
 //! The first is the file checksums that scan uploaded, fetched and subtracted
 //! from this run's. It needs no git history, so it is the only one that works
@@ -47,7 +50,7 @@ use crate::manifest::{Manifest, MANIFEST_VERSION};
 use crate::scanners::blast::{classify_scan_status, ScanState};
 use crate::utils::api::{self, ScanResponse};
 use git2::Repository;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 /// How many of the project's scans to read at a time, newest first.
 const SCAN_LOOKUP_PAGE_SIZE: u16 = 30;
@@ -139,10 +142,11 @@ impl IncrementalPlan {
 /// booleans and a caller listing them positionally can swap two without the
 /// compiler noticing — which would quietly change how the scan is scoped.
 pub struct DiffSources<'a> {
-    /// Branch the upload reports. Names where a baseline may come from, and
-    /// the git diff needs it to have one at all.
+    /// Branch the upload reports. Names where a baseline may come from; when
+    /// absent, a baseline is looked for in this commit's history first.
     pub branch: Option<&'a str>,
-    /// Commit the upload reports, the near side of a git diff.
+    /// Commit the upload reports: what a baseline found without a branch has
+    /// to be an ancestor of, and the near side of a git diff.
     pub head_sha: Option<&'a str>,
     /// Whether the worktree holds edits a commit-to-commit diff cannot see.
     pub worktree_dirty: bool,
@@ -189,6 +193,7 @@ fn plan_diff(
     // Optional, because a checksum diff needs no repository. Only the git diff
     // below does, and it reports its absence by its real name.
     let repo = Repository::discover(".").ok();
+    let checksums_usable = sources.manifest.is_some();
     // Branch names are only meaningful where there is a clone to read them
     // from. Without one, take the project's newest usable scan whatever branch
     // it names -- including none, which is what a scan uploaded from a
@@ -198,12 +203,40 @@ fn plan_diff(
         .as_ref()
         .map(|repo| baseline_branches(repo, sources.branch.filter(|name| !name.is_empty())));
 
-    let lookup = find_baseline(
-        config,
-        project_name,
-        candidates.as_deref(),
-        sources.manifest.is_some(),
-    );
+    // With no branch to name -- a detached HEAD, which is how CI checkouts
+    // usually land -- the name lookup can only ask about trunk, and misses the
+    // earlier runs of this same pipeline, which recorded no branch either.
+    // Ancestry finds them by commit instead. A named branch keeps the name
+    // lookup: its own last scan is the baseline it has always diffed against.
+    let branch_known = sources.branch.is_some_and(|name| !name.is_empty());
+    let ancestry = match (repo.as_ref(), sources.head_sha) {
+        (Some(repo), Some(head)) if !branch_known => Ancestry::new(repo, head),
+        _ => None,
+    };
+    let ancestry_tried = ancestry.is_some();
+    let lookup = match ancestry {
+        Some(mut ancestry) => match find_ancestor_baseline(
+            config,
+            project_name,
+            &mut ancestry,
+            checksums_usable,
+            can_git_diff(sources),
+        ) {
+            BaselineLookup::NotFound => find_baseline(
+                config,
+                project_name,
+                candidates.as_deref(),
+                checksums_usable,
+            ),
+            found_or_failed => found_or_failed,
+        },
+        None => find_baseline(
+            config,
+            project_name,
+            candidates.as_deref(),
+            checksums_usable,
+        ),
+    };
     let baseline = match lookup {
         BaselineLookup::Found(scan) => scan,
         BaselineLookup::NotFound => {
@@ -211,6 +244,10 @@ fn plan_diff(
                 "project '{project_name}' has no completed scan {} that could be diffed \
                  against, so there is nothing to compare this one to",
                 match &candidates {
+                    Some(candidates) if ancestry_tried => format!(
+                        "among its recent scans of this commit's history, nor on {}",
+                        join_or(candidates)
+                    ),
                     Some(candidates) => format!("on {}", join_or(candidates)),
                     None => "of its whole state".to_string(),
                 }
@@ -301,20 +338,21 @@ fn plan_git_diff(
     }
 
     // Nothing to diff from. Covers a non-git directory, a repo with no commit,
-    // a detached HEAD, and a scan started below the repo root — none of which
-    // report RepoInfo to the upload either.
-    let (Some(_branch), Some(head_sha), Some(repo), Some(base_sha)) = (
-        sources.branch,
-        sources.head_sha,
-        repo,
-        baseline.sha.as_deref(),
-    ) else {
+    // and a scan started below the repo root — none of which report RepoInfo
+    // to the upload either. A detached HEAD is not one of them: a diff between
+    // two commits needs no branch.
+    let (Some(head_sha), Some(repo)) = (sources.head_sha, repo) else {
         return Err(
-            "there is no git branch and commit to diff from either (not a git \
-             repository, no commit yet, a detached HEAD, or a scan started below the \
-             repository root)"
+            "there is no git commit to diff from either (not a git repository, no \
+             commit yet, or a scan started below the repository root)"
                 .to_string(),
         );
+    };
+    let Some(base_sha) = baseline.sha.as_deref() else {
+        return Err(format!(
+            "the {} recorded no commit for a git diff to start from",
+            baseline.describe()
+        ));
     };
 
     let changed_files = changed_files_since(repo, base_sha, head_sha, covers_worktree)?;
@@ -401,11 +439,38 @@ struct BaselineScan {
     /// Digest of the file manifest it stored, `None` when it stored none.
     manifest_root: Option<String>,
     manifest_version: Option<String>,
+    /// Commits between its commit and this run's, when it was picked for
+    /// being in this run's history rather than for the branch it names.
+    commits_back: Option<usize>,
 }
 
 impl BaselineScan {
+    fn from_response(scan: &ScanResponse) -> Self {
+        BaselineScan {
+            id: scan.id.clone(),
+            sha: scan.git_sha.clone().filter(|sha| !sha.is_empty()),
+            branch: scan.branch.clone(),
+            manifest_root: scan
+                .file_manifest_root
+                .clone()
+                .filter(|root| !root.is_empty()),
+            manifest_version: scan.file_manifest_version.clone(),
+            commits_back: None,
+        }
+    }
+
     /// How to refer to this scan in the one line the run prints.
     fn describe(&self) -> String {
+        if let (Some(commits_back), Some(sha)) = (self.commits_back, &self.sha) {
+            return match commits_back {
+                0 => format!("scan of this commit ({})", short_sha(sha)),
+                1 => format!("scan of ancestor commit {} (1 commit back)", short_sha(sha)),
+                n => format!(
+                    "scan of ancestor commit {} ({n} commits back)",
+                    short_sha(sha)
+                ),
+            };
+        }
         let what = match &self.branch {
             Some(branch) => format!("last scan of {branch}"),
             None => "last scan of this project".to_string(),
@@ -623,16 +688,144 @@ fn branch_baseline(
     } else {
         newest?
     };
-    Some(BaselineScan {
-        id: scan.id.clone(),
-        sha: scan.git_sha.clone().filter(|sha| !sha.is_empty()),
-        branch: scan.branch.clone(),
-        manifest_root: scan
-            .file_manifest_root
-            .clone()
-            .filter(|root| !root.is_empty()),
-        manifest_version: scan.file_manifest_version.clone(),
-    })
+    Some(BaselineScan::from_response(scan))
+}
+
+/// Whether this run could diff from a baseline's commit, as opposed to only
+/// from its stored checksums. Mirrors the refusals in `plan_git_diff`.
+fn can_git_diff(sources: &DiffSources<'_>) -> bool {
+    !sources.exclude_narrowed && (!sources.worktree_dirty || sources.ignore_dirty_worktree)
+}
+
+/// Where scanned commits sit relative to this run's, read from this clone.
+struct Ancestry<'repo> {
+    repo: &'repo Repository,
+    head: git2::Oid,
+    /// Per commit, since many scans share one and each answer is a graph walk.
+    known: HashMap<String, Option<usize>>,
+}
+
+impl<'repo> Ancestry<'repo> {
+    /// None when `head_sha` is not a commit this clone holds.
+    fn new(repo: &'repo Repository, head_sha: &str) -> Option<Self> {
+        let head = repo
+            .find_commit(git2::Oid::from_str(head_sha).ok()?)
+            .ok()?
+            .id();
+        Some(Ancestry {
+            repo,
+            head,
+            known: HashMap::new(),
+        })
+    }
+
+    /// Commits reachable from HEAD but not from `sha`, or None when `sha` is
+    /// not an ancestor of HEAD (or HEAD itself). A commit this clone does not
+    /// hold -- beyond a shallow clone's depth, or on a branch never fetched --
+    /// cannot be shown to be one, so it is None as well.
+    fn commits_back(&mut self, sha: &str) -> Option<usize> {
+        if let Some(known) = self.known.get(sha) {
+            return *known;
+        }
+        let answer = git2::Oid::from_str(sha)
+            .ok()
+            .and_then(|oid| self.repo.find_commit(oid).ok())
+            .and_then(|base| self.repo.graph_ahead_behind(self.head, base.id()).ok())
+            .and_then(|(ahead, behind)| (behind == 0).then_some(ahead));
+        self.known.insert(sha.to_string(), answer);
+        answer
+    }
+}
+
+/// The recent scan whose commit is nearest behind HEAD, on any branch. Asked
+/// only when this checkout names no branch to look a baseline up by.
+///
+/// Any branch, including none, because ancestry settles what the branch name
+/// was standing in for. A scan of a commit HEAD descends from covered a tree
+/// this history produced, so the diff from it is exactly what this history has
+/// done since -- whether the scan was recorded under this branch, under trunk,
+/// under the branch this one forked from, or, from a detached CI checkout,
+/// under no branch at all. The last is what every earlier run of a pipeline
+/// that checks out detached records, and a lookup keyed on names never finds
+/// them.
+///
+/// Nearest wins because it leaves the fewest files to rescan. Stops at the
+/// first page holding any ancestor: scans arrive newest first, and an older
+/// one being of a nearer commit is the unusual case not worth reading the
+/// whole history for.
+fn find_ancestor_baseline(
+    config: &Config,
+    project_name: &str,
+    ancestry: &mut Ancestry<'_>,
+    checksums_usable: bool,
+    git_diffable: bool,
+) -> BaselineLookup {
+    let url = config.get_url();
+    for page in 1..=SCAN_LOOKUP_MAX_PAGES {
+        let response = match api::query_baseline_scans(
+            &url,
+            project_name,
+            BLAST_ENGINE,
+            None,
+            // Only a checksum baseline may have been dirty, so without one
+            // the server can drop what could never qualify.
+            !checksums_usable,
+            page,
+            SCAN_LOOKUP_PAGE_SIZE,
+        ) {
+            Ok(response) => response,
+            Err(e) => {
+                crate::log::debug(&format!("Baseline scan lookup failed: {e}"));
+                return BaselineLookup::LookupFailed;
+            }
+        };
+        let scans = response.scans.unwrap_or_default();
+        if scans.is_empty() {
+            break;
+        }
+        if let Some(scan) =
+            nearest_ancestor_baseline(&scans, ancestry, checksums_usable, git_diffable)
+        {
+            return BaselineLookup::Found(scan);
+        }
+        if response
+            .total_pages
+            .is_some_and(|total| u32::from(page) >= total)
+        {
+            break;
+        }
+    }
+    BaselineLookup::NotFound
+}
+
+/// The scan on this page nearest behind HEAD that this run can diff from.
+///
+/// A scan only diffable by its commit is no use to a run that cannot git diff
+/// (a dirty tree without `--ignore-dirty-worktree`, or an `--exclude`d
+/// archive), so there it has to carry checksums. Between scans of the same
+/// commit, checksums win, then recency.
+fn nearest_ancestor_baseline(
+    scans: &[ScanResponse],
+    ancestry: &mut Ancestry<'_>,
+    checksums_usable: bool,
+    git_diffable: bool,
+) -> Option<BaselineScan> {
+    scans
+        .iter()
+        .enumerate()
+        .filter(|(_, scan)| is_usable_baseline(scan, checksums_usable))
+        .filter(|(_, scan)| git_diffable || (checksums_usable && has_readable_checksums(scan)))
+        .filter_map(|(position, scan)| {
+            let sha = scan.git_sha.as_deref().filter(|sha| !sha.is_empty())?;
+            let commits_back = ancestry.commits_back(sha)?;
+            let without_checksums = !(checksums_usable && has_readable_checksums(scan));
+            Some(((commits_back, without_checksums, position), scan))
+        })
+        .min_by_key(|(rank, _)| *rank)
+        .map(|((commits_back, _, _), scan)| BaselineScan {
+            commits_back: Some(commits_back),
+            ..BaselineScan::from_response(scan)
+        })
 }
 
 /// Whether `scan` may be diffed against, given what this run can diff with.
@@ -1225,6 +1418,172 @@ mod tests {
             .expect_err("a moved submodule must refuse the diff");
 
         assert!(err.contains("submodule vendor"), "{err}");
+    }
+
+    /// Commit with `parents`, adding `name` to the first parent's tree.
+    /// Leaves HEAD alone, so a test can grow side branches off any commit.
+    fn commit_on(repo: &Repository, parents: &[git2::Oid], name: &str) -> git2::Oid {
+        let sig = git2::Signature::now("t", "t@example.com").expect("sig");
+        let parents: Vec<git2::Commit> = parents
+            .iter()
+            .map(|oid| repo.find_commit(*oid).expect("parent"))
+            .collect();
+        let parent_tree = parents.first().map(|c| c.tree().expect("parent tree"));
+        let mut builder = repo.treebuilder(parent_tree.as_ref()).expect("treebuilder");
+        let blob = repo.blob(name.as_bytes()).expect("blob");
+        builder.insert(name, blob, 0o100644).expect("insert");
+        let tree = repo
+            .find_tree(builder.write().expect("write tree"))
+            .expect("find tree");
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(None, &sig, &sig, name, &tree, &parent_refs)
+            .expect("commit")
+    }
+
+    /// root -> near -> head on one line, and `side` forked off root.
+    struct Lineage {
+        _dir: tempfile::TempDir,
+        repo: Repository,
+        root: String,
+        near: String,
+        head: String,
+        side: String,
+    }
+
+    fn lineage() -> Lineage {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(dir.path()).expect("init");
+        let root = commit_on(&repo, &[], "root.txt");
+        let near = commit_on(&repo, &[root], "near.txt");
+        let head = commit_on(&repo, &[near], "head.txt");
+        let side = commit_on(&repo, &[root], "side.txt");
+        Lineage {
+            _dir: dir,
+            repo,
+            root: root.to_string(),
+            near: near.to_string(),
+            head: head.to_string(),
+            side: side.to_string(),
+        }
+    }
+
+    /// A scan uploaded from a detached CI checkout: a commit, no branch.
+    fn detached_scan(sha: &str) -> ScanResponse {
+        let mut scan = scan("unused", sha);
+        scan.branch = None;
+        scan
+    }
+
+    #[test]
+    fn a_detached_head_finds_the_nearest_ancestor_scan_on_any_branch() {
+        let l = lineage();
+        let mut ancestry = Ancestry::new(&l.repo, &l.head).expect("head in clone");
+        // Newest first: a scan of a sibling branch, one of a commit this clone
+        // never fetched, then two ancestors -- the nearer recorded detached.
+        let scans = vec![
+            scan("feature", &l.side),
+            scan("other", &"f".repeat(40)),
+            scan("main", &l.root),
+            detached_scan(&l.near),
+        ];
+
+        let picked =
+            nearest_ancestor_baseline(&scans, &mut ancestry, false, true).expect("a baseline");
+
+        assert_eq!(picked.sha.as_deref(), Some(l.near.as_str()));
+        assert_eq!(picked.commits_back, Some(1));
+        assert_eq!(
+            picked.describe(),
+            format!("scan of ancestor commit {} (1 commit back)", &l.near[..7])
+        );
+    }
+
+    #[test]
+    fn a_scan_of_head_itself_is_zero_commits_back() {
+        let l = lineage();
+        let mut ancestry = Ancestry::new(&l.repo, &l.head).expect("head in clone");
+        let scans = vec![scan("main", &l.near), detached_scan(&l.head)];
+
+        let picked =
+            nearest_ancestor_baseline(&scans, &mut ancestry, false, true).expect("a baseline");
+
+        assert_eq!(picked.commits_back, Some(0));
+    }
+
+    #[test]
+    fn no_ancestor_on_the_page_means_no_ancestry_baseline() {
+        let l = lineage();
+        let mut ancestry = Ancestry::new(&l.repo, &l.head).expect("head in clone");
+        let scans = vec![scan("feature", &l.side), scan_without_git("no-git")];
+
+        assert_eq!(
+            nearest_ancestor_baseline(&scans, &mut ancestry, true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn between_scans_of_one_commit_the_one_with_checksums_wins() {
+        let l = lineage();
+        let mut ancestry = Ancestry::new(&l.repo, &l.head).expect("head in clone");
+        let mut plain = detached_scan(&l.near);
+        plain.id = "plain".to_string();
+        let mut hashed = with_checksums(detached_scan(&l.near));
+        hashed.id = "hashed".to_string();
+
+        let picked = nearest_ancestor_baseline(&[plain, hashed], &mut ancestry, true, true)
+            .expect("a baseline");
+
+        assert_eq!(picked.id, "hashed");
+    }
+
+    #[test]
+    fn a_run_that_cannot_git_diff_needs_an_ancestor_with_checksums() {
+        // A dirty tree without --ignore-dirty-worktree, or an --exclude run:
+        // the nearer scan could only be diffed from its commit.
+        let l = lineage();
+        let mut ancestry = Ancestry::new(&l.repo, &l.head).expect("head in clone");
+        let scans = vec![
+            detached_scan(&l.near),
+            with_checksums(detached_scan(&l.root)),
+        ];
+
+        let picked =
+            nearest_ancestor_baseline(&scans, &mut ancestry, true, false).expect("a baseline");
+
+        assert_eq!(picked.sha.as_deref(), Some(l.root.as_str()));
+        assert_eq!(picked.commits_back, Some(2));
+    }
+
+    #[test]
+    fn a_head_this_clone_does_not_hold_offers_no_ancestry() {
+        let l = lineage();
+        assert!(Ancestry::new(&l.repo, &"0".repeat(40)).is_none());
+        assert!(Ancestry::new(&l.repo, "not-a-sha").is_none());
+    }
+
+    #[test]
+    fn a_git_diff_needs_no_branch() {
+        // A detached HEAD reports a commit and no branch; a diff between two
+        // commits needs nothing more.
+        let (_dir, repo, base, head) = repo_with_history();
+        let baseline = BaselineScan::from_response(&detached_scan(&base));
+        let sources = DiffSources {
+            branch: None,
+            head_sha: Some(&head),
+            worktree_dirty: false,
+            ignore_dirty_worktree: false,
+            exclude_narrowed: false,
+            manifest: None,
+        };
+
+        let (plan, _) = plan_git_diff(&baseline, Some(&repo), &sources).expect("a plan");
+
+        assert_eq!(plan.base, BaselineRef::Commit(base));
+        assert_eq!(
+            plan.changed_files,
+            vec!["added.txt", "edit.txt", "gone.txt"]
+        );
     }
 
     #[test]
