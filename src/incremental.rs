@@ -229,7 +229,7 @@ fn plan_diff(
                     project_name,
                     ancestry,
                     checksums_usable,
-                    can_git_diff(sources),
+                    git_diff_refusal(sources).is_none(),
                 );
             }
             if lookup == BaselineLookup::NotFound {
@@ -313,33 +313,10 @@ fn plan_git_diff(
     repo: Option<&Repository>,
     sources: &DiffSources<'_>,
 ) -> Result<(IncrementalPlan, String), String> {
-    // git diffs the repository, and --exclude means the archive is not it. An
-    // excluded file git reports unchanged is left off the list, so the server
-    // copies its findings forward over a file this upload does not contain --
-    // and no later run under the same --exclude will look at it either. First,
-    // because these runs report dirty whatever the worktree holds, so the check
-    // below would otherwise answer for a tree with nothing uncommitted in it.
-    if sources.exclude_narrowed {
-        return Err(
-            "--exclude held files back from this archive, so a git diff of the repository \
-             would not describe it (its stored file checksums would, on the next run)"
-                .to_string(),
-        );
+    if let Some(refusal) = git_diff_refusal(sources) {
+        return Err(refusal);
     }
-
-    // A commit-to-commit diff cannot see uncommitted edits, so on a dirty tree
-    // it leaves modified files off the list and their old findings are copied
-    // forward as current. --ignore-dirty-worktree does not paper over that; it
-    // switches the diff to measure the working tree, so those files are named
-    // and rescanned like any other change.
     let covers_worktree = sources.worktree_dirty;
-    if sources.worktree_dirty && !sources.ignore_dirty_worktree {
-        return Err(
-            "this worktree has uncommitted changes that a commit-to-commit diff cannot \
-             see. Pass --ignore-dirty-worktree to diff the working tree instead"
-                .to_string(),
-        );
-    }
 
     // Nothing to diff from. Covers a non-git directory, a repo with no commit,
     // and a scan started below the repo root — none of which report RepoInfo
@@ -695,10 +672,37 @@ fn branch_baseline(
     Some(BaselineScan::from_response(scan))
 }
 
-/// Whether this run could diff from a baseline's commit, as opposed to only
-/// from its stored checksums. Mirrors the refusals in `plan_git_diff`.
-fn can_git_diff(sources: &DiffSources<'_>) -> bool {
-    !sources.exclude_narrowed && (!sources.worktree_dirty || sources.ignore_dirty_worktree)
+/// Why this run cannot diff from any baseline's commit, only from stored
+/// checksums. One function for both `plan_git_diff` and the ancestor lookup,
+/// which skips commit-only baselines when this says no.
+fn git_diff_refusal(sources: &DiffSources<'_>) -> Option<String> {
+    // git diffs the repository, and --exclude means the archive is not it. An
+    // excluded file git reports unchanged is left off the list, so the server
+    // copies its findings forward over a file this upload does not contain --
+    // and no later run under the same --exclude will look at it either. First,
+    // because these runs report dirty whatever the worktree holds, so the check
+    // below would otherwise answer for a tree with nothing uncommitted in it.
+    if sources.exclude_narrowed {
+        return Some(
+            "--exclude held files back from this archive, so a git diff of the repository \
+             would not describe it (its stored file checksums would, on the next run)"
+                .to_string(),
+        );
+    }
+
+    // A commit-to-commit diff cannot see uncommitted edits, so on a dirty tree
+    // it leaves modified files off the list and their old findings are copied
+    // forward as current. --ignore-dirty-worktree does not paper over that; it
+    // switches the diff to measure the working tree, so those files are named
+    // and rescanned like any other change.
+    if sources.worktree_dirty && !sources.ignore_dirty_worktree {
+        return Some(
+            "this worktree has uncommitted changes that a commit-to-commit diff cannot \
+             see. Pass --ignore-dirty-worktree to diff the working tree instead"
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// HEAD and the commits nearest behind it in this clone, with how far back

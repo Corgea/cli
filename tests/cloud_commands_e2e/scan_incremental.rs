@@ -806,6 +806,61 @@ fn a_scan_of_a_recent_commit_is_the_baseline_when_the_branch_has_none() {
     }
 }
 
+/// A detached HEAD has no branch lookup to make, and when none of its recent
+/// commits was scanned it still reaches trunk -- through a git diff here, which
+/// needs the two commits and no branch.
+#[test]
+fn a_detached_head_with_no_scanned_recent_commit_falls_back_to_trunk() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    let head_sha = second_commit(&project);
+    run_git(project.path(), &["checkout", "--detach"]);
+
+    let mut scan = baseline_scan(&base_sha);
+    scan["branch"] = json!("main");
+    let expected_base = base_sha.clone();
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        ancestor_lookup(Some(vec![head_sha, base_sha]), vec![]),
+        baseline_lookup("main", vec![scan]),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with the git diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_multipart_text_field(request, "incremental_base_sha", &expected_base)?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_changed_files",
+                    r#"["helper.py","main.py"]"#,
+                )
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains("Incremental scan: 2 files changed since commit"),
+        "{context}"
+    );
+}
+
 /// A backend predating the server-side filters returns scans of every kind, so
 /// a page can hold nothing usable. The walk is what stops that project from
 /// being permanently unable to find a baseline it has.
@@ -853,20 +908,40 @@ fn a_baseline_on_a_later_page_is_still_found() {
 
 /// A lookup that failed says so. Reporting it as "no earlier scan" tells someone
 /// with years of scan history that they have none, and now that incremental is
-/// the default, any network blip would say it.
+/// the default, any network blip would say it. Nor does a failure fall through
+/// to the next lookup: the endpoint that failed is the one it would ask.
 #[test]
 fn a_failed_lookup_is_not_reported_as_a_missing_baseline() {
+    for fail_by_commit in [false, true] {
+        assert_failed_lookup_scans_everything(fail_by_commit);
+    }
+}
+
+fn assert_failed_lookup_scans_everything(fail_by_commit: bool) {
     let project = git_project();
     second_commit(&project);
 
-    let mut plan = vec![
-        verify_request(),
-        scan_settings_request(PROJECT),
-        expected_request(
+    let failure =
+        || json_response_with_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "boom"}));
+    let mut plan = vec![verify_request(), scan_settings_request(PROJECT)];
+    if fail_by_commit {
+        plan.extend([
+            baseline_lookup(FIXTURE_BRANCH, vec![]),
+            clean_baseline_lookup(FIXTURE_BRANCH, vec![]),
+            expected_request(
+                "fail the baseline lookup by commit",
+                |request| assert_ancestor_lookup_request(request, PROJECT, None, false),
+                failure(),
+            ),
+        ]);
+    } else {
+        plan.push(expected_request(
             "fail the baseline lookup",
             |request| assert_baseline_lookup_request(request, PROJECT, Some(FIXTURE_BRANCH), false),
-            json_response_with_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "boom"})),
-        ),
+            failure(),
+        ));
+    }
+    plan.extend([
         start_upload(),
         expected_request(
             "upload BLAST archive with no diff",
@@ -881,7 +956,7 @@ fn a_failed_lookup_is_not_reported_as_a_missing_baseline() {
             },
             json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
         ),
-    ];
+    ]);
     plan.extend(scan_tail());
 
     let api = ApiStub::start(plan);
