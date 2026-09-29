@@ -6,12 +6,12 @@
 //! commits. This module works the diff out where the scan is run.
 //!
 //! Finding what to diff *against* is the same in both directions: ask the
-//! server for the newest completed scan of this branch, then of trunk if this
-//! branch has never been scanned. When the checkout names no branch -- the
-//! detached HEAD a CI checkout usually lands on, where earlier runs of the same
-//! pipeline recorded no branch either -- the scan of the nearest commit in this
-//! checkout's own history is tried first, whatever branch it was recorded
-//! under. What changed since the baseline can then be measured two ways.
+//! server for the newest completed scan of this branch. If this branch has
+//! never been scanned -- or the checkout names none, the detached HEAD a CI
+//! checkout usually lands on -- take the scan of the nearest commit in this
+//! checkout's recent history, whatever branch it was recorded under, and only
+//! then the newest scan of trunk. What changed since the baseline can then be
+//! measured two ways.
 //!
 //! The first is the file checksums that scan uploaded, fetched and subtracted
 //! from this run's. It needs no git history, so it is the only one that works
@@ -50,10 +50,16 @@ use crate::manifest::{Manifest, MANIFEST_VERSION};
 use crate::scanners::blast::{classify_scan_status, ScanState};
 use crate::utils::api::{self, ScanResponse};
 use git2::Repository;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 /// How many of the project's scans to read at a time, newest first.
 const SCAN_LOOKUP_PAGE_SIZE: u16 = 30;
+
+/// How many of this checkout's nearest commits a baseline is looked for among.
+/// The most the scan list's `sha` filter takes in one request, and the most
+/// scans per page it returns.
+const ANCESTOR_LOOKUP_COMMITS: usize = 50;
+const ANCESTOR_LOOKUP_PAGE_SIZE: u16 = 50;
 
 /// Backstop on pages walked looking for a baseline.
 ///
@@ -142,11 +148,10 @@ impl IncrementalPlan {
 /// booleans and a caller listing them positionally can swap two without the
 /// compiler noticing — which would quietly change how the scan is scoped.
 pub struct DiffSources<'a> {
-    /// Branch the upload reports. Names where a baseline may come from; when
-    /// absent, a baseline is looked for in this commit's history first.
+    /// Branch the upload reports. Its own last scan is the preferred baseline.
     pub branch: Option<&'a str>,
-    /// Commit the upload reports: what a baseline found without a branch has
-    /// to be an ancestor of, and the near side of a git diff.
+    /// Commit the upload reports: what a baseline found by ancestry has to be
+    /// an ancestor of, and the near side of a git diff.
     pub head_sha: Option<&'a str>,
     /// Whether the worktree holds edits a commit-to-commit diff cannot see.
     pub worktree_dirty: bool,
@@ -199,43 +204,40 @@ fn plan_diff(
     // it names -- including none, which is what a scan uploaded from a
     // directory with no git records, and so what the earlier runs of *this*
     // pipeline recorded.
-    let candidates = repo
-        .as_ref()
-        .map(|repo| baseline_branches(repo, sources.branch.filter(|name| !name.is_empty())));
-
-    // With no branch to name -- a detached HEAD, which is how CI checkouts
-    // usually land -- the name lookup can only ask about trunk, and misses the
-    // earlier runs of this same pipeline, which recorded no branch either.
-    // Ancestry finds them by commit instead. A named branch keeps the name
-    // lookup: its own last scan is the baseline it has always diffed against.
-    let branch_known = sources.branch.is_some_and(|name| !name.is_empty());
+    let branch = sources.branch.filter(|name| !name.is_empty());
+    let candidates = repo.as_ref().map(|repo| baseline_branches(repo, branch));
     let ancestry = match (repo.as_ref(), sources.head_sha) {
-        (Some(repo), Some(head)) if !branch_known => Ancestry::new(repo, head),
+        (Some(repo), Some(head)) => Ancestry::walk(repo, head),
         _ => None,
     };
-    let ancestry_tried = ancestry.is_some();
-    let lookup = match ancestry {
-        Some(mut ancestry) => match find_ancestor_baseline(
-            config,
-            project_name,
-            &mut ancestry,
-            checksums_usable,
-            can_git_diff(sources),
-        ) {
-            BaselineLookup::NotFound => find_baseline(
-                config,
-                project_name,
-                candidates.as_deref(),
-                checksums_usable,
-            ),
-            found_or_failed => found_or_failed,
-        },
-        None => find_baseline(
-            config,
-            project_name,
-            candidates.as_deref(),
-            checksums_usable,
-        ),
+
+    let lookup = match &candidates {
+        Some(candidates) => {
+            // `baseline_branches` puts the branch being scanned first.
+            let (own, trunks) = candidates.split_at(usize::from(branch.is_some()));
+            let mut lookup = find_baseline(config, project_name, Some(own), checksums_usable);
+            // Between this branch's own history and trunk's newest scan,
+            // because the scan of a commit this one descends from differs by
+            // only what this history has done since. Trunk's newest also
+            // differs by whatever trunk did after this branch forked, and may
+            // not be this branch's trunk at all where that is not main or
+            // master. It also finds the earlier runs of a detached CI pipeline,
+            // which recorded no branch for a name to match.
+            if let (BaselineLookup::NotFound, Some(ancestry)) = (&lookup, &ancestry) {
+                lookup = find_ancestor_baseline(
+                    config,
+                    project_name,
+                    ancestry,
+                    checksums_usable,
+                    can_git_diff(sources),
+                );
+            }
+            if lookup == BaselineLookup::NotFound {
+                lookup = find_baseline(config, project_name, Some(trunks), checksums_usable);
+            }
+            lookup
+        }
+        None => find_baseline(config, project_name, None, checksums_usable),
     };
     let baseline = match lookup {
         BaselineLookup::Found(scan) => scan,
@@ -243,13 +245,15 @@ fn plan_diff(
             return Err(format!(
                 "project '{project_name}' has no completed scan {} that could be diffed \
                  against, so there is nothing to compare this one to",
-                match &candidates {
-                    Some(candidates) if ancestry_tried => format!(
-                        "among its recent scans of this commit's history, nor on {}",
-                        join_or(candidates)
+                match (&candidates, &ancestry) {
+                    (Some(candidates), Some(ancestry)) => format!(
+                        "on {}, nor of any of the {} most recent commits in this checkout's \
+                         history",
+                        join_or(candidates),
+                        ancestry.shas.len()
                     ),
-                    Some(candidates) => format!("on {}", join_or(candidates)),
-                    None => "of its whole state".to_string(),
+                    (Some(candidates), None) => format!("on {}", join_or(candidates)),
+                    (None, _) => "of its whole state".to_string(),
                 }
             ))
         }
@@ -697,81 +701,81 @@ fn can_git_diff(sources: &DiffSources<'_>) -> bool {
     !sources.exclude_narrowed && (!sources.worktree_dirty || sources.ignore_dirty_worktree)
 }
 
-/// Where scanned commits sit relative to this run's, read from this clone.
-struct Ancestry<'repo> {
-    repo: &'repo Repository,
-    head: git2::Oid,
-    /// Per commit, since many scans share one and each answer is a graph walk.
-    known: HashMap<String, Option<usize>>,
+/// HEAD and the commits nearest behind it in this clone, with how far back
+/// each sits.
+struct Ancestry {
+    /// Nearest first, HEAD leading.
+    shas: Vec<String>,
+    commits_back: HashMap<String, usize>,
 }
 
-impl<'repo> Ancestry<'repo> {
-    /// None when `head_sha` is not a commit this clone holds.
-    fn new(repo: &'repo Repository, head_sha: &str) -> Option<Self> {
-        let head = repo
-            .find_commit(git2::Oid::from_str(head_sha).ok()?)
-            .ok()?
-            .id();
-        Some(Ancestry {
-            repo,
-            head,
-            known: HashMap::new(),
-        })
-    }
-
-    /// Commits reachable from HEAD but not from `sha`, or None when `sha` is
-    /// not an ancestor of HEAD (or HEAD itself). A commit this clone does not
-    /// hold -- beyond a shallow clone's depth, or on a branch never fetched --
-    /// cannot be shown to be one, so it is None as well.
-    fn commits_back(&mut self, sha: &str) -> Option<usize> {
-        if let Some(known) = self.known.get(sha) {
-            return *known;
+impl Ancestry {
+    /// Breadth-first over every parent, so the far side of a merge counts as
+    /// history too, stopping at `ANCESTOR_LOOKUP_COMMITS`. None when
+    /// `head_sha` is not a commit this clone holds. A shallow clone's history
+    /// ends at its depth, and so does this.
+    fn walk(repo: &Repository, head_sha: &str) -> Option<Self> {
+        let head = repo.find_commit(git2::Oid::from_str(head_sha).ok()?).ok()?;
+        let mut ancestry = Ancestry {
+            shas: vec![head.id().to_string()],
+            commits_back: HashMap::from([(head.id().to_string(), 0)]),
+        };
+        let mut queue = VecDeque::from([(head, 0)]);
+        while let Some((commit, depth)) = queue.pop_front() {
+            for parent_id in commit.parent_ids() {
+                if ancestry.shas.len() >= ANCESTOR_LOOKUP_COMMITS {
+                    return Some(ancestry);
+                }
+                let sha = parent_id.to_string();
+                if ancestry.commits_back.contains_key(&sha) {
+                    continue;
+                }
+                let Ok(parent) = repo.find_commit(parent_id) else {
+                    continue;
+                };
+                ancestry.commits_back.insert(sha.clone(), depth + 1);
+                ancestry.shas.push(sha);
+                queue.push_back((parent, depth + 1));
+            }
         }
-        let answer = git2::Oid::from_str(sha)
-            .ok()
-            .and_then(|oid| self.repo.find_commit(oid).ok())
-            .and_then(|base| self.repo.graph_ahead_behind(self.head, base.id()).ok())
-            .and_then(|(ahead, behind)| (behind == 0).then_some(ahead));
-        self.known.insert(sha.to_string(), answer);
-        answer
+        Some(ancestry)
     }
 }
 
-/// The recent scan whose commit is nearest behind HEAD, on any branch. Asked
-/// only when this checkout names no branch to look a baseline up by.
+/// The scan whose commit is nearest behind HEAD among this checkout's recent
+/// commits, on any branch.
 ///
 /// Any branch, including none, because ancestry settles what the branch name
 /// was standing in for. A scan of a commit HEAD descends from covered a tree
 /// this history produced, so the diff from it is exactly what this history has
-/// done since -- whether the scan was recorded under this branch, under trunk,
-/// under the branch this one forked from, or, from a detached CI checkout,
-/// under no branch at all. The last is what every earlier run of a pipeline
-/// that checks out detached records, and a lookup keyed on names never finds
-/// them.
+/// done since -- whether the scan was recorded under trunk, under the branch
+/// this one forked from, or, from a detached CI checkout, under no branch at
+/// all. The last is what every earlier run of a pipeline that checks out
+/// detached records, and a lookup keyed on names never finds them.
 ///
-/// Nearest wins because it leaves the fewest files to rescan. Stops at the
-/// first page holding any ancestor: scans arrive newest first, and an older
-/// one being of a nearer commit is the unusual case not worth reading the
-/// whole history for.
+/// Nearest wins because it leaves the fewest files to rescan. The commits
+/// travel in the request, so a page normally holds every candidate. Stops at
+/// the first page holding any: the pages after it are for a backend that
+/// ignored the filter and is listing the whole history.
 fn find_ancestor_baseline(
     config: &Config,
     project_name: &str,
-    ancestry: &mut Ancestry<'_>,
+    ancestry: &Ancestry,
     checksums_usable: bool,
     git_diffable: bool,
 ) -> BaselineLookup {
     let url = config.get_url();
     for page in 1..=SCAN_LOOKUP_MAX_PAGES {
-        let response = match api::query_baseline_scans(
+        let response = match api::query_baseline_scans_at_commits(
             &url,
             project_name,
             BLAST_ENGINE,
-            None,
+            &ancestry.shas,
             // Only a checksum baseline may have been dirty, so without one
             // the server can drop what could never qualify.
             !checksums_usable,
             page,
-            SCAN_LOOKUP_PAGE_SIZE,
+            ANCESTOR_LOOKUP_PAGE_SIZE,
         ) {
             Ok(response) => response,
             Err(e) => {
@@ -800,13 +804,15 @@ fn find_ancestor_baseline(
 
 /// The scan on this page nearest behind HEAD that this run can diff from.
 ///
-/// A scan only diffable by its commit is no use to a run that cannot git diff
-/// (a dirty tree without `--ignore-dirty-worktree`, or an `--exclude`d
-/// archive), so there it has to carry checksums. Between scans of the same
-/// commit, checksums win, then recency.
+/// Matched against the walked commits client-side too: a backend that ignored
+/// the filter would otherwise hand back a scan of any commit. A scan only
+/// diffable by its commit is no use to a run that cannot git diff (a dirty
+/// tree without `--ignore-dirty-worktree`, or an `--exclude`d archive), so
+/// there it has to carry checksums. Between scans of the same commit,
+/// checksums win, then recency.
 fn nearest_ancestor_baseline(
     scans: &[ScanResponse],
-    ancestry: &mut Ancestry<'_>,
+    ancestry: &Ancestry,
     checksums_usable: bool,
     git_diffable: bool,
 ) -> Option<BaselineScan> {
@@ -816,8 +822,8 @@ fn nearest_ancestor_baseline(
         .filter(|(_, scan)| is_usable_baseline(scan, checksums_usable))
         .filter(|(_, scan)| git_diffable || (checksums_usable && has_readable_checksums(scan)))
         .filter_map(|(position, scan)| {
-            let sha = scan.git_sha.as_deref().filter(|sha| !sha.is_empty())?;
-            let commits_back = ancestry.commits_back(sha)?;
+            let sha = scan.git_sha.as_deref()?;
+            let commits_back = *ancestry.commits_back.get(sha)?;
             let without_checksums = !(checksums_usable && has_readable_checksums(scan));
             Some(((commits_back, without_checksums, position), scan))
         })
@@ -1475,9 +1481,9 @@ mod tests {
     }
 
     #[test]
-    fn a_detached_head_finds_the_nearest_ancestor_scan_on_any_branch() {
+    fn the_nearest_ancestor_scan_wins_whatever_branch_it_names() {
         let l = lineage();
-        let mut ancestry = Ancestry::new(&l.repo, &l.head).expect("head in clone");
+        let ancestry = Ancestry::walk(&l.repo, &l.head).expect("head in clone");
         // Newest first: a scan of a sibling branch, one of a commit this clone
         // never fetched, then two ancestors -- the nearer recorded detached.
         let scans = vec![
@@ -1487,8 +1493,7 @@ mod tests {
             detached_scan(&l.near),
         ];
 
-        let picked =
-            nearest_ancestor_baseline(&scans, &mut ancestry, false, true).expect("a baseline");
+        let picked = nearest_ancestor_baseline(&scans, &ancestry, false, true).expect("a baseline");
 
         assert_eq!(picked.sha.as_deref(), Some(l.near.as_str()));
         assert_eq!(picked.commits_back, Some(1));
@@ -1501,11 +1506,10 @@ mod tests {
     #[test]
     fn a_scan_of_head_itself_is_zero_commits_back() {
         let l = lineage();
-        let mut ancestry = Ancestry::new(&l.repo, &l.head).expect("head in clone");
+        let ancestry = Ancestry::walk(&l.repo, &l.head).expect("head in clone");
         let scans = vec![scan("main", &l.near), detached_scan(&l.head)];
 
-        let picked =
-            nearest_ancestor_baseline(&scans, &mut ancestry, false, true).expect("a baseline");
+        let picked = nearest_ancestor_baseline(&scans, &ancestry, false, true).expect("a baseline");
 
         assert_eq!(picked.commits_back, Some(0));
     }
@@ -1513,11 +1517,11 @@ mod tests {
     #[test]
     fn no_ancestor_on_the_page_means_no_ancestry_baseline() {
         let l = lineage();
-        let mut ancestry = Ancestry::new(&l.repo, &l.head).expect("head in clone");
+        let ancestry = Ancestry::walk(&l.repo, &l.head).expect("head in clone");
         let scans = vec![scan("feature", &l.side), scan_without_git("no-git")];
 
         assert_eq!(
-            nearest_ancestor_baseline(&scans, &mut ancestry, true, true),
+            nearest_ancestor_baseline(&scans, &ancestry, true, true),
             None
         );
     }
@@ -1525,14 +1529,14 @@ mod tests {
     #[test]
     fn between_scans_of_one_commit_the_one_with_checksums_wins() {
         let l = lineage();
-        let mut ancestry = Ancestry::new(&l.repo, &l.head).expect("head in clone");
+        let ancestry = Ancestry::walk(&l.repo, &l.head).expect("head in clone");
         let mut plain = detached_scan(&l.near);
         plain.id = "plain".to_string();
         let mut hashed = with_checksums(detached_scan(&l.near));
         hashed.id = "hashed".to_string();
 
-        let picked = nearest_ancestor_baseline(&[plain, hashed], &mut ancestry, true, true)
-            .expect("a baseline");
+        let picked =
+            nearest_ancestor_baseline(&[plain, hashed], &ancestry, true, true).expect("a baseline");
 
         assert_eq!(picked.id, "hashed");
     }
@@ -1542,14 +1546,13 @@ mod tests {
         // A dirty tree without --ignore-dirty-worktree, or an --exclude run:
         // the nearer scan could only be diffed from its commit.
         let l = lineage();
-        let mut ancestry = Ancestry::new(&l.repo, &l.head).expect("head in clone");
+        let ancestry = Ancestry::walk(&l.repo, &l.head).expect("head in clone");
         let scans = vec![
             detached_scan(&l.near),
             with_checksums(detached_scan(&l.root)),
         ];
 
-        let picked =
-            nearest_ancestor_baseline(&scans, &mut ancestry, true, false).expect("a baseline");
+        let picked = nearest_ancestor_baseline(&scans, &ancestry, true, false).expect("a baseline");
 
         assert_eq!(picked.sha.as_deref(), Some(l.root.as_str()));
         assert_eq!(picked.commits_back, Some(2));
@@ -1558,8 +1561,47 @@ mod tests {
     #[test]
     fn a_head_this_clone_does_not_hold_offers_no_ancestry() {
         let l = lineage();
-        assert!(Ancestry::new(&l.repo, &"0".repeat(40)).is_none());
-        assert!(Ancestry::new(&l.repo, "not-a-sha").is_none());
+        assert!(Ancestry::walk(&l.repo, &"0".repeat(40)).is_none());
+        assert!(Ancestry::walk(&l.repo, "not-a-sha").is_none());
+    }
+
+    #[test]
+    fn the_walk_follows_both_sides_of_a_merge_and_skips_other_branches() {
+        let l = lineage();
+        let side_tip = commit_on(&l.repo, &[git2::Oid::from_str(&l.side).unwrap()], "tip.txt");
+        let merge = commit_on(
+            &l.repo,
+            &[git2::Oid::from_str(&l.near).unwrap(), side_tip],
+            "merge.txt",
+        );
+
+        let ancestry = Ancestry::walk(&l.repo, &merge.to_string()).expect("head in clone");
+
+        let back = |sha: &str| ancestry.commits_back.get(sha).copied();
+        assert_eq!(back(&l.near), Some(1));
+        assert_eq!(back(&side_tip.to_string()), Some(1));
+        assert_eq!(back(&l.side), Some(2));
+        assert_eq!(back(&l.root), Some(2));
+        assert_eq!(back(&l.head), None);
+        assert_eq!(ancestry.shas.first(), Some(&merge.to_string()));
+    }
+
+    #[test]
+    fn the_walk_stops_at_what_one_request_can_ask_about() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repository::init(dir.path()).expect("init");
+        let mut tip = commit_on(&repo, &[], "0");
+        for i in 1..=ANCESTOR_LOOKUP_COMMITS + 5 {
+            tip = commit_on(&repo, &[tip], &i.to_string());
+        }
+
+        let ancestry = Ancestry::walk(&repo, &tip.to_string()).expect("head in clone");
+
+        assert_eq!(ancestry.shas.len(), ANCESTOR_LOOKUP_COMMITS);
+        assert_eq!(
+            ancestry.commits_back.get(ancestry.shas.last().unwrap()),
+            Some(&(ANCESTOR_LOOKUP_COMMITS - 1))
+        );
     }
 
     #[test]
