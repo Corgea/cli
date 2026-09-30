@@ -343,26 +343,87 @@ pub(crate) fn plan_step(plan: &[ExpectedRequest], label: &str) -> usize {
 
 /// Every baseline lookup a fixture repo makes when nothing turns up.
 ///
-/// Two walks over the branch candidates: the one being scanned, whose last scan
-/// is the nearest baseline there could be, then the two trunk names, since the
-/// fixture records no origin/HEAD. The first walk takes a baseline of either
-/// kind, so it cannot let the server drop scans that are not known-clean; the
-/// second asks for exactly those once no checksums have been found, so a clean
-/// scan behind a page budget's worth of dirty ones is still reachable.
+/// The branch being scanned first, whose last scan is the nearest baseline
+/// there could be; then the scans of this checkout's recent commits on any
+/// branch; then the two trunk names, since the fixture records no origin/HEAD.
+/// Each branch lookup is two walks. The first takes a baseline of either kind,
+/// so it cannot let the server drop scans that are not known-clean; the second
+/// asks for exactly those once no checksums have been found, so a clean scan
+/// behind a page budget's worth of dirty ones is still reachable.
 pub(crate) fn baseline_lookups_finding_nothing(project: &'static str) -> Vec<ExpectedRequest> {
-    let mut lookups = Vec::new();
-    for require_clean in [false, true] {
-        for branch in BASELINE_BRANCH_ORDER {
-            lookups.push(expected_request(
-                "look up a baseline scan to diff against",
-                move |request| {
-                    assert_baseline_lookup_request(request, project, Some(branch), require_clean)
-                },
-                json_response(scans_response(Vec::new())),
-            ));
-        }
-    }
+    let (own, trunks) = BASELINE_BRANCH_ORDER.split_at(1);
+    let branch_walks = |branches: &[&'static str]| -> Vec<ExpectedRequest> {
+        [false, true]
+            .into_iter()
+            .flat_map(|require_clean| {
+                branches.iter().map(move |&branch| {
+                    expected_request(
+                        "look up a baseline scan to diff against",
+                        move |request| {
+                            assert_baseline_lookup_request(
+                                request,
+                                project,
+                                Some(branch),
+                                require_clean,
+                            )
+                        },
+                        json_response(scans_response(Vec::new())),
+                    )
+                })
+            })
+            .collect()
+    };
+    let mut lookups = branch_walks(own);
+    lookups.push(expected_request(
+        "look up a baseline scan of a recent commit",
+        move |request| assert_ancestor_lookup_request(request, project, None, false),
+        json_response(scans_response(Vec::new())),
+    ));
+    lookups.extend(branch_walks(trunks));
     lookups
+}
+
+/// The lookup by commit: the checkout's recent commits in one `sha` list, on
+/// any branch. `shas`, when given, is the exact list expected, nearest first;
+/// otherwise any list of full commit hashes passes.
+pub(crate) fn assert_ancestor_lookup_request(
+    request: &CapturedRequest,
+    project: &str,
+    shas: Option<&[String]>,
+    require_clean: bool,
+) -> Result<(), String> {
+    assert_authenticated_request(request, Method::GET, "/api/v1/scans")?;
+    assert_query(request, "page", "1")?;
+    assert_query(request, "page_size", "50")?;
+    assert_query(request, "project", project)?;
+    assert_query(request, "engine", "corgea-blast")?;
+    assert_query(request, "status", "complete")?;
+    assert_query(request, "exclude_pull_requests", "true")?;
+    assert_query(request, "full_project_state", "true")?;
+    if let Ok(branch) = query_value(request, "branch") {
+        return Err(format!(
+            "a lookup by commit must not ask for branch {branch}"
+        ));
+    }
+    match (require_clean, query_value(request, "worktree_dirty")) {
+        (true, Ok(value)) if value == "false" => {}
+        (false, Err(_)) => {}
+        (_, value) => return Err(format!("unexpected worktree_dirty filter {value:?}")),
+    }
+    let sent = query_value(request, "sha")?;
+    match shas {
+        Some(shas) if sent != shas.join(",") => {
+            Err(format!("expected sha={}, got {sent}", shas.join(",")))
+        }
+        Some(_) => Ok(()),
+        None if sent
+            .split(',')
+            .all(|sha| sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())) =>
+        {
+            Ok(())
+        }
+        None => Err(format!("expected a list of commit hashes, got sha={sent}")),
+    }
 }
 
 /// One baseline lookup an incremental scan makes before uploading.

@@ -1241,6 +1241,41 @@ pub fn query_baseline_scans(
     page: u16,
     page_size: u16,
 ) -> Result<ScansResponse, Box<dyn Error>> {
+    let mut query_params = baseline_scan_params(project, engine, require_clean, page, page_size);
+    if let Some(branch) = branch {
+        query_params.push(("branch", branch.to_string()));
+    }
+    request_scan_list(url, query_params)
+}
+
+/// One page of the project's scans of any of `shas` that could be diffed
+/// against, on any branch, newest first.
+///
+/// A backend that takes a single `sha` reads the list as one literal commit
+/// and matches nothing. One predating the `sha` filter ignores it and answers
+/// with scans at any commit, so callers must re-check `git_sha` on every scan
+/// they act on.
+pub fn query_baseline_scans_at_commits(
+    url: &str,
+    project: &str,
+    engine: &str,
+    shas: &[String],
+    require_clean: bool,
+    page: u16,
+    page_size: u16,
+) -> Result<ScansResponse, Box<dyn Error>> {
+    let mut query_params = baseline_scan_params(project, engine, require_clean, page, page_size);
+    query_params.push(("sha", shas.join(",")));
+    request_scan_list(url, query_params)
+}
+
+fn baseline_scan_params(
+    project: &str,
+    engine: &str,
+    require_clean: bool,
+    page: u16,
+    page_size: u16,
+) -> Vec<(&'static str, String)> {
     let mut query_params = vec![
         ("page", page.to_string()),
         ("page_size", page_size.to_string()),
@@ -1252,13 +1287,10 @@ pub fn query_baseline_scans(
         // so copying forward from one would drop everything else.
         ("full_project_state", "true".to_string()),
     ];
-    if let Some(branch) = branch {
-        query_params.push(("branch", branch.to_string()));
-    }
     if require_clean {
         query_params.push(("worktree_dirty", "false".to_string()));
     }
-    request_scan_list(url, query_params)
+    query_params
 }
 
 /// One page of the project's scans at exactly `sha`, newest first.
