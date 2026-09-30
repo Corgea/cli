@@ -56,9 +56,10 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 const SCAN_LOOKUP_PAGE_SIZE: u16 = 30;
 
 /// How many of this checkout's nearest commits a baseline is looked for among.
-/// The most the scan list's `sha` filter takes in one request, and the most
-/// scans per page it returns.
-const ANCESTOR_LOOKUP_COMMITS: usize = 50;
+/// Must stay within the 50 the scan list's `sha` filter takes in one request.
+const ANCESTOR_LOOKUP_COMMITS: usize = 10;
+/// The most scans per page the scan list returns, so one page normally holds
+/// every scan of those commits.
 const ANCESTOR_LOOKUP_PAGE_SIZE: u16 = 50;
 
 /// Backstop on pages walked looking for a baseline.
