@@ -62,21 +62,18 @@ three retries again. A `429` that names a `Retry-After` in seconds is honored,
 up to two minutes for any one pause, and never shortens the pause below the
 schedule.
 
-Which requests get retried depends on whether the request could have reached
-Corgea:
+Which requests get retried depends on which it is:
 
-- A `429`, `521 Web Server Is Down` or `523 Origin Is Unreachable` retries
-  everything, `POST` and `PATCH` included. The rate limiter declined the
-  request, or Cloudflare could not connect to Corgea at all, so nothing was
-  created and sending it again finishes the same work.
-- A `502`, `504`, `520`, `522` or `524 A Timeout Occurred` retries reads only.
-  Each comes from a proxy rather than from Corgea, so it is equally the answer
-  for "the request never arrived" and for "the request was processed and the
-  reply was lost coming back" — a `524` in particular means Corgea took the
-  request and was still working on it when Cloudflare stopped waiting. Every
-  write the CLI sends creates something, so re-sending one does not finish the
-  first scan, it starts a second. A write's gateway error goes straight to the
-  caller.
+- A `429` retries everything, `POST` and `PATCH` included. The rate limiter
+  declines the request before the API sees it, so nothing was created and
+  sending it again finishes the same work.
+- A gateway error — `502`, `504`, or Cloudflare's `520`–`524` — retries reads
+  only. It comes from a proxy rather than from Corgea, so it is not Corgea's
+  word on what happened to the request: a `524` in particular means Corgea took
+  the request and was still working on it when Cloudflare stopped waiting.
+  Every write the CLI sends creates something, so re-sending one does not
+  finish the first scan, it starts a second. A write's gateway error goes
+  straight to the caller.
 
 Writes still retry network errors, where nothing reached Corgea at all.
 

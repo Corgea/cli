@@ -422,8 +422,8 @@ pub fn upload_scan(
                         // the platform being unavailable, not something wrong
                         // with this one file: a gateway error such as a 502 or
                         // 524 because an upload is a write and so is never
-                        // replayed, a 429 or 521 because its retries are
-                        // already spent. Walking the remaining paths would
+                        // replayed, the 429 because its retries are already
+                        // spent. Walking the remaining paths would
                         // just collect the same answer once per file, so stop
                         // uploading source files altogether.
                         if utils::api::is_transient_error(status) {

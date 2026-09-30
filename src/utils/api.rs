@@ -210,72 +210,63 @@ const CLOUDFLARE_CONNECTION_TIMED_OUT: u16 = 522;
 const CLOUDFLARE_ORIGIN_UNREACHABLE: u16 = 523;
 const CLOUDFLARE_TIMEOUT_OCCURRED: u16 = 524;
 
-/// Statuses that say the request never reached the API, so nothing was
-/// created and any method can be sent again.
-///
-/// - `429 Too Many Requests` is Corgea's rate limiter declining the request.
-/// - `521 Web Server Is Down` is Cloudflare having its connection to the
-///   origin refused.
-/// - `523 Origin Is Unreachable` is Cloudflare finding no route to the origin.
-fn never_reached_api(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS
-        || matches!(
-            status.as_u16(),
-            CLOUDFLARE_WEB_SERVER_DOWN | CLOUDFLARE_ORIGIN_UNREACHABLE
-        )
-}
-
-/// Statuses where a proxy in front of the API gave up waiting for it, which
-/// says nothing about whether the API acted: each is equally the answer for
-/// "never arrived" and for "was processed, and the reply was lost".
+/// Statuses where a proxy in front of the API failed to get an answer from it.
 ///
 /// - `502 Bad Gateway` and `504 Gateway Timeout` from any proxy.
 /// - `520 Unknown Error`: the origin reset the connection or sent back
 ///   something that was not an HTTP response.
+/// - `521 Web Server Is Down`: the origin refused Cloudflare's connection.
 /// - `522 Connection Timed Out`: covers the connection never opening, but also
 ///   the request going out and never being acknowledged.
+/// - `523 Origin Is Unreachable`: Cloudflare found no route to the origin.
 /// - `524 A Timeout Occurred`: Cloudflare delivered the request and the origin
 ///   did not answer within the proxy read timeout (125s by default) — which
 ///   is the API still working on it, not the API never seeing it.
-fn proxy_lost_answer(status: StatusCode) -> bool {
+fn is_gateway_error(status: StatusCode) -> bool {
     matches!(
         status,
         StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT
     ) || matches!(
         status.as_u16(),
-        CLOUDFLARE_UNKNOWN_ERROR | CLOUDFLARE_CONNECTION_TIMED_OUT | CLOUDFLARE_TIMEOUT_OCCURRED
+        CLOUDFLARE_UNKNOWN_ERROR
+            | CLOUDFLARE_WEB_SERVER_DOWN
+            | CLOUDFLARE_CONNECTION_TIMED_OUT
+            | CLOUDFLARE_ORIGIN_UNREACHABLE
+            | CLOUDFLARE_TIMEOUT_OCCURRED
     )
 }
 
 /// Statuses the CLI answers with a retry rather than a failure.
 ///
-/// None of them is the API rejecting the request on its merits — they are the
-/// rate limiter, or the proxies between the CLI and the API failing to get an
-/// answer — so under the parallel scanning load that produces them a retry
-/// succeeds where failing the pipeline would not.
+/// A `429` is Corgea's rate limiter turning the request away and a gateway
+/// error is a proxy in front of Corgea failing to get an answer from the API.
+/// Neither is the API rejecting the request on its merits, so under the
+/// parallel scanning load that produces them a retry succeeds where failing the
+/// pipeline would not.
 pub fn is_transient_error(status: StatusCode) -> bool {
-    never_reached_api(status) || proxy_lost_answer(status)
+    status == StatusCode::TOO_MANY_REQUESTS || is_gateway_error(status)
 }
 
 /// Whether `status` is worth sending this `method` again.
 ///
 /// Every transient status is worth retrying, but they promise different things
-/// about what happened to the request, and only some are safe to answer by
+/// about what happened to the request, and only one is safe to answer by
 /// re-sending a write:
 ///
-/// - A status from `never_reached_api` means nothing was created, so any
-///   method can be sent again — which matters most for the writes, since an
-///   upload that failed the command leaves a pipeline to be re-run by hand.
-/// - A status from `proxy_lost_answer` leaves it open whether the API acted.
-///   Only a request that changes nothing is safe to send into that ambiguity,
-///   and every write the CLI sends creates something. `POST /start-scan` mints
-///   a transfer, `POST /scan-upload` takes a whole report, and the archive
-///   `PATCH` that fills the last of `Upload-Length` is the one that answers
-///   with `scan_id` — on an archive under `CHUNK_SIZE`, the only chunk.
-///   Re-sending one of those does not finish the first scan, it starts a
-///   second.
+/// - `429 Too Many Requests` is the rate limiter declining the request before
+///   the API sees it. Nothing was created, so any method can be sent again —
+///   which matters most for the writes, since a rate-limited upload that failed
+///   the command leaves a pipeline to be re-run by hand.
+/// - A gateway error comes from a proxy, so it is not the API's word on what
+///   happened to the request. Only a request that changes nothing is sent
+///   again, because every write the CLI sends creates something.
+///   `POST /start-scan` mints a transfer, `POST /scan-upload` takes a whole
+///   report, and the archive `PATCH` that fills the last of `Upload-Length` is
+///   the one that answers with `scan_id` — on an archive under `CHUNK_SIZE`,
+///   the only chunk. Re-sending one of those does not finish the first scan,
+///   it starts a second.
 fn should_retry(status: StatusCode, method: &Method) -> bool {
-    never_reached_api(status) || (proxy_lost_answer(status) && method.is_safe())
+    status == StatusCode::TOO_MANY_REQUESTS || (is_gateway_error(status) && method.is_safe())
 }
 
 /// Pauses before each retry: a transient error has to survive four attempts
@@ -3142,17 +3133,9 @@ mod tests {
     }
 
     #[test]
-    fn cloudflare_retries_writes_only_when_the_origin_never_saw_them() {
-        // Refused (521) or unroutable (523): the request never left Cloudflare.
-        for code in [521, 523] {
-            for method in [Method::GET, Method::POST, Method::PATCH] {
-                assert!(should_retry(status(code), &method), "{code} {method}");
-            }
-        }
-        // A gateway timeout, an origin reset (520), a request never
-        // acknowledged (522), or an origin that took the request and outran the
-        // read timeout (524): the API may have acted, so only reads go again.
-        for code in [504, 520, 522, 524] {
+    fn cloudflare_gateway_errors_are_retried_only_for_reads() {
+        // A proxy's word on the request, not the API's: only reads go again.
+        for code in [504, 520, 521, 522, 523, 524] {
             for method in [Method::GET, Method::HEAD] {
                 assert!(should_retry(status(code), &method), "{code} {method}");
             }
@@ -3201,9 +3184,9 @@ mod tests {
     }
 
     #[test]
-    fn send_retries_a_post_the_origin_refused() {
+    fn send_leaves_a_post_at_one_attempt_when_the_origin_is_down() {
         let (base, hits) = spawn_failing_stub(
-            2,
+            usize::MAX,
             "521 Web Server Is Down",
             "",
             "<html><body>error code: 521</body></html>",
@@ -3211,8 +3194,8 @@ mod tests {
 
         let response = http_client().post(&base).body("{}").send().expect("send");
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(response.status().as_u16(), 521);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[test]
