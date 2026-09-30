@@ -202,45 +202,71 @@ impl DebugRequestBuilder {
     }
 }
 
-/// Statuses the CLI answers with a retry rather than a failure.
+/// Cloudflare's own statuses for failing to get an answer from the origin.
+/// They have no `StatusCode` constants because no RFC defines them.
+const CLOUDFLARE_UNKNOWN_ERROR: u16 = 520;
+const CLOUDFLARE_WEB_SERVER_DOWN: u16 = 521;
+const CLOUDFLARE_CONNECTION_TIMED_OUT: u16 = 522;
+const CLOUDFLARE_ORIGIN_UNREACHABLE: u16 = 523;
+const CLOUDFLARE_TIMEOUT_OCCURRED: u16 = 524;
+
+/// Statuses where a proxy in front of the API failed to get an answer from it.
 ///
-/// A `429` is Corgea's rate limiter turning the request away and a `502` is the
-/// proxy in front of Corgea failing to get an answer from the API. Neither is
-/// the API rejecting the request on its merits, so under the parallel scanning
-/// load that produces them a retry succeeds where failing the pipeline would
-/// not.
-pub fn is_transient_error(status: StatusCode) -> bool {
+/// - `502 Bad Gateway` and `504 Gateway Timeout` from any proxy.
+/// - `520 Unknown Error`: the origin reset the connection or sent back
+///   something that was not an HTTP response.
+/// - `521 Web Server Is Down`: the origin refused Cloudflare's connection.
+/// - `522 Connection Timed Out`: covers the connection never opening, but also
+///   the request going out and never being acknowledged.
+/// - `523 Origin Is Unreachable`: Cloudflare found no route to the origin.
+/// - `524 A Timeout Occurred`: Cloudflare delivered the request and the origin
+///   did not answer within the proxy read timeout (125s by default) — which
+///   is the API still working on it, not the API never seeing it.
+fn is_gateway_error(status: StatusCode) -> bool {
     matches!(
         status,
-        StatusCode::TOO_MANY_REQUESTS | StatusCode::BAD_GATEWAY
+        StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT
+    ) || matches!(
+        status.as_u16(),
+        CLOUDFLARE_UNKNOWN_ERROR
+            | CLOUDFLARE_WEB_SERVER_DOWN
+            | CLOUDFLARE_CONNECTION_TIMED_OUT
+            | CLOUDFLARE_ORIGIN_UNREACHABLE
+            | CLOUDFLARE_TIMEOUT_OCCURRED
     )
+}
+
+/// Statuses the CLI answers with a retry rather than a failure.
+///
+/// A `429` is Corgea's rate limiter turning the request away and a gateway
+/// error is a proxy in front of Corgea failing to get an answer from the API.
+/// Neither is the API rejecting the request on its merits, so under the
+/// parallel scanning load that produces them a retry succeeds where failing the
+/// pipeline would not.
+pub fn is_transient_error(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || is_gateway_error(status)
 }
 
 /// Whether `status` is worth sending this `method` again.
 ///
-/// Both transient statuses are worth retrying, but they promise different
-/// things about what happened to the request, and only one of them is safe to
-/// answer by re-sending a write:
+/// Every transient status is worth retrying, but they promise different things
+/// about what happened to the request, and only one is safe to answer by
+/// re-sending a write:
 ///
 /// - `429 Too Many Requests` is the rate limiter declining the request before
 ///   the API sees it. Nothing was created, so any method can be sent again —
 ///   which matters most for the writes, since a rate-limited upload that failed
 ///   the command leaves a pipeline to be re-run by hand.
-/// - `502 Bad Gateway` comes from the proxy, so it says nothing about whether
-///   the API acted: it is equally the answer for "never arrived" and for "was
-///   processed, and the reply was lost coming back". Only a request that changes
-///   nothing is safe to send into that ambiguity, and every write the CLI sends
-///   creates something. `POST /start-scan` mints a transfer, `POST /scan-upload`
-///   takes a whole report, and the archive `PATCH` that fills the last of
-///   `Upload-Length` is the one that answers with `scan_id` — on an archive
-///   under `CHUNK_SIZE`, the only chunk. Re-sending one of those does not finish
-///   the first scan, it starts a second.
+/// - A gateway error comes from a proxy, so it is not the API's word on what
+///   happened to the request. Only a request that changes nothing is sent
+///   again, because every write the CLI sends creates something.
+///   `POST /start-scan` mints a transfer, `POST /scan-upload` takes a whole
+///   report, and the archive `PATCH` that fills the last of `Upload-Length` is
+///   the one that answers with `scan_id` — on an archive under `CHUNK_SIZE`,
+///   the only chunk. Re-sending one of those does not finish the first scan,
+///   it starts a second.
 fn should_retry(status: StatusCode, method: &Method) -> bool {
-    match status {
-        StatusCode::TOO_MANY_REQUESTS => true,
-        StatusCode::BAD_GATEWAY => method.is_safe(),
-        _ => false,
-    }
+    status == StatusCode::TOO_MANY_REQUESTS || (is_gateway_error(status) && method.is_safe())
 }
 
 /// Pauses before each retry: a transient error has to survive four attempts
@@ -3014,20 +3040,21 @@ mod tests {
                 Duration::from_secs(50)
             ]
         );
-        assert!(is_transient_error(StatusCode::BAD_GATEWAY));
-        assert!(is_transient_error(StatusCode::TOO_MANY_REQUESTS));
+        for code in [429, 502, 504, 520, 521, 522, 523, 524] {
+            assert!(is_transient_error(status(code)), "{code}");
+        }
         // Everything else is the API answering for itself, including the other
         // 5xx: those are not what the pipelines are hitting, and replaying an
-        // upload the server did read is not free.
-        for status in [
-            StatusCode::OK,
-            StatusCode::UNAUTHORIZED,
-            StatusCode::NOT_FOUND,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            StatusCode::SERVICE_UNAVAILABLE,
-        ] {
-            assert!(!is_transient_error(status), "{status}");
+        // upload the server did read is not free. 525, 526 and 530 are
+        // Cloudflare too, but a broken certificate or DNS record does not fix
+        // itself within the schedule.
+        for code in [200, 401, 404, 500, 503, 525, 526, 530] {
+            assert!(!is_transient_error(status(code)), "{code}");
         }
+    }
+
+    fn status(code: u16) -> StatusCode {
+        StatusCode::from_u16(code).unwrap()
     }
 
     #[test]
@@ -3135,6 +3162,72 @@ mod tests {
             assert!(!should_retry(status, &Method::GET), "{status}");
             assert!(!should_retry(status, &Method::POST), "{status}");
         }
+    }
+
+    #[test]
+    fn cloudflare_gateway_errors_are_retried_only_for_reads() {
+        // A proxy's word on the request, not the API's: only reads go again.
+        for code in [504, 520, 521, 522, 523, 524] {
+            for method in [Method::GET, Method::HEAD] {
+                assert!(should_retry(status(code), &method), "{code} {method}");
+            }
+            for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+                assert!(
+                    !should_retry(status(code), &method),
+                    "{code} {method} must be sent once"
+                );
+            }
+        }
+        for code in [525, 526, 530] {
+            assert!(!should_retry(status(code), &Method::GET), "{code}");
+        }
+    }
+
+    #[test]
+    fn send_retries_a_cloudflare_timeout_on_a_read() {
+        let (base, hits) = spawn_failing_stub(
+            2,
+            "524 A Timeout Occurred",
+            "",
+            "<html><body>error code: 524</body></html>",
+        );
+
+        let response = http_client().get(&base).send().expect("send");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "two 524s, then the answer");
+    }
+
+    #[test]
+    fn send_leaves_a_post_at_one_attempt_on_a_cloudflare_timeout() {
+        // The origin took the request and was still working on it when
+        // Cloudflare gave up; sending it again would start a second scan.
+        let (base, hits) = spawn_failing_stub(
+            usize::MAX,
+            "524 A Timeout Occurred",
+            "",
+            "<html><body>error code: 524</body></html>",
+        );
+
+        let response = http_client().post(&base).body("{}").send().expect("send");
+
+        assert_eq!(response.status().as_u16(), 524);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn send_leaves_a_post_at_one_attempt_when_the_origin_is_down() {
+        let (base, hits) = spawn_failing_stub(
+            usize::MAX,
+            "521 Web Server Is Down",
+            "",
+            "<html><body>error code: 521</body></html>",
+        );
+
+        let response = http_client().post(&base).body("{}").send().expect("send");
+
+        assert_eq!(response.status().as_u16(), 521);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[test]

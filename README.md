@@ -50,8 +50,9 @@ that exits 1 on a blocking rule still leaves its report behind to ingest.
 
 ### Rate limits and gateway errors are retried
 
-Neither `429 Too Many Requests` nor `502 Bad Gateway` is Corgea rejecting a
-request on its merits, so both are retried rather than failed: the CLI waits
+A `429 Too Many Requests`, a `502 Bad Gateway` or `504 Gateway Timeout`, and
+Cloudflare's `520`–`524` are not Corgea rejecting a request on its merits, so
+all of them are retried rather than failed: the CLI waits
 10s, then 30s, then 50s, and a pipeline rides out the blips a busy platform
 produces under parallel scans instead of failing on them. A request still
 answered the same way after those three retries fails the command in the usual
@@ -61,21 +62,23 @@ three retries again. A `429` that names a `Retry-After` in seconds is honored,
 up to two minutes for any one pause, and never shortens the pause below the
 schedule.
 
-Which requests get retried depends on which of the two it is:
+Which requests get retried depends on which it is:
 
 - A `429` retries everything, `POST` and `PATCH` included. The rate limiter
   declines the request before the API sees it, so nothing was created and
   sending it again finishes the same work.
-- A `502` retries reads only. It comes from the proxy rather than from Corgea,
-  so it is equally the answer for "the request never arrived" and for "the
-  request was processed and the reply was lost coming back" — and every write
-  the CLI sends creates something, so re-sending one does not finish the first
-  scan, it starts a second. A write's 502 goes straight to the caller.
+- A gateway error — `502`, `504`, or Cloudflare's `520`–`524` — retries reads
+  only. It comes from a proxy rather than from Corgea, so it is not Corgea's
+  word on what happened to the request: a `524` in particular means Corgea took
+  the request and was still working on it when Cloudflare stopped waiting.
+  Every write the CLI sends creates something, so re-sending one does not
+  finish the first scan, it starts a second. A write's gateway error goes
+  straight to the caller.
 
 Writes still retry network errors, where nothing reached Corgea at all.
 
-`corgea upload` treats either status on a source upload — a 502, or a rate limit
-that outlived its retries — as the platform being unavailable rather than one bad
+`corgea upload` treats any of these on a source upload — a gateway error, or a
+rate limit that outlived its retries — as the platform being unavailable rather than one bad
 file, and reports the remaining paths as unsent instead of collecting the same
 answer once per path.
 
