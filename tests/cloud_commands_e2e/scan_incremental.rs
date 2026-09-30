@@ -809,8 +809,17 @@ fn a_scan_of_a_recent_commit_is_the_baseline_when_the_branch_has_none() {
 /// A detached HEAD has no branch lookup to make, and when none of its recent
 /// commits was scanned it still reaches trunk -- through a git diff here, which
 /// needs the two commits and no branch.
+///
+/// So does a lookup by commit that fails. A backend that cannot answer a list
+/// of commits must not cost the trunk baseline every earlier release found.
 #[test]
 fn a_detached_head_with_no_scanned_recent_commit_falls_back_to_trunk() {
+    for lookup_by_commit_fails in [false, true] {
+        assert_detached_head_falls_back_to_trunk(lookup_by_commit_fails);
+    }
+}
+
+fn assert_detached_head_falls_back_to_trunk(lookup_by_commit_fails: bool) {
     let project = git_project();
     let base_sha = project.sha.clone();
     let head_sha = second_commit(&project);
@@ -819,10 +828,20 @@ fn a_detached_head_with_no_scanned_recent_commit_falls_back_to_trunk() {
     let mut scan = baseline_scan(&base_sha);
     scan["branch"] = json!("main");
     let expected_base = base_sha.clone();
+    let shas = vec![head_sha, base_sha];
+    let lookup_by_commit = if lookup_by_commit_fails {
+        expected_request(
+            "fail the baseline lookup by commit",
+            move |request| assert_ancestor_lookup_request(request, PROJECT, Some(&shas), false),
+            json_response_with_status(StatusCode::BAD_REQUEST, json!({"error": "bad sha"})),
+        )
+    } else {
+        ancestor_lookup(Some(shas), vec![])
+    };
     let mut plan = vec![
         verify_request(),
         scan_settings_request(PROJECT),
-        ancestor_lookup(Some(vec![head_sha, base_sha]), vec![]),
+        lookup_by_commit,
         baseline_lookup("main", vec![scan]),
         start_upload(),
         expected_request(
@@ -908,40 +927,20 @@ fn a_baseline_on_a_later_page_is_still_found() {
 
 /// A lookup that failed says so. Reporting it as "no earlier scan" tells someone
 /// with years of scan history that they have none, and now that incremental is
-/// the default, any network blip would say it. Nor does a failure fall through
-/// to the next lookup: the endpoint that failed is the one it would ask.
+/// the default, any network blip would say it.
 #[test]
 fn a_failed_lookup_is_not_reported_as_a_missing_baseline() {
-    for fail_by_commit in [false, true] {
-        assert_failed_lookup_scans_everything(fail_by_commit);
-    }
-}
-
-fn assert_failed_lookup_scans_everything(fail_by_commit: bool) {
     let project = git_project();
     second_commit(&project);
 
-    let failure =
-        || json_response_with_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "boom"}));
-    let mut plan = vec![verify_request(), scan_settings_request(PROJECT)];
-    if fail_by_commit {
-        plan.extend([
-            baseline_lookup(FIXTURE_BRANCH, vec![]),
-            clean_baseline_lookup(FIXTURE_BRANCH, vec![]),
-            expected_request(
-                "fail the baseline lookup by commit",
-                |request| assert_ancestor_lookup_request(request, PROJECT, None, false),
-                failure(),
-            ),
-        ]);
-    } else {
-        plan.push(expected_request(
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        expected_request(
             "fail the baseline lookup",
             |request| assert_baseline_lookup_request(request, PROJECT, Some(FIXTURE_BRANCH), false),
-            failure(),
-        ));
-    }
-    plan.extend([
+            json_response_with_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "boom"})),
+        ),
         start_upload(),
         expected_request(
             "upload BLAST archive with no diff",
@@ -956,7 +955,7 @@ fn assert_failed_lookup_scans_everything(fail_by_commit: bool) {
             },
             json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
         ),
-    ]);
+    ];
     plan.extend(scan_tail());
 
     let api = ApiStub::start(plan);

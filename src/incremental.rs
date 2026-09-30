@@ -211,6 +211,9 @@ fn plan_diff(
         _ => None,
     };
 
+    // Whether the lookup by commit answered, so the refusal below only claims
+    // none of those commits was scanned when the server actually said so.
+    let mut commits_searched = false;
     let lookup = match &candidates {
         Some(candidates) => {
             // `baseline_branches` puts the branch being scanned first.
@@ -224,13 +227,22 @@ fn plan_diff(
             // master. It also finds the earlier runs of a detached CI pipeline,
             // which recorded no branch for a name to match.
             if let (BaselineLookup::NotFound, Some(ancestry)) = (&lookup, &ancestry) {
-                lookup = find_ancestor_baseline(
+                lookup = match find_ancestor_baseline(
                     config,
                     project_name,
                     ancestry,
                     checksums_usable,
                     git_diff_refusal(sources).is_none(),
-                );
+                ) {
+                    // A backend that cannot answer a list of commits must not
+                    // cost the trunk lookup every earlier release made. If the
+                    // endpoint itself is down, that lookup fails and says so.
+                    BaselineLookup::LookupFailed => BaselineLookup::NotFound,
+                    answered => {
+                        commits_searched = true;
+                        answered
+                    }
+                };
             }
             if lookup == BaselineLookup::NotFound {
                 lookup = find_baseline(config, project_name, Some(trunks), checksums_usable);
@@ -245,7 +257,7 @@ fn plan_diff(
             return Err(format!(
                 "project '{project_name}' has no completed scan {} that could be diffed \
                  against, so there is nothing to compare this one to",
-                match (&candidates, &ancestry) {
+                match (&candidates, ancestry.as_ref().filter(|_| commits_searched)) {
                     (Some(candidates), Some(ancestry)) => format!(
                         "on {}, nor of any of the {} most recent commits in this checkout's \
                          history",
@@ -783,7 +795,9 @@ fn find_ancestor_baseline(
         ) {
             Ok(response) => response,
             Err(e) => {
-                crate::log::debug(&format!("Baseline scan lookup failed: {e}"));
+                crate::log::debug(&format!(
+                    "Baseline lookup by commit failed, trying trunk instead: {e}"
+                ));
                 return BaselineLookup::LookupFailed;
             }
         };
