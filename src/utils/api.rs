@@ -2169,9 +2169,23 @@ pub struct AutoFixSuggestion {
     pub full_code: Option<FullCode>,
 }
 
+/// Reads an explicit `null` as an empty string.
+///
+/// Fixes the server could not produce a patch for (e.g. an `unsupported`
+/// Dockerfile finding) come back with `"diff": null` from older deployments,
+/// and `explanation` is not coalesced server-side at all.
+fn null_as_empty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Patch {
+    #[serde(default, deserialize_with = "null_as_empty_string")]
     pub diff: String,
+    #[serde(default, deserialize_with = "null_as_empty_string")]
     pub explanation: String,
 }
 
@@ -2373,6 +2387,39 @@ mod tests {
         assert_eq!(parsed.file_manifest_root, None);
         assert_eq!(parsed.file_manifest_version, None);
         assert_eq!(parsed.git_sha.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn an_issue_whose_fix_has_a_null_patch_still_parses() {
+        let body = r#"{
+            "status": "ok",
+            "issue": {
+                "id": "issue-1",
+                "scan_id": "scan-1",
+                "status": "open",
+                "urgency": "HI",
+                "created_at": "2026-01-01T00:00:00Z",
+                "classification": {"id": "CWE-20", "name": "Improper Input Validation", "description": null},
+                "location": {
+                    "file": {"name": "Dockerfile", "language": "other", "path": "Dockerfile"},
+                    "project": {"name": "proj", "branch": null, "git_sha": null},
+                    "line_number": 1
+                },
+                "details": {"explanation": null},
+                "auto_triage": {"false_positive_detection": {"status": "valid", "reasoning": null}},
+                "auto_fix_suggestion": {
+                    "status": "unsupported",
+                    "id": "fix-1",
+                    "patch": {"diff": null, "explanation": null}
+                }
+            }
+        }"#;
+
+        let parsed: FullIssueResponse = serde_json::from_str(body).unwrap();
+
+        let patch = parsed.issue.auto_fix_suggestion.unwrap().patch.unwrap();
+        assert_eq!(patch.diff, "");
+        assert_eq!(patch.explanation, "");
     }
 
     #[test]
