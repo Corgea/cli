@@ -121,6 +121,140 @@ const SCA_FAILURE: &str = r#"{"scan_type":"sca","level":"error","location":"Proj
     "message":"Could not read dependency metadata from the package registry."}"#;
 
 #[test]
+fn wait_retries_a_not_found_poll_then_succeeds() {
+    // The reported shape: the scan exists (first read) and then a later poll
+    // 404s before the row is visible again. That miss used to fail the command
+    // as if the scan itself had failed.
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&reads);
+    let url = common::spawn_http_stub(move |path| {
+        if path.contains("/issues") {
+            return ("200 OK", issues_json());
+        }
+        if path.starts_with("/api/v1/scan/") {
+            let read = reads.fetch_add(1, Ordering::SeqCst);
+            return match read {
+                0 => ("200 OK", scan_json("processing", "", "")),
+                1 => (
+                    "404 Not Found",
+                    String::from(r#"{"status":"error","message":"Scan doesn't exist"}"#),
+                ),
+                _ => ("200 OK", scan_json("complete", "", "")),
+            };
+        }
+        ("200 OK", String::from(r#"{"status":"ok"}"#))
+    });
+
+    let (code, output) = run_wait(&url, &[]);
+
+    assert_eq!(
+        code,
+        Some(0),
+        "a 404 mid-poll must be retried, not fail the wait: {output}"
+    );
+    assert!(
+        output.contains("Scan Completed Successfully"),
+        "a recovered 404 poll must still report success: {output}"
+    );
+    assert!(
+        !output.contains("did not complete"),
+        "a missed status read must not be reported as a scan failure: {output}"
+    );
+    assert!(
+        counter.load(Ordering::SeqCst) >= 3,
+        "expected initial read + 404 poll + successful poll, got {}: {output}",
+        counter.load(Ordering::SeqCst)
+    );
+}
+
+#[test]
+fn wait_fails_fast_on_unauthorized_poll() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let url = common::spawn_http_stub(move |path| {
+        if path.contains("/issues") {
+            return ("200 OK", issues_json());
+        }
+        if path.starts_with("/api/v1/scan/") {
+            // First read has to succeed so `corgea wait` enters the poll loop;
+            // the 401 is the poll itself.
+            let read = reads.fetch_add(1, Ordering::SeqCst);
+            if read == 0 {
+                return ("200 OK", scan_json("processing", "", ""));
+            }
+            return (
+                "401 Unauthorized",
+                String::from(r#"{"status":"error","message":"unauthorized"}"#),
+            );
+        }
+        ("200 OK", String::from(r#"{"status":"ok"}"#))
+    });
+
+    let started = Instant::now();
+    let (code, output) = run_wait(&url, &[("CORGEA_SCAN_TIMEOUT_SECONDS", "20")]);
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        code,
+        Some(1),
+        "auth failure must fail the command: {output}"
+    );
+    assert!(
+        output.contains("Unable to check the status"),
+        "auth failure during poll is a status-check failure: {output}"
+    );
+    assert!(
+        output.contains("status-check failure"),
+        "must distinguish a missed status from the scan failing: {output}"
+    );
+    assert!(
+        !output.contains("did not complete"),
+        "must not report the scan as failed when status could not be read: {output}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "retried a 401 until timeout ({elapsed:?}): {output}"
+    );
+}
+
+#[test]
+fn wait_timeout_after_not_found_polls_is_not_a_scan_failure() {
+    // Persistent 404s after the scan was seen once: the wait expires, and that
+    // expiry must not be worded as the scan failing.
+    let reads = Arc::new(AtomicUsize::new(0));
+    let url = common::spawn_http_stub(move |path| {
+        if path.contains("/issues") {
+            return ("200 OK", issues_json());
+        }
+        if path.starts_with("/api/v1/scan/") {
+            if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                return ("200 OK", scan_json("processing", "", ""));
+            }
+            return (
+                "404 Not Found",
+                String::from(r#"{"status":"error","message":"Scan doesn't exist"}"#),
+            );
+        }
+        ("200 OK", String::from(r#"{"status":"ok"}"#))
+    });
+
+    let (code, output) = run_wait(&url, &[("CORGEA_SCAN_TIMEOUT_SECONDS", "7")]);
+
+    assert_eq!(code, Some(1), "a timeout must fail the command: {output}");
+    assert!(
+        output.contains("Stopped waiting"),
+        "persistent 404s must expire as a timeout, not a scan failure: {output}"
+    );
+    assert!(
+        output.contains("not found"),
+        "timeout must name the last status we actually saw: {output}"
+    );
+    assert!(
+        !output.contains("did not complete"),
+        "a missed status read must not be reported as a scan failure: {output}"
+    );
+}
+
+#[test]
 fn wait_on_already_failed_scan_exits_nonzero() {
     let url = spawn_scan_api(
         &["incomplete"],
