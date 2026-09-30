@@ -116,11 +116,36 @@ jobs:
               ;;
           esac
 
+      # Release builds are named after the tag so they match the release they are
+      # attached to (npm-publish.yml looks them up by tag). Branch builds have no
+      # tag, so they fall back to the Cargo.toml version.
+      - name: Resolve Asset Name
+        id: asset
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ -n "$INPUT_TAG" ]]; then
+            version="$INPUT_TAG"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="v$(cargo metadata --no-deps --format-version 1 \
+              | jq -r '.packages[] | select(.name == "corgea") | .version')"
+          fi
+
+          if [[ -z "$version" || "$version" == "v" ]]; then
+            echo "Could not resolve the release version" >&2
+            exit 1
+          fi
+
+          echo "zip=corgea-${version}-${{ matrix.target }}.zip" >> "$GITHUB_OUTPUT"
+
       - name: Archive Binary (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          zip -j "corgea-${{ matrix.target }}.zip" \
+          zip -j "${{ steps.asset.outputs.zip }}" \
             "target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
 
       - name: Archive Binary (Windows)
@@ -129,7 +154,7 @@ jobs:
         run: |
           Compress-Archive `
             -Path "target\${{ matrix.target }}\release\${{ matrix.binary_name }}" `
-            -DestinationPath "corgea-${{ matrix.target }}.zip" `
+            -DestinationPath "${{ steps.asset.outputs.zip }}" `
             -Force
 
       - name: Upload to GitHub Release (tags)
@@ -137,7 +162,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
-          files: "corgea-${{ matrix.target }}.zip"
+          files: ${{ steps.asset.outputs.zip }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -146,4 +171,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.target }}
-          path: "corgea-${{ matrix.target }}.zip"
+          path: ${{ steps.asset.outputs.zip }}

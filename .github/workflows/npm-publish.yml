@@ -76,7 +76,7 @@ jobs:
         run: npm install --include=dev
 
       - name: Bundle binaries into vendor/
-        run: node scripts/npm/bundle-binaries.js release-assets
+        run: node scripts/npm/bundle-binaries.js release-assets "${{ needs.prepare.outputs.tag_name }}"
 
       - name: Publish corgea-cli
         env:
