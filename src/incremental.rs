@@ -6,12 +6,12 @@
 //! commits. This module works the diff out where the scan is run.
 //!
 //! Finding what to diff *against* is the same in both directions: ask the
-//! server for the newest completed scan of this branch. If this branch has
-//! never been scanned -- or the checkout names none, the detached HEAD a CI
-//! checkout usually lands on -- take the scan of the nearest commit in this
-//! checkout's recent history, whatever branch it was recorded under, and only
-//! then the newest scan of trunk. What changed since the baseline can then be
-//! measured two ways.
+//! server for scans of the commits nearest behind HEAD in this checkout's
+//! history, whatever branch they were recorded under, and take the one of the
+//! closest commit. Only when none of those was scanned -- or there is no
+//! history to walk -- fall back to the newest completed scan of this branch,
+//! then of trunk. What changed since the baseline can then be measured two
+//! ways.
 //!
 //! The first is the file checksums that scan uploaded, fetched and subtracted
 //! from this run's. It needs no git history, so it is the only one that works
@@ -56,8 +56,10 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 const SCAN_LOOKUP_PAGE_SIZE: u16 = 30;
 
 /// How many of this checkout's nearest commits a baseline is looked for among.
-/// Must stay within the 50 the scan list's `sha` filter takes in one request.
-const ANCESTOR_LOOKUP_COMMITS: usize = 10;
+const ANCESTOR_LOOKUP_COMMITS: usize = 20;
+/// How many of those commits one request asks about, nearest first. Must stay
+/// within the 50 the scan list's `sha` filter takes in one request.
+const ANCESTOR_LOOKUP_BATCH: usize = 10;
 /// The most scans per page the scan list returns, so one page normally holds
 /// every scan of those commits.
 const ANCESTOR_LOOKUP_PAGE_SIZE: u16 = 50;
@@ -215,43 +217,49 @@ fn plan_diff(
     // Whether the lookup by commit answered, so the refusal below only claims
     // none of those commits was scanned when the server actually said so.
     let mut commits_searched = false;
-    let lookup = match &candidates {
-        Some(candidates) => {
-            // `baseline_branches` puts the branch being scanned first.
-            let (own, trunks) = candidates.split_at(usize::from(branch.is_some()));
-            let mut lookup = find_baseline(config, project_name, Some(own), checksums_usable);
-            // Between this branch's own history and trunk's newest scan,
-            // because the scan of a commit this one descends from differs by
-            // only what this history has done since. Trunk's newest also
-            // differs by whatever trunk did after this branch forked, and may
-            // not be this branch's trunk at all where that is not main or
-            // master. It also finds the earlier runs of a detached CI pipeline,
-            // which recorded no branch for a name to match.
-            if let (BaselineLookup::NotFound, Some(ancestry)) = (&lookup, &ancestry) {
-                lookup = match find_ancestor_baseline(
-                    config,
-                    project_name,
-                    ancestry,
-                    checksums_usable,
-                    git_diff_refusal(sources).is_none(),
-                ) {
-                    // A backend that cannot answer a list of commits must not
-                    // cost the trunk lookup every earlier release made. If the
-                    // endpoint itself is down, that lookup fails and says so.
-                    BaselineLookup::LookupFailed => BaselineLookup::NotFound,
-                    answered => {
-                        commits_searched = true;
-                        answered
+    // Ancestry before any branch name, because the scan of a commit HEAD
+    // descends from differs by only what this history has done since. A
+    // branch's newest scan may be of a commit this checkout is behind or was
+    // rebased away from, and trunk's newest also differs by whatever trunk did
+    // after this branch forked. It also finds the earlier runs of a detached
+    // CI pipeline, which recorded no branch for a name to match.
+    let mut lookup = BaselineLookup::NotFound;
+    if let Some(ancestry) = &ancestry {
+        lookup = match find_ancestor_baseline(
+            config,
+            project_name,
+            ancestry,
+            checksums_usable,
+            git_diff_refusal(sources).is_none(),
+        ) {
+            // A backend that cannot answer a list of commits must not cost
+            // the branch lookups every earlier release made. If the endpoint
+            // itself is down, those fail too and say so.
+            BaselineLookup::LookupFailed => BaselineLookup::NotFound,
+            answered => {
+                commits_searched = true;
+                answered
+            }
+        };
+    }
+    if lookup == BaselineLookup::NotFound {
+        lookup = match &candidates {
+            Some(candidates) => {
+                // `baseline_branches` puts the branch being scanned first. Its
+                // own two walks finish before trunk is asked about, so a clean
+                // scan of this branch behind a page of dirty ones still beats
+                // trunk's.
+                let (own, trunks) = candidates.split_at(usize::from(branch.is_some()));
+                match find_baseline(config, project_name, Some(own), checksums_usable) {
+                    BaselineLookup::NotFound => {
+                        find_baseline(config, project_name, Some(trunks), checksums_usable)
                     }
-                };
+                    found => found,
+                }
             }
-            if lookup == BaselineLookup::NotFound {
-                lookup = find_baseline(config, project_name, Some(trunks), checksums_usable);
-            }
-            lookup
-        }
-        None => find_baseline(config, project_name, None, checksums_usable),
-    };
+            None => find_baseline(config, project_name, None, checksums_usable),
+        };
+    }
     let baseline = match lookup {
         BaselineLookup::Found(scan) => scan,
         BaselineLookup::NotFound => {
@@ -260,10 +268,10 @@ fn plan_diff(
                  against, so there is nothing to compare this one to",
                 match (&candidates, ancestry.as_ref().filter(|_| commits_searched)) {
                     (Some(candidates), Some(ancestry)) => format!(
-                        "on {}, nor of any of the {} most recent commits in this checkout's \
-                         history",
-                        join_or(candidates),
-                        ancestry.shas.len()
+                        "of any of the {} most recent commits in this checkout's history, \
+                         nor on {},",
+                        ancestry.shas.len(),
+                        join_or(candidates)
                     ),
                     (Some(candidates), None) => format!("on {}", join_or(candidates)),
                     (None, _) => "of its whole state".to_string(),
@@ -453,6 +461,17 @@ impl BaselineScan {
         }
     }
 
+    /// Order among scans found by ancestry, lowest best: fewest commits back,
+    /// then one this run can diff by its checksums over one it cannot.
+    fn ancestor_rank(&self, checksums_usable: bool) -> (usize, bool) {
+        let readable_checksums = self.manifest_root.is_some()
+            && self.manifest_version.as_deref() == Some(MANIFEST_VERSION);
+        (
+            self.commits_back.unwrap_or(usize::MAX),
+            !(checksums_usable && readable_checksums),
+        )
+    }
+
     /// How to refer to this scan in the one line the run prints.
     fn describe(&self) -> String {
         if let (Some(commits_back), Some(sha)) = (self.commits_back, &self.sha) {
@@ -488,19 +507,22 @@ enum BaselineLookup {
     LookupFailed,
 }
 
-/// The branches a baseline may come from, best first.
+/// The branches a baseline may come from, best first, once no scan of a recent
+/// commit was found.
 ///
-/// The branch being scanned leads. Its last scan is the nearest ancestor of
-/// this one that exists, so the diff against it is the smallest honest one and
-/// the findings carried forward are this branch's own. A long-lived branch that
-/// has diverged from trunk gets the biggest reduction: against trunk every file
-/// it has touched since it forked is "changed", against its own last scan only
-/// what moved since that scan is.
+/// The branch being scanned leads. Its last scan is usually an ancestor of this
+/// one further back than the commit lookup reaches, so the diff against it is
+/// the smallest left and the findings carried forward are this branch's own. A
+/// long-lived branch that has diverged from trunk gets the biggest reduction:
+/// against trunk every file it has touched since it forked is "changed",
+/// against its own last scan only what moved since that scan is.
 ///
 /// Trunk follows, because a branch on its first scan has no history of its own
-/// and trunk is the line it descends from. *Other* branches never qualify: a
-/// scan of someone else's feature branch is a baseline whose contents nobody
-/// can predict, and the findings copied forward would be that branch's.
+/// and trunk is the line it descends from. *Other* branches never qualify by
+/// name: the newest scan of someone else's feature branch is a baseline whose
+/// contents nobody can predict, and the findings copied forward would be that
+/// branch's. The commit lookup may take one, because ancestry proves it covered
+/// a tree this history produced.
 ///
 /// `origin/HEAD` records what the remote advertised as its default when this
 /// clone was made. It is absent from single-branch and `actions/checkout`
@@ -770,10 +792,10 @@ impl Ancestry {
 /// all. The last is what every earlier run of a pipeline that checks out
 /// detached records, and a lookup keyed on names never finds them.
 ///
-/// Nearest wins because it leaves the fewest files to rescan. The commits
-/// travel in the request, so a page normally holds every candidate. Stops at
-/// the first page holding any: the pages after it are for a backend that
-/// ignored the filter and is listing the whole history.
+/// Nearest wins because it leaves the fewest files to rescan. The commits are
+/// asked about `ANCESTOR_LOOKUP_BATCH` at a time, nearest first, and the walk
+/// stops at the first batch with any usable scan: every commit in a later batch
+/// is at least as far back, so none of its scans could be closer.
 fn find_ancestor_baseline(
     config: &Config,
     project_name: &str,
@@ -782,12 +804,47 @@ fn find_ancestor_baseline(
     git_diffable: bool,
 ) -> BaselineLookup {
     let url = config.get_url();
-    for page in 1..=SCAN_LOOKUP_MAX_PAGES {
-        let response = match api::query_baseline_scans_at_commits(
+    for batch in ancestry.shas.chunks(ANCESTOR_LOOKUP_BATCH) {
+        match search_ancestor_batch(
             &url,
             project_name,
+            ancestry,
+            batch,
+            checksums_usable,
+            git_diffable,
+        ) {
+            BaselineLookup::NotFound => continue,
+            answered => return answered,
+        }
+    }
+    BaselineLookup::NotFound
+}
+
+/// The nearest usable scan of any commit in `batch`.
+///
+/// The server orders by recency, not by distance from HEAD, so a page full of
+/// re-runs of one commit can push a nearer commit's scan onto the next page.
+/// Pages are read until none is left, the budget runs out, or the best so far
+/// is a scan of the batch's nearest commit, which nothing later can beat.
+fn search_ancestor_batch(
+    url: &str,
+    project_name: &str,
+    ancestry: &Ancestry,
+    batch: &[String],
+    checksums_usable: bool,
+    git_diffable: bool,
+) -> BaselineLookup {
+    let unbeatable = batch
+        .first()
+        .and_then(|sha| ancestry.commits_back.get(sha))
+        .map(|&commits_back| (commits_back, !checksums_usable));
+    let mut best: Option<BaselineScan> = None;
+    for page in 1..=SCAN_LOOKUP_MAX_PAGES {
+        let response = match api::query_baseline_scans_at_commits(
+            url,
+            project_name,
             BLAST_ENGINE,
-            &ancestry.shas,
+            batch,
             // Only a checksum baseline may have been dirty, so without one
             // the server can drop what could never qualify.
             !checksums_usable,
@@ -796,10 +853,9 @@ fn find_ancestor_baseline(
         ) {
             Ok(response) => response,
             Err(e) => {
-                crate::log::debug(&format!(
-                    "Baseline lookup by commit failed, trying trunk instead: {e}"
-                ));
-                return BaselineLookup::LookupFailed;
+                crate::log::debug(&format!("Baseline lookup by commit failed: {e}"));
+                // A scan already read is still a scan of this history.
+                return best.map_or(BaselineLookup::LookupFailed, BaselineLookup::Found);
             }
         };
         let scans = response.scans.unwrap_or_default();
@@ -809,7 +865,19 @@ fn find_ancestor_baseline(
         if let Some(scan) =
             nearest_ancestor_baseline(&scans, ancestry, checksums_usable, git_diffable)
         {
-            return BaselineLookup::Found(scan);
+            // Strictly better only: earlier pages are newer, and recency
+            // breaks a tie.
+            if best.as_ref().is_none_or(|kept| {
+                scan.ancestor_rank(checksums_usable) < kept.ancestor_rank(checksums_usable)
+            }) {
+                best = Some(scan);
+            }
+        }
+        if best
+            .as_ref()
+            .is_some_and(|kept| Some(kept.ancestor_rank(checksums_usable)) == unbeatable)
+        {
+            break;
         }
         if response
             .total_pages
@@ -818,7 +886,7 @@ fn find_ancestor_baseline(
             break;
         }
     }
-    BaselineLookup::NotFound
+    best.map_or(BaselineLookup::NotFound, BaselineLookup::Found)
 }
 
 /// The scan on this page nearest behind HEAD that this run can diff from.
@@ -843,14 +911,17 @@ fn nearest_ancestor_baseline(
         .filter_map(|(position, scan)| {
             let sha = scan.git_sha.as_deref()?;
             let commits_back = *ancestry.commits_back.get(sha)?;
-            let without_checksums = !(checksums_usable && has_readable_checksums(scan));
-            Some(((commits_back, without_checksums, position), scan))
+            let baseline = BaselineScan {
+                commits_back: Some(commits_back),
+                ..BaselineScan::from_response(scan)
+            };
+            Some((
+                (baseline.ancestor_rank(checksums_usable), position),
+                baseline,
+            ))
         })
         .min_by_key(|(rank, _)| *rank)
-        .map(|((commits_back, _, _), scan)| BaselineScan {
-            commits_back: Some(commits_back),
-            ..BaselineScan::from_response(scan)
-        })
+        .map(|(_, baseline)| baseline)
 }
 
 /// Whether `scan` may be diffed against, given what this run can diff with.
@@ -1606,7 +1677,7 @@ mod tests {
     }
 
     #[test]
-    fn the_walk_stops_at_what_one_request_can_ask_about() {
+    fn the_walk_stops_at_the_commit_lookup_limit() {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = Repository::init(dir.path()).expect("init");
         let mut tip = commit_on(&repo, &[], "0");
