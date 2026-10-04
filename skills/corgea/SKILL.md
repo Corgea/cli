@@ -159,6 +159,8 @@ corgea inspect --issue --diff ISSUE_ID         # Diff only
 corgea inspect --issue --json ISSUE_ID         # JSON output
 ```
 
+Issue summaries include a "Scanner Metadata" section when the originating scanner reported identifiers (for Fortify: `instance_id`, `class_id`, `kingdom`, `category`, `analyzer`, `build_id`). With `--json` they appear under `issue.metadata` (the issue's scanner identifiers) and `issue.scanner_metadata` (the fix analysis copy).
+
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--issue` | `-i` | Treat ID as issue (default: scan) |

@@ -1118,7 +1118,7 @@ pub fn get_scan_report(
 }
 
 pub fn get_issue(url: &str, issue: &str) -> Result<FullIssueResponse, Box<dyn std::error::Error>> {
-    let url = format!("{}{}/issue/{}", url, API_BASE, issue,);
+    let url = format!("{}{}/issue/{}?include_metadata=true", url, API_BASE, issue);
     let client = http_client();
     debug(&format!("Sending request to URL: {}", url));
     let response = match client.get(&url).send() {
@@ -2110,6 +2110,38 @@ pub struct Issue {
     pub details: Option<Details>,
     pub auto_triage: AutoTriage,
     pub auto_fix_suggestion: Option<AutoFixSuggestion>,
+    /// Scanner identifiers recorded by the fix analysis. Only the single-issue
+    /// endpoint sends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanner_metadata: Option<serde_json::Map<String, Value>>,
+    /// Identifiers the originating scanner reported for the finding (e.g.
+    /// Fortify `instance_id`, `class_id`, `kingdom`). Sent only when the issue
+    /// is fetched with `include_metadata=true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Map<String, Value>>,
+}
+
+impl Issue {
+    /// Both metadata sources merged for display; the issue's own scanner
+    /// identifiers win over the fix analysis copy on key collisions.
+    pub fn combined_scanner_metadata(&self) -> Vec<(String, String)> {
+        let mut merged = std::collections::BTreeMap::new();
+        for source in [&self.scanner_metadata, &self.metadata]
+            .into_iter()
+            .flatten()
+        {
+            for (key, value) in source {
+                let rendered = match value {
+                    Value::Null => continue,
+                    Value::String(text) if text.trim().is_empty() => continue,
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                merged.insert(key.clone(), rendered);
+            }
+        }
+        merged.into_iter().collect()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]

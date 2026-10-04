@@ -49,6 +49,14 @@ pub fn run(
                 "Status",
                 utils::generic::get_status(&issue_details.issue.status),
             );
+            let scanner_metadata = issue_details.issue.combined_scanner_metadata();
+            if !scanner_metadata.is_empty() {
+                println!("Scanner Metadata:");
+                for (key, value) in &scanner_metadata {
+                    println!("  {:<13}: {}", key, value);
+                }
+                println!("-------------------------");
+            }
         }
         if let Some(ref details) = issue_details.issue.details {
             if let Some(ref explanation) = details.explanation {
