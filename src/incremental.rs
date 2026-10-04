@@ -268,15 +268,22 @@ fn plan_diff(
                  against, so there is nothing to compare this one to",
                 match (&candidates, ancestry.as_ref().filter(|_| commits_searched)) {
                     (Some(candidates), Some(ancestry)) => format!(
-                        "of any of the {} most recent commits in this checkout's history, \
-                         nor on {},",
-                        ancestry.shas.len(),
+                        "{}, nor on {},",
+                        match ancestry.shas.len() {
+                            // Only when no parent is reachable: a shallow
+                            // clone's depth, or a repository's first commit.
+                            1 => "of the only commit in this checkout's history".to_string(),
+                            n => format!(
+                                "of any of the {n} most recent commits in this checkout's \
+                                 history"
+                            ),
+                        },
                         join_or(candidates)
                     ),
                     (Some(candidates), None) => format!("on {}", join_or(candidates)),
                     (None, _) => "of its whole state".to_string(),
                 }
-            ))
+            ));
         }
         BaselineLookup::LookupFailed => {
             return Err(format!(
@@ -1646,6 +1653,41 @@ mod tests {
 
         assert_eq!(picked.sha.as_deref(), Some(l.root.as_str()));
         assert_eq!(picked.commits_back, Some(2));
+    }
+
+    /// A shallow clone holds its boundary commit's parent ids but not the
+    /// parents, so the walk ends at the depth instead of reporting commits
+    /// nothing could diff against.
+    #[test]
+    fn a_shallow_clone_offers_only_the_commits_it_holds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let origin = dir.path().join("origin");
+        let repo = Repository::init(&origin).expect("init");
+        let mut tip = commit_on(&repo, &[], "0");
+        for i in 1..5 {
+            tip = commit_on(&repo, &[tip], &i.to_string());
+        }
+        repo.reference("refs/heads/main", tip, true, "test")
+            .expect("branch");
+        repo.set_head("refs/heads/main").expect("HEAD");
+
+        for depth in [1, 2] {
+            let clone = dir.path().join(format!("depth-{depth}"));
+            let status = std::process::Command::new("git")
+                .args(["clone", "--quiet", "--depth", &depth.to_string()])
+                .arg(format!("file://{}", origin.display()))
+                .arg(&clone)
+                .status()
+                .expect("run git clone");
+            assert!(status.success(), "git clone --depth {depth} failed");
+            let shallow = Repository::open(&clone).expect("open clone");
+            assert!(shallow.is_shallow());
+
+            let ancestry = Ancestry::walk(&shallow, &tip.to_string()).expect("head in clone");
+
+            assert_eq!(ancestry.shas.len(), depth);
+            assert_eq!(ancestry.shas.first(), Some(&tip.to_string()));
+        }
     }
 
     #[test]

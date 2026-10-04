@@ -962,6 +962,89 @@ fn the_closest_commit_wins_even_when_its_scan_is_on_a_later_page() {
     );
 }
 
+/// A depth-1 clone, the `actions/checkout` default, holds only HEAD. The lookup
+/// by commit asks about that one commit rather than history the clone does not
+/// have, then falls back to the branch. The branch's scan is of a commit this
+/// clone cannot reach, so only its stored checksums can diff against it; without
+/// them the run scans everything and says why.
+#[test]
+fn a_shallow_clone_asks_about_the_commits_it_holds_then_falls_back_to_the_branch() {
+    for stored_checksums in [true, false] {
+        let project = git_project();
+        let base_sha = project.sha.clone();
+        let head_sha = second_commit(&project);
+        let clone = tempfile::TempDir::new().expect("create clone");
+        run_git(
+            project.path(),
+            &[
+                "clone",
+                "--quiet",
+                "--depth",
+                "1",
+                "--branch",
+                FIXTURE_BRANCH,
+                &format!("file://{}", project.path().display()),
+                &clone.path().display().to_string(),
+            ],
+        );
+
+        let mut plan = vec![
+            verify_request(),
+            scan_settings_request(PROJECT),
+            ancestor_lookup(Some(vec![head_sha.clone()]), vec![]),
+        ];
+        if stored_checksums {
+            let (scan, manifest) =
+                baseline_scan_with_checksums(&base_sha, &[("main.py", SOURCE_BODY)]);
+            plan.extend([
+                baseline_lookup(FIXTURE_BRANCH, vec![scan]),
+                checksum_download(manifest),
+                start_upload(),
+                checksum_diff_upload(),
+            ]);
+        } else {
+            plan.extend([
+                baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
+                start_upload(),
+                expected_request(
+                    "upload BLAST archive with no diff",
+                    |request| {
+                        assert_authenticated_request(
+                            request,
+                            Method::PATCH,
+                            "/api/v1/start-scan/transfer-123/",
+                        )?;
+                        assert_no_multipart_field(request, "incremental_base_sha")?;
+                        assert_no_multipart_field(request, "incremental_changed_files")
+                    },
+                    json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+                ),
+            ]);
+        }
+        plan.extend(scan_tail());
+
+        let api = ApiStub::start(plan);
+        let (mut command, _home) = cloud_command(&api, clone.path());
+        command.args(["scan", "blast", "--project-name", PROJECT]);
+
+        let output = run_with_timeout(command, &api);
+        let transcript = api.assert_finished();
+        let context = output_context(&output, &transcript);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert_eq!(output.status.code(), Some(0), "{context}");
+        let expected = if stored_checksums {
+            format!(
+                "Incremental scan: 2 files changed since the last scan of {FIXTURE_BRANCH} ({})",
+                &base_sha[..7]
+            )
+        } else {
+            "A shallow clone cannot diff against it".to_string()
+        };
+        assert!(stdout.contains(&expected), "{context}");
+    }
+}
+
 /// A detached HEAD has no branch lookup to make, and when none of its recent
 /// commits was scanned it still reaches trunk -- through a git diff here, which
 /// needs the two commits and no branch.
