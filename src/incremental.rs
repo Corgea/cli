@@ -50,7 +50,7 @@ use crate::manifest::{Manifest, MANIFEST_VERSION};
 use crate::scanners::blast::{classify_scan_status, ScanState};
 use crate::utils::api::{self, ScanResponse};
 use git2::Repository;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 /// How many of the project's scans to read at a time, newest first.
 const SCAN_LOOKUP_PAGE_SIZE: u16 = 30;
@@ -451,7 +451,14 @@ struct BaselineScan {
     /// Commits between its commit and this run's, when it was picked for
     /// being in this run's history rather than for the branch it names.
     commits_back: Option<usize>,
+    /// Whether its commit is on HEAD's first-parent line, when it was picked
+    /// for being in this run's history.
+    on_first_parent: bool,
 }
+
+/// `BaselineScan::ancestor_rank`: commits back, off the first-parent line,
+/// diffable only without checksums. Lowest is best.
+type AncestorRank = (usize, bool, bool);
 
 impl BaselineScan {
     fn from_response(scan: &ScanResponse) -> Self {
@@ -465,16 +472,24 @@ impl BaselineScan {
                 .filter(|root| !root.is_empty()),
             manifest_version: scan.file_manifest_version.clone(),
             commits_back: None,
+            on_first_parent: false,
         }
     }
 
     /// Order among scans found by ancestry, lowest best: fewest commits back,
-    /// then one this run can diff by its checksums over one it cannot.
-    fn ancestor_rank(&self, checksums_usable: bool) -> (usize, bool) {
+    /// then one on HEAD's first-parent line, then one this run can diff by its
+    /// checksums over one it cannot.
+    ///
+    /// The first-parent line breaks the tie a merge makes, whose parents are
+    /// both one commit back. The diff from the first parent is the merge
+    /// itself; the diff from the other is everything the first line did since
+    /// the fork, which can outgrow an incremental scan.
+    fn ancestor_rank(&self, checksums_usable: bool) -> AncestorRank {
         let readable_checksums = self.manifest_root.is_some()
             && self.manifest_version.as_deref() == Some(MANIFEST_VERSION);
         (
             self.commits_back.unwrap_or(usize::MAX),
+            !self.on_first_parent,
             !(checksums_usable && readable_checksums),
         )
     }
@@ -753,6 +768,8 @@ struct Ancestry {
     /// Nearest first, HEAD leading.
     shas: Vec<String>,
     commits_back: HashMap<String, usize>,
+    /// Those of `shas` reached from HEAD through first parents alone.
+    first_parent: HashSet<String>,
 }
 
 impl Ancestry {
@@ -765,7 +782,18 @@ impl Ancestry {
         let mut ancestry = Ancestry {
             shas: vec![head.id().to_string()],
             commits_back: HashMap::from([(head.id().to_string(), 0)]),
+            first_parent: HashSet::from([head.id().to_string()]),
         };
+        // A missing parent ends the line, which is where a shallow clone's
+        // history ends too.
+        let mut tip = head.clone();
+        while ancestry.first_parent.len() < ANCESTOR_LOOKUP_COMMITS {
+            let Ok(parent) = tip.parent(0) else {
+                break;
+            };
+            ancestry.first_parent.insert(parent.id().to_string());
+            tip = parent;
+        }
         let mut queue = VecDeque::from([(head, 0)]);
         while let Some((commit, depth)) = queue.pop_front() {
             for parent_id in commit.parent_ids() {
@@ -841,10 +869,18 @@ fn search_ancestor_batch(
     checksums_usable: bool,
     git_diffable: bool,
 ) -> BaselineLookup {
-    let unbeatable = batch
-        .first()
-        .and_then(|sha| ancestry.commits_back.get(sha))
-        .map(|&commits_back| (commits_back, !checksums_usable));
+    // Over the whole batch, not its first commit: that one can sit off the
+    // first-parent line at the same distance as one on it.
+    let unbeatable: Option<AncestorRank> = batch
+        .iter()
+        .filter_map(|sha| {
+            let commits_back = *ancestry.commits_back.get(sha)?;
+            Some((commits_back, !ancestry.first_parent.contains(sha)))
+        })
+        .min()
+        .map(|(commits_back, off_first_parent)| {
+            (commits_back, off_first_parent, !checksums_usable)
+        });
     let mut best: Option<BaselineScan> = None;
     for page in 1..=SCAN_LOOKUP_MAX_PAGES {
         let response = match api::query_baseline_scans_at_commits(
@@ -920,6 +956,7 @@ fn nearest_ancestor_baseline(
             let commits_back = *ancestry.commits_back.get(sha)?;
             let baseline = BaselineScan {
                 commits_back: Some(commits_back),
+                on_first_parent: ancestry.first_parent.contains(sha),
                 ..BaselineScan::from_response(scan)
             };
             Some((
@@ -1716,6 +1753,43 @@ mod tests {
         assert_eq!(back(&l.root), Some(2));
         assert_eq!(back(&l.head), None);
         assert_eq!(ancestry.shas.first(), Some(&merge.to_string()));
+
+        let on_first_parent = |sha: &str| ancestry.first_parent.contains(sha);
+        assert!(on_first_parent(&merge.to_string()));
+        assert!(on_first_parent(&l.near));
+        assert!(on_first_parent(&l.root));
+        assert!(!on_first_parent(&side_tip.to_string()));
+        assert!(!on_first_parent(&l.side));
+    }
+
+    /// A merge's parents are both one commit back. The diff from the first is
+    /// the merge; the diff from the other is everything the first line did
+    /// since the fork, so the first wins even when the other was scanned later.
+    #[test]
+    fn between_the_parents_of_a_merge_the_first_parent_wins() {
+        let l = lineage();
+        let side_tip = commit_on(&l.repo, &[git2::Oid::from_str(&l.side).unwrap()], "tip.txt");
+        let merge = commit_on(
+            &l.repo,
+            &[git2::Oid::from_str(&l.near).unwrap(), side_tip],
+            "merge.txt",
+        );
+        let ancestry = Ancestry::walk(&l.repo, &merge.to_string()).expect("head in clone");
+        // Newest first, so the merged-in side would win on recency.
+        let other_side = with_checksums(scan("feature", &side_tip.to_string()));
+        let scans = vec![other_side, scan("main", &l.near)];
+
+        for checksums_usable in [false, true] {
+            let picked = nearest_ancestor_baseline(&scans, &ancestry, checksums_usable, true)
+                .expect("a baseline");
+            assert_eq!(picked.sha.as_deref(), Some(l.near.as_str()));
+            assert_eq!(picked.commits_back, Some(1));
+        }
+
+        // Still the baseline when the first parent was never scanned.
+        let picked =
+            nearest_ancestor_baseline(&scans[..1], &ancestry, true, true).expect("a baseline");
+        assert_eq!(picked.sha, Some(side_tip.to_string()));
     }
 
     #[test]
