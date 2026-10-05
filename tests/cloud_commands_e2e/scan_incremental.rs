@@ -623,6 +623,59 @@ fn checksums_that_do_not_match_their_digest_fall_back_to_the_git_diff() {
     assert_eq!(output.status.code(), Some(0), "{context}");
 }
 
+/// When the checksums that should have answered are unreadable and git then
+/// refuses too, the fault is reported as the cause: a dirty tree is only why
+/// the fallback could not cover for it.
+#[test]
+fn unreadable_checksums_are_the_cause_when_git_cannot_cover_for_them() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    std::fs::write(project.path().join("main.py"), "print('uncommitted')\n")
+        .expect("dirty the tree");
+
+    let (scan, mut manifest) = baseline_scan_with_checksums(&base_sha, &[("main.py", SOURCE_BODY)]);
+    manifest.truncate(manifest.len() / 2);
+
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
+        baseline_lookup(FIXTURE_BRANCH, vec![scan]),
+        checksum_download(manifest),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with no diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_no_multipart_field(request, "incremental_changed_files")?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_skipped_reason",
+                    "baseline_checksums_unreadable",
+                )?;
+                assert_body_contains(request, b"could not be read")?;
+                assert_body_contains(request, b"this worktree has uncommitted changes")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+}
+
 #[test]
 fn the_upload_carries_the_baseline_commit_and_the_files_that_changed_since_it() {
     let project = git_project();
@@ -654,7 +707,8 @@ fn the_upload_carries_the_baseline_commit_and_the_files_that_changed_since_it() 
                     request,
                     "incremental_changed_files",
                     r#"["helper.py","main.py"]"#,
-                )
+                )?;
+                assert_no_multipart_field(request, "incremental_skipped_reason")
             },
             json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
         ),

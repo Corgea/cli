@@ -109,8 +109,12 @@ pub enum FullScanCause {
     TargetedUpload,
     NoBaselineScan,
     BaselineLookupFailed,
-    /// `--exclude` held files back, and the baseline has no checksums to diff
-    /// the archive against.
+    /// The baseline stored checksums, but they could not be downloaded, read,
+    /// or are a version this client does not speak, and git could not answer
+    /// either.
+    BaselineChecksumsUnreadable,
+    /// `--exclude` held files back, and the baseline stored no checksums to
+    /// diff the archive against.
     ExcludeNeedsChecksums,
     /// Uncommitted edits a commit-to-commit diff cannot see, without
     /// `--ignore-dirty-worktree`.
@@ -131,6 +135,7 @@ impl FullScanCause {
             FullScanCause::TargetedUpload => "targeted_upload",
             FullScanCause::NoBaselineScan => "no_baseline_scan",
             FullScanCause::BaselineLookupFailed => "baseline_lookup_failed",
+            FullScanCause::BaselineChecksumsUnreadable => "baseline_checksums_unreadable",
             FullScanCause::ExcludeNeedsChecksums => "exclude_needs_checksums",
             FullScanCause::DirtyWorktree => "dirty_worktree",
             FullScanCause::NoGitCommit => "no_git_commit",
@@ -376,9 +381,9 @@ fn plan_diff(
             }
             // Not fatal on its own: git may still be able to answer, and this
             // is the expected path for a baseline that predates manifests.
-            Err(reason) => {
-                crate::log::debug(&format!("{reason}. Trying git."));
-                Some(reason)
+            Err(refusal) => {
+                crate::log::debug(&format!("{}. Trying git.", refusal.1));
+                Some(refusal)
             }
         },
         None => None,
@@ -388,11 +393,12 @@ fn plan_diff(
     // ends up reporting has to name every reason it could not. Printing only
     // git's leaves someone looking at a full scan they expected to be
     // incremental with no idea the checksums were tried at all, let alone why
-    // they did not apply.
-    plan_git_diff(&baseline, repo.as_ref(), sources).map_err(|reason| match &checksum_refusal {
-        Some(refusal) => FullScanReason {
+    // they did not apply. A checksum fault outranks git's refusal as the
+    // cause: it is why a diff that should have worked did not.
+    plan_git_diff(&baseline, repo.as_ref(), sources).map_err(|reason| match checksum_refusal {
+        Some((cause, refusal)) => FullScanReason {
+            cause: cause.unwrap_or(reason.cause),
             detail: format!("{refusal}, and {}", reason.detail),
-            ..reason
         },
         None => reason,
     })
@@ -478,33 +484,45 @@ fn summarize(changed_files: &[String], since: &str) -> Result<String, FullScanRe
 /// what the run prints when git cannot answer either. "It stored none" is the
 /// ordinary one and is not a fault: it is what every scan uploaded before
 /// checksums existed says, and what a deployment that does not store them yet
-/// says about all of them.
+/// says about all of them, so it carries no cause and leaves git's to stand.
 fn changed_files_against(
     config: &Config,
     baseline: &BaselineScan,
     local: &Manifest,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ChecksumRefusal> {
     let what = baseline.describe();
     let Some(root) = baseline.manifest_root.as_deref() else {
-        return Err(format!(
-            "the {what} stored no file checksums to diff against"
+        return Err((
+            None,
+            format!("the {what} stored no file checksums to diff against"),
         ));
     };
+    let unreadable = |detail: String| (Some(FullScanCause::BaselineChecksumsUnreadable), detail);
     // A manifest is only comparable to one written the same way. Rather than
     // guess at a format a later client introduced, leave it to git.
     if baseline.manifest_version.as_deref() != Some(MANIFEST_VERSION) {
-        return Err(format!(
+        return Err(unreadable(format!(
             "the file checksums of the {what} are version {}, which this client does \
              not read (it reads version {MANIFEST_VERSION})",
             baseline.manifest_version.as_deref().unwrap_or("unknown")
-        ));
+        )));
     }
-    let body = api::download_scan_file_manifest(&config.get_url(), &baseline.id)
-        .map_err(|e| format!("the file checksums of the {what} could not be downloaded ({e})"))?;
-    let decoded = Manifest::decode(&body, root)
-        .map_err(|e| format!("the file checksums of the {what} could not be read ({e})"))?;
+    let body = api::download_scan_file_manifest(&config.get_url(), &baseline.id).map_err(|e| {
+        unreadable(format!(
+            "the file checksums of the {what} could not be downloaded ({e})"
+        ))
+    })?;
+    let decoded = Manifest::decode(&body, root).map_err(|e| {
+        unreadable(format!(
+            "the file checksums of the {what} could not be read ({e})"
+        ))
+    })?;
     Ok(decoded.changed_paths(local))
 }
+
+/// Why stored checksums could not answer: a cause when that was a fault rather
+/// than a baseline that stored none, and the clause describing it.
+type ChecksumRefusal = (Option<FullScanCause>, String);
 
 /// A scan that can be diffed against, and what it offers to diff with.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1934,6 +1952,48 @@ mod tests {
             .expect_err("unknown base must fail");
         assert_eq!(err.cause, FullScanCause::BaselineCommitNotInClone);
         assert!(err.detail.contains("shallow clone"), "{}", err.detail);
+    }
+
+    /// The server stores these, so renaming one splits its history in two.
+    #[test]
+    fn cause_codes_are_the_ones_the_server_stores() {
+        use FullScanCause::*;
+        let codes: Vec<&str> = [
+            DisabledByFlag,
+            TargetedUpload,
+            NoBaselineScan,
+            BaselineLookupFailed,
+            BaselineChecksumsUnreadable,
+            ExcludeNeedsChecksums,
+            DirtyWorktree,
+            NoGitCommit,
+            BaselineHasNoCommit,
+            BaselineCommitNotInClone,
+            GitDiffFailed,
+            SubmoduleMoved,
+            TooManyChangedFiles,
+        ]
+        .into_iter()
+        .map(FullScanCause::code)
+        .collect();
+        assert_eq!(
+            codes,
+            [
+                "disabled_by_flag",
+                "targeted_upload",
+                "no_baseline_scan",
+                "baseline_lookup_failed",
+                "baseline_checksums_unreadable",
+                "exclude_needs_checksums",
+                "dirty_worktree",
+                "no_git_commit",
+                "baseline_has_no_commit",
+                "baseline_commit_not_in_clone",
+                "git_diff_failed",
+                "submodule_moved",
+                "too_many_changed_files",
+            ]
+        );
     }
 
     #[test]
