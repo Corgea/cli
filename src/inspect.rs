@@ -33,7 +33,28 @@ pub fn run(
             }
         };
         if *json {
-            println!("{}", serde_json::to_string_pretty(&issue_details).unwrap());
+            // `Issue` does not serialize these maps. List and scan-report JSON
+            // re-emit that struct, and the blocking-rules list path uses a
+            // second struct that never had the fields.
+            let mut body = serde_json::to_value(&issue_details).unwrap();
+            if let Some(issue) = body
+                .get_mut("issue")
+                .and_then(|value| value.as_object_mut())
+            {
+                if let Some(scanner_metadata) = &issue_details.issue.scanner_metadata {
+                    issue.insert(
+                        "scanner_metadata".to_string(),
+                        serde_json::Value::Object(scanner_metadata.clone()),
+                    );
+                }
+                if let Some(metadata) = &issue_details.issue.metadata {
+                    issue.insert(
+                        "metadata".to_string(),
+                        serde_json::Value::Object(metadata.clone()),
+                    );
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&body).unwrap());
             return;
         }
         if *summary || show_everything {
@@ -49,6 +70,14 @@ pub fn run(
                 "Status",
                 utils::generic::get_status(&issue_details.issue.status),
             );
+            let scanner_metadata = issue_details.issue.combined_scanner_metadata();
+            if !scanner_metadata.is_empty() {
+                println!("Scanner Metadata:");
+                for (key, value) in &scanner_metadata {
+                    println!("  {:<13}: {}", key, value);
+                }
+                println!("-------------------------");
+            }
         }
         if let Some(ref details) = issue_details.issue.details {
             if let Some(ref explanation) = details.explanation {

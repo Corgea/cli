@@ -87,6 +87,80 @@ fn inspect_issue_json_returns_requested_issue() {
     assert_eq!(body["issue"]["location"]["line_number"], 7, "{context}");
 }
 
+fn inspect_issue_with_scanner_metadata(args: &[&str]) -> (std::process::Output, String) {
+    let project = TempDir::new().expect("create inspect project");
+    let issue_id = "inspect-fortify-issue";
+    let issue_path = format!("/api/v1/issue/{issue_id}");
+    let mut issue = regular_issue(issue_id, "inspect-scan-123", "inspect-project", "HI");
+    issue["scanner_metadata"] = json!({"scanner": "fortify", "kingdom": "stale"});
+    issue["metadata"] = json!({
+        "instance_id": "6B481068C7D139B941ADF736E39E0676",
+        "class_id": "78E0700E-56FE-45A2-A11B-6A560F730576",
+        "kingdom": "Encapsulation",
+        "category": "Cross-Site Request Forgery",
+        "analyzer": "content",
+        "build_id": "TODS",
+        "sub_category": null
+    });
+    let api = ApiStub::start(vec![
+        verify_request(),
+        expected_request(
+            "inspect issue with scanner metadata",
+            move |request| {
+                assert_authenticated_request(request, Method::GET, &issue_path)?;
+                assert_query(request, "include_metadata", "true")
+            },
+            json_response(json!({"status": "ok", "issue": issue})),
+        ),
+    ]);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command
+        .args(["inspect", "--issue"])
+        .args(args)
+        .arg(issue_id);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    (output, transcript)
+}
+
+#[test]
+fn inspect_issue_json_includes_scanner_metadata() {
+    let (output, transcript) = inspect_issue_with_scanner_metadata(&["--json"]);
+    let body = parse_output_json(&output, &transcript);
+    let issue = &body["issue"];
+    assert_eq!(issue["scanner_metadata"]["scanner"], "fortify");
+    assert_eq!(
+        issue["metadata"]["instance_id"],
+        "6B481068C7D139B941ADF736E39E0676"
+    );
+    assert_eq!(issue["metadata"]["kingdom"], "Encapsulation");
+    assert_eq!(issue["metadata"]["build_id"], "TODS");
+}
+
+#[test]
+fn inspect_issue_summary_prints_scanner_metadata() {
+    let (output, transcript) = inspect_issue_with_scanner_metadata(&["--summary"]);
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Scanner Metadata:"), "{context}");
+    for expected in [
+        "instance_id  : 6B481068C7D139B941ADF736E39E0676",
+        "class_id     : 78E0700E-56FE-45A2-A11B-6A560F730576",
+        "kingdom      : Encapsulation",
+        "category     : Cross-Site Request Forgery",
+        "analyzer     : content",
+        "build_id     : TODS",
+        "scanner      : fortify",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected:?}\n{context}");
+    }
+    assert!(!stdout.contains("stale"), "{context}");
+    assert!(!stdout.contains("sub_category"), "{context}");
+}
+
 #[test]
 fn inspect_scan_exits_one_on_server_error() {
     let project = TempDir::new().expect("create inspect project");

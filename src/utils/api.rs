@@ -1118,7 +1118,7 @@ pub fn get_scan_report(
 }
 
 pub fn get_issue(url: &str, issue: &str) -> Result<FullIssueResponse, Box<dyn std::error::Error>> {
-    let url = format!("{}{}/issue/{}", url, API_BASE, issue,);
+    let url = format!("{}{}/issue/{}?include_metadata=true", url, API_BASE, issue);
     let client = http_client();
     debug(&format!("Sending request to URL: {}", url));
     let response = match client.get(&url).send() {
@@ -2110,6 +2110,39 @@ pub struct Issue {
     pub details: Option<Details>,
     pub auto_triage: AutoTriage,
     pub auto_fix_suggestion: Option<AutoFixSuggestion>,
+    /// Scanner identifiers recorded by the fix analysis. List and scan-report
+    /// JSON re-emit this struct, so the maps stay off `Serialize`. `inspect
+    /// --json` copies them back onto the printed object.
+    #[serde(default, skip_serializing)]
+    pub scanner_metadata: Option<serde_json::Map<String, Value>>,
+    /// Identifiers the originating scanner reported for the finding (e.g.
+    /// Fortify `instance_id`, `class_id`, `kingdom`). Sent only when the issue
+    /// is fetched with `include_metadata=true`.
+    #[serde(default, skip_serializing)]
+    pub metadata: Option<serde_json::Map<String, Value>>,
+}
+
+impl Issue {
+    /// Both metadata sources merged for display; the issue's own scanner
+    /// identifiers win over the fix analysis copy on key collisions.
+    pub fn combined_scanner_metadata(&self) -> Vec<(String, String)> {
+        let mut merged = std::collections::BTreeMap::new();
+        for source in [&self.scanner_metadata, &self.metadata]
+            .into_iter()
+            .flatten()
+        {
+            for (key, value) in source {
+                let rendered = match value {
+                    Value::Null => continue,
+                    Value::String(text) if text.trim().is_empty() => continue,
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                merged.insert(key.clone(), rendered);
+            }
+        }
+        merged.into_iter().collect()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -2350,6 +2383,49 @@ pub struct SCAIssuesResponse {
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn issue_json_omits_scanner_metadata_that_list_and_scan_reports_reemit() {
+        // `corgea list --json` and `corgea scan --out-format json` serialize
+        // `Issue` directly. The list API sends `scanner_metadata`; writing it
+        // back would change those outputs, and the blocking-rules list path
+        // would then drop it again.
+        let raw = r#"{
+            "id": "issue-1",
+            "scan_id": "scan-1",
+            "status": "open",
+            "urgency": "HI",
+            "created_at": "2026-01-01T00:00:00Z",
+            "classification": {"id": "c", "name": "n", "description": null},
+            "location": {
+                "file": {"name": "a.py", "language": "python", "path": "a.py"},
+                "line_number": 1,
+                "project": {"name": "p", "branch": null, "git_sha": null}
+            },
+            "details": null,
+            "auto_triage": {"false_positive_detection": {"status": "pending", "reasoning": null}},
+            "auto_fix_suggestion": null,
+            "scanner_metadata": {"kingdom": "Encapsulation", "scanner": "fortify"},
+            "metadata": {"instance_id": "ABC", "kingdom": "Encapsulation"}
+        }"#;
+
+        let issue: Issue = serde_json::from_str(raw).unwrap();
+        let merged = issue.combined_scanner_metadata();
+        assert_eq!(
+            merged
+                .iter()
+                .find(|(key, _)| key == "kingdom")
+                .map(|(_, value)| value.as_str()),
+            Some("Encapsulation")
+        );
+        assert!(merged.iter().any(|(key, _)| key == "scanner"));
+        assert!(merged.iter().any(|(key, _)| key == "instance_id"));
+
+        let rendered = serde_json::to_value(&issue).unwrap();
+        assert!(rendered.get("scanner_metadata").is_none());
+        assert!(rendered.get("metadata").is_none());
+        assert_eq!(rendered["id"], "issue-1");
+    }
 
     #[test]
     fn a_scan_from_a_deployment_without_manifests_parses_as_having_none() {
