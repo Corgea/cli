@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.acme</groupId>
+    <artifactId>a</artifactId>
+    <version>1.0.0</version>
+  </parent>
+  <artifactId>b</artifactId>
+
+  <properties>
+    <b.version>2.2.2</b.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>from-a</artifactId>
+      <version>${a.version}</version>
+    </dependency>
+  </dependencies>
+</project>

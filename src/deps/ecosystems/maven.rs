@@ -1,6 +1,7 @@
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 
-use crate::deps::detect::DepFileKind;
+use crate::deps::detect::{DepFileKind, DetectedFile};
 use crate::deps::ecosystems::classify_constraint;
 use crate::deps::ecosystems::evaluate::{
     constraint_to_findings, dep001, file_in_dir, parent_dir, ScanContext,
@@ -9,11 +10,12 @@ use crate::deps::model::{DependencyEdge, DependencyNode, Ecosystem, PackageId, S
 use crate::deps::DepsError;
 
 pub fn scan_maven_projects(ctx: &mut ScanContext<'_>) -> Result<(), DepsError> {
+    let poms = PomIndex::build(ctx.detected);
     for f in ctx.detected {
         match f.kind {
             DepFileKind::MavenPom => {
                 let dir = parent_dir(&f.path);
-                scan_maven_pom(ctx, &dir, &f.path)?;
+                scan_maven_pom(ctx, &poms, &dir, &f.path)?;
             }
             DepFileKind::GradleBuild => {
                 let dir = parent_dir(&f.path);
@@ -33,7 +35,191 @@ struct MavenDep {
     scope: Scope,
 }
 
-fn scan_maven_pom(ctx: &mut ScanContext<'_>, dir: &Path, pom_path: &Path) -> Result<(), DepsError> {
+/// A `<parent>` reference: the coordinates a child inherits from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParentRef {
+    group: String,
+    artifact: String,
+    version: String,
+    /// `None` when absent (Maven defaults to `../pom.xml`); `Some("")` for
+    /// an explicit empty `<relativePath/>`, which disables the path lookup.
+    relative_path: Option<String>,
+}
+
+/// One pom.xml in the scanned tree, reduced to what parent resolution needs.
+struct PomInfo {
+    /// Pom content with `NON_DEPENDENCY_SECTIONS` stripped.
+    content: String,
+    group: String,
+    artifact: String,
+    /// The project version, resolved against the pom's own properties.
+    version: String,
+    parent: Option<ParentRef>,
+}
+
+/// Every pom.xml found in the scan, so a child can inherit properties and
+/// `<dependencyManagement>` from a parent that lives elsewhere in the repo
+/// rather than only at `../pom.xml`.
+struct PomIndex {
+    by_path: HashMap<PathBuf, PomInfo>,
+    by_coords: HashMap<(String, String, String), PathBuf>,
+}
+
+/// Parent chains longer than this are treated as broken.
+const MAX_PARENT_DEPTH: usize = 64;
+
+impl PomIndex {
+    fn build(detected: &[DetectedFile]) -> Self {
+        let mut by_path = HashMap::new();
+        let mut by_coords = HashMap::new();
+        for f in detected.iter().filter(|f| f.kind == DepFileKind::MavenPom) {
+            // Unreadable or malformed poms are reported when scanned on
+            // their own; here they just can't serve as parents.
+            let Ok(raw) = std::fs::read_to_string(&f.path) else {
+                continue;
+            };
+            if !raw.trim_start().starts_with('<') {
+                continue;
+            }
+            let content = strip_sections(&raw, NON_DEPENDENCY_SECTIONS);
+            let info = pom_info(content);
+            let key = normalize_path(&f.path);
+            if !info.group.is_empty() && !info.artifact.is_empty() && !info.version.is_empty() {
+                by_coords
+                    .entry((
+                        info.group.clone(),
+                        info.artifact.clone(),
+                        info.version.clone(),
+                    ))
+                    .or_insert_with(|| key.clone());
+            }
+            by_path.insert(key, info);
+        }
+        Self { by_path, by_coords }
+    }
+
+    /// Stripped contents of the pom's in-repo ancestors, nearest parent
+    /// first. The chain stops at the first parent not present in the scan
+    /// (typically one published to a registry).
+    fn ancestors(&self, pom_path: &Path) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut current_path = normalize_path(pom_path);
+        let mut visited = HashSet::from([current_path.clone()]);
+        while out.len() < MAX_PARENT_DEPTH {
+            let Some(parent) = self
+                .by_path
+                .get(&current_path)
+                .and_then(|info| info.parent.as_ref())
+            else {
+                break;
+            };
+            let Some(parent_path) = self.find_parent(&current_path, parent) else {
+                break;
+            };
+            if !visited.insert(parent_path.clone()) {
+                break;
+            }
+            out.push(self.by_path[&parent_path].content.as_str());
+            current_path = parent_path;
+        }
+        out
+    }
+
+    /// Maven's lookup order: `<relativePath>` (default `../pom.xml`) when
+    /// the pom there has the referenced coordinates, then any pom in the
+    /// scan with exactly those coordinates.
+    fn find_parent(&self, child_path: &Path, parent: &ParentRef) -> Option<PathBuf> {
+        let relative = parent.relative_path.as_deref().unwrap_or("../pom.xml");
+        if !relative.is_empty() {
+            let candidate = normalize_path(&parent_dir(child_path).join(relative));
+            for path in [candidate.join("pom.xml"), candidate] {
+                if self
+                    .by_path
+                    .get(&path)
+                    .is_some_and(|info| parent_matches(info, parent))
+                {
+                    return Some(path);
+                }
+            }
+        }
+        if parent.version.contains("${") {
+            return None;
+        }
+        self.by_coords
+            .get(&(
+                parent.group.clone(),
+                parent.artifact.clone(),
+                parent.version.clone(),
+            ))
+            .cloned()
+    }
+}
+
+/// A placeholder parent version (CI-friendly `${revision}`) can only be
+/// checked on groupId/artifactId; the relativePath already pins the file.
+fn parent_matches(info: &PomInfo, parent: &ParentRef) -> bool {
+    info.group == parent.group
+        && info.artifact == parent.artifact
+        && (info.version == parent.version || parent.version.contains("${"))
+}
+
+/// Lexically collapse `.` and `..` so `a/b/../pom.xml` and `./a/pom.xml`
+/// key the same entry as `a/pom.xml`.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn pom_info(content: String) -> PomInfo {
+    let head = project_head(&content);
+    let (own, parent) = match split_section(head, "parent") {
+        Some((own, parent_block)) => (
+            own,
+            Some(ParentRef {
+                group: extract_xml_tag(parent_block, "groupId"),
+                artifact: extract_xml_tag(parent_block, "artifactId"),
+                version: extract_xml_tag(parent_block, "version"),
+                relative_path: extract_optional_xml_tag(parent_block, "relativePath"),
+            }),
+        ),
+        None => (head.to_string(), None),
+    };
+    let mut group = extract_xml_tag(&own, "groupId");
+    if group.is_empty() {
+        group = parent.as_ref().map(|p| p.group.clone()).unwrap_or_default();
+    }
+    let artifact = extract_xml_tag(&own, "artifactId");
+    let version = resolve_properties(raw_properties(&content), &content)
+        .remove("project.version")
+        .unwrap_or_else(|| pom_project_version(&content));
+    PomInfo {
+        content,
+        group,
+        artifact,
+        version,
+        parent,
+    }
+}
+
+fn scan_maven_pom(
+    ctx: &mut ScanContext<'_>,
+    poms: &PomIndex,
+    dir: &Path,
+    pom_path: &Path,
+) -> Result<(), DepsError> {
     let rel = pom_path
         .strip_prefix(ctx.root)
         .unwrap_or(pom_path)
@@ -51,7 +237,7 @@ fn scan_maven_pom(ctx: &mut ScanContext<'_>, dir: &Path, pom_path: &Path) -> Res
 
     dep001(ctx.findings, ctx.policy, &rel, "Maven");
 
-    let deps = parse_pom_dependencies(&content)?;
+    let deps = parse_pom_dependencies(&content, &poms.ancestors(pom_path))?;
     for dep in deps {
         let name = dep.artifact.clone();
         let declared = dep.version.clone();
@@ -101,15 +287,24 @@ fn scan_maven_pom(ctx: &mut ScanContext<'_>, dir: &Path, pom_path: &Path) -> Res
 /// dependencies; stripped before any dependency or property extraction.
 const NON_DEPENDENCY_SECTIONS: &[&str] = &["profiles", "build", "reporting"];
 
-fn parse_pom_dependencies(content: &str) -> Result<Vec<MavenDep>, DepsError> {
+/// `ancestors` are the stripped contents of the pom's in-repo parents,
+/// nearest first. Their `<properties>` and `<dependencyManagement>` are
+/// inherited, with nearer poms (and the pom itself) taking precedence.
+fn parse_pom_dependencies(content: &str, ancestors: &[&str]) -> Result<Vec<MavenDep>, DepsError> {
     let stripped = strip_sections(content, NON_DEPENDENCY_SECTIONS);
-    let props = parse_pom_properties(&stripped);
-    let (rest, management) = split_dependency_management(&stripped);
-    let managed: std::collections::HashMap<(String, String), String> = parse_pom_regex(management)
-        .into_iter()
-        .filter(|d| !d.version.is_empty())
-        .map(|d| ((d.group, d.artifact), d.version))
-        .collect();
+    let mut raw_props = HashMap::new();
+    let mut managed = HashMap::new();
+    for pom in ancestors
+        .iter()
+        .rev()
+        .copied()
+        .chain(std::iter::once(stripped.as_str()))
+    {
+        raw_props.extend(raw_properties(pom));
+        managed.extend(managed_versions(pom));
+    }
+    let props = resolve_properties(raw_props, &stripped);
+    let (rest, _) = split_dependency_management(&stripped);
     let mut deps = parse_pom_regex(&rest);
     for dep in &mut deps {
         if dep.version.is_empty() {
@@ -159,9 +354,20 @@ fn split_section<'a>(content: &'a str, tag: &str) -> Option<(String, &'a str)> {
     Some((rest, inner))
 }
 
-/// Collect `<properties>` entries plus the built-in `project.version`.
-fn parse_pom_properties(content: &str) -> std::collections::HashMap<String, String> {
-    let mut props = std::collections::HashMap::new();
+/// Versions pinned by the pom's own `<dependencyManagement>`, keyed by
+/// (groupId, artifactId), placeholders left unresolved.
+fn managed_versions(content: &str) -> HashMap<(String, String), String> {
+    let (_, management) = split_dependency_management(content);
+    parse_pom_regex(management)
+        .into_iter()
+        .filter(|d| !d.version.is_empty())
+        .map(|d| ((d.group, d.artifact), d.version))
+        .collect()
+}
+
+/// The pom's own `<properties>` entries, placeholders left unresolved.
+fn raw_properties(content: &str) -> HashMap<String, String> {
+    let mut props = HashMap::new();
     if let Some(start) = content.find("<properties>") {
         let rest = &content[start + "<properties>".len()..];
         if let Some(end) = rest.find("</properties>") {
@@ -188,6 +394,16 @@ fn parse_pom_properties(content: &str) -> std::collections::HashMap<String, Stri
             }
         }
     }
+    props
+}
+
+/// Resolve raw properties for the pom `content`, adding the built-in
+/// `project.version`. Inherited properties resolve in the child's context,
+/// so a parent's `${project.version}` means the child's version, as in Maven.
+fn resolve_properties(
+    mut props: HashMap<String, String>,
+    content: &str,
+) -> HashMap<String, String> {
     // Property values may reference other properties; resolve the map to a
     // fixed point, bounded to guard against definition cycles.
     resolve_props_fixed_point(&mut props);
@@ -217,25 +433,29 @@ fn resolve_props_fixed_point(props: &mut std::collections::HashMap<String, Strin
     }
 }
 
-/// The pom's own `<version>`: first `<version>` before `<dependencies>`,
-/// excluding the `<parent>` block. A child that inherits its version has
-/// none of its own, so fall back to the parent's (Maven's inheritance rule).
-fn pom_project_version(content: &str) -> String {
+/// The part of the pom holding its own coordinates and `<parent>`: before
+/// `<dependencies>` and any nested section that may carry unrelated
+/// `<groupId>`/`<version>` tags of its own (plugin versions in `<build>`,
+/// managed versions in `<dependencyManagement>`, etc).
+fn project_head(content: &str) -> &str {
     let head = content.split("<dependencies>").next().unwrap_or(content);
-    // The project's own <version> lives among its coordinates, before any
-    // nested section that may carry unrelated <version> tags of its own
-    // (plugin versions in <build>, managed versions in
-    // <dependencyManagement>, etc).
     let nested_start = NON_DEPENDENCY_SECTIONS
         .iter()
         .copied()
         .chain(["dependencyManagement"])
         .filter_map(|tag| head.find(&format!("<{tag}>")))
         .min();
-    let head = match nested_start {
+    match nested_start {
         Some(pos) => &head[..pos],
         None => head,
-    };
+    }
+}
+
+/// The pom's own `<version>`, excluding the `<parent>` block. A child that
+/// inherits its version has none of its own, so fall back to the parent's
+/// (Maven's inheritance rule).
+fn pom_project_version(content: &str) -> String {
+    let head = project_head(content);
     if let Some((cleaned, parent)) = split_section(head, "parent") {
         let own = extract_xml_tag(&cleaned, "version");
         if !own.is_empty() {
@@ -297,15 +517,25 @@ fn parse_pom_regex(content: &str) -> Vec<MavenDep> {
 }
 
 fn extract_xml_tag(block: &str, tag: &str) -> String {
+    extract_optional_xml_tag(block, tag).unwrap_or_default()
+}
+
+/// Like `extract_xml_tag`, but tells an absent tag (`None`) apart from an
+/// empty one (`<tag/>` or `<tag></tag>`, `Some("")`).
+fn extract_optional_xml_tag(block: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     if let Some(start) = block.find(&open) {
         let rest = &block[start + open.len()..];
         if let Some(end) = rest.find(&close) {
-            return rest[..end].trim().to_string();
+            return Some(rest[..end].trim().to_string());
         }
     }
-    String::new()
+    let self_closing = [format!("<{tag}/>"), format!("<{tag} />")];
+    if self_closing.iter().any(|t| block.contains(t.as_str())) {
+        return Some(String::new());
+    }
+    None
 }
 
 fn scan_gradle(ctx: &mut ScanContext<'_>, dir: &Path, gradle_path: &Path) -> Result<(), DepsError> {

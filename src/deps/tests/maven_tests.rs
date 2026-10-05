@@ -232,6 +232,101 @@ fn maven_property_aliasing_project_version_resolves() {
     assert_eq!(*n.id(), PackageId("pkg:maven/com.acme/shared@1.2.3".into()));
 }
 
+/// A parent pom elsewhere in the repo (not at `../pom.xml`) is found by its
+/// coordinates, and its `<properties>` resolve the child's placeholders.
+#[test]
+fn maven_parent_properties_resolve_from_pom_elsewhere_in_repo() {
+    let inv = scan_fixture("java-maven-repo-parent");
+    let n = inv
+        .node("nimbus-jose-jwt")
+        .expect("nimbus-jose-jwt missing");
+    assert_eq!(n.version(), Some("10.4"));
+    assert_eq!(
+        *n.id(),
+        PackageId("pkg:maven/com.nimbusds/nimbus-jose-jwt@10.4".into())
+    );
+    assert_eq!(
+        inv.node("commons-httpclient").unwrap().version(),
+        Some("3.1")
+    );
+}
+
+/// Properties inherit through every in-repo ancestor, nearer poms winning.
+#[test]
+fn maven_grandparent_properties_resolve_and_child_overrides_win() {
+    let inv = scan_fixture("java-maven-repo-parent");
+    assert_eq!(inv.node("slf4j-api").unwrap().version(), Some("2.0.9"));
+    assert_eq!(
+        inv.node("guava").unwrap().version(),
+        Some("32.1.3-jre"),
+        "the child's own guava.version overrides the grandparent's"
+    );
+}
+
+/// A versionless dependency takes its version from the parent's
+/// `<dependencyManagement>`, resolved with the parent's properties.
+#[test]
+fn maven_parent_dependency_management_pins_child_versions() {
+    let inv = scan_fixture("java-maven-repo-parent");
+    let n = inv
+        .node("jackson-databind")
+        .expect("jackson-databind missing");
+    assert_eq!(n.version(), Some("2.15.2"));
+}
+
+/// `${project.version}` in a child without its own `<version>` resolves to
+/// the inherited parent version.
+#[test]
+fn maven_project_version_inherits_from_in_repo_parent() {
+    let inv = scan_fixture("java-maven-repo-parent");
+    assert_eq!(
+        inv.node("gccs-common").unwrap().version(),
+        Some("8.384-SNAPSHOT")
+    );
+}
+
+/// `<relativePath>` (pointing at a directory) locates the parent even when
+/// its version is a placeholder that can't be matched by coordinates.
+#[test]
+fn maven_relative_path_locates_parent() {
+    let inv = scan_fixture("java-maven-repo-parent");
+    assert_eq!(inv.node("httpclient").unwrap().version(), Some("3.1"));
+}
+
+/// A parent version that is not in the repo must not borrow properties
+/// from a different version of the same parent that is.
+#[test]
+fn maven_parent_version_mismatch_does_not_resolve() {
+    let inv = scan_fixture("java-maven-repo-parent");
+    assert_eq!(
+        inv.node("json-smart").unwrap().version(),
+        Some("${nimbus-jose-jwt.version}")
+    );
+}
+
+/// The parent poms' own `<dependencyManagement>` entries are not
+/// dependencies and must not surface as nodes.
+#[test]
+fn maven_in_repo_parent_management_does_not_emit_nodes() {
+    let inv = scan_fixture("java-maven-repo-parent");
+    assert_eq!(
+        inv.graph
+            .nodes
+            .iter()
+            .filter(|n| n.name() == "jackson-databind")
+            .count(),
+        1
+    );
+}
+
+/// Poms naming each other as parents must not loop forever.
+#[test]
+fn maven_parent_cycle_terminates() {
+    let inv = scan_fixture("java-maven-parent-cycle");
+    assert!(inv.node("from-a").is_some());
+    assert!(inv.node("from-b").is_some());
+}
+
 #[test]
 fn maven_scan_yields_root_edges() {
     let inv = scan_fixture("java-maven");

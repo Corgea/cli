@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <!-- ../pom.xml (platform/pom.xml) does not exist: found by coordinates. -->
+  <parent>
+    <groupId>com.acme</groupId>
+    <artifactId>acme-root</artifactId>
+    <version>1.0.0</version>
+  </parent>
+  <groupId>com.acme.gccs</groupId>
+  <artifactId>gccs-aggregate-all</artifactId>
+  <version>8.384-SNAPSHOT</version>
+  <packaging>pom</packaging>
+  <name>US-TUCI-Atlas-GCCS</name>
+
+  <properties>
+    <commons-httpclient.version>3.1</commons-httpclient.version>
+    <nimbus-jose-jwt.version>10.4</nimbus-jose-jwt.version>
+    <jackson.version>2.15.2</jackson.version>
+    <continuous.deployment.always>false</continuous.deployment.always>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-databind</artifactId>
+        <version>${jackson.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+</project>

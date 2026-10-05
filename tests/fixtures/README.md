@@ -19,6 +19,8 @@ Offline fixture projects for `corgea deps` unit and CLI tests per `docs/PRD_DEPS
 | `python-pip-nolock` | DEP001 + requirements.txt |
 | `python-uv-requirements` | `uv.lock` does not suppress requirements scanning |
 | `java-maven` / `java-gradle` | Maven/Gradle parsers |
+| `java-maven-repo-parent` | parent/grandparent poms elsewhere in the repo: inherited properties and `<dependencyManagement>` |
+| `java-maven-parent-cycle` | poms naming each other as parents terminate |
 | `go-mod-smoke` | detection only |
 | `malformed/` | graceful parse errors |
 | `vuln-db.json` | mock DEP010 advisories |

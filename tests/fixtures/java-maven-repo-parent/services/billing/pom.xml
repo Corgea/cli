@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <!-- A placeholder parent version can't be matched by coordinates, only
+       through relativePath (here a directory). -->
+  <parent>
+    <groupId>com.acme.gccs</groupId>
+    <artifactId>gccs-aggregate-all</artifactId>
+    <version>${revision}</version>
+    <relativePath>../../platform/aggregate</relativePath>
+  </parent>
+  <artifactId>billing-service</artifactId>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.httpcomponents</groupId>
+      <artifactId>httpclient</artifactId>
+      <version>${commons-httpclient.version}</version>
+    </dependency>
+  </dependencies>
+</project>
