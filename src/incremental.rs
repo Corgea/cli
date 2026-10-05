@@ -95,7 +95,8 @@ pub enum BaselineRef {
     Scan(String),
 }
 
-/// Why an upload carries no diff, so every file is analyzed.
+/// Why an upload carries no diff for the server to analyze instead of every
+/// file it holds.
 ///
 /// Sent with the upload and stored on the scan, so the codes are a contract:
 /// add new ones, never rename one already shipped.
@@ -142,7 +143,8 @@ impl FullScanCause {
     }
 }
 
-/// The cause, and the clause the run prints after "Scanning every file:".
+/// The cause, and a clause describing it: the one printed after "Scanning
+/// every file:" for every cause but the two flags, which print nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FullScanReason {
     pub cause: FullScanCause,
@@ -193,12 +195,10 @@ impl IncrementalPlan {
             return Ok(self);
         }
         if self.changed_files.len() + additions.len() > MAX_CHANGED_FILES {
-            let reason = FullScanReason::new(
+            return Err(FullScanReason::new(
                 FullScanCause::TooManyChangedFiles,
                 "the include rules cover more files than an incremental scan is worth",
-            );
-            println!("Scanning every file: {}.", reason.detail);
-            return Err(reason);
+            ));
         }
         match additions.len() {
             1 => println!("Incremental scan: also analyzing 1 force-included file."),
@@ -236,25 +236,16 @@ pub struct DiffSources<'a> {
 
 /// What an incremental scan of this upload would cover.
 ///
-/// Prints one line either way: the scope it resolved to, or why the scan is
-/// analyzing everything.
+/// Prints the scope it resolved to. A refusal is never fatal — a full scan is
+/// correct, only slower — so the caller prints it and carries on.
 pub fn resolve_incremental_plan(
     config: &Config,
     project_name: &str,
     sources: DiffSources<'_>,
 ) -> Result<IncrementalPlan, FullScanReason> {
-    match plan_diff(config, project_name, &sources) {
-        Ok((plan, summary)) => {
-            println!("{summary}");
-            Ok(plan)
-        }
-        // Never fatal — a full scan is correct, only slower, so the run
-        // continues and only says why.
-        Err(reason) => {
-            println!("Scanning every file: {}.", reason.detail);
-            Err(reason)
-        }
-    }
+    let (plan, summary) = plan_diff(config, project_name, &sources)?;
+    println!("{summary}");
+    Ok(plan)
 }
 
 /// The diff and a line describing it, or why there is no diff to send.

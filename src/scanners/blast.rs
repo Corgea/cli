@@ -661,6 +661,7 @@ fn start_new_scan(
         // findings forward for whatever the diff omits — so without this an
         // include rule would never get the file looked at on an incremental run.
         .and_then(|plan| plan.including(&repo_relative_strings(&force_included)))
+        .inspect_err(|reason| println!("Scanning every file: {}.", reason.detail))
     };
     // Stored with the scan for a later run to diff against, so it is worth
     // uploading even when this run scans everything. Under

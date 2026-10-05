@@ -726,13 +726,11 @@ pub fn upload_zip(
                 if let Some(patterns) = &include_paths_field {
                     form = form.part("include_paths", multipart::Part::text(patterns.clone()));
                 }
-                // Both fields or neither: the list is only safe next to the commit
-                // it was measured from, and a server seeing one without the other
-                // would guess a baseline. A list that will not serialize drops
-                // both, leaving a full scan.
                 match &incremental {
                     // Stored on the scan, so a full scan that was expected to
-                    // be incremental can be explained after the fact.
+                    // be incremental can be explained after the fact. The
+                    // server also honours `disabled_by_flag` rather than
+                    // diffing through the SCM integration on its own.
                     Err(reason) => {
                         form = form
                             .part(
@@ -744,6 +742,10 @@ pub fn upload_zip(
                                 multipart::Part::text(reason.detail.clone()),
                             );
                     }
+                    // Both fields or neither: the list is only safe next to the
+                    // commit it was measured from, and a server seeing one
+                    // without the other would guess a baseline. A list that
+                    // will not serialize drops both, leaving a full scan.
                     Ok(plan) => match serde_json::to_string(&plan.changed_files) {
                         Ok(changed_files) => {
                             // Which scan the diff was measured from. A commit
