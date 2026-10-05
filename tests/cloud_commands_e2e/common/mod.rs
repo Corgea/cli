@@ -343,10 +343,11 @@ pub(crate) fn plan_step(plan: &[ExpectedRequest], label: &str) -> usize {
 
 /// Every baseline lookup a fixture repo makes when nothing turns up.
 ///
-/// The branch being scanned first, whose last scan is the nearest baseline
-/// there could be; then the scans of this checkout's recent commits on any
-/// branch; then the two trunk names, since the fixture records no origin/HEAD.
-/// Each branch lookup is two walks. The first takes a baseline of either kind,
+/// The scans of this checkout's recent commits on any branch first, since the
+/// nearest scanned ancestor is the best baseline there could be; the fixture's
+/// history fits in one batch. Then the branch being scanned, then the two trunk
+/// names, since the fixture records no origin/HEAD. Each branch lookup is two
+/// walks. The first takes a baseline of either kind,
 /// so it cannot let the server drop scans that are not known-clean; the second
 /// asks for exactly those once no checksums have been found, so a clean scan
 /// behind a page budget's worth of dirty ones is still reachable.
@@ -373,12 +374,12 @@ pub(crate) fn baseline_lookups_finding_nothing(project: &'static str) -> Vec<Exp
             })
             .collect()
     };
-    let mut lookups = branch_walks(own);
-    lookups.push(expected_request(
+    let mut lookups = vec![expected_request(
         "look up a baseline scan of a recent commit",
         move |request| assert_ancestor_lookup_request(request, project, None, false),
         json_response(scans_response(Vec::new())),
-    ));
+    )];
+    lookups.extend(branch_walks(own));
     lookups.extend(branch_walks(trunks));
     lookups
 }

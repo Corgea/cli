@@ -124,6 +124,37 @@ fn ancestor_lookup(shas: Option<Vec<String>>, scans: Vec<Value>) -> ExpectedRequ
     )
 }
 
+/// One page of the lookup by commit, for the cases that read more than one.
+fn ancestor_lookup_page(
+    shas: Vec<String>,
+    page: u16,
+    total_pages: u32,
+    scans: Vec<Value>,
+) -> ExpectedRequest {
+    expected_request(
+        "look up a baseline scan of a recent commit",
+        move |request| {
+            assert_authenticated_request(request, Method::GET, "/api/v1/scans")?;
+            assert_query(request, "project", PROJECT)?;
+            assert_query(request, "page", &page.to_string())?;
+            assert_query(request, "page_size", "50")?;
+            assert_query(request, "sha", &shas.join(","))
+        },
+        json_response(json!({
+            "status": "ok",
+            "page": page,
+            "total_pages": total_pages,
+            "scans": scans,
+        })),
+    )
+}
+
+/// The lookup by commit every git run makes first, answered with nothing, for
+/// the cases about what happens once it falls back to branch names.
+fn no_scanned_recent_commit() -> ExpectedRequest {
+    ancestor_lookup(None, vec![])
+}
+
 /// One page of the baseline lookup, for the walk an old backend forces.
 fn baseline_lookup_page(
     branch: &'static str,
@@ -208,6 +239,7 @@ fn the_baselines_stored_checksums_are_used_in_preference_to_a_git_diff() {
     let mut plan = vec![
         verify_request(),
         scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
         baseline_lookup(FIXTURE_BRANCH, vec![scan]),
         checksum_download(manifest),
         start_upload(),
@@ -326,6 +358,7 @@ fn a_dirty_worktree_is_scanned_incrementally_from_the_stored_checksums() {
     let mut plan = vec![
         verify_request(),
         scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
         baseline_lookup(FIXTURE_BRANCH, vec![scan]),
         checksum_download(manifest),
         start_upload(),
@@ -403,6 +436,7 @@ fn an_excluded_run_diffs_its_checksums_and_names_what_it_holds_back() {
     let mut plan = vec![
         verify_request(),
         scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
         baseline_lookup(FIXTURE_BRANCH, vec![scan]),
         checksum_download(manifest),
         start_upload(),
@@ -474,6 +508,7 @@ fn an_excluded_run_with_no_checksums_to_diff_scans_everything() {
     let mut plan = vec![
         verify_request(),
         scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
         baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
         start_upload(),
         expected_request(
@@ -539,6 +574,7 @@ fn checksums_that_do_not_match_their_digest_fall_back_to_the_git_diff() {
     let mut plan = vec![
         verify_request(),
         scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
         baseline_lookup(FIXTURE_BRANCH, vec![scan]),
         checksum_download(manifest),
         start_upload(),
@@ -585,6 +621,7 @@ fn the_upload_carries_the_baseline_commit_and_the_files_that_changed_since_it() 
     let mut plan = vec![
         verify_request(),
         scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
         baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
         start_upload(),
         expected_request(
@@ -670,15 +707,15 @@ fn a_project_with_no_baseline_scan_uploads_without_a_diff() {
     assert_eq!(output.status.code(), Some(0), "{context}");
     assert!(
         stdout.contains(&format!(
-            "has no completed scan on {FIXTURE_BRANCH}, main or master, nor of any of the 2 \
-             most recent commits in this checkout's history that could be diffed against"
+            "has no completed scan of any of the 2 most recent commits in this checkout's \
+             history, nor on {FIXTURE_BRANCH}, main or master, that could be diffed against"
         )),
         "{context}"
     );
 }
 
-/// The branch being scanned is asked about first, and its own last scan wins
-/// over trunk's.
+/// Once no recent commit turns out to have been scanned, the branch being
+/// scanned is asked about next, and its own last scan wins over trunk's.
 ///
 /// A branch that has been scanned before has a nearer ancestor than trunk does:
 /// everything it changed before that scan was already analyzed, so diffing
@@ -694,15 +731,18 @@ fn the_branch_being_scanned_is_preferred_over_trunk_and_falls_back_to_it() {
 
         let mut scan = baseline_scan(&base_sha);
         scan["branch"] = json!(baseline_branch);
-        // The branch being scanned is asked about first either way. When the
-        // baseline is trunk's, that lookup and the one by commit come back
-        // empty and the next one finds it -- so the plan is the assertion that
-        // the order is what it is.
-        let mut plan = vec![verify_request(), scan_settings_request(PROJECT)];
+        // The lookup by commit comes first either way, then the branch being
+        // scanned. When the baseline is trunk's, those come back empty and the
+        // next one finds it -- so the plan is the assertion that the order is
+        // what it is.
+        let mut plan = vec![
+            verify_request(),
+            scan_settings_request(PROJECT),
+            no_scanned_recent_commit(),
+        ];
         if baseline_branch != FIXTURE_BRANCH {
             plan.push(baseline_lookup(FIXTURE_BRANCH, vec![]));
             plan.push(clean_baseline_lookup(FIXTURE_BRANCH, vec![]));
-            plan.push(ancestor_lookup(None, vec![]));
         }
         let expected_base = base_sha.clone();
         plan.extend([
@@ -735,12 +775,12 @@ fn the_branch_being_scanned_is_preferred_over_trunk_and_falls_back_to_it() {
     }
 }
 
-/// A branch with no scan of its own diffs against the scan of the commit it
-/// forked from, whatever branch that scan names -- here a trunk called
-/// `develop`, which the name lookup never asks about. A detached HEAD, which
-/// names no branch to look up at all, gets the same answer.
+/// The scan of a recent commit is asked about before any branch name, and
+/// taken whatever branch it names -- here a trunk called `develop`, which the
+/// name lookup never asks about. No branch lookup is made at all once it is
+/// found, whether or not the checkout names a branch.
 #[test]
-fn a_scan_of_a_recent_commit_is_the_baseline_when_the_branch_has_none() {
+fn a_scan_of_a_recent_commit_is_the_baseline_before_any_branch_is_asked_about() {
     for detached in [false, true] {
         let project = git_project();
         let base_sha = project.sha.clone();
@@ -753,10 +793,6 @@ fn a_scan_of_a_recent_commit_is_the_baseline_when_the_branch_has_none() {
             baseline_scan_with_checksums(&base_sha, &[("main.py", SOURCE_BODY)]);
         scan["branch"] = json!("develop");
         let mut plan = vec![verify_request(), scan_settings_request(PROJECT)];
-        if !detached {
-            plan.push(baseline_lookup(FIXTURE_BRANCH, vec![]));
-            plan.push(clean_baseline_lookup(FIXTURE_BRANCH, vec![]));
-        }
         plan.extend([
             ancestor_lookup(Some(vec![head_sha.clone(), base_sha.clone()]), vec![scan]),
             checksum_download(manifest),
@@ -803,6 +839,209 @@ fn a_scan_of_a_recent_commit_is_the_baseline_when_the_branch_has_none() {
             )),
             "{context}"
         );
+    }
+}
+
+/// Commits `count` new files on top of the fixture, one per commit, and
+/// returns this checkout's history nearest first.
+fn commit_steps(project: &GitProject, count: usize) -> Vec<String> {
+    for step in 0..count {
+        let name = format!("step{step}.py");
+        std::fs::write(project.path().join(&name), format!("print({step})\n")).expect("write step");
+        run_git(project.path(), &["add", &name]);
+        run_git(project.path(), &["commit", "-m", &name]);
+    }
+    String::from_utf8(run_git(project.path(), &["rev-list", "HEAD"]).stdout)
+        .expect("UTF-8 SHAs")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Upload asserting the checksum diff named [`BASELINE_SCAN`].
+fn checksum_diff_upload() -> ExpectedRequest {
+    expected_request(
+        "upload BLAST archive with the checksum diff",
+        |request| {
+            assert_authenticated_request(
+                request,
+                Method::PATCH,
+                "/api/v1/start-scan/transfer-123/",
+            )?;
+            assert_multipart_text_field(request, "incremental_base_scan_id", BASELINE_SCAN)
+        },
+        json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+    )
+}
+
+/// Commits are asked about ten at a time, nearest first, so a scan of a commit
+/// further back than the first ten is still found -- by a second request for
+/// the next ten, and before any branch is asked about.
+#[test]
+fn a_scan_beyond_the_first_ten_commits_is_found_by_the_second_batch() {
+    let project = git_project();
+    let history = commit_steps(&project, 11);
+    let base_sha = history.last().expect("fixture commit").clone();
+    assert_eq!(history.len(), 12);
+
+    let (scan, manifest) = baseline_scan_with_checksums(&base_sha, &[("main.py", SOURCE_BODY)]);
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        ancestor_lookup(Some(history[..10].to_vec()), vec![]),
+        ancestor_lookup(Some(history[10..].to_vec()), vec![scan]),
+        checksum_download(manifest),
+        start_upload(),
+        checksum_diff_upload(),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(&format!(
+            "Incremental scan: 11 files changed since the scan of ancestor commit {} (11 \
+             commits back).",
+            &base_sha[..7]
+        )),
+        "{context}"
+    );
+}
+
+/// The server lists scans newest first, not nearest first, so the scan of the
+/// closer commit can come back on a later page than one further back. The
+/// batch is read to the end, and the closer commit wins.
+#[test]
+fn the_closest_commit_wins_even_when_its_scan_is_on_a_later_page() {
+    let project = git_project();
+    let history = commit_steps(&project, 2);
+    let (near_sha, far_sha) = (history[1].clone(), history[2].clone());
+
+    let (mut far, _) = baseline_scan_with_checksums(&far_sha, &[("main.py", SOURCE_BODY)]);
+    far["id"] = json!("farther-scan");
+    let (near, manifest) = baseline_scan_with_checksums(
+        &near_sha,
+        &[("main.py", SOURCE_BODY), ("step0.py", "print(0)\n")],
+    );
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        ancestor_lookup_page(history.clone(), 1, 2, vec![far]),
+        ancestor_lookup_page(history.clone(), 2, 2, vec![near]),
+        checksum_download(manifest),
+        start_upload(),
+        checksum_diff_upload(),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(&format!(
+            "Incremental scan: 1 file changed since the scan of ancestor commit {} (1 commit \
+             back).",
+            &near_sha[..7]
+        )),
+        "{context}"
+    );
+}
+
+/// A depth-1 clone, the `actions/checkout` default, holds only HEAD. The lookup
+/// by commit asks about that one commit rather than history the clone does not
+/// have, then falls back to the branch. The branch's scan is of a commit this
+/// clone cannot reach, so only its stored checksums can diff against it; without
+/// them the run scans everything and says why.
+#[test]
+fn a_shallow_clone_asks_about_the_commits_it_holds_then_falls_back_to_the_branch() {
+    for stored_checksums in [true, false] {
+        let project = git_project();
+        let base_sha = project.sha.clone();
+        let head_sha = second_commit(&project);
+        let clone = tempfile::TempDir::new().expect("create clone");
+        run_git(
+            project.path(),
+            &[
+                "clone",
+                "--quiet",
+                "--depth",
+                "1",
+                "--branch",
+                FIXTURE_BRANCH,
+                &format!("file://{}", project.path().display()),
+                &clone.path().display().to_string(),
+            ],
+        );
+
+        let mut plan = vec![
+            verify_request(),
+            scan_settings_request(PROJECT),
+            ancestor_lookup(Some(vec![head_sha.clone()]), vec![]),
+        ];
+        if stored_checksums {
+            let (scan, manifest) =
+                baseline_scan_with_checksums(&base_sha, &[("main.py", SOURCE_BODY)]);
+            plan.extend([
+                baseline_lookup(FIXTURE_BRANCH, vec![scan]),
+                checksum_download(manifest),
+                start_upload(),
+                checksum_diff_upload(),
+            ]);
+        } else {
+            plan.extend([
+                baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
+                start_upload(),
+                expected_request(
+                    "upload BLAST archive with no diff",
+                    |request| {
+                        assert_authenticated_request(
+                            request,
+                            Method::PATCH,
+                            "/api/v1/start-scan/transfer-123/",
+                        )?;
+                        assert_no_multipart_field(request, "incremental_base_sha")?;
+                        assert_no_multipart_field(request, "incremental_changed_files")
+                    },
+                    json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+                ),
+            ]);
+        }
+        plan.extend(scan_tail());
+
+        let api = ApiStub::start(plan);
+        let (mut command, _home) = cloud_command(&api, clone.path());
+        command.args(["scan", "blast", "--project-name", PROJECT]);
+
+        let output = run_with_timeout(command, &api);
+        let transcript = api.assert_finished();
+        let context = output_context(&output, &transcript);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert_eq!(output.status.code(), Some(0), "{context}");
+        let expected = if stored_checksums {
+            format!(
+                "Incremental scan: 2 files changed since the last scan of {FIXTURE_BRANCH} ({})",
+                &base_sha[..7]
+            )
+        } else {
+            "A shallow clone cannot diff against it".to_string()
+        };
+        assert!(stdout.contains(&expected), "{context}");
     }
 }
 
@@ -896,6 +1135,7 @@ fn a_baseline_on_a_later_page_is_still_found() {
     let mut plan = vec![
         verify_request(),
         scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
         baseline_lookup_page(FIXTURE_BRANCH, 1, 2, vec![unusable]),
         baseline_lookup_page(FIXTURE_BRANCH, 2, 2, vec![baseline_scan(&base_sha)]),
         start_upload(),
@@ -936,6 +1176,7 @@ fn a_failed_lookup_is_not_reported_as_a_missing_baseline() {
     let mut plan = vec![
         verify_request(),
         scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
         expected_request(
             "fail the baseline lookup",
             |request| assert_baseline_lookup_request(request, PROJECT, Some(FIXTURE_BRANCH), false),
@@ -1097,6 +1338,7 @@ fn a_clean_baseline_is_found_even_when_dirty_scans_come_back_first() {
     let mut plan = vec![
         verify_request(),
         scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
         baseline_lookup(FIXTURE_BRANCH, vec![dirty]),
         clean_baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
         start_upload(),
@@ -1194,6 +1436,7 @@ fn ignore_dirty_worktree_diffs_the_working_tree_instead_of_refusing() {
     let mut plan = vec![
         verify_request(),
         scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
         baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
         start_upload(),
         expected_request(
@@ -1260,6 +1503,7 @@ fn a_dirty_worktree_with_no_stored_checksums_scans_everything() {
     let mut plan = vec![
         verify_request(),
         scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
         baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
         start_upload(),
         expected_request(
