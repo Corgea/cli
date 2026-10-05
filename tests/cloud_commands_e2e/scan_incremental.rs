@@ -262,7 +262,9 @@ fn the_baselines_stored_checksums_are_used_in_preference_to_a_git_diff() {
                 )?;
                 // Checksums are taken over the files on disk, so the list
                 // covers uncommitted work by construction.
-                assert_multipart_text_field(request, "incremental_covers_worktree", "true")
+                assert_multipart_text_field(request, "incremental_covers_worktree", "true")?;
+                assert_no_multipart_field(request, "incremental_skipped_reason")?;
+                assert_no_multipart_field(request, "incremental_skipped_detail")
             },
             json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
         ),
@@ -522,6 +524,17 @@ fn an_excluded_run_with_no_checksums_to_diff_scans_everything() {
                 assert_no_multipart_field(request, "incremental_base_sha")?;
                 assert_no_multipart_field(request, "incremental_base_scan_id")?;
                 assert_no_multipart_field(request, "incremental_changed_files")?;
+                // Classified by what finally refused, explained by everything
+                // that was tried.
+                assert_multipart_text_field(
+                    request,
+                    "incremental_skipped_reason",
+                    "exclude_needs_checksums",
+                )?;
+                assert_body_contains(
+                    request,
+                    b"stored no file checksums to diff against, and --exclude held files back",
+                )?;
                 // Still uploaded: this scan cannot diff, but it leaves the
                 // next one something to diff against.
                 assert_body_contains(request, b"name=\"file_manifest_root\"")
@@ -610,6 +623,59 @@ fn checksums_that_do_not_match_their_digest_fall_back_to_the_git_diff() {
     assert_eq!(output.status.code(), Some(0), "{context}");
 }
 
+/// When the checksums that should have answered are unreadable and git then
+/// refuses too, the fault is reported as the cause: a dirty tree is only why
+/// the fallback could not cover for it.
+#[test]
+fn unreadable_checksums_are_the_cause_when_git_cannot_cover_for_them() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    std::fs::write(project.path().join("main.py"), "print('uncommitted')\n")
+        .expect("dirty the tree");
+
+    let (scan, mut manifest) = baseline_scan_with_checksums(&base_sha, &[("main.py", SOURCE_BODY)]);
+    manifest.truncate(manifest.len() / 2);
+
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
+        baseline_lookup(FIXTURE_BRANCH, vec![scan]),
+        checksum_download(manifest),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with no diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_no_multipart_field(request, "incremental_changed_files")?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_skipped_reason",
+                    "baseline_checksums_unreadable",
+                )?;
+                assert_body_contains(request, b"could not be read")?;
+                assert_body_contains(request, b"this worktree has uncommitted changes")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+}
+
 #[test]
 fn the_upload_carries_the_baseline_commit_and_the_files_that_changed_since_it() {
     let project = git_project();
@@ -641,7 +707,8 @@ fn the_upload_carries_the_baseline_commit_and_the_files_that_changed_since_it() 
                     request,
                     "incremental_changed_files",
                     r#"["helper.py","main.py"]"#,
-                )
+                )?;
+                assert_no_multipart_field(request, "incremental_skipped_reason")
             },
             json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
         ),
@@ -688,7 +755,16 @@ fn a_project_with_no_baseline_scan_uploads_without_a_diff() {
                 // Neither field alone, nor at all: a base commit without a
                 // list lets the server carry everything forward.
                 assert_no_multipart_field(request, "incremental_base_sha")?;
-                assert_no_multipart_field(request, "incremental_changed_files")
+                assert_no_multipart_field(request, "incremental_changed_files")?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_skipped_reason",
+                    "no_baseline_scan",
+                )?;
+                assert_body_contains(
+                    request,
+                    b"has no completed scan of any of the 2 most recent",
+                )
             },
             json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
         ),
@@ -1192,7 +1268,12 @@ fn a_failed_lookup_is_not_reported_as_a_missing_baseline() {
                     "/api/v1/start-scan/transfer-123/",
                 )?;
                 assert_no_multipart_field(request, "incremental_base_sha")?;
-                assert_no_multipart_field(request, "incremental_changed_files")
+                assert_no_multipart_field(request, "incremental_changed_files")?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_skipped_reason",
+                    "baseline_lookup_failed",
+                )
             },
             json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
         ),
@@ -1216,9 +1297,10 @@ fn a_failed_lookup_is_not_reported_as_a_missing_baseline() {
     );
 }
 
-/// The opt-out is absolute: no baseline lookup, no fields, no message. Someone
-/// reaching for it wants every file analyzed, usually because something outside
-/// `corgea.yaml` changed that the server's baseline checks cannot see.
+/// The opt-out is absolute: no baseline lookup, no diff fields, no message.
+/// Someone reaching for it wants every file analyzed, usually because something
+/// outside `corgea.yaml` changed that the server's baseline checks cannot see.
+/// The server is still told why, so the full scan can be explained later.
 #[test]
 fn disable_incremental_does_not_even_look_for_a_baseline() {
     let project = git_project();
@@ -1240,7 +1322,17 @@ fn disable_incremental_does_not_even_look_for_a_baseline() {
                 assert_multipart_text_field(request, "sha", &patch_sha)?;
                 assert_multipart_text_field(request, "dirty", "false")?;
                 assert_no_multipart_field(request, "incremental_base_sha")?;
-                assert_no_multipart_field(request, "incremental_changed_files")
+                assert_no_multipart_field(request, "incremental_changed_files")?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_skipped_reason",
+                    "disabled_by_flag",
+                )?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_skipped_detail",
+                    "--disable-incremental was passed",
+                )
             },
             json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
         ),
@@ -1290,7 +1382,13 @@ fn a_narrowed_archive_skips_incremental_without_claiming_a_full_scan() {
                 // A partial archive is never an exact snapshot of the commit.
                 assert_multipart_text_field(request, "dirty", "true")?;
                 assert_no_multipart_field(request, "incremental_base_sha")?;
-                assert_no_multipart_field(request, "incremental_changed_files")
+                assert_no_multipart_field(request, "incremental_changed_files")?;
+                // Silent in the terminal, not to the server.
+                assert_multipart_text_field(
+                    request,
+                    "incremental_skipped_reason",
+                    "targeted_upload",
+                )
             },
             json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
         ),
@@ -1517,7 +1615,8 @@ fn a_dirty_worktree_with_no_stored_checksums_scans_everything() {
                 assert_multipart_text_field(request, "sha", &patch_sha)?;
                 assert_multipart_text_field(request, "dirty", "true")?;
                 assert_no_multipart_field(request, "incremental_base_sha")?;
-                assert_no_multipart_field(request, "incremental_changed_files")
+                assert_no_multipart_field(request, "incremental_changed_files")?;
+                assert_multipart_text_field(request, "incremental_skipped_reason", "dirty_worktree")
             },
             json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
         ),

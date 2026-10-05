@@ -1,4 +1,4 @@
-use crate::incremental::{BaselineRef, IncrementalPlan};
+use crate::incremental::{BaselineRef, FullScanReason, IncrementalPlan};
 use crate::log::debug;
 use crate::manifest::EncodedManifest;
 use crate::utils;
@@ -541,14 +541,14 @@ pub struct UploadZipResult {
 }
 
 /// Per-scan settings travelling with the archive without being part of it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct UploadOptions {
     pub scan_type: Option<String>,
     pub policy: Option<String>,
     pub metadata: Option<String>,
-    /// Set when this run resolved a diff for the server to analyze instead of
-    /// the whole project.
-    pub incremental: Option<IncrementalPlan>,
+    /// The diff for the server to analyze instead of the whole project, or why
+    /// this run has none.
+    pub incremental: Result<IncrementalPlan, FullScanReason>,
     /// `--include` patterns for this run. The project's own include rules are
     /// already stored server-side, so only the flag values are sent.
     pub include_paths: Vec<String>,
@@ -726,12 +726,27 @@ pub fn upload_zip(
                 if let Some(patterns) = &include_paths_field {
                     form = form.part("include_paths", multipart::Part::text(patterns.clone()));
                 }
-                // Both fields or neither: the list is only safe next to the commit
-                // it was measured from, and a server seeing one without the other
-                // would guess a baseline. A list that will not serialize drops
-                // both, leaving a full scan.
-                if let Some(plan) = &incremental {
-                    match serde_json::to_string(&plan.changed_files) {
+                match &incremental {
+                    // Stored on the scan, so a full scan that was expected to
+                    // be incremental can be explained after the fact. The
+                    // server also honours `disabled_by_flag` rather than
+                    // diffing through the SCM integration on its own.
+                    Err(reason) => {
+                        form = form
+                            .part(
+                                "incremental_skipped_reason",
+                                multipart::Part::text(reason.cause.code()),
+                            )
+                            .part(
+                                "incremental_skipped_detail",
+                                multipart::Part::text(reason.detail.clone()),
+                            );
+                    }
+                    // Both fields or neither: the list is only safe next to the
+                    // commit it was measured from, and a server seeing one
+                    // without the other would guess a baseline. A list that
+                    // will not serialize drops both, leaving a full scan.
+                    Ok(plan) => match serde_json::to_string(&plan.changed_files) {
                         Ok(changed_files) => {
                             // Which scan the diff was measured from. A commit
                             // when git produced it, and the scan itself when
@@ -760,7 +775,7 @@ pub fn upload_zip(
                         Err(e) => debug(&format!(
                         "Could not serialize the incremental file list, scanning every file: {e}"
                     )),
-                    }
+                    },
                 }
                 // Root and version travel beside the bytes rather than inside
                 // them: the server recomputes the root from what it
