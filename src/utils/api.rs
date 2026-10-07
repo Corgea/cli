@@ -2,7 +2,7 @@ use crate::incremental::{BaselineRef, IncrementalPlan};
 use crate::log::debug;
 use crate::manifest::EncodedManifest;
 use crate::utils;
-use corgea::vuln_api::{auth_header, source};
+use corgea::vuln_api::{auth_header, default_headers, source};
 use reqwest::header::HeaderMap;
 use reqwest::{
     blocking::multipart,
@@ -53,6 +53,7 @@ static SHARED_CLIENT: std::sync::LazyLock<reqwest::blocking::Client> =
     std::sync::LazyLock::new(|| {
         let mut builder = reqwest::blocking::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .default_headers(default_headers())
             .cookie_provider(COOKIE_JAR.clone());
 
         if let Ok(https_proxy) = std::env::var("https_proxy") {
@@ -1770,10 +1771,9 @@ pub fn exchange_code_for_token(
     base_url: &str,
     code: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let client = reqwest::blocking::Client::new();
     let exchange_url = format!("{}{}/authorize", base_url, API_BASE);
 
-    let response = client
+    let response = SHARED_CLIENT
         .get(&exchange_url)
         .header("CORGEA-SOURCE", source())
         .query(&[("code", code)])
@@ -2805,6 +2805,19 @@ mod tests {
             }
         });
         base
+    }
+
+    #[test]
+    fn unauthenticated_requests_send_cli_version() {
+        let (base, requests) = corgea::vuln_api_stub::spawn_capturing_vuln_api_stub();
+        let _ = exchange_code_for_token(&base, "code");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            corgea::vuln_api_stub::header_value(&requests[0], corgea::vuln_api::CLI_VERSION_HEADER)
+                .as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]
