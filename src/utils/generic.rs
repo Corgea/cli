@@ -66,11 +66,14 @@ const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
 pub struct ArchiveContents {
     /// Source paths of everything added, in the order they were written.
     pub added_files: Vec<PathBuf>,
+    /// Zip entry names of the project files added, which is how the server
+    /// names a file in a partial scan's list.
+    pub entry_names: HashSet<String>,
     /// Digest of every archived file, keyed by its zip entry name.
     ///
-    /// Only built for a whole-project archive. A `--target` or
-    /// `--only-uncommitted` run packs a chosen handful of files, and a manifest
-    /// of those reads to the server as every other file having been deleted.
+    /// Only built for a whole-project archive. A `--target` run packs a chosen
+    /// handful of files, and a manifest of those reads to the server as every
+    /// other file having been deleted.
     pub manifest: Option<Manifest>,
 }
 
@@ -252,6 +255,7 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
         .unix_permissions(0o755);
 
     let mut added_files = Vec::new();
+    let mut entry_names = HashSet::new();
     let mut excluded_files = Vec::new();
     // Hashing rides along on the copy that compresses each file, so the archive
     // is still read once. Skipped outright when the caller has already decided
@@ -273,13 +277,14 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
                     Some(manifest) => {
                         let mut tee = TeeWriter::new(&mut zip);
                         io::copy(&mut file, &mut tee)?;
-                        manifest.insert(entry_name, tee.finish());
+                        manifest.insert(entry_name.clone(), tee.finish());
                     }
                     None => {
                         io::copy(&mut file, &mut zip)?;
                     }
                 }
                 added_files.push(path);
+                entry_names.insert(entry_name);
             } else if path.is_dir() {
                 zip.add_directory(directory_entry_name(&relative_path), options)?;
             }
@@ -334,6 +339,7 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     zip.finish()?;
     Ok(ArchiveContents {
         added_files,
+        entry_names,
         manifest,
     })
 }

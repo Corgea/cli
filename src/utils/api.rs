@@ -555,6 +555,11 @@ pub struct UploadOptions {
     /// Digests of everything in the archive, stored with the scan for a later
     /// run to diff against. Set only when the archive is the whole project.
     pub file_manifest: Option<EncodedManifest>,
+    /// Zip entry names to analyze out of a whole-project archive. Set, even
+    /// when empty, for a partial scan, which the server registers the way it
+    /// does a pull request scan: findings for these files only, never standing
+    /// in for the branch's state.
+    pub partial_files: Option<Vec<String>>,
 }
 
 pub fn upload_zip(
@@ -571,6 +576,7 @@ pub fn upload_zip(
         incremental,
         include_paths,
         file_manifest,
+        partial_files,
     } = options;
     let include_paths_field = match include_paths.is_empty() {
         true => None,
@@ -582,6 +588,14 @@ pub fn upload_zip(
             }
         },
     };
+    // JSON rather than the comma-separated form the server also accepts: a
+    // path may contain a comma. Failing here, rather than dropping the list,
+    // keeps a partial scan from registering as a full one.
+    let partial_files_field = partial_files
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| format!("Could not serialize the files to scan: {e}"))?;
     let client = http_client();
     let file_size = std::fs::metadata(file_path)?.len();
     let file_name = Path::new(file_path).file_name().unwrap().to_str().unwrap();
@@ -725,6 +739,11 @@ pub fn upload_zip(
                 }
                 if let Some(patterns) = &include_paths_field {
                     form = form.part("include_paths", multipart::Part::text(patterns.clone()));
+                }
+                if let Some(files) = &partial_files_field {
+                    form = form
+                        .part("partial_scan", multipart::Part::text("true"))
+                        .part("files_to_scan", multipart::Part::text(files.clone()));
                 }
                 // Both fields or neither: the list is only safe next to the commit
                 // it was measured from, and a server seeing one without the other
