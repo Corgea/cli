@@ -17,7 +17,7 @@ use zip::{write::FileOptions, ZipWriter};
 /// of the worktree it was pointed at. `deps::run` scrubs the same set for its
 /// own git subprocesses; the library and binary crates share no module that
 /// could hold one copy.
-const GIT_LOCAL_ENV_VARS: &[&str] = &[
+pub const GIT_LOCAL_ENV_VARS: &[&str] = &[
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CONFIG",
     "GIT_CONFIG_PARAMETERS",
@@ -687,7 +687,7 @@ fn split_remote(url: &str) -> Option<Vec<&str>> {
 }
 
 /// True when `dir` is the repository worktree root (not a subdirectory).
-fn is_at_repo_root(dir: &str) -> bool {
+pub fn is_at_repo_root(dir: &str) -> bool {
     let Ok(repo) = Repository::discover(Path::new(dir)) else {
         return false;
     };
