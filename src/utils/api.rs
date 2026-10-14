@@ -549,6 +549,8 @@ pub struct UploadOptions {
     /// Set when this run resolved a diff for the server to analyze instead of
     /// the whole project.
     pub incremental: Option<IncrementalPlan>,
+    /// `--disable-incremental`. Stops the server deriving its own SCM diff.
+    pub disable_incremental: bool,
     /// `--include` patterns for this run. The project's own include rules are
     /// already stored server-side, so only the flag values are sent.
     pub include_paths: Vec<String>,
@@ -569,6 +571,7 @@ pub fn upload_zip(
         policy,
         metadata,
         incremental,
+        disable_incremental,
         include_paths,
         file_manifest,
     } = options;
@@ -761,6 +764,10 @@ pub fn upload_zip(
                         "Could not serialize the incremental file list, scanning every file: {e}"
                     )),
                     }
+                }
+                // No file list means "try the SCM diff". This field means "analyze every file".
+                if disable_incremental {
+                    form = form.part("disable_incremental", multipart::Part::text("true"));
                 }
                 // Root and version travel beside the bytes rather than inside
                 // them: the server recomputes the root from what it

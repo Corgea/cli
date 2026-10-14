@@ -670,6 +670,7 @@ fn start_new_scan(
             policy,
             metadata,
             incremental,
+            disable_incremental: *disable_incremental,
             include_paths: include_rules.cli_patterns,
             file_manifest,
         },
