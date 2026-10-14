@@ -756,6 +756,17 @@ pub fn upload_zip(
                                     multipart::Part::text("true"),
                                 );
                             }
+                            // Without it, a server seeing that the baseline's
+                            // ignore rules were lifted scans every file, since
+                            // only this says the list covers what they hid.
+                            if let Some(rules) = plan
+                                .ignore_rules
+                                .as_ref()
+                                .and_then(|rules| serde_json::to_string(rules).ok())
+                            {
+                                form = form
+                                    .part("incremental_ignore_rules", multipart::Part::text(rules));
+                            }
                         }
                         Err(e) => debug(&format!(
                         "Could not serialize the incremental file list, scanning every file: {e}"
