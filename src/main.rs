@@ -1,6 +1,7 @@
 mod authorize;
 mod cicd;
 mod config;
+mod ignore_rules;
 mod images;
 mod include_rules;
 mod incremental;
