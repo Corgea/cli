@@ -493,6 +493,7 @@ mod tests {
             scan_errors: vec![],
             file_manifest_root: None,
             file_manifest_version: None,
+            ignore_paths: None,
         }
     }
 

@@ -167,6 +167,8 @@ pub struct DiffSources<'a> {
     /// This archive's checksums, absent when the archive is not the whole
     /// project.
     pub manifest: Option<&'a Manifest>,
+    /// The project's ignore rules now, `None` when they could not be read.
+    pub ignore_paths: Option<&'a [String]>,
 }
 
 /// What an incremental scan of this upload would cover.
@@ -292,6 +294,9 @@ fn plan_diff(
             ))
         }
     };
+    if let Some(refusal) = lifted_ignore_rules_refusal(&baseline, sources.ignore_paths) {
+        return Err(refusal);
+    }
 
     // Checksums first. They describe the archive rather than the repository, so
     // they are exact where a git diff has to be argued about, and they work in
@@ -401,6 +406,46 @@ fn summarize(changed_files: &[String], since: &str) -> Result<String, String> {
     })
 }
 
+/// Why the baseline's findings cannot be carried forward under the project's
+/// ignore rules now, if they cannot.
+///
+/// A scan holds no findings for the files its ignore rules matched, and the
+/// server only ever narrows what it copies by the new scan's rules. So once a
+/// rule the baseline applied is removed, disabled or edited, the files it hid
+/// would stay unscanned on every incremental run until a full one. The server
+/// refuses that baseline too; checking here says so, rather than reporting an
+/// incremental scan the server then turns into a full one.
+fn lifted_ignore_rules_refusal(
+    baseline: &BaselineScan,
+    current: Option<&[String]>,
+) -> Option<String> {
+    let applied = baseline.ignore_paths.as_deref().unwrap_or_default();
+    if applied.iter().all(String::is_empty) {
+        return None;
+    }
+    let Some(current) = current else {
+        return Some(format!(
+            "the project's ignore rules could not be read, so there is no telling whether \
+             the ones the {} was scanned under still apply",
+            baseline.describe()
+        ));
+    };
+    let lifted: BTreeSet<&str> = applied
+        .iter()
+        .filter(|pattern| !pattern.is_empty() && !current.contains(pattern))
+        .map(String::as_str)
+        .collect();
+    if lifted.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "the {} was scanned under ignore rules the project no longer has ({}), so it holds \
+         no findings for the files they matched",
+        baseline.describe(),
+        lifted.into_iter().collect::<Vec<_>>().join(", ")
+    ))
+}
+
 /// Files differing from the checksums `baseline` stored, by fetching them.
 ///
 /// Every refusal names the baseline and reads as a whole clause, because it is
@@ -448,6 +493,9 @@ struct BaselineScan {
     /// Digest of the file manifest it stored, `None` when it stored none.
     manifest_root: Option<String>,
     manifest_version: Option<String>,
+    /// The ignore rules it was scanned under, `None` when the server did not
+    /// say.
+    ignore_paths: Option<Vec<String>>,
     /// Commits between its commit and this run's, when it was picked for
     /// being in this run's history rather than for the branch it names.
     commits_back: Option<usize>,
@@ -471,6 +519,7 @@ impl BaselineScan {
                 .clone()
                 .filter(|root| !root.is_empty()),
             manifest_version: scan.file_manifest_version.clone(),
+            ignore_paths: scan.ignore_paths.clone(),
             commits_back: None,
             on_first_parent: false,
         }
@@ -1136,6 +1185,7 @@ mod tests {
             scan_errors: Vec::new(),
             file_manifest_root: None,
             file_manifest_version: None,
+            ignore_paths: None,
         }
     }
 
@@ -1823,6 +1873,7 @@ mod tests {
             ignore_dirty_worktree: false,
             exclude_narrowed: false,
             manifest: None,
+            ignore_paths: None,
         };
 
         let (plan, _) = plan_git_diff(&baseline, Some(&repo), &sources).expect("a plan");
@@ -1840,5 +1891,53 @@ mod tests {
         let err = changed_files_since(&repo, &"0".repeat(40), &head, false)
             .expect_err("unknown base must fail");
         assert!(err.contains("shallow clone"), "{err}");
+    }
+
+    fn scanned_ignoring(patterns: &[&str]) -> BaselineScan {
+        let mut scan = scan("main", "abc");
+        scan.ignore_paths = Some(patterns.iter().map(|p| p.to_string()).collect());
+        BaselineScan::from_response(&scan)
+    }
+
+    /// The baseline holds no findings for files its rules hid, and the server
+    /// copies everything the diff omits, so those files would never be scanned.
+    #[test]
+    fn a_baseline_scanned_under_a_since_lifted_ignore_rule_is_refused() {
+        let now = vec!["docs/**".to_string()];
+        let baseline = scanned_ignoring(&["vendor/**", "docs/**"]);
+
+        let refusal = lifted_ignore_rules_refusal(&baseline, Some(&now)).expect("must be refused");
+
+        assert!(refusal.contains("vendor/**"), "{refusal}");
+        assert!(!refusal.contains("docs/**"), "{refusal}");
+    }
+
+    #[test]
+    fn rules_still_in_place_or_added_since_keep_the_baseline() {
+        // The server drops findings the new rules hide while copying, so a
+        // stricter rule set needs nothing rescanned.
+        let now = vec!["vendor/**".to_string(), "docs/**".to_string()];
+        assert_eq!(
+            lifted_ignore_rules_refusal(&scanned_ignoring(&["vendor/**"]), Some(&now)),
+            None
+        );
+        assert_eq!(
+            lifted_ignore_rules_refusal(&scanned_ignoring(&[]), Some(&[])),
+            None
+        );
+        // A backend that does not report the rules leaves the check to it.
+        let unreported = BaselineScan::from_response(&scan("main", "abc"));
+        assert_eq!(lifted_ignore_rules_refusal(&unreported, None), None);
+    }
+
+    #[test]
+    fn unreadable_project_rules_refuse_a_baseline_that_had_some() {
+        let refusal = lifted_ignore_rules_refusal(&scanned_ignoring(&["vendor/**"]), None)
+            .expect("must be refused");
+        assert!(refusal.contains("could not be read"), "{refusal}");
+        assert_eq!(
+            lifted_ignore_rules_refusal(&scanned_ignoring(&[]), None),
+            None
+        );
     }
 }

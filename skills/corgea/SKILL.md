@@ -89,6 +89,8 @@ A pattern that matches the whole repository (`**`, `*`, `/**`) is refused, by bo
 
 Include rules also take scan reuse off the table. A reusable scan ran before the rules existed, so its results cannot cover the files they force in — a run with any include rule (from the flag or the project) starts a real scan and prints `CORGEA_SCAN_SKIPPED=false`, as does a run whose rule lookup failed.
 
+Removing, disabling or editing a project ignore rule (scan settings → File Ignore Rules) makes the next incremental run scan every file and say why. Earlier scans hold no findings for the files the rule matched, so carrying their findings forward would leave those files unscanned. Adding an ignore rule does not cost a full scan: the findings it hides are dropped when they are carried forward.
+
 `--only-uncommitted` and `--target` are mutually exclusive. `--fail-on`, `--fail`, and `--block-on` are mutually exclusive.
 
 `--out-format`/`--out-file` and `--sbom` are honored regardless of the gate: the report and the SBOM are written before `--fail`/`--block-on` are evaluated, so a scan that exits 1 on a blocking rule still leaves the report file behind for the pipeline to ingest.

@@ -2059,6 +2059,11 @@ pub struct ScanResponse {
     /// left alone rather than guessed at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_manifest_version: Option<String>,
+    /// The project's ignore rules as they applied to this scan. It holds no
+    /// findings for the files they matched. `None` from a backend predating
+    /// the field, or for a scan predating the rules being recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_paths: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
     /// Why a scan ended without finishing. Only set for failed scans.
