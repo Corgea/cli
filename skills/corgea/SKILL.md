@@ -87,7 +87,9 @@ An included image is enough on its own: when it is combined with `--only-uncommi
 
 A pattern that matches the whole repository (`**`, `*`, `/**`) is refused, by both the flag and the web app: include beats exclude, so it would disable every configured exclusion for the scan, including ones set to keep sensitive paths out. Name a directory or file instead.
 
-Include rules also take scan reuse off the table. A reusable scan ran before the rules existed, so its results cannot cover the files they force in — a run with any include rule (from the flag or the project) starts a real scan and prints `CORGEA_SCAN_SKIPPED=false`, as does a run whose rule lookup failed.
+Include rules also take scan reuse off the table. A reusable scan ran before the rules existed, so its results cannot cover the files they force in — a run with any include rule (from the flag or the project) starts a real scan and prints `CORGEA_SCAN_SKIPPED=false`, as does a run whose rule lookup failed. Ignore rules work the same way: a scan that ran under different project ignore rules than the project has now is not reused.
+
+Removing, disabling or editing a project ignore rule (scan settings → File Ignore Rules) makes the next incremental run also analyze the files the old rule matched and the current rules do not, and it says how many. Earlier scans hold no findings for those files, so carrying findings forward alone would leave them unscanned. If those files would push the run past the incremental limit, or the project's rules cannot be read, it scans every file and says why. Adding an ignore rule does not cost anything extra: the findings it hides are dropped when they are carried forward. Scans started from an integration rather than the CLI scan every file after a rule is lifted.
 
 `--only-uncommitted` and `--target` are mutually exclusive. `--fail-on`, `--fail`, and `--block-on` are mutually exclusive.
 

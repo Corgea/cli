@@ -50,6 +50,7 @@ use crate::manifest::{Manifest, MANIFEST_VERSION};
 use crate::scanners::blast::{classify_scan_status, ScanState};
 use crate::utils::api::{self, ScanResponse};
 use git2::Repository;
+use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 /// How many of the project's scans to read at a time, newest first.
@@ -108,9 +109,40 @@ pub struct IncrementalPlan {
     /// server refuses a dirty upload otherwise, because a commit-to-commit diff
     /// cannot describe one.
     pub covers_worktree: bool,
+    /// Set when the baseline was scanned under ignore rules the project has
+    /// since lifted, and the files they hid were added to `changed_files`.
+    pub ignore_rules: Option<ReconciledIgnoreRules>,
+}
+
+/// The two rule sets a diff reconciled. The server refuses to copy forward
+/// from a baseline whose ignore rules were lifted, unless the client names
+/// exactly the rules it recorded for both scans: only then do the added files
+/// cover everything those rules hid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReconciledIgnoreRules {
+    pub base: Vec<String>,
+    pub current: Vec<String>,
 }
 
 impl IncrementalPlan {
+    /// `extra` merged into the list, and how many of them were not on it yet.
+    /// `None` when the merged list outgrows an incremental scan.
+    fn merged(mut self, extra: &[String]) -> Option<(Self, usize)> {
+        let mut listed: BTreeSet<String> = self.changed_files.iter().cloned().collect();
+        let additions: Vec<String> = extra
+            .iter()
+            .filter(|path| listed.insert((*path).clone()))
+            .cloned()
+            .collect();
+        if self.changed_files.len() + additions.len() > MAX_CHANGED_FILES {
+            return None;
+        }
+        let added = additions.len();
+        self.changed_files.extend(additions);
+        self.changed_files.sort();
+        Some((self, added))
+    }
+
     /// Add force-included files to what the server will analyze.
     ///
     /// The server carries findings forward for every file the diff omits, so a
@@ -119,29 +151,19 @@ impl IncrementalPlan {
     /// scanned before, so there is nothing to carry forward. Returns `None`
     /// when the combined list outgrows an incremental scan, which falls back to
     /// scanning everything.
-    pub fn including(mut self, forced: &[String]) -> Option<Self> {
-        let mut listed: BTreeSet<String> = self.changed_files.iter().cloned().collect();
-        let additions: Vec<String> = forced
-            .iter()
-            .filter(|path| listed.insert((*path).clone()))
-            .cloned()
-            .collect();
-        if additions.is_empty() {
-            return Some(self);
-        }
-        if self.changed_files.len() + additions.len() > MAX_CHANGED_FILES {
+    pub fn including(self, forced: &[String]) -> Option<Self> {
+        let Some((plan, added)) = self.merged(forced) else {
             println!(
                 "Scanning every file: the include rules cover more files than an incremental scan is worth."
             );
             return None;
-        }
-        match additions.len() {
+        };
+        match added {
+            0 => {}
             1 => println!("Incremental scan: also analyzing 1 force-included file."),
             count => println!("Incremental scan: also analyzing {count} force-included files."),
         }
-        self.changed_files.extend(additions);
-        self.changed_files.sort();
-        Some(self)
+        Some(plan)
     }
 }
 
@@ -167,6 +189,8 @@ pub struct DiffSources<'a> {
     /// This archive's checksums, absent when the archive is not the whole
     /// project.
     pub manifest: Option<&'a Manifest>,
+    /// The project's ignore rules now, `None` when they could not be read.
+    pub ignore_paths: Option<&'a [String]>,
 }
 
 /// What an incremental scan of this upload would cover.
@@ -292,12 +316,51 @@ fn plan_diff(
             ))
         }
     };
+    let reconciled = reconcile_ignore_rules(&baseline, sources)?;
+    let (plan, summary) = measure_diff(config, &baseline, repo.as_ref(), sources)?;
+    let Some((rules, unignored)) = reconciled else {
+        return Ok((plan, summary));
+    };
+    let lifted = rules
+        .base
+        .iter()
+        .filter(|pattern| !rules.current.contains(pattern))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let Some((mut plan, added)) = plan.merged(&unignored) else {
+        return Err(format!(
+            "ignore rules lifted since the {} ({lifted}) uncover more files than an \
+             incremental scan is worth",
+            baseline.describe()
+        ));
+    };
+    plan.ignore_rules = Some(rules);
+    let files = match added {
+        1 => "1 file".to_string(),
+        count => format!("{count} files"),
+    };
+    Ok((
+        plan,
+        format!(
+            "{summary}\nIncremental scan: also analyzing {files} that ignore rules lifted since \
+             then ({lifted}) had kept out."
+        ),
+    ))
+}
 
+/// The diff from `baseline` to this upload, and a line describing it.
+fn measure_diff(
+    config: &Config,
+    baseline: &BaselineScan,
+    repo: Option<&Repository>,
+    sources: &DiffSources<'_>,
+) -> Result<(IncrementalPlan, String), String> {
     // Checksums first. They describe the archive rather than the repository, so
     // they are exact where a git diff has to be argued about, and they work in
     // a clone that cannot reach the baseline commit — or has no commits.
     let checksum_refusal = match sources.manifest {
-        Some(local) => match changed_files_against(config, &baseline, local) {
+        Some(local) => match changed_files_against(config, baseline, local) {
             Ok(changed_files) => {
                 let summary = summarize(&changed_files, &format!("the {}", baseline.describe()))?;
                 return Ok((
@@ -305,9 +368,10 @@ fn plan_diff(
                         // Checksums are taken over the files as they sit on
                         // disk, so uncommitted edits are named in the list like
                         // any other change rather than missing from it.
-                        base: BaselineRef::Scan(baseline.id),
+                        base: BaselineRef::Scan(baseline.id.clone()),
                         changed_files,
                         covers_worktree: true,
+                        ignore_rules: None,
                     },
                     summary,
                 ));
@@ -327,7 +391,7 @@ fn plan_diff(
     // git's leaves someone looking at a full scan they expected to be
     // incremental with no idea the checksums were tried at all, let alone why
     // they did not apply.
-    plan_git_diff(&baseline, repo.as_ref(), sources).map_err(|reason| match &checksum_refusal {
+    plan_git_diff(baseline, repo, sources).map_err(|reason| match &checksum_refusal {
         Some(refusal) => format!("{refusal}, and {reason}"),
         None => reason,
     })
@@ -380,6 +444,7 @@ fn plan_git_diff(
             base: BaselineRef::Commit(base_sha.to_string()),
             changed_files,
             covers_worktree,
+            ignore_rules: None,
         },
         summary,
     ))
@@ -399,6 +464,68 @@ fn summarize(changed_files: &[String], since: &str) -> Result<String, String> {
         1 => format!("Incremental scan: 1 file changed since {since}."),
         count => format!("Incremental scan: {count} files changed since {since}."),
     })
+}
+
+/// The rule sets to reconcile, and the archived files the baseline's lifted
+/// rules hid that no current rule does. `None` when no rule was lifted.
+///
+/// A scan holds no findings for the files its ignore rules matched, and the
+/// server only ever narrows what it copies by the new scan's rules. So once a
+/// rule the baseline applied is removed, disabled or edited, the files it hid
+/// have to be analyzed like changed ones, or they stay unscanned on every
+/// incremental run until a full one.
+fn reconcile_ignore_rules(
+    baseline: &BaselineScan,
+    sources: &DiffSources<'_>,
+) -> Result<Option<(ReconciledIgnoreRules, Vec<String>)>, String> {
+    let applied: Vec<String> = baseline
+        .ignore_paths
+        .iter()
+        .flatten()
+        .filter(|pattern| !pattern.is_empty())
+        .cloned()
+        .collect();
+    if applied.is_empty() {
+        return Ok(None);
+    }
+    let Some(current) = sources.ignore_paths else {
+        return Err(format!(
+            "the project's ignore rules could not be read, so there is no telling whether \
+             the ones the {} was scanned under still apply",
+            baseline.describe()
+        ));
+    };
+    let current: Vec<String> = current
+        .iter()
+        .filter(|pattern| !pattern.is_empty())
+        .cloned()
+        .collect();
+    let lifted: Vec<String> = applied
+        .iter()
+        .filter(|pattern| !current.contains(pattern))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if lifted.is_empty() {
+        return Ok(None);
+    }
+    let Some(manifest) = sources.manifest else {
+        return Err(format!(
+            "the {} was scanned under ignore rules the project no longer has ({}), and \
+             without this archive's file list there is no telling which files they hid",
+            baseline.describe(),
+            lifted.join(", ")
+        ));
+    };
+    let unignored = crate::ignore_rules::newly_unignored(manifest.paths(), &lifted, &current)?;
+    Ok(Some((
+        ReconciledIgnoreRules {
+            base: applied,
+            current,
+        },
+        unignored,
+    )))
 }
 
 /// Files differing from the checksums `baseline` stored, by fetching them.
@@ -448,6 +575,9 @@ struct BaselineScan {
     /// Digest of the file manifest it stored, `None` when it stored none.
     manifest_root: Option<String>,
     manifest_version: Option<String>,
+    /// The ignore rules it was scanned under, `None` when the server did not
+    /// say.
+    ignore_paths: Option<Vec<String>>,
     /// Commits between its commit and this run's, when it was picked for
     /// being in this run's history rather than for the branch it names.
     commits_back: Option<usize>,
@@ -471,6 +601,7 @@ impl BaselineScan {
                 .clone()
                 .filter(|root| !root.is_empty()),
             manifest_version: scan.file_manifest_version.clone(),
+            ignore_paths: scan.ignore_paths.clone(),
             commits_back: None,
             on_first_parent: false,
         }
@@ -1136,6 +1267,7 @@ mod tests {
             scan_errors: Vec::new(),
             file_manifest_root: None,
             file_manifest_version: None,
+            ignore_paths: None,
         }
     }
 
@@ -1176,6 +1308,7 @@ mod tests {
             base: BaselineRef::Commit("abc123".to_string()),
             changed_files: changed.iter().map(|f| f.to_string()).collect(),
             covers_worktree: false,
+            ignore_rules: None,
         }
     }
 
@@ -1823,6 +1956,7 @@ mod tests {
             ignore_dirty_worktree: false,
             exclude_narrowed: false,
             manifest: None,
+            ignore_paths: None,
         };
 
         let (plan, _) = plan_git_diff(&baseline, Some(&repo), &sources).expect("a plan");
@@ -1840,5 +1974,113 @@ mod tests {
         let err = changed_files_since(&repo, &"0".repeat(40), &head, false)
             .expect_err("unknown base must fail");
         assert!(err.contains("shallow clone"), "{err}");
+    }
+
+    fn scanned_ignoring(patterns: &[&str]) -> BaselineScan {
+        let mut scan = scan("main", "abc");
+        scan.ignore_paths = Some(patterns.iter().map(|p| p.to_string()).collect());
+        BaselineScan::from_response(&scan)
+    }
+
+    fn reconcile(
+        baseline: &BaselineScan,
+        now: Option<&[String]>,
+        archived: Option<&Manifest>,
+    ) -> Result<Option<(ReconciledIgnoreRules, Vec<String>)>, String> {
+        reconcile_ignore_rules(
+            baseline,
+            &DiffSources {
+                branch: None,
+                head_sha: None,
+                worktree_dirty: false,
+                ignore_dirty_worktree: false,
+                exclude_narrowed: false,
+                manifest: archived,
+                ignore_paths: now,
+            },
+        )
+    }
+
+    fn archive(paths: &[&str]) -> Manifest {
+        let mut manifest = Manifest::new();
+        for path in paths {
+            manifest.insert((*path).to_string(), "digest".to_string());
+        }
+        manifest
+    }
+
+    fn rules(patterns: &[&str]) -> Vec<String> {
+        patterns.iter().map(|p| p.to_string()).collect()
+    }
+
+    /// The baseline holds no findings for files its rules hid, and the server
+    /// copies everything the diff omits, so those files are added to it.
+    #[test]
+    fn files_a_narrowed_rule_no_longer_hides_are_rescanned() {
+        let archived = archive(&["src/app.js", "src/x-ahmad.js", "src/app.py", "docs/a.md"]);
+        let now = rules(&["*/*-ahmad.js", "", "docs/**"]);
+
+        let (reconciled, unignored) = reconcile(
+            &scanned_ignoring(&["*/*.js", "docs/**"]),
+            Some(&now),
+            Some(&archived),
+        )
+        .expect("reconciles")
+        .expect("a rule was lifted");
+
+        assert_eq!(unignored, vec!["src/app.js"]);
+        assert_eq!(
+            reconciled,
+            ReconciledIgnoreRules {
+                base: rules(&["*/*.js", "docs/**"]),
+                current: rules(&["*/*-ahmad.js", "docs/**"]),
+            }
+        );
+    }
+
+    #[test]
+    fn a_widened_rule_rescans_nothing_but_still_reports_the_rules() {
+        // The server only accepts the list when told which rules it reconciles,
+        // even when no file needed adding.
+        let archived = archive(&["src/app.js", "src/x-ahmad.js"]);
+        let now = rules(&["*/*.js"]);
+
+        let (reconciled, unignored) = reconcile(
+            &scanned_ignoring(&["*/*-ahmad.js"]),
+            Some(&now),
+            Some(&archived),
+        )
+        .expect("reconciles")
+        .expect("a rule was lifted");
+
+        assert!(unignored.is_empty());
+        assert_eq!(reconciled.base, rules(&["*/*-ahmad.js"]));
+    }
+
+    #[test]
+    fn rules_still_in_place_or_added_since_need_no_reconciling() {
+        // The server drops findings the new rules hide while copying, so a
+        // stricter rule set needs nothing rescanned.
+        let now = rules(&["vendor/**", "docs/**"]);
+        assert_eq!(
+            reconcile(&scanned_ignoring(&["vendor/**"]), Some(&now), None),
+            Ok(None)
+        );
+        assert_eq!(reconcile(&scanned_ignoring(&[]), Some(&[]), None), Ok(None));
+        // A backend that does not report the rules leaves the check to it.
+        let unreported = BaselineScan::from_response(&scan("main", "abc"));
+        assert_eq!(reconcile(&unreported, None, None), Ok(None));
+    }
+
+    #[test]
+    fn a_lifted_rule_that_cannot_be_reconciled_refuses_the_baseline() {
+        let unreadable =
+            reconcile(&scanned_ignoring(&["vendor/**"]), None, None).expect_err("must be refused");
+        assert!(unreadable.contains("could not be read"), "{unreadable}");
+        assert_eq!(reconcile(&scanned_ignoring(&[]), None, None), Ok(None));
+
+        let unlisted = reconcile(&scanned_ignoring(&["vendor/**"]), Some(&[]), None)
+            .expect_err("must be refused");
+        assert!(unlisted.contains("vendor/**"), "{unlisted}");
     }
 }
