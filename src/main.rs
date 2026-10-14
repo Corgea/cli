@@ -9,6 +9,7 @@ mod list;
 mod log;
 mod manifest;
 mod mcp;
+mod project_naming;
 mod scan;
 mod setup_hooks;
 mod skill;
@@ -29,8 +30,13 @@ mod targets;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use config::Config;
+use project_naming::ProjectNamingMode;
 use scanners::fortify::parse as fortify_parse;
 use std::str::FromStr;
+
+const PROJECT_NAMING_MODE_HELP: &str = "Derive the Corgea project name instead of passing --project-name. sparse-postfixed: in a sparse checkout at the repository root, the checked-out top-level folders are appended to the default project name (monorepo-jsoar-agent for a checkout of jsoar-agent from monorepo), so each service of a monorepo gets its own project. Anywhere else it warns and the default name is used.";
+
+const PROJECT_NAMING_MODE_QUERY_HELP: &str = "Query the project that a scan with the same --project-naming-mode names. sparse-postfixed: in a sparse checkout at the repository root, the default project name followed by the checked-out top-level folders (monorepo-jsoar-agent). Anywhere else it warns and the project is resolved as usual.";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -77,6 +83,15 @@ enum Commands {
             help = "The name of the Corgea project. Defaults to git repository name if found, otherwise to the current directory name."
         )]
         project_name: Option<String>,
+
+        #[arg(
+            long,
+            value_enum,
+            value_name = "MODE",
+            conflicts_with = "project_name",
+            help = PROJECT_NAMING_MODE_HELP
+        )]
+        project_naming_mode: Option<ProjectNamingMode>,
 
         #[arg(
             long,
@@ -180,6 +195,15 @@ enum Commands {
 
         #[arg(
             long,
+            value_enum,
+            value_name = "MODE",
+            conflicts_with = "project_name",
+            help = PROJECT_NAMING_MODE_HELP
+        )]
+        project_naming_mode: Option<ProjectNamingMode>,
+
+        #[arg(
+            long,
             value_name = "FILE",
             num_args = 0..=1,
             default_missing_value = "bom.json",
@@ -224,6 +248,14 @@ enum Commands {
             help = "Query this exact Corgea project name directly (skips repo auto-resolution)."
         )]
         project_name: Option<String>,
+        #[arg(
+            long,
+            value_enum,
+            value_name = "MODE",
+            conflicts_with_all = ["project_name", "repo"],
+            help = PROJECT_NAMING_MODE_QUERY_HELP
+        )]
+        project_naming_mode: Option<ProjectNamingMode>,
         #[arg(
             long,
             help = "Resolve the project from this repo (org/repo slug or remote URL) instead of the git remote."
@@ -276,6 +308,15 @@ enum Commands {
             help = "Query this exact Corgea project name directly (skips repo auto-resolution)."
         )]
         project_name: Option<String>,
+
+        #[arg(
+            long,
+            value_enum,
+            value_name = "MODE",
+            conflicts_with_all = ["project_name", "repo"],
+            help = PROJECT_NAMING_MODE_QUERY_HELP
+        )]
+        project_naming_mode: Option<ProjectNamingMode>,
 
         #[arg(
             long,
@@ -689,9 +730,11 @@ fn main() {
         Some(Commands::Upload {
             report,
             project_name,
+            project_naming_mode,
             wait,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
+            let project_name = project_naming::resolve(project_name.clone(), *project_naming_mode);
             let result = match report {
                 Some(report) => {
                     if report.ends_with(".fpr") {
@@ -737,6 +780,7 @@ fn main() {
             exclude,
             include,
             project_name,
+            project_naming_mode,
             sbom,
             include_image,
             skip_if_commit_scanned_recently,
@@ -915,6 +959,8 @@ fn main() {
                 None
             };
 
+            let project_name = project_naming::resolve(project_name.clone(), *project_naming_mode);
+
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config, project_name.clone()),
                 Scanner::Semgrep => scan::run_semgrep(&corgea_config, project_name.clone()),
@@ -945,6 +991,7 @@ fn main() {
         Some(Commands::Wait {
             scan_id,
             project_name,
+            project_naming_mode,
             repo,
             project_id,
         }) => {
@@ -954,7 +1001,7 @@ fn main() {
                 wait::WaitArgs {
                     scan_id: scan_id.clone(),
                     selector: utils::api::ProjectSelector {
-                        name: project_name.clone(),
+                        name: project_naming::resolve(project_name.clone(), *project_naming_mode),
                         repo: repo.clone(),
                     },
                     project_id: project_id.clone(),
@@ -970,6 +1017,7 @@ fn main() {
             sca_issues,
             code_quality,
             project_name,
+            project_naming_mode,
             repo,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
@@ -999,7 +1047,7 @@ fn main() {
                     page_size: *page_size,
                     scan_id: scan_id.clone(),
                     selector: utils::api::ProjectSelector {
-                        name: project_name.clone(),
+                        name: project_naming::resolve(project_name.clone(), *project_naming_mode),
                         repo: repo.clone(),
                     },
                 },
