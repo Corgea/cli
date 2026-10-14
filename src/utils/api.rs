@@ -2527,6 +2527,16 @@ mod tests {
         }"#;
         let parsed: ScanResponse = serde_json::from_str(without_sha).unwrap();
         assert_eq!(parsed.git_sha, None);
+        // A backend predating `ignore_paths` omits it; a scan predating the
+        // stamp reports null. Neither may fail the scan list.
+        assert_eq!(parsed.ignore_paths, None);
+        let mut value: serde_json::Value = serde_json::from_str(without_sha).unwrap();
+        value["ignore_paths"] = serde_json::Value::Null;
+        let parsed: ScanResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.ignore_paths, None);
+        value["ignore_paths"] = serde_json::json!(["vendor/**"]);
+        let parsed: ScanResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.ignore_paths, Some(vec!["vendor/**".to_string()]));
     }
 
     #[test]
