@@ -1407,10 +1407,23 @@ fn request_scan_list(
 pub struct ScanSettings {
     /// Patterns that force files into the scan even when Corgea would classify
     /// them as vendored, third-party, generated or test code.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "patterns_without_nulls")]
     pub include_paths: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "patterns_without_nulls")]
     pub ignore_paths: Vec<String>,
+}
+
+/// A rule saved without a pattern is listed as `null`. It matches nothing, so
+/// it is dropped rather than failing the whole read.
+fn patterns_without_nulls<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<Option<String>>>::deserialize(deserializer)?
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -2510,6 +2523,24 @@ mod tests {
         assert!(!is_retryable_blocking_rules_error_message(
             "Failed to parse response: expected value"
         ));
+    }
+
+    #[test]
+    fn scan_settings_drop_rules_saved_without_a_pattern() {
+        let parsed: ScanSettingsResponse = serde_json::from_str(
+            r#"{"settings": {"include_paths": null, "ignore_paths": ["vendor/**", null]}}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            parsed.settings,
+            ScanSettings {
+                include_paths: vec![],
+                ignore_paths: vec!["vendor/**".to_string()],
+            }
+        );
+        let missing: ScanSettingsResponse =
+            serde_json::from_str(r#"{"settings": {}}"#).expect("parses");
+        assert_eq!(missing.settings, ScanSettings::default());
     }
 
     #[test]
