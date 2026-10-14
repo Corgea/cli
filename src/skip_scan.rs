@@ -37,6 +37,7 @@ use crate::scanners::blast::{classify_scan_status, format_scan_warnings, ScanSta
 use crate::utils;
 use crate::utils::api::ScanResponse;
 use chrono::{DateTime, Utc};
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 /// How far back a prior scan may have run and still be reused.
@@ -124,6 +125,7 @@ pub fn resolve_reusable_scan(
     skip: &SkipRecentScan,
     exclude: Option<&str>,
     ignore_dirty_worktree: bool,
+    ignore_paths: Option<&[String]>,
 ) -> Option<ScanResponse> {
     // Dirtiness here is what `git status` reports, the same signal the upload
     // sends and the same one the user can check for themselves before asking
@@ -191,6 +193,15 @@ pub fn resolve_reusable_scan(
         return None;
     };
 
+    if let Some(reason) = ignore_rules_refusal(&scan, ignore_paths) {
+        println!(
+            "Not reusing scan {}: {reason}. Running a new scan.",
+            scan.id
+        );
+        print_skipped_marker(None);
+        return None;
+    }
+
     if let Err(reason) = confirm_reusable_scan(config, &scan.id) {
         log::warn!(
             "Not reusing scan {}: {}. Running a new scan.",
@@ -219,6 +230,36 @@ pub fn resolve_reusable_scan(
     }
     print_skipped_marker(Some(&scan.id));
     Some(scan)
+}
+
+/// Why `scan` cannot stand in for one under the project's ignore rules now.
+///
+/// A reused scan holds no findings for the files its rules matched, and still
+/// reports what it found in files the rules hide now: nothing narrows it the
+/// way an incremental scan's copy does. So any difference refuses it. A scan
+/// that recorded no rules predates the record, and stays reusable.
+fn ignore_rules_refusal(scan: &ScanResponse, current: Option<&[String]>) -> Option<String> {
+    let applied: BTreeSet<&str> = scan
+        .ignore_paths
+        .as_ref()?
+        .iter()
+        .filter(|pattern| !pattern.is_empty())
+        .map(String::as_str)
+        .collect();
+    let Some(current) = current else {
+        return (!applied.is_empty()).then(|| {
+            "the project's ignore rules could not be read, so it cannot be shown to have \
+             applied them"
+                .to_string()
+        });
+    };
+    let current: BTreeSet<&str> = current
+        .iter()
+        .filter(|pattern| !pattern.is_empty())
+        .map(String::as_str)
+        .collect();
+    (applied != current)
+        .then(|| "it ran under different ignore rules than the project has now".to_string())
 }
 
 /// Walk the commit's scans, newest first, for one that can stand in for a fresh
@@ -755,5 +796,29 @@ mod tests {
             "3h 12m"
         );
         assert_eq!(format_age(Duration::from_secs(2 * 86_400 + 3600)), "2d 1h");
+    }
+
+    #[test]
+    fn a_scan_under_other_ignore_rules_is_not_reused() {
+        let stamped = |patterns: &[&str]| {
+            let mut found = scan("a", "complete", Some(SHA), "2026-01-01T12:00:00Z");
+            found.ignore_paths = Some(patterns.iter().map(|p| p.to_string()).collect());
+            found
+        };
+        let now = vec!["vendor/**".to_string(), String::new()];
+
+        assert_eq!(
+            ignore_rules_refusal(&stamped(&["vendor/**"]), Some(&now)),
+            None
+        );
+        // Lifted: the scan never looked at the files the rule hid.
+        assert!(ignore_rules_refusal(&stamped(&["vendor/**", "docs/**"]), Some(&now)).is_some());
+        // Added: nothing drops the findings the new rule hides.
+        assert!(ignore_rules_refusal(&stamped(&[]), Some(&now)).is_some());
+        assert!(ignore_rules_refusal(&stamped(&["vendor/**"]), None).is_some());
+        assert_eq!(ignore_rules_refusal(&stamped(&[]), None), None);
+        // Predates the record, so there is nothing to compare.
+        let unstamped = scan("a", "complete", Some(SHA), "2026-01-01T12:00:00Z");
+        assert_eq!(ignore_rules_refusal(&unstamped, Some(&now)), None);
     }
 }

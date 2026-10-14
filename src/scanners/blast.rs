@@ -139,6 +139,7 @@ pub fn run(
             skip,
             exclude.as_deref(),
             *ignore_dirty_worktree,
+            include_rules.project_ignore_paths.as_deref(),
         )
     });
 
