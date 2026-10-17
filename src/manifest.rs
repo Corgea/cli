@@ -40,12 +40,13 @@
 //! analyzed again.
 //!
 //! The archive has to be the whole project under whatever exclude set built
-//! it. A `--target` or `--only-uncommitted` run is not that: it names the files
-//! to pack, so the archive holds what someone pointed at this once, and a
-//! manifest of it reads as every other file having been deleted -- every one
-//! of their findings dropped without anything having looked at them. Those
-//! runs build no manifest, which is the same reason they already skip
-//! incremental.
+//! it. A `--target` run is not that: it names the files to pack, so the
+//! archive holds what someone pointed at this once, and a manifest of it reads
+//! as every other file having been deleted -- every one of their findings
+//! dropped without anything having looked at them. Those runs build no
+//! manifest, which is the same reason they already skip incremental. An
+//! `--only-uncommitted` run packs the whole project but is a partial scan, which
+//! the server never stores a manifest for, so it skips hashing too.
 
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;

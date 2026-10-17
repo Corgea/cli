@@ -2,7 +2,8 @@
 //! binary through the blast scan flow against a stubbed HTTP server with a
 //! stubbed container CLI, and asserts the exported image archive is bundled
 //! into the uploaded project zip under the name the backend greps for
-//! (`corgea-image-scanning-*.tar`).
+//! (`corgea-image-scanning-*.tar`). Also covers how `--only-uncommitted`
+//! registers its upload as a partial scan.
 
 mod common;
 
@@ -200,7 +201,44 @@ fn scan_only_uncommitted_with_include_image_uploads_the_archive() {
         stderr.contains("only the included container image"),
         "should say the scan covers only the image, got:\n{stderr}"
     );
-    assert!(uploaded_text(&uploads).contains("corgea-image-scanning-myapp-1.0.tar"));
+    let uploaded = uploaded_text(&uploads);
+    assert!(uploaded.contains("corgea-image-scanning-myapp-1.0.tar"));
+    assert!(
+        uploaded.contains("name=\"files_to_scan\"\r\n\r\n[]"),
+        "still a partial scan, of no source files"
+    );
+}
+
+/// `--only-uncommitted` uploads the whole project and names the changed files,
+/// the way a pull request scan is registered, so the server records a partial
+/// scan rather than a branch state holding only those files.
+#[test]
+fn scan_only_uncommitted_uploads_the_project_and_names_the_changed_files() {
+    let (base_url, uploads) = spawn_recording_scan_stub("scan-uncommitted");
+    let project = stub_project();
+    commit_everything(project.path());
+    fs::write(project.path().join("edited.py"), "print(2)\n").expect("write new file");
+
+    let (mut cmd, _home) = corgea_isolated();
+    cmd.current_dir(project.path())
+        .env("CORGEA_URL", &base_url)
+        .env("CORGEA_TOKEN", "test-token")
+        .args(["scan", "--only-uncommitted"]);
+
+    let output = cmd.output().expect("run corgea scan --only-uncommitted");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let uploaded = uploaded_text(&uploads);
+    assert!(uploaded.contains("main.py"), "committed files upload too");
+    assert!(uploaded.contains("name=\"partial_scan\"\r\n\r\ntrue"));
+    assert!(uploaded.contains("name=\"files_to_scan\"\r\n\r\n[\"edited.py\"]"));
+    assert!(uploaded.contains("name=\"dirty\"\r\n\r\ntrue"));
+    assert!(!uploaded.contains("name=\"file_manifest\""));
 }
 
 /// A copy of an archive living in the repository must not ride along: it would put
