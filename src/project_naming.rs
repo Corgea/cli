@@ -1,12 +1,15 @@
 use crate::utils::generic;
 use clap::ValueEnum;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 use std::process::Command;
 
 /// The SEAL pipeline template cuts derived names at this length, so the CLI
 /// does too: a longer name would not match the projects the template created.
 const MAX_DERIVED_NAME_CHARS: usize = 100;
+
+/// Git's default path quoting, which CI checkouts run with.
+const QUOTE_PATH: &str = "core.quotePath=true";
 
 /// Ways to derive the Corgea project name, picked with `--project-naming-mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -75,14 +78,21 @@ fn sparse_checkout_folders(dir: &Path) -> Result<Vec<String>, String> {
     if enabled.trim() != "true" {
         return Err("this checkout is not a sparse checkout".into());
     }
-    let mut patterns = git_stdout(dir, &["sparse-checkout", "list"]).unwrap_or_default();
+    // Pinned so a `core.quotePath=false` in the user's git config cannot turn
+    // a non-ASCII folder into a different project name than CI derives.
+    let mut patterns =
+        git_stdout(dir, &["-c", QUOTE_PATH, "sparse-checkout", "list"]).unwrap_or_default();
     // `sparse-checkout list` needs git 2.25; older git only has the file.
     if patterns.trim().is_empty() {
         patterns = git_stdout(dir, &["rev-parse", "--git-path", "info/sparse-checkout"])
             .and_then(|path| std::fs::read_to_string(dir.join(path.trim())).ok())
             .unwrap_or_default();
     }
-    let folders = top_level_folders(&patterns);
+    // Git accepts a root file such as `package.json` in either mode, and a
+    // file is no service folder.
+    let root_files = root_files(dir);
+    let mut folders = top_level_folders(&patterns);
+    folders.retain(|folder| !root_files.contains(folder));
     if folders.is_empty() {
         return Err(
             "sparse checkout is on, but no folder could be derived from its patterns".into(),
@@ -112,6 +122,19 @@ fn top_level_folders(patterns: &str) -> Vec<String> {
         })
         .collect();
     folders.into_iter().collect()
+}
+
+/// Files at the top of `HEAD`'s tree, quoted as `sparse-checkout list` quotes
+/// them. Empty when there is no commit to read.
+fn root_files(dir: &Path) -> HashSet<String> {
+    git_stdout(dir, &["-c", QUOTE_PATH, "ls-tree", "HEAD"])
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (meta, name) = line.split_once('\t')?;
+            (meta.split_whitespace().nth(1) == Some("blob")).then(|| name.to_string())
+        })
+        .collect()
 }
 
 /// `base`, a dash, then the folders joined with dots. The folders get the
@@ -280,6 +303,48 @@ mod tests {
         assert_eq!(
             sparse_checkout_folders(repo.path()).unwrap(),
             ["jsoar-agent", "services"]
+        );
+    }
+
+    #[test]
+    fn root_files_in_the_sparse_list_are_not_folders() {
+        for args in [
+            &["--no-cone", "root.txt", "/services/**"][..],
+            // A `--no-checkout` clone, as CI sparse clones start, skips these
+            // checks without being asked.
+            &["--cone", "--skip-checks", "services", "root.txt"][..],
+        ] {
+            let repo = monorepo(&["services/payments"]);
+            let mut set = vec!["sparse-checkout", "set"];
+            set.extend_from_slice(args);
+            git(repo.path(), &set);
+            assert_eq!(
+                sparse_checkout_folders(repo.path()).unwrap(),
+                ["services"],
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sparse_list_of_only_root_files_names_no_folder() {
+        let repo = monorepo(&["services/payments"]);
+        git(
+            repo.path(),
+            &["sparse-checkout", "set", "--no-cone", "root.txt"],
+        );
+        let err = sparse_checkout_folders(repo.path()).unwrap_err();
+        assert!(err.contains("no folder could be derived"), "{err}");
+    }
+
+    #[test]
+    fn non_ascii_folders_are_read_quoted_whatever_the_git_config_says() {
+        let repo = monorepo(&["café"]);
+        git(repo.path(), &["config", "core.quotePath", "false"]);
+        git(repo.path(), &["sparse-checkout", "set", "--cone", "café"]);
+        assert_eq!(
+            sparse_checkout_folders(repo.path()).unwrap(),
+            ["\"caf\\303\\251\""]
         );
     }
 
