@@ -95,6 +95,76 @@ pub enum BaselineRef {
     Scan(String),
 }
 
+/// Why an upload carries no diff for the server to analyze instead of every
+/// file it holds.
+///
+/// Sent with the upload and stored on the scan, so the codes are a contract:
+/// add new ones, never rename one already shipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullScanCause {
+    /// `--disable-incremental`.
+    DisabledByFlag,
+    /// `--target` or `--only-uncommitted` chose the files, so the archive is
+    /// not a project state findings could be carried forward into.
+    TargetedUpload,
+    NoBaselineScan,
+    BaselineLookupFailed,
+    /// The baseline stored checksums, but they could not be downloaded, read,
+    /// or are a version this client does not speak, and git could not answer
+    /// either.
+    BaselineChecksumsUnreadable,
+    /// `--exclude` held files back, and the baseline stored no checksums to
+    /// diff the archive against.
+    ExcludeNeedsChecksums,
+    /// Uncommitted edits a commit-to-commit diff cannot see, without
+    /// `--ignore-dirty-worktree`.
+    DirtyWorktree,
+    NoGitCommit,
+    BaselineHasNoCommit,
+    /// The baseline's commit is not in this clone, typically a shallow one.
+    BaselineCommitNotInClone,
+    GitDiffFailed,
+    SubmoduleMoved,
+    TooManyChangedFiles,
+}
+
+impl FullScanCause {
+    pub fn code(self) -> &'static str {
+        match self {
+            FullScanCause::DisabledByFlag => "disabled_by_flag",
+            FullScanCause::TargetedUpload => "targeted_upload",
+            FullScanCause::NoBaselineScan => "no_baseline_scan",
+            FullScanCause::BaselineLookupFailed => "baseline_lookup_failed",
+            FullScanCause::BaselineChecksumsUnreadable => "baseline_checksums_unreadable",
+            FullScanCause::ExcludeNeedsChecksums => "exclude_needs_checksums",
+            FullScanCause::DirtyWorktree => "dirty_worktree",
+            FullScanCause::NoGitCommit => "no_git_commit",
+            FullScanCause::BaselineHasNoCommit => "baseline_has_no_commit",
+            FullScanCause::BaselineCommitNotInClone => "baseline_commit_not_in_clone",
+            FullScanCause::GitDiffFailed => "git_diff_failed",
+            FullScanCause::SubmoduleMoved => "submodule_moved",
+            FullScanCause::TooManyChangedFiles => "too_many_changed_files",
+        }
+    }
+}
+
+/// The cause, and a clause describing it: the one printed after "Scanning
+/// every file:" for every cause but the two flags, which print nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullScanReason {
+    pub cause: FullScanCause,
+    pub detail: String,
+}
+
+impl FullScanReason {
+    pub fn new(cause: FullScanCause, detail: impl Into<String>) -> Self {
+        FullScanReason {
+            cause,
+            detail: detail.into(),
+        }
+    }
+}
+
 /// A diff the server can turn into an incremental scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncrementalPlan {
@@ -116,10 +186,10 @@ impl IncrementalPlan {
     /// The server carries findings forward for every file the diff omits, so a
     /// force-included file that has not changed would never be looked at — and
     /// the reason to add an include rule is precisely that the file was never
-    /// scanned before, so there is nothing to carry forward. Returns `None`
-    /// when the combined list outgrows an incremental scan, which falls back to
-    /// scanning everything.
-    pub fn including(mut self, forced: &[String]) -> Option<Self> {
+    /// scanned before, so there is nothing to carry forward. Refuses when the
+    /// combined list outgrows an incremental scan, which falls back to scanning
+    /// everything.
+    pub fn including(mut self, forced: &[String]) -> Result<Self, FullScanReason> {
         let mut listed: BTreeSet<String> = self.changed_files.iter().cloned().collect();
         let additions: Vec<String> = forced
             .iter()
@@ -127,13 +197,13 @@ impl IncrementalPlan {
             .cloned()
             .collect();
         if additions.is_empty() {
-            return Some(self);
+            return Ok(self);
         }
         if self.changed_files.len() + additions.len() > MAX_CHANGED_FILES {
-            println!(
-                "Scanning every file: the include rules cover more files than an incremental scan is worth."
-            );
-            return None;
+            return Err(FullScanReason::new(
+                FullScanCause::TooManyChangedFiles,
+                "the include rules cover more files than an incremental scan is worth",
+            ));
         }
         match additions.len() {
             1 => println!("Incremental scan: also analyzing 1 force-included file."),
@@ -141,7 +211,7 @@ impl IncrementalPlan {
         }
         self.changed_files.extend(additions);
         self.changed_files.sort();
-        Some(self)
+        Ok(self)
     }
 }
 
@@ -171,25 +241,16 @@ pub struct DiffSources<'a> {
 
 /// What an incremental scan of this upload would cover.
 ///
-/// Prints one line either way: the scope it resolved to, or why the scan is
-/// analyzing everything.
+/// Prints the scope it resolved to. A refusal is never fatal — a full scan is
+/// correct, only slower — so the caller prints it and carries on.
 pub fn resolve_incremental_plan(
     config: &Config,
     project_name: &str,
     sources: DiffSources<'_>,
-) -> Option<IncrementalPlan> {
-    match plan_diff(config, project_name, &sources) {
-        Ok((plan, summary)) => {
-            println!("{summary}");
-            Some(plan)
-        }
-        // Never fatal — a full scan is correct, only slower, so the run
-        // continues and only says why.
-        Err(reason) => {
-            println!("Scanning every file: {reason}.");
-            None
-        }
-    }
+) -> Result<IncrementalPlan, FullScanReason> {
+    let (plan, summary) = plan_diff(config, project_name, &sources)?;
+    println!("{summary}");
+    Ok(plan)
 }
 
 /// The diff and a line describing it, or why there is no diff to send.
@@ -197,7 +258,7 @@ fn plan_diff(
     config: &Config,
     project_name: &str,
     sources: &DiffSources<'_>,
-) -> Result<(IncrementalPlan, String), String> {
+) -> Result<(IncrementalPlan, String), FullScanReason> {
     // Optional, because a checksum diff needs no repository. Only the git diff
     // below does, and it reports its absence by its real name.
     let repo = Repository::discover(".").ok();
@@ -263,32 +324,38 @@ fn plan_diff(
     let baseline = match lookup {
         BaselineLookup::Found(scan) => scan,
         BaselineLookup::NotFound => {
-            return Err(format!(
-                "project '{project_name}' has no completed scan {} that could be diffed \
+            return Err(FullScanReason::new(
+                FullScanCause::NoBaselineScan,
+                format!(
+                    "project '{project_name}' has no completed scan {} that could be diffed \
                  against, so there is nothing to compare this one to",
-                match (&candidates, ancestry.as_ref().filter(|_| commits_searched)) {
-                    (Some(candidates), Some(ancestry)) => format!(
-                        "{}, nor on {},",
-                        match ancestry.shas.len() {
-                            // Only when no parent is reachable: a shallow
-                            // clone's depth, or a repository's first commit.
-                            1 => "of the only commit in this checkout's history".to_string(),
-                            n => format!(
-                                "of any of the {n} most recent commits in this checkout's \
+                    match (&candidates, ancestry.as_ref().filter(|_| commits_searched)) {
+                        (Some(candidates), Some(ancestry)) => format!(
+                            "{}, nor on {},",
+                            match ancestry.shas.len() {
+                                // Only when no parent is reachable: a shallow
+                                // clone's depth, or a repository's first commit.
+                                1 => "of the only commit in this checkout's history".to_string(),
+                                n => format!(
+                                    "of any of the {n} most recent commits in this checkout's \
                                  history"
-                            ),
-                        },
-                        join_or(candidates)
-                    ),
-                    (Some(candidates), None) => format!("on {}", join_or(candidates)),
-                    (None, _) => "of its whole state".to_string(),
-                }
+                                ),
+                            },
+                            join_or(candidates)
+                        ),
+                        (Some(candidates), None) => format!("on {}", join_or(candidates)),
+                        (None, _) => "of its whole state".to_string(),
+                    }
+                ),
             ));
         }
         BaselineLookup::LookupFailed => {
-            return Err(format!(
-                "the earlier scans of project '{project_name}' could not be looked up, \
-                 so there is nothing to diff against. Run with --verbose for the error"
+            return Err(FullScanReason::new(
+                FullScanCause::BaselineLookupFailed,
+                format!(
+                    "the earlier scans of project '{project_name}' could not be looked up, \
+                     so there is nothing to diff against. Run with --verbose for the error"
+                ),
             ))
         }
     };
@@ -314,9 +381,9 @@ fn plan_diff(
             }
             // Not fatal on its own: git may still be able to answer, and this
             // is the expected path for a baseline that predates manifests.
-            Err(reason) => {
-                crate::log::debug(&format!("{reason}. Trying git."));
-                Some(reason)
+            Err(refusal) => {
+                crate::log::debug(&format!("{}. Trying git.", refusal.1));
+                Some(refusal)
             }
         },
         None => None,
@@ -326,9 +393,13 @@ fn plan_diff(
     // ends up reporting has to name every reason it could not. Printing only
     // git's leaves someone looking at a full scan they expected to be
     // incremental with no idea the checksums were tried at all, let alone why
-    // they did not apply.
-    plan_git_diff(&baseline, repo.as_ref(), sources).map_err(|reason| match &checksum_refusal {
-        Some(refusal) => format!("{refusal}, and {reason}"),
+    // they did not apply. A checksum fault outranks git's refusal as the
+    // cause: it is why a diff that should have worked did not.
+    plan_git_diff(&baseline, repo.as_ref(), sources).map_err(|reason| match checksum_refusal {
+        Some((cause, refusal)) => FullScanReason {
+            cause: cause.unwrap_or(reason.cause),
+            detail: format!("{refusal}, and {}", reason.detail),
+        },
         None => reason,
     })
 }
@@ -340,7 +411,7 @@ fn plan_git_diff(
     baseline: &BaselineScan,
     repo: Option<&Repository>,
     sources: &DiffSources<'_>,
-) -> Result<(IncrementalPlan, String), String> {
+) -> Result<(IncrementalPlan, String), FullScanReason> {
     if let Some(refusal) = git_diff_refusal(sources) {
         return Err(refusal);
     }
@@ -351,16 +422,19 @@ fn plan_git_diff(
     // to the upload either. A detached HEAD is not one of them: a diff between
     // two commits needs no branch.
     let (Some(head_sha), Some(repo)) = (sources.head_sha, repo) else {
-        return Err(
+        return Err(FullScanReason::new(
+            FullScanCause::NoGitCommit,
             "there is no git commit to diff from either (not a git repository, no \
-             commit yet, or a scan started below the repository root)"
-                .to_string(),
-        );
+             commit yet, or a scan started below the repository root)",
+        ));
     };
     let Some(base_sha) = baseline.sha.as_deref() else {
-        return Err(format!(
-            "the {} recorded no commit for a git diff to start from",
-            baseline.describe()
+        return Err(FullScanReason::new(
+            FullScanCause::BaselineHasNoCommit,
+            format!(
+                "the {} recorded no commit for a git diff to start from",
+                baseline.describe()
+            ),
         ));
     };
 
@@ -386,12 +460,15 @@ fn plan_git_diff(
 }
 
 /// One line for a diff of this size, or why it is too big to be worth sending.
-fn summarize(changed_files: &[String], since: &str) -> Result<String, String> {
+fn summarize(changed_files: &[String], since: &str) -> Result<String, FullScanReason> {
     if changed_files.len() > MAX_CHANGED_FILES {
-        return Err(format!(
-            "{} files changed since {since}, which is more than an incremental scan \
-             is worth",
-            changed_files.len()
+        return Err(FullScanReason::new(
+            FullScanCause::TooManyChangedFiles,
+            format!(
+                "{} files changed since {since}, which is more than an incremental scan \
+                 is worth",
+                changed_files.len()
+            ),
         ));
     }
     Ok(match changed_files.len() {
@@ -407,33 +484,45 @@ fn summarize(changed_files: &[String], since: &str) -> Result<String, String> {
 /// what the run prints when git cannot answer either. "It stored none" is the
 /// ordinary one and is not a fault: it is what every scan uploaded before
 /// checksums existed says, and what a deployment that does not store them yet
-/// says about all of them.
+/// says about all of them, so it carries no cause and leaves git's to stand.
 fn changed_files_against(
     config: &Config,
     baseline: &BaselineScan,
     local: &Manifest,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ChecksumRefusal> {
     let what = baseline.describe();
     let Some(root) = baseline.manifest_root.as_deref() else {
-        return Err(format!(
-            "the {what} stored no file checksums to diff against"
+        return Err((
+            None,
+            format!("the {what} stored no file checksums to diff against"),
         ));
     };
+    let unreadable = |detail: String| (Some(FullScanCause::BaselineChecksumsUnreadable), detail);
     // A manifest is only comparable to one written the same way. Rather than
     // guess at a format a later client introduced, leave it to git.
     if baseline.manifest_version.as_deref() != Some(MANIFEST_VERSION) {
-        return Err(format!(
+        return Err(unreadable(format!(
             "the file checksums of the {what} are version {}, which this client does \
              not read (it reads version {MANIFEST_VERSION})",
             baseline.manifest_version.as_deref().unwrap_or("unknown")
-        ));
+        )));
     }
-    let body = api::download_scan_file_manifest(&config.get_url(), &baseline.id)
-        .map_err(|e| format!("the file checksums of the {what} could not be downloaded ({e})"))?;
-    let decoded = Manifest::decode(&body, root)
-        .map_err(|e| format!("the file checksums of the {what} could not be read ({e})"))?;
+    let body = api::download_scan_file_manifest(&config.get_url(), &baseline.id).map_err(|e| {
+        unreadable(format!(
+            "the file checksums of the {what} could not be downloaded ({e})"
+        ))
+    })?;
+    let decoded = Manifest::decode(&body, root).map_err(|e| {
+        unreadable(format!(
+            "the file checksums of the {what} could not be read ({e})"
+        ))
+    })?;
     Ok(decoded.changed_paths(local))
 }
+
+/// Why stored checksums could not answer: a cause when that was a fault rather
+/// than a baseline that stored none, and the clause describing it.
+type ChecksumRefusal = (Option<FullScanCause>, String);
 
 /// A scan that can be diffed against, and what it offers to diff with.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -732,7 +821,7 @@ fn branch_baseline(
 /// Why this run cannot diff from any baseline's commit, only from stored
 /// checksums. One function for both `plan_git_diff` and the ancestor lookup,
 /// which skips commit-only baselines when this says no.
-fn git_diff_refusal(sources: &DiffSources<'_>) -> Option<String> {
+fn git_diff_refusal(sources: &DiffSources<'_>) -> Option<FullScanReason> {
     // git diffs the repository, and --exclude means the archive is not it. An
     // excluded file git reports unchanged is left off the list, so the server
     // copies its findings forward over a file this upload does not contain --
@@ -740,11 +829,11 @@ fn git_diff_refusal(sources: &DiffSources<'_>) -> Option<String> {
     // because these runs report dirty whatever the worktree holds, so the check
     // below would otherwise answer for a tree with nothing uncommitted in it.
     if sources.exclude_narrowed {
-        return Some(
+        return Some(FullScanReason::new(
+            FullScanCause::ExcludeNeedsChecksums,
             "--exclude held files back from this archive, so a git diff of the repository \
-             would not describe it (its stored file checksums would, on the next run)"
-                .to_string(),
-        );
+             would not describe it (its stored file checksums would, on the next run)",
+        ));
     }
 
     // A commit-to-commit diff cannot see uncommitted edits, so on a dirty tree
@@ -753,11 +842,11 @@ fn git_diff_refusal(sources: &DiffSources<'_>) -> Option<String> {
     // switches the diff to measure the working tree, so those files are named
     // and rescanned like any other change.
     if sources.worktree_dirty && !sources.ignore_dirty_worktree {
-        return Some(
+        return Some(FullScanReason::new(
+            FullScanCause::DirtyWorktree,
             "this worktree has uncommitted changes that a commit-to-commit diff cannot \
-             see. Pass --ignore-dirty-worktree to diff the working tree instead"
-                .to_string(),
-        );
+             see. Pass --ignore-dirty-worktree to diff the working tree instead",
+        ));
     }
     None
 }
@@ -1042,26 +1131,39 @@ fn changed_files_since(
     base_sha: &str,
     head_sha: &str,
     include_worktree: bool,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, FullScanReason> {
     let base_tree = commit_tree(repo, base_sha).map_err(|e| {
-        format!(
-            "commit {}, the one the last scan covered, is not in this clone ({e}). A shallow \
-             clone cannot diff against it — fetch more history (for example `actions/checkout` \
-             with `fetch-depth: 0`) to scan incrementally",
-            short_sha(base_sha)
+        FullScanReason::new(
+            FullScanCause::BaselineCommitNotInClone,
+            format!(
+                "commit {}, the one the last scan covered, is not in this clone ({e}). A \
+                 shallow clone cannot diff against it — fetch more history (for example \
+                 `actions/checkout` with `fetch-depth: 0`) to scan incrementally",
+                short_sha(base_sha)
+            ),
         )
     })?;
 
+    let diff_failed = |detail: String| FullScanReason::new(FullScanCause::GitDiffFailed, detail);
     let diff = if include_worktree {
         let mut options = git2::DiffOptions::new();
         options.include_untracked(true).recurse_untracked_dirs(true);
         repo.diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut options))
     } else {
-        let head_tree = commit_tree(repo, head_sha)
-            .map_err(|e| format!("commit {} could not be read ({e})", short_sha(head_sha)))?;
+        let head_tree = commit_tree(repo, head_sha).map_err(|e| {
+            diff_failed(format!(
+                "commit {} could not be read ({e})",
+                short_sha(head_sha)
+            ))
+        })?;
         repo.diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)
     }
-    .map_err(|e| format!("the diff against {} failed ({e})", short_sha(base_sha)))?;
+    .map_err(|e| {
+        diff_failed(format!(
+            "the diff against {} failed ({e})",
+            short_sha(base_sha)
+        ))
+    })?;
 
     // Sorted and deduplicated: a rename reports one path per side, and stable
     // order keeps the uploaded list reproducible for the same two commits.
@@ -1076,10 +1178,13 @@ fn changed_files_since(
                 .or_else(|| delta.old_file().path())
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "a submodule".to_string());
-            return Err(format!(
-                "submodule {name} moved to a different commit, and the diff names only \
-                 the submodule itself rather than the files inside it that this scan \
-                 uploads"
+            return Err(FullScanReason::new(
+                FullScanCause::SubmoduleMoved,
+                format!(
+                    "submodule {name} moved to a different commit, and the diff names only \
+                     the submodule itself rather than the files inside it that this scan \
+                     uploads"
+                ),
             ));
         }
         for file in [delta.old_file(), delta.new_file()] {
@@ -1204,7 +1309,7 @@ mod tests {
         let original = plan(&["src/app.py"]);
         assert_eq!(
             original.clone().including(&["src/app.py".to_string()]),
-            Some(original)
+            Ok(original)
         );
     }
 
@@ -1213,7 +1318,12 @@ mod tests {
         let forced: Vec<String> = (0..=MAX_CHANGED_FILES)
             .map(|i| format!("v/{i}.js"))
             .collect();
-        assert_eq!(plan(&["src/app.py"]).including(&forced), None);
+        assert_eq!(
+            plan(&["src/app.py"])
+                .including(&forced)
+                .map_err(|r| r.cause),
+            Err(FullScanCause::TooManyChangedFiles)
+        );
     }
 
     #[test]
@@ -1557,7 +1667,8 @@ mod tests {
         let err = changed_files_since(&repo, &before.to_string(), &after.to_string(), false)
             .expect_err("a moved submodule must refuse the diff");
 
-        assert!(err.contains("submodule vendor"), "{err}");
+        assert_eq!(err.cause, FullScanCause::SubmoduleMoved);
+        assert!(err.detail.contains("submodule vendor"), "{}", err.detail);
     }
 
     /// Commit with `parents`, adding `name` to the first parent's tree.
@@ -1839,6 +1950,93 @@ mod tests {
         let (_dir, repo, _base, head) = repo_with_history();
         let err = changed_files_since(&repo, &"0".repeat(40), &head, false)
             .expect_err("unknown base must fail");
-        assert!(err.contains("shallow clone"), "{err}");
+        assert_eq!(err.cause, FullScanCause::BaselineCommitNotInClone);
+        assert!(err.detail.contains("shallow clone"), "{}", err.detail);
+    }
+
+    /// The server stores these, so renaming one splits its history in two.
+    #[test]
+    fn cause_codes_are_the_ones_the_server_stores() {
+        use FullScanCause::*;
+        let codes: Vec<&str> = [
+            DisabledByFlag,
+            TargetedUpload,
+            NoBaselineScan,
+            BaselineLookupFailed,
+            BaselineChecksumsUnreadable,
+            ExcludeNeedsChecksums,
+            DirtyWorktree,
+            NoGitCommit,
+            BaselineHasNoCommit,
+            BaselineCommitNotInClone,
+            GitDiffFailed,
+            SubmoduleMoved,
+            TooManyChangedFiles,
+        ]
+        .into_iter()
+        .map(FullScanCause::code)
+        .collect();
+        assert_eq!(
+            codes,
+            [
+                "disabled_by_flag",
+                "targeted_upload",
+                "no_baseline_scan",
+                "baseline_lookup_failed",
+                "baseline_checksums_unreadable",
+                "exclude_needs_checksums",
+                "dirty_worktree",
+                "no_git_commit",
+                "baseline_has_no_commit",
+                "baseline_commit_not_in_clone",
+                "git_diff_failed",
+                "submodule_moved",
+                "too_many_changed_files",
+            ]
+        );
+    }
+
+    #[test]
+    fn each_git_diff_refusal_reports_its_own_cause() {
+        let (_dir, repo, base, head) = repo_with_history();
+        let baseline = BaselineScan::from_response(&detached_scan(&base));
+        let clean = DiffSources {
+            branch: None,
+            head_sha: Some(&head),
+            worktree_dirty: false,
+            ignore_dirty_worktree: false,
+            exclude_narrowed: false,
+            manifest: None,
+        };
+        let cause = |sources: &DiffSources<'_>, repo: Option<&Repository>| {
+            plan_git_diff(&baseline, repo, sources)
+                .expect_err("refused")
+                .cause
+        };
+
+        // --exclude is checked before dirtiness, since these runs always
+        // report dirty whatever the worktree holds.
+        let excluded = DiffSources {
+            exclude_narrowed: true,
+            worktree_dirty: true,
+            ..clean
+        };
+        assert_eq!(
+            cause(&excluded, Some(&repo)),
+            FullScanCause::ExcludeNeedsChecksums
+        );
+        let dirty = DiffSources {
+            worktree_dirty: true,
+            ..clean
+        };
+        assert_eq!(cause(&dirty, Some(&repo)), FullScanCause::DirtyWorktree);
+        assert_eq!(cause(&clean, None), FullScanCause::NoGitCommit);
+        let no_commit = BaselineScan::from_response(&scan_without_git("no-git"));
+        assert_eq!(
+            plan_git_diff(&no_commit, Some(&repo), &clean)
+                .expect_err("refused")
+                .cause,
+            FullScanCause::BaselineHasNoCommit
+        );
     }
 }

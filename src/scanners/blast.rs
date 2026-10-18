@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::images;
+use crate::incremental::{FullScanCause, FullScanReason};
 use crate::manifest::Manifest;
 use crate::scan::build_scan_url;
 use crate::targets;
@@ -715,9 +716,21 @@ fn start_new_scan(
     // own checksums describe exactly -- so those runs resolve a plan like any
     // other and say what came of it. A partial scan already names what to
     // analyze and carries nothing forward, so it is silent too.
-    let targeted_archive = target_str.is_some();
-    let incremental = if *disable_incremental || targeted_archive || partial_files.is_some() {
-        None
+    let incremental = if *disable_incremental {
+        Err(FullScanReason::new(
+            FullScanCause::DisabledByFlag,
+            "--disable-incremental was passed",
+        ))
+    } else if target_str.is_some() {
+        Err(FullScanReason::new(
+            FullScanCause::TargetedUpload,
+            "--target narrowed the upload to the files it selects",
+        ))
+    } else if partial_files.is_some() {
+        Err(FullScanReason::new(
+            FullScanCause::TargetedUpload,
+            "--only-uncommitted narrowed the analysis to uncommitted files",
+        ))
     } else {
         // Reconciled repo info, so a tree that turned out dirty — or a HEAD
         // that moved mid-packaging — refuses rather than diffing against a
@@ -740,6 +753,7 @@ fn start_new_scan(
         // findings forward for whatever the diff omits — so without this an
         // include rule would never get the file looked at on an incremental run.
         .and_then(|plan| plan.including(&repo_relative_strings(&force_included)))
+        .inspect_err(|reason| println!("Scanning every file: {}.", reason.detail))
     };
     // Stored with the scan for a later run to diff against, so it is worth
     // uploading even when this run scans everything. Under
@@ -761,6 +775,7 @@ fn start_new_scan(
             policy,
             metadata,
             incremental,
+            disable_incremental: *disable_incremental,
             include_paths: include_rules.cli_patterns,
             file_manifest,
             partial_files,

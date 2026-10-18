@@ -1289,9 +1289,10 @@ mod tests {
 
         assert!(added.contains(&staged), "staged archive should be added");
 
-        let mut archive = zip::ZipArchive::new(File::open(&output_zip).unwrap()).unwrap();
-        let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+        let archive = zip::ZipArchive::new(File::open(&output_zip).unwrap()).unwrap();
+        let names: Vec<String> = archive
+            .file_names()
+            .map(|name| name.unwrap().into_owned())
             .collect();
         assert!(names.contains(&entry_name), "zip entries: {:?}", names);
     }
