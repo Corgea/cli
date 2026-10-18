@@ -1,0 +1,29 @@
+{
+  "name": "@corgea/cli",
+  "version": "0.0.0",
+  "description": "The Corgea CLI. Scan for vulnerabilities, create fixes.",
+  "license": "LGPL-2.1-only",
+  "homepage": "https://corgea.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Corgea/cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Corgea/cli/issues"
+  },
+  "bin": {
+    "corgea": "bin/corgea.js"
+  },
+  "files": [
+    "bin",
+    "vendor",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "fflate": "^0.8.2"
+  }
+}

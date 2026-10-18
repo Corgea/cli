@@ -9,12 +9,12 @@ pub fn setup_pre_commit_hook(include_default_scan_types: bool) {
             if metadata.is_dir() {
                 ".git"
             } else {
-                eprintln!("Error: .git exists but is not a directory");
+                log::error!("Error: .git exists but is not a directory");
                 std::process::exit(1);
             }
         }
         Err(_) => {
-            eprintln!("Error: Not a git repository (or any of the parent directories)");
+            log::error!("Error: Not a git repository (or any of the parent directories)");
             std::process::exit(1);
         }
     };
@@ -24,16 +24,19 @@ pub fn setup_pre_commit_hook(include_default_scan_types: bool) {
 
     // Create hooks directory if it doesn't exist
     std::fs::create_dir_all(&hooks_dir).unwrap_or_else(|e| {
-        eprintln!("Failed to create hooks directory: {}", e);
+        log::error!("Failed to create hooks directory: {}", e);
         std::process::exit(1);
     });
 
     // Check if pre-commit hook already exists
-    if std::path::Path::new(&pre_commit_path).exists() {
-        if !terminal::ask_yes_no("Pre-commit hook already exists. Do you want to overwrite it?", false) {
-            println!("Skipping pre-commit hook setup.");
-            return;
-        }
+    if std::path::Path::new(&pre_commit_path).exists()
+        && !terminal::ask_yes_no(
+            "Pre-commit hook already exists. Do you want to overwrite it?",
+            false,
+        )
+    {
+        println!("Skipping pre-commit hook setup.");
+        return;
     }
 
     // Determine scan types to include
@@ -62,23 +65,29 @@ pub fn setup_pre_commit_hook(include_default_scan_types: bool) {
     // Determine fail-on severity levels to include
 
     // Create pre-commit hook content
-    let hook_content = format!(r#"#!/bin/sh
+    let hook_content = format!(
+        r#"#!/bin/sh
 # Corgea pre-commit hook
 corgea scan blast --only-uncommitted --fail-on LO --scan-type {}
-"#, scan_types.join(","));
+"#,
+        scan_types.join(",")
+    );
 
     // Write pre-commit hook
     std::fs::write(&pre_commit_path, hook_content).unwrap_or_else(|e| {
-        eprintln!("Failed to write pre-commit hook: {}", e);
+        log::error!("Failed to write pre-commit hook: {}", e);
         std::process::exit(1);
     });
 
     #[cfg(unix)]
-    std::fs::set_permissions(&pre_commit_path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to set pre-commit hook permissions: {}", e);
-            std::process::exit(1);
-        });
+    std::fs::set_permissions(
+        &pre_commit_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap_or_else(|e| {
+        log::error!("Failed to set pre-commit hook permissions: {}", e);
+        std::process::exit(1);
+    });
 
     println!("Successfully installed pre-commit hook!");
 }

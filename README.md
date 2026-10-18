@@ -6,6 +6,12 @@ For full documentation, visit https://docs.corgea.app/cli
 
 ## Installation
 
+### Using npm
+```
+npm install -g @corgea/cli
+```
+The npm package bundles native binaries for all supported platforms. The correct binary for your OS and architecture is selected automatically at runtime.
+
 ### Using pip
 ```
 pip install corgea-cli
@@ -14,12 +20,168 @@ pip install corgea-cli
 ### Manual Installation
 You can get the latest binaries for your OS from https://github.com/Corgea/cli/releases.
 
+On Linux, both a `-gnu` and a `-musl` binary are published for x86_64 and
+aarch64. The `-gnu` builds run on glibc 2.17 and newer; the `-musl` builds are
+fully static and have no libc requirement at all, which makes them the safer
+pick for minimal containers and CI runners.
+
 ### Setup
 Once the binary is installed, login with your token from the Corgea app.
 ```
 corgea login <token>
 ```
 
+## Scanning
+
+`corgea scan` uploads your project and waits for results. `corgea wait [scan_id]`
+attaches to a running scan; `corgea upload <report> --wait` does the same for a
+third-party report.
+
+All three exit 1 if the scan fails, printing the reason and the scanners that hit
+problems. A scan that completes with a scanner missing exits 0 with a warning.
+While waiting, the scan's status is read every 3 seconds. Waiting gives up after
+10 hours; override with `CORGEA_SCAN_TIMEOUT_SECONDS`.
+`--fail`/`--block-on` then wait up to 15 minutes for blocking rules to be
+evaluated; override with `CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS`.
+
+`--out-format`/`--out-file` and `--sbom` are honored whether or not a gate
+trips: both are written before `--fail`/`--block-on` are evaluated, so a scan
+that exits 1 on a blocking rule still leaves its report behind to ingest.
+
+### Rate limits and gateway errors are retried
+
+A `429 Too Many Requests`, a `502 Bad Gateway` or `504 Gateway Timeout`, and
+Cloudflare's `520`–`524` are not Corgea rejecting a request on its merits, so
+all of them are retried rather than failed: the CLI waits
+10s, then 30s, then 50s, and a pipeline rides out the blips a busy platform
+produces under parallel scans instead of failing on them. A request still
+answered the same way after those three retries fails the command in the usual
+way, so a real outage still exits non-zero. Each retry is logged, and the count
+belongs to a single request: any other answer starts the next one with the full
+three retries again. A `429` that names a `Retry-After` in seconds is honored,
+up to two minutes for any one pause, and never shortens the pause below the
+schedule.
+
+Which requests get retried depends on which it is:
+
+- A `429` retries everything, `POST` and `PATCH` included. The rate limiter
+  declines the request before the API sees it, so nothing was created and
+  sending it again finishes the same work.
+- A gateway error — `502`, `504`, or Cloudflare's `520`–`524` — retries reads
+  only. It comes from a proxy rather than from Corgea, so it is not Corgea's
+  word on what happened to the request: a `524` in particular means Corgea took
+  the request and was still working on it when Cloudflare stopped waiting.
+  Every write the CLI sends creates something, so re-sending one does not
+  finish the first scan, it starts a second. A write's gateway error goes
+  straight to the caller.
+
+Writes still retry network errors, where nothing reached Corgea at all.
+
+`corgea upload` treats any of these on a source upload — a gateway error, or a
+rate limit that outlived its retries — as the platform being unavailable rather than one bad
+file, and reports the remaining paths as unsent instead of collecting the same
+answer once per path.
+
+### Skipping a re-scan of the same commit
+
+A pipeline that re-runs on an unchanged commit can reuse the scan it already
+has instead of paying for a duplicate:
+
+```bash
+corgea scan --skip-if-commit-scanned-recently --block-on criticals
+corgea scan --skip-if-commit-scanned-recently --scanned-within 4h   # 90s, 30m, 4h, 7d
+```
+
+When the project already has a completed scan of the current commit inside the
+window (24h by default), that scan takes the new scan's place: the results
+table, the `--block-on` gate and its exit code, and any `--out-file` report all
+come from it, so the pipeline behaves the same whether or not a scan ran. The
+window exists because unchanged code is still exposed to advisories published
+since it was last scanned.
+
+Two lines make the outcome scriptable — `CORGEA_SCAN_SKIPPED=true` plus
+`CORGEA_SCAN_ID=<id>` when a scan was reused, `CORGEA_SCAN_SKIPPED=false` when
+one ran — so a later step (an ingest, say) can branch on it.
+
+Only a scan that answers the same question is reused, which is stricter than
+"same commit". A candidate has to be a completed BLAST scan of that commit, on a
+branch rather than a pull request, from an explicitly clean worktree, with no
+scanner problems reported — and this run has to be a default whole-commit scan
+itself. Anything else runs a real scan: nothing inside the window, only a failed
+or still-running scan, a worktree `git status` reports changes in, or a lookup
+the platform could not answer.
+
+Two things are hard errors instead. An unresolvable commit (not a git
+repository, or no commits yet) exits 1 rather than silently scanning. And a run
+that changes what gets scanned cannot be matched against a candidate — the API
+exposes neither a scan's configured scan types and target policies nor whether
+it bundled a container image — so the flag is rejected alongside `--scan-type`,
+`--policy`, `--include-image`, `--only-uncommitted`, and `--target`.
+
+`--exclude` is allowed, and warns on a skip. A reused scan is one of the whole
+commit (an `--exclude` upload is recorded as not matching the commit exactly, so
+it is never itself reusable), which means the results and the gate can cover
+files this run would have skipped — over-reporting, never under-reporting.
+
+## Dependency Inventory (offline)
+
+`corgea deps` builds a dependency inventory from npm, Python, and Java manifests
+and lockfiles, then evaluates a pinning policy (DEP rules). Runs fully offline —
+no token or network required.
+
+```bash
+corgea deps scan                       # table report for the current directory
+corgea deps scan --format agent        # compact TSV for coding agents
+corgea deps scan --format json         # JSON inventory on stdout
+corgea deps scan --format quiet        # no stdout; exit code still applies
+corgea deps scan --fail-on high        # exit 1 if any finding is >= high
+corgea deps scan --out-format json     # machine-readable (json or sarif)
+corgea deps graph --format json        # print the resolved dependency graph
+corgea deps explain <package> --format agent  # show why a package is present
+corgea deps diff --base origin/main --format json
+corgea deps sbom --format cyclonedx    # emit a CycloneDX SBOM
+corgea deps policy init --exist-ok     # write starter policy, or keep existing file
+```
+
+`corgea deps` defaults to `--format agent` when an agent environment is detected (`AI_AGENT`, `CODEX_SANDBOX`, `CLAUDECODE`, and related agent variables). Use `--format human` to force the normal terminal output.
+
+See [Dependency Scanning (CLI)](https://docs.corgea.app/cli/deps) for the full flag and exit-code reference.
+
+## Install Gate
+
+Prefix a package-manager install with `corgea` to vet every package it would
+install — named **and transitive** — against Corgea's vulnerability API *before*
+anything lands on disk. Known-vulnerable or malicious versions block the install;
+a clean set runs the underlying command untouched. Works with `pip`, `npm`,
+`yarn`, `pnpm`, and `uv`.
+
+No token required — baseline public CVE checks run out of the box. Try it:
+
+```bash
+corgea npm install lodash@4.17.20      # blocks: known-vulnerable (CVE-2025-13465), exits 1
+corgea pip install requests            # resolves, checks the verdict, then runs pip
+corgea npm install axios@^1.0.0        # ranges resolve to a concrete version first
+corgea pip --force install <pkg>       # print findings but install anyway
+corgea pip list                        # non-install subcommands pass straight through
+```
+
+`corgea pip install` and `corgea npm install` resolve the **full would-install
+set** (named + transitive) via a safe dry-run, so a vulnerable *transitive*
+dependency blocks too. Blocked findings steer to the fix: each advisory shows
+`fixed in <version>`, and the gate prints the safe version to install instead.
+
+The gate also blocks **freshly published** packages — anything published within
+the recency window (default 14 days) — to catch just-shipped typosquats and
+hijacks before advisory feeds catch up. It is on by default; turn it off with
+`recency_gate = false` in `~/.corgea/config.toml`, retune the window with
+`recency_threshold_days`, or pass `--force` for a one-off install.
+
+Logging in (`corgea login`) upgrades the gate to authenticated enforcement —
+unverifiable packages, resolution errors, and lookup failures then fail closed
+(public mode warns and continues). Wrapper flags (`--force`, `--json`) go between
+the manager and its command: `corgea npm --force install <pkg>`.
+
+See [the CLI docs](https://docs.corgea.app/cli) for the full flag and exit-code reference.
 
 ## Development Setup
 
@@ -63,4 +225,3 @@ corgea login <token>
    ```
 
 Note: After making changes to Rust code, you'll need to run `maturin develop` again to rebuild the package.
-

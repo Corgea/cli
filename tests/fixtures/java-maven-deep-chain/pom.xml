@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.acme</groupId>
+  <artifactId>app</artifactId>
+  <version>1.0.0</version>
+
+  <properties>
+    <v1>3.3.3</v1>
+    <v2>${v1}</v2>
+    <v3>${v2}</v3>
+    <v4>${v3}</v4>
+    <v5>${v4}</v5>
+    <v6>${v5}</v6>
+    <v7>${v6}</v7>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>deep</artifactId>
+      <version>${v7}</version>
+    </dependency>
+  </dependencies>
+</project>

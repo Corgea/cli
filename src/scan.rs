@@ -1,13 +1,105 @@
-use std::collections::HashSet;
-use serde_json::Value;
-use std::io::{self, Read};
-use crate::Config;
-use uuid::Uuid;
-use std::path::Path;
-use std::process::Command;
-use crate::cicd::{*};
+use crate::cicd::*;
 use crate::log::debug;
+use crate::scanners::parsers::ScanParserFactory;
+use crate::scanners::report_paths;
+use crate::{utils, Config};
 use reqwest::header;
+use reqwest::Method;
+use serde_json::Value;
+use std::collections::HashSet;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use uuid::Uuid;
+
+const CORGEA_POLICY_FILENAMES: &[&str] = &["corgea.yaml", "corgea.yml"];
+
+fn is_regular_file(path: &Path) -> bool {
+    !path.is_symlink() && path.is_file()
+}
+
+/// `corgea.yaml` / `corgea.yml` under `root`, including a gitignored copy at `root`.
+fn find_corgea_policy_files(root: &Path) -> Vec<String> {
+    if !root.is_dir() {
+        return Vec::new();
+    }
+
+    let mut found = Vec::new();
+    for name in CORGEA_POLICY_FILENAMES {
+        if is_regular_file(&root.join(name)) {
+            found.push((*name).to_string());
+        }
+    }
+
+    let walker = ignore::WalkBuilder::new(root)
+        .standard_filters(true)
+        .build();
+    for result in walker {
+        let Ok(entry) = result else {
+            continue;
+        };
+        let path = entry.path();
+        if !is_regular_file(path) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !CORGEA_POLICY_FILENAMES.contains(&name) {
+            continue;
+        }
+        if let Ok(rel) = path.strip_prefix(root) {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if !found.iter().any(|existing| existing == &rel) {
+                found.push(rel);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// One file to send to `code-upload`.
+struct SourceUpload {
+    /// Sent as `path=`, exactly as the report wrote it. The engine matches the
+    /// report's paths against this, so it stays as written even when the file
+    /// itself was found somewhere else.
+    report_path: String,
+    /// Where the file actually is on this machine.
+    local_path: PathBuf,
+}
+
+/// Pair every path a report names with the file to read for it, and append the
+/// repo's `corgea.yaml` policy files.
+///
+/// The prefix search runs on the report's paths alone, before the policy files
+/// are added: those are found by walking `root`, so they always resolve, and
+/// one of them counting as a path that "already resolves" would call off the
+/// search for a report that matches nothing.
+fn plan_source_uploads(root: &Path, report_paths: &[String]) -> Vec<SourceUpload> {
+    let prefix = report_paths::find_report_path_prefix(root, report_paths);
+
+    let mut uploads: Vec<SourceUpload> = report_paths
+        .iter()
+        .map(|path| SourceUpload {
+            report_path: path.clone(),
+            local_path: report_paths::local_report_path(root, path, &prefix),
+        })
+        .collect();
+
+    for yaml in find_corgea_policy_files(root) {
+        if uploads.iter().any(|upload| upload.report_path == yaml) {
+            continue;
+        }
+        debug(&format!("Including repo policy file: {yaml}"));
+        uploads.push(SourceUpload {
+            local_path: root.join(&yaml),
+            report_path: yaml,
+        });
+    }
+
+    uploads
+}
 
 pub fn run_command(base_cmd: &String, mut command: Command) -> String {
     match which::which(base_cmd) {
@@ -15,7 +107,7 @@ pub fn run_command(base_cmd: &String, mut command: Command) -> String {
             let output = match command.output() {
                 Ok(output) => output,
                 Err(e) => {
-                    eprintln!("Failed to execute command: {}", e);
+                    log::error!("Failed to execute command: {}", e);
                     std::process::exit(1);
                 }
             };
@@ -25,40 +117,107 @@ pub fn run_command(base_cmd: &String, mut command: Command) -> String {
                 let stdout = String::from_utf8(output.stdout).expect("Failed to parse stdout");
 
                 if stdout.contains("run `semgrep login`") {
-                    eprintln!("You are not authenticated with semgrep. Please run 'semgrep login' to authenticate.");
+                    log::error!("You are not authenticated with semgrep. Please run 'semgrep login' to authenticate.");
                     std::process::exit(1);
                 }
 
-                return stdout;
+                stdout
             } else {
                 let stderr = String::from_utf8(output.stderr).expect("Failed to parse stderr");
                 let stdout = String::from_utf8(output.stdout).expect("Failed to parse stdout");
-                eprintln!("{} failed: {}", base_cmd, stderr);
-                eprintln!("{}", stdout);
+                log::error!("{} failed: {}", base_cmd, stderr);
+                log::error!("{}", stdout);
                 std::process::exit(1);
             }
         }
         Err(_) => {
-            eprintln!("{} binary not found, is it installed?", base_cmd);
+            log::error!("{} binary not found, is it installed?", base_cmd);
             std::process::exit(1);
         }
     }
 }
 
-pub fn run_semgrep(config: &Config) {
+pub struct ScanUploadResult {
+    pub scan_id: String,
+    pub project_id: Option<String>,
+    pub project_name: String,
+}
+
+/// Build the URL to the Corgea scan page so users can track results.
+///
+/// The project-name fallback is a free-form path segment — uploads from CI name
+/// the project `{owner/repo}-{pr}` — so it must be percent-encoded or the `/`
+/// would route the link to the wrong project.
+pub fn build_scan_url(
+    base_url: &str,
+    project_id: Option<&str>,
+    project_name: &str,
+    scan_id: &str,
+) -> String {
+    match project_id {
+        Some(pid) => format!("{}/project/{}/?scan_id={}", base_url, pid, scan_id),
+        None => format!(
+            "{}/project/{}?scan_id={}",
+            base_url,
+            urlencoding::encode(project_name),
+            scan_id
+        ),
+    }
+}
+
+/// Print the scan page URL so the user can track the scan results without
+/// waiting for it to complete.
+pub fn print_scan_tracking_url(config: &Config, result: &ScanUploadResult) {
+    let scan_url = build_scan_url(
+        &config.get_url(),
+        result.project_id.as_deref(),
+        &result.project_name,
+        &result.scan_id,
+    );
+    print!(
+        "\n\nScan has started with ID: {}.\n\nYou can view it populate at the link:\n{}\n\n",
+        result.scan_id,
+        utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
+    );
+    print!(
+        "{}",
+        utils::terminal::set_text_color(
+            "Your scan will continue securely in the Corgea cloud.\n",
+            utils::terminal::TerminalColor::Blue
+        )
+    );
+}
+
+pub fn run_semgrep(config: &Config, project_name: Option<String>) {
     println!("Scanning with semgrep...");
     let base_command = "semgrep";
     let mut command = std::process::Command::new(base_command);
-    command.arg("scan").arg("--config").arg("auto").arg("--json");
+    command
+        .arg("scan")
+        .arg("--config")
+        .arg("auto")
+        .arg("--json");
 
     println!("Running \"semgrep scan --config auto --json\"");
 
     let output = run_command(&base_command.to_string(), command);
 
-    parse_scan(config, output, true);
+    if let Some(result) = parse_scan(config, output, true, project_name.clone()) {
+        crate::wait::run(
+            config,
+            crate::wait::WaitArgs {
+                scan_id: Some(result.scan_id),
+                selector: crate::utils::api::ProjectSelector {
+                    name: Some(result.project_name.clone()),
+                    ..Default::default()
+                },
+                project_id: result.project_id,
+            },
+        );
+    }
 }
 
-pub fn run_snyk(config: &Config) {
+pub fn run_snyk(config: &Config, project_name: Option<String>) {
     println!("Scanning with snyk...");
     let base_command = "snyk";
     let mut command = std::process::Command::new(base_command);
@@ -68,196 +227,161 @@ pub fn run_snyk(config: &Config) {
 
     let output = run_command(&base_command.to_string(), command);
 
-    parse_scan(config, output, true);
+    if let Some(result) = parse_scan(config, output, true, project_name.clone()) {
+        crate::wait::run(
+            config,
+            crate::wait::WaitArgs {
+                scan_id: Some(result.scan_id),
+                selector: crate::utils::api::ProjectSelector {
+                    name: Some(result.project_name.clone()),
+                    ..Default::default()
+                },
+                project_id: result.project_id,
+            },
+        );
+    }
 }
 
-pub fn read_stdin_report(config: &Config) {
+pub fn read_stdin_report(
+    config: &Config,
+    project_name: Option<String>,
+) -> Option<ScanUploadResult> {
     let mut input = String::new();
     let _ = io::stdin().read_to_string(&mut input);
 
-    parse_scan(config, input, false);
+    parse_scan(config, input, false, project_name)
 }
 
-pub fn read_file_report(config: &Config, file_path: &str) {
+pub fn read_file_report(
+    config: &Config,
+    file_path: &str,
+    project_name: Option<String>,
+) -> Option<ScanUploadResult> {
     let input = match std::fs::read_to_string(file_path) {
         Ok(input) => input,
         Err(e) => {
-            eprintln!("Failed to read file: {}", e);
+            log::error!("Failed to read file: {}", e);
             std::process::exit(1);
         }
     };
 
-    parse_scan(config, input, false);
+    parse_scan(config, input, false, project_name)
 }
 
-pub fn parse_scan(config: &Config, input: String, save_to_file: bool) {
-    debug("Parsing the scan report json");
+pub fn parse_scan(
+    config: &Config,
+    input: String,
+    save_to_file: bool,
+    project_name: Option<String>,
+) -> Option<ScanUploadResult> {
+    debug("Parsing the scan report");
 
-    let mut paths: Vec<String> = Vec::new();
-    let mut scanner = String::new();
-    let data: std::result::Result<Value, _> = serde_json::from_str(&input);
+    // Remove BOM (Byte Order Mark) if present
+    let cleaned_input = input.trim_start_matches('\u{feff}').trim();
 
-    match data {
-        Ok(data) => {
-            let schema = data.get("$schema").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let parser_factory = ScanParserFactory::new();
 
-            if input.contains("semgrep.dev") {
-                debug("Detected semgrep schema");
-                scanner = "semgrep".to_string();
-                if let Some(results) = data.get("results").and_then(|v| v.as_array()) {
-                    for result in results {
-                        if let Some(path) = result.get("path").and_then(|v| v.as_str()) {
-                            paths.push(path.to_string());
-                        }
-                    }
-                }
-            } else if schema.contains("sarif") {
-                debug("Detected sarif schema");
-                let run = data.get("runs").and_then(|v| v.as_array()).and_then(|v| v.get(0));
-                let driver = run.and_then(|v| v.get("tool")).and_then(|v| v.get("driver")).and_then(|v| v.get("name"));
-                let tool = driver.and_then(|v| v.as_str()).unwrap_or("unknown");
-
-                if tool == "SnykCode" {
-                    debug("Detected snyk version of sarif schema");
-                    scanner = "snyk".to_string();
-                } else if tool == "CodeQL" {
-                    debug("Detected codeql version of sarif schema");
-                    scanner = "codeql".to_string();
-                } else {
-                    eprintln!("{} is not supported as this time.", tool);
-                    std::process::exit(1);
-                }
-
-                if let Some(runs) = data.get("runs").and_then(|v| v.as_array()) {
-                    for run in runs {
-                        if let Some(results) = run.get("results").and_then(|v| v.as_array()) {
-                            for result in results {
-                                if let Some(locations) = result.get("locations").and_then(|v| v.as_array()) {
-                                    for location in locations {
-                                        if let Some(uri) = location.get("physicalLocation").and_then(|v| v.get("artifactLocation")).and_then(|v| v.get("uri")).and_then(|v| v.as_str()) {
-                                            paths.push(uri.to_string());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            // checkmarx report generated by CLI
-            } else if data.get("totalCount").is_some() && data.get("results").is_some() && data.get("scanID").is_some() {
-                debug("Detected checkmarx cli schema");
-                scanner = "checkmarx".to_string();
-                if let Some(results) = data.get("results").and_then(|v| v.as_array()) {
-                    for result in results {
-                        if let Some(data) = result.get("data") {
-                            if let Some(nodes) = data.get("nodes").and_then(|v| v.as_array()) {
-                                for node in nodes {
-                                    if let Some(path) = node.get("fileName") {
-                                        if let Some(truncated_path) = path.as_str() {
-                                            paths.push(truncated_path.get(1..).unwrap_or("").to_string());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            // for checkmarx report generated by web
-            } else if data.get("scanResults").is_some() && data.get("reportId").is_some() {
-                debug("Detected checkmarx web schema");
-                scanner = "checkmarx".to_string();
-                if let Some(scan_results) = data.get("scanResults") {
-                    if let Some(sast) = scan_results.get("sast") {
-                        if let Some(languges) = sast.get("languages").and_then(|v| v.as_array()) {
-                            for language in languges {
-                                if let Some(queries) = language.get("queries").and_then(|v| v.as_array()) {
-                                    for query in queries {
-                                        if let Some(vulns) = query.get("vulnerabilities").and_then(|v| v.as_array()) {
-                                            for vuln in vulns {
-                                                if let Some(nodes) = vuln.get("nodes").and_then(|v| v.as_array()) {
-                                                    for node in nodes {
-                                                        if let Some(path) = node.get("fileName") {
-                                                            if let Some(truncated_path) = path.as_str() {
-                                                                paths.push(truncated_path.get(1..).unwrap_or("").to_string());
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                debug("Couldn't detect what kind of report this is.")
+    match parser_factory.parse_scan_data(cleaned_input) {
+        Ok(parse_result) => {
+            if parse_result.paths.is_empty() {
+                log::info!("No issues found in scan report, exiting.");
+                std::process::exit(0);
             }
+
+            upload_scan(
+                config,
+                parse_result.paths,
+                parse_result.scanner,
+                cleaned_input.to_string(),
+                save_to_file,
+                project_name,
+            )
         }
-        Err(e) => {
-            eprintln!("Failed to parse JSON report: {}", e);
-            eprintln!("Only reports in JSON format are supported.");
+
+        Err(error_message) => {
+            log::error!("{}", error_message);
             std::process::exit(1);
         }
     }
-
-    if paths.len() == 0 {
-        eprintln!("No issues found in scan report, exiting.");
-        std::process::exit(0);
-    }
-
-    upload_scan(config, paths, scanner, input, save_to_file);
 }
 
-pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: String, save_to_file: bool) {
+pub fn upload_scan(
+    config: &Config,
+    paths: Vec<String>,
+    scanner: String,
+    input: String,
+    save_to_file: bool,
+    project_name: Option<String>,
+) -> Option<ScanUploadResult> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let uploads = plan_source_uploads(&cwd, &paths);
     let in_ci = running_in_ci();
     let ci_platform = which_ci();
     let github_env_vars = get_github_env_vars();
 
     let run_id = Uuid::new_v4().to_string();
-    let token = config.get_token();
     let base_url = config.get_url();
-    let current_dir = std::env::current_dir().expect("Failed to get current directory");
-    let project;
+    let api_base = "/api/v1";
 
-    if in_ci {
+    let project = if in_ci {
         debug("Running in CI");
-        project = format!("{}-{}",
-                          github_env_vars.get("GITHUB_REPOSITORY").expect("Failed to get GITHUB_REPOSITORY").to_string(),
-                          github_env_vars.get("GITHUB_PR").expect("Failed to get GITHUB_REPOSITORY").to_string())
+        format!(
+            "{}-{}",
+            github_env_vars
+                .get("GITHUB_REPOSITORY")
+                .expect("Failed to get GITHUB_REPOSITORY"),
+            github_env_vars
+                .get("GITHUB_PR")
+                .expect("Failed to get GITHUB_REPOSITORY")
+        )
     } else {
-        project = current_dir.file_name().expect("Failed to get directory name").to_str().expect("Failed to convert OsStr to str").to_string();
-    }
-    let repo_data = std::env::var("REPO_DATA").unwrap_or_else(|_| "".to_string()); //encoded data to forward.
+        utils::generic::determine_project_name(project_name.as_deref())
+    };
+    let repo_data = std::env::var("REPO_DATA").unwrap_or_else(|_| "".to_string());
 
     let scan_upload_url = if repo_data.is_empty() {
         format!(
-            "{}/api/cli/scan-upload?token={}&engine={}&run_id={}&project={}&ci={}&ci_platform={}", base_url, token, scanner, run_id, project, in_ci, ci_platform
+            "{}{}/scan-upload?engine={}&run_id={}&project={}&ci={}&ci_platform={}",
+            base_url, api_base, scanner, run_id, project, in_ci, ci_platform
         )
     } else {
         format!(
-            "{}/api/cli/scan-upload?token={}&engine={}&run_id={}&project={}&ci={}&ci_platform={}&repo_data={}", base_url, token, scanner, run_id, project, in_ci, ci_platform, repo_data
+            "{}{}/scan-upload?engine={}&run_id={}&project={}&ci={}&ci_platform={}&repo_data={}",
+            base_url, api_base, scanner, run_id, project, in_ci, ci_platform, repo_data
         )
     };
 
     let git_config_upload_url = format!(
-        "{}/api/cli/git-config-upload?token={}&run_id={}", base_url, token, run_id
+        "{}{}/git-config-upload?run_id={}",
+        base_url, api_base, run_id
     );
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5 * 60))
-        .build()
-        .expect("Failed to build client");
+    let client = utils::api::http_client();
 
     println!("Uploading required files for the scan...");
 
     let mut uploaded_paths = HashSet::new();
     let mut uploaded_count = 0;
     let mut upload_error_count = 0;
+    let mut platform_declined = false;
 
-    for path in &paths {
-        if !Path::new(&path).exists() {
-            eprintln!("Required file {} not found which is required for the scan, exiting.", path);
+    'files: for upload in &uploads {
+        let path = &upload.report_path;
+        let fp = upload.local_path.as_path();
+
+        if !fp.exists() {
+            // Name where the file was looked for whenever that is not the path
+            // in the report, so a prefix that resolved most of the report but
+            // not this path is visible rather than mystifying.
+            let looked_in = if fp.as_os_str() == path.as_str() {
+                String::new()
+            } else {
+                format!(" (looked for it at '{}')", fp.display())
+            };
+            log::error!(
+                "Required file {}{} not found which is required for the scan, exiting.",
+                path,
+                looked_in
+            );
             std::process::exit(1);
         }
 
@@ -266,28 +390,48 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
         }
 
         let src_upload_url = format!(
-            "{}/api/cli/code-upload?token={}&run_id={}&path={}", base_url, token, run_id, path
+            "{}{}/code-upload?run_id={}&path={}",
+            base_url, api_base, run_id, path
         );
         debug(&format!("Uploading file: {}", path));
-        let fp = Path::new(&path);
 
         let mut attempts = 0;
         let mut success = false;
 
         while attempts < 3 && !success {
-            let form = reqwest::blocking::multipart::Form::new()
-                .file("file", fp)
-                .expect("Failed to read file");
-
             debug(&format!("POST: {}", src_upload_url));
-            let res = client.post(&src_upload_url)
-                .multipart(form)
-                .send();
+            let res = utils::api::send_with_retries("a source file upload", &Method::POST, || {
+                let form = reqwest::blocking::multipart::Form::new()
+                    .file("file", fp)
+                    .expect("Failed to read file");
+                client.post(&src_upload_url).multipart(form).send()
+            });
 
             match res {
                 Ok(response) => {
                     if !response.status().is_success() {
-                        eprintln!("Failed to upload file {} {}... retrying", response.status(), path);
+                        let status = response.status();
+                        let body = response
+                            .text()
+                            .unwrap_or_else(|_| "Unable to read response body".to_string());
+                        debug(&format!(
+                            "Code upload failed with status: {}. Response body: {}",
+                            status, body
+                        ));
+                        // A gateway error or a rate limit that got this far is
+                        // the platform being unavailable, not something wrong
+                        // with this one file: a gateway error such as a 502 or
+                        // 524 because an upload is a write and so is never
+                        // replayed, the 429 because its retries are already
+                        // spent. Walking the remaining paths would
+                        // just collect the same answer once per file, so stop
+                        // uploading source files altogether.
+                        if utils::api::is_transient_error(status) {
+                            log::warn!("Failed to upload file {}: {}", path, status);
+                            platform_declined = true;
+                            break 'files;
+                        }
+                        log::warn!("Failed to upload file {} {}... retrying", status, path);
                         std::thread::sleep(std::time::Duration::from_secs(1));
                         attempts += 1;
                     } else {
@@ -297,74 +441,233 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to send request: {}", e);
-                    std::process::exit(1);
+                    upload_error_count += 1;
+                    log::warn!(
+                        "Failed to upload file {} after network retries: {}",
+                        path,
+                        e
+                    );
+                    break;
                 }
             }
         }
 
         if attempts == 3 && !success {
             upload_error_count += 1;
-            eprintln!("Failed to upload file: {} after 3 attempts. skipping...", path);
+            log::warn!(
+                "Failed to upload file: {} after 3 attempts. skipping...",
+                path
+            );
         }
     }
 
+    // Everything the aborted walk never attempted still counts as unsent, or
+    // the closing summary would report one failure for a whole skipped tree.
+    if platform_declined {
+        let distinct: HashSet<&String> = uploads.iter().map(|upload| &upload.report_path).collect();
+        let unsent = distinct.len() - uploaded_paths.len();
+        upload_error_count += unsent;
+        log::warn!(
+            "Stopped uploading source files: Corgea is not accepting them right now. {} of {} files were not sent.",
+            unsent,
+            distinct.len()
+        );
+    }
+
     if uploaded_count == 0 {
-        eprintln!("Failed to upload any files for the scan, exiting.");
+        log::error!("Failed to upload any files for the scan, exiting.");
         std::process::exit(1);
     }
 
     println!("Uploading the scan...");
 
     // main scan upload
-    debug(&format!("POST: {}", scan_upload_url));
-    let res = client.post(scan_upload_url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(input.clone())
-        .send();
+    let input_bytes = input.as_bytes();
+    let input_size = input_bytes.len();
+    let max_upload_size = 50 * 1024 * 1024; // 50mb
+    let chunk_size = match std::env::var("DEBUG_CORGEA_OVERRIDE_REPORT_CHUNK_SIZE") {
+        Ok(val) => match val.parse::<usize>() {
+            Ok(mb) if mb > 0 => {
+                debug(&format!("Overriding report chunk size to {} MB", mb));
+                mb * 1024 * 1024
+            }
+            _ => {
+                log::warn!("Invalid DEBUG_CORGEA_OVERRIDE_REPORT_CHUNK_SIZE value '{}', using default 1 MB", val);
+                1024 * 1024
+            }
+        },
+        Err(_) => 1024 * 1024, // default 1mb
+    };
+    let is_chunked = input_size > max_upload_size;
+    let res = if is_chunked {
+        let total_chunks = input_size.div_ceil(chunk_size);
+        debug(&format!("Uploading scan in {} chunks", total_chunks));
+        let mut offset = 0usize;
+        let mut last_response = None;
+
+        for (index, chunk) in input_bytes.chunks(chunk_size).enumerate() {
+            debug(&format!(
+                "POST: {} (chunk {}/{})",
+                scan_upload_url,
+                index + 1,
+                total_chunks
+            ));
+            let response =
+                utils::api::send_with_retries("a scan report chunk upload", &Method::POST, || {
+                    client
+                        .post(&scan_upload_url)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("Upload-Offset", offset.to_string())
+                        .header("Upload-Length", input_size.to_string())
+                        .body(chunk.to_vec())
+                        .send()
+                });
+
+            let should_break = match &response {
+                Ok(res) => {
+                    if !res.status().is_success() {
+                        true
+                    } else if let Some(server_offset) = res.headers().get("Upload-Offset") {
+                        let expected_offset = offset + chunk.len();
+                        if let Ok(server_offset_str) = server_offset.to_str() {
+                            if let Ok(server_offset_val) = server_offset_str.parse::<usize>() {
+                                if server_offset_val != expected_offset {
+                                    log::error!(
+                                        "Upload offset mismatch on chunk {}/{}: server has {} bytes but expected {}. \
+                                        This may indicate that chunks are being routed to different server instances. \
+                                        Please contact support.",
+                                        index + 1, total_chunks, server_offset_val, expected_offset
+                                    );
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }
+                Err(_) => true,
+            };
+            last_response = Some(response);
+            if should_break {
+                break;
+            }
+            offset += chunk.len();
+        }
+
+        last_response.expect("Failed to upload scan.")
+    } else {
+        debug(&format!("POST: {}", scan_upload_url));
+        utils::api::send_with_retries("the scan report upload", &Method::POST, || {
+            client
+                .post(&scan_upload_url)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(input.clone())
+                .send()
+        })
+    };
+
+    let mut sast_scan_id: Option<String> = None;
+    let mut project_id: Option<String> = None;
+
+    let mut upload_failed = false;
 
     match res {
         Ok(response) => {
             if response.status().is_success() {
-                println!("Successfully uploaded scan.");
+                let body_text = match response.text() {
+                    Ok(text) => text,
+                    Err(e) => {
+                        log::warn!("Failed to read response body: {}", e);
+                        String::new()
+                    }
+                };
+
+                if !body_text.is_empty() {
+                    match serde_json::from_str::<Value>(&body_text) {
+                        Ok(json) => {
+                            if let Some(id_val) = json.get("sast_scan_id") {
+                                if let Some(id_str) = id_val.as_str() {
+                                    println!("Scan ID: {}", id_str);
+                                    sast_scan_id = Some(id_str.to_string());
+                                } else if let Some(id_num) = id_val.as_i64() {
+                                    println!("Scan ID: {}", id_num);
+                                    sast_scan_id = Some(id_num.to_string());
+                                }
+                            }
+                            if let Some(pid_val) = json.get("project_id") {
+                                if let Some(pid_str) = pid_val.as_str() {
+                                    project_id = Some(pid_str.to_string());
+                                } else if let Some(pid_num) = pid_val.as_i64() {
+                                    project_id = Some(pid_num.to_string());
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to parse response JSON: {}", e);
+                        }
+                    }
+                }
+
+                if is_chunked && sast_scan_id.is_none() {
+                    log::error!("Failed to upload scan: server did not return a scan ID after all chunks were sent. The scan was not created on the platform.");
+                    upload_failed = true;
+                } else {
+                    println!("Successfully uploaded scan.");
+                }
             } else {
-                eprintln!("Failed to upload scan: {}", response.status());
+                upload_failed = true;
+                let status = response.status();
+                let body = response
+                    .text()
+                    .unwrap_or_else(|_| "Unable to read response body".to_string());
+                debug(&format!(
+                    "Scan upload failed with status: {}. Response body: {}",
+                    status, body
+                ));
+                log::error!("Failed to upload scan: {}", status);
             }
         }
         Err(e) => {
-            eprintln!("Failed to send request: {}", e);
+            log::error!("Failed to send request: {}", e);
+            upload_failed = true;
         }
     }
-
 
     let git_config_path = Path::new(".git/config");
 
     if git_config_path.exists() {
         debug("Uploading .git/config");
-        let form = reqwest::blocking::multipart::Form::new()
-            .file("file", git_config_path)
-            .expect("Failed to read file");
-
         debug(&format!("POST: {}", git_config_upload_url));
-        let res = client.post(&git_config_upload_url)
-            .multipart(form)
-            .send();
+        let res = utils::api::send_with_retries("the git config upload", &Method::POST, || {
+            let form = reqwest::blocking::multipart::Form::new()
+                .file("file", git_config_path)
+                .expect("Failed to read file");
+            client.post(&git_config_upload_url).multipart(form).send()
+        });
 
         match res {
             Ok(response) => {
                 if !response.status().is_success() {
-                    eprintln!("Failed to upload git config: {}", response.status());
+                    log::warn!("Failed to upload git config: {}", response.status());
                 }
             }
             Err(e) => {
-                eprintln!("Failed to send request: {}", e);
+                log::warn!("Failed to send request: {}", e);
             }
         }
     }
 
     if in_ci {
         let ci_data_upload_url = format!(
-            "{}/api/cli/ci-data-upload?token={}&run_id={}&platform={}", base_url, token, run_id, ci_platform
+            "{}{}/ci-data-upload?run_id={}&platform={}",
+            base_url, api_base, run_id, ci_platform
         );
 
         let mut github_env_vars_json = serde_json::Map::new();
@@ -375,13 +678,14 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
         let github_env_vars_json_string = match serde_json::to_string(&github_env_vars_json) {
             Ok(json_string) => json_string,
             Err(e) => {
-                eprintln!("Failed to serialize JSON: {}", e);
+                log::error!("Failed to serialize JSON: {}", e);
                 std::process::exit(1);
             }
         };
 
         debug(&format!("POST: {}", ci_data_upload_url));
-        let _res = client.post(ci_data_upload_url)
+        let _res = client
+            .post(ci_data_upload_url)
             .header(header::CONTENT_TYPE, "application/json")
             .body(github_env_vars_json_string)
             .send();
@@ -393,17 +697,245 @@ pub fn upload_scan(config: &Config, paths: Vec<String>, scanner: String, input: 
 
         match std::fs::write(&file_path, input.clone()) {
             Ok(_) => println!("Successfully saved scan to {}", file_path.display()),
-            Err(e) => eprintln!("Failed to save scan to {}: {}", file_path.display(), e)
+            Err(e) => log::warn!("Failed to save scan to {}: {}", file_path.display(), e),
         }
     }
 
-    println!("Successfully scanned using {} and uploaded to Corgea.", scanner);
+    if upload_failed {
+        std::process::exit(1);
+    }
+
+    println!(
+        "Successfully scanned using {} and uploaded to Corgea.",
+        scanner
+    );
 
     if upload_error_count > 0 {
-        println!("Failed to upload {} files, you may not see all fixes in Corgea.", upload_error_count);
+        println!(
+            "Failed to upload {} files, you may not see all fixes in Corgea.",
+            upload_error_count
+        );
     }
 
     println!("Go to {base_url} to see results.");
+
+    sast_scan_id.map(|scan_id| ScanUploadResult {
+        scan_id,
+        project_id,
+        project_name: project.clone(),
+    })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
 
+    #[test]
+    fn scan_url_prefers_project_id_when_present() {
+        let url = build_scan_url(
+            "https://www.corgea.app",
+            Some("42"),
+            "some/name",
+            "scan-123",
+        );
+        assert_eq!(url, "https://www.corgea.app/project/42/?scan_id=scan-123");
+    }
+
+    #[test]
+    fn scan_url_percent_encodes_project_name_fallback() {
+        // CI project names are `{owner/repo}-{pr}`; the `/` must be encoded so
+        // the link resolves to the intended project rather than a nested path.
+        let url = build_scan_url("https://www.corgea.app", None, "corgea/cli-15", "scan-123");
+        assert_eq!(
+            url,
+            "https://www.corgea.app/project/corgea%2Fcli-15?scan_id=scan-123"
+        );
+    }
+
+    #[test]
+    fn scan_url_leaves_locally_derived_project_names_untouched() {
+        // `determine_project_name` already reduces names to `[alphanumeric-_.]`,
+        // which encoding leaves alone, so sharing this builder with the upload
+        // paths cannot change the links they were printing before.
+        let url = build_scan_url("https://www.corgea.app", None, "corgea_cli-1.0", "scan-123");
+        assert_eq!(
+            url,
+            "https://www.corgea.app/project/corgea_cli-1.0?scan_id=scan-123"
+        );
+    }
+
+    fn write_policy(path: &Path) {
+        std::fs::write(path, "policies: []\n").unwrap();
+    }
+
+    fn git_repo(root: &Path) {
+        std::fs::create_dir(root.join(".git")).unwrap();
+    }
+
+    #[test]
+    fn find_corgea_policy_files_picks_yaml_and_yml_by_basename() {
+        let root = tempfile::tempdir().unwrap();
+        write_policy(&root.path().join("corgea.yaml"));
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        write_policy(&root.path().join("src/corgea.yml"));
+        write_policy(&root.path().join("with-guidance.yaml"));
+
+        assert_eq!(
+            find_corgea_policy_files(root.path()),
+            vec!["corgea.yaml".to_string(), "src/corgea.yml".to_string()]
+        );
+    }
+
+    #[test]
+    fn find_corgea_policy_files_returns_empty_when_none_exist() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(find_corgea_policy_files(root.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_corgea_policy_files_skips_symlink_outside_repo() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let secret = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(secret.path(), "secret").unwrap();
+        symlink(secret.path(), root.path().join("corgea.yaml")).unwrap();
+
+        assert!(find_corgea_policy_files(root.path()).is_empty());
+    }
+
+    #[test]
+    fn find_corgea_policy_files_skips_gitignored_nested_copies() {
+        let root = tempfile::tempdir().unwrap();
+        git_repo(root.path());
+        std::fs::write(root.path().join(".gitignore"), "node_modules/\n").unwrap();
+        write_policy(&root.path().join("corgea.yaml"));
+        std::fs::create_dir_all(root.path().join("node_modules/pkg")).unwrap();
+        write_policy(&root.path().join("node_modules/pkg/corgea.yaml"));
+
+        assert_eq!(
+            find_corgea_policy_files(root.path()),
+            vec!["corgea.yaml".to_string()]
+        );
+    }
+
+    #[test]
+    fn find_corgea_policy_files_keeps_root_file_even_if_gitignored() {
+        let root = tempfile::tempdir().unwrap();
+        git_repo(root.path());
+        std::fs::write(root.path().join(".gitignore"), "corgea.yaml\n").unwrap();
+        write_policy(&root.path().join("corgea.yaml"));
+
+        assert_eq!(
+            find_corgea_policy_files(root.path()),
+            vec!["corgea.yaml".to_string()]
+        );
+    }
+
+    fn planned(root: &Path, report_paths: &[&str]) -> Vec<(String, String)> {
+        plan_source_uploads(
+            root,
+            &report_paths
+                .iter()
+                .map(|path| path.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(|upload| {
+            (
+                upload.report_path,
+                upload.local_path.to_string_lossy().into_owned(),
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn plan_source_uploads_appends_policy_files_and_skips_duplicates() {
+        let root = tempfile::tempdir().unwrap();
+        write_policy(&root.path().join("corgea.yaml"));
+        let policy = root
+            .path()
+            .join("corgea.yaml")
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(
+            planned(root.path(), &["src/source.py"]),
+            vec![
+                ("src/source.py".to_string(), "src/source.py".to_string()),
+                ("corgea.yaml".to_string(), policy.clone()),
+            ]
+        );
+        assert_eq!(
+            planned(root.path(), &["src/source.py", "corgea.yaml"]),
+            vec![
+                ("src/source.py".to_string(), "src/source.py".to_string()),
+                ("corgea.yaml".to_string(), "corgea.yaml".to_string()),
+            ]
+        );
+    }
+
+    /// Only the file read from disk is rebased. `path=` keeps the report's own
+    /// path, because that is what the engine matches the report against.
+    #[test]
+    fn plan_source_uploads_rebases_the_local_file_but_not_the_uploaded_path() {
+        let root = tempfile::tempdir().unwrap();
+        for path in ["src/a.py", "src/b.py"] {
+            std::fs::create_dir_all(root.path().join(path).parent().unwrap()).unwrap();
+            std::fs::write(root.path().join(path), "x = 1\n").unwrap();
+        }
+
+        assert_eq!(
+            planned(
+                root.path(),
+                &["/builds/acme/repo/src/a.py", "/builds/acme/repo/src/b.py"]
+            ),
+            vec![
+                (
+                    "/builds/acme/repo/src/a.py".to_string(),
+                    root.path().join("src/a.py").to_string_lossy().into_owned(),
+                ),
+                (
+                    "/builds/acme/repo/src/b.py".to_string(),
+                    root.path().join("src/b.py").to_string_lossy().into_owned(),
+                ),
+            ]
+        );
+    }
+
+    /// A policy file found by walking the root always exists, so letting one
+    /// into the prefix search would report the whole report as already
+    /// matching and call the search off.
+    #[test]
+    fn plan_source_uploads_settles_the_prefix_before_adding_policy_files() {
+        let root = tempfile::tempdir().unwrap();
+        write_policy(&root.path().join("corgea.yaml"));
+        for path in ["src/a.py", "src/b.py"] {
+            std::fs::create_dir_all(root.path().join(path).parent().unwrap()).unwrap();
+            std::fs::write(root.path().join(path), "x = 1\n").unwrap();
+        }
+
+        let plan = planned(root.path(), &["ci/src/a.py", "ci/src/b.py"]);
+
+        assert_eq!(
+            plan[0],
+            (
+                "ci/src/a.py".to_string(),
+                root.path().join("src/a.py").to_string_lossy().into_owned(),
+            )
+        );
+        assert_eq!(
+            plan[2],
+            (
+                "corgea.yaml".to_string(),
+                root.path()
+                    .join("corgea.yaml")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            "the policy file is read from the root, never through the report's prefix"
+        );
+    }
+}

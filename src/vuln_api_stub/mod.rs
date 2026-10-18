@@ -1,0 +1,607 @@
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread;
+
+pub type PackageKey = (String, String, String);
+
+pub type ProfileKey = (String, String);
+
+/// `(ecosystem, name)` key for the profile route table — same
+/// lowercase+trim rule as `key()`.
+pub fn profile_key(eco: &str, name: &str) -> ProfileKey {
+    (eco.to_string(), name.trim().to_lowercase())
+}
+
+/// Profile body helper for tests: a package block plus `advisories`.
+pub fn profile_body(ecosystem: &str, name: &str, advisories_json: &str) -> String {
+    format!(
+        r#"{{"package":{{"ecosystem":"{ecosystem}","name":"{name}"}},"advisories":{advisories_json}}}"#
+    )
+}
+
+/// `(ecosystem, name, version)` key for the stub's route tables. Applies the
+/// REAL server's normalization (worker.js `normalizePackageName`: lowercase
+/// and trim, NOT PEP 503) on both the fixture and lookup sides. The stub
+/// must miss exactly when production would miss — a looser rule here would
+/// mask client/server normalization divergence in tests.
+pub fn key(eco: &str, name: &str, ver: &str) -> PackageKey {
+    (eco.to_string(), name.trim().to_lowercase(), ver.to_string())
+}
+
+/// Single-match verdict body with the per-match `malware` wire flag;
+/// `fixed: None` renders `"fixed_version":null`.
+fn check_body(
+    ecosystem: &str,
+    name: &str,
+    version: &str,
+    advisory: &str,
+    fixed: Option<&str>,
+    malware: bool,
+) -> String {
+    let fixed = fixed.map_or("null".to_string(), |f| format!(r#""{f}""#));
+    format!(
+        r#"{{"ecosystem":"{ecosystem}","package_name":"{name}","version":"{version}","is_vulnerable":true,
+        "matches":[{{"advisory_id":"{advisory}","severity_level":"critical","tier":1,
+                    "vulnerable_version_range":null,"fixed_version":{fixed},"malware":{malware}}}]}}"#
+    )
+}
+
+/// Single-match vulnerable verdict body (`malware:false`); `fixed: None`
+/// renders `"fixed_version":null`. Shared by the in-crate unit tests and the
+/// integration tests (via `tests/common`).
+pub fn vulnerable_body(
+    ecosystem: &str,
+    name: &str,
+    version: &str,
+    advisory: &str,
+    fixed: Option<&str>,
+) -> String {
+    check_body(ecosystem, name, version, advisory, fixed, false)
+}
+
+/// Single-match malicious verdict body: same shape as [`vulnerable_body`]
+/// with the wire `malware` flag set.
+pub fn malicious_body(
+    ecosystem: &str,
+    name: &str,
+    version: &str,
+    advisory: &str,
+    fixed: Option<&str>,
+) -> String {
+    check_body(ecosystem, name, version, advisory, fixed, true)
+}
+
+const NOT_FOUND_BODY: &str = r#"{"error":"not found"}"#;
+
+pub struct VulnApiStub {
+    pub base_url: String,
+    _handle: thread::JoinHandle<()>,
+}
+
+/// Minimal TCP vuln-api stub for CLI integration tests. Binds an ephemeral
+/// 127.0.0.1 port; unknown packages get a synthesized clean 200.
+pub fn spawn_with_statuses(
+    package_checks: HashMap<PackageKey, String>,
+    status_overrides: HashMap<PackageKey, u16>,
+) -> VulnApiStub {
+    spawn_with_retry_once(package_checks, status_overrides, HashSet::new())
+}
+
+/// Like [`spawn_with_statuses`], but keys in `retry_once` answer their first
+/// hit with 429 + `Retry-After: 1` and fall through to the scripted response
+/// from the second hit on — for exercising the client's retry path.
+pub fn spawn_with_retry_once(
+    package_checks: HashMap<PackageKey, String>,
+    status_overrides: HashMap<PackageKey, u16>,
+    retry_once: HashSet<PackageKey>,
+) -> VulnApiStub {
+    spawn(
+        package_checks,
+        status_overrides,
+        retry_once,
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        None,
+    )
+}
+
+/// Like [`spawn_with_statuses`], plus a profile route table for
+/// `/v1/packages/{eco}/{name}`. Unknown profile keys answer 404
+/// ("Package not found"), matching the real handler — unlike /check's
+/// synthesized clean. `profile_statuses` overrides the status for a
+/// scripted key (e.g. 500), like `status_overrides` does for /check.
+pub fn spawn_with_profiles(
+    package_checks: HashMap<PackageKey, String>,
+    status_overrides: HashMap<PackageKey, u16>,
+    package_profiles: HashMap<ProfileKey, String>,
+    profile_statuses: HashMap<ProfileKey, u16>,
+) -> VulnApiStub {
+    spawn(
+        package_checks,
+        status_overrides,
+        HashSet::new(),
+        HashMap::new(),
+        package_profiles,
+        profile_statuses,
+        None,
+    )
+}
+
+/// Like [`spawn_with_statuses`], but keys in `drops` have their first N hits
+/// answered by reading the request and closing the connection without
+/// writing a response — the client surfaces each as a `send()` error
+/// (`connection closed before message completed`). Falls through to the
+/// scripted response once the drops are spent. For exercising the client's
+/// transient-failure retry path hermetically.
+pub fn spawn_with_drops(
+    package_checks: HashMap<PackageKey, String>,
+    status_overrides: HashMap<PackageKey, u16>,
+    drops: HashMap<PackageKey, usize>,
+) -> VulnApiStub {
+    spawn(
+        package_checks,
+        status_overrides,
+        HashSet::new(),
+        drops,
+        HashMap::new(),
+        HashMap::new(),
+        None,
+    )
+}
+
+/// Vuln-api stub that records raw requests and answers every package check
+/// with a clean verdict (echoing the eco/name/version from the path). Used
+/// to assert the client's header behavior, both in-crate and from the CLI.
+pub fn spawn_capturing_vuln_api_stub() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stub = spawn(
+        HashMap::new(),
+        HashMap::new(),
+        HashSet::new(),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        Some(std::sync::Arc::clone(&requests)),
+    );
+    // Dropping the stub's join handle detaches the listener thread; the
+    // base URL keeps working for the caller's lifetime.
+    (stub.base_url, requests)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn(
+    package_checks: HashMap<PackageKey, String>,
+    status_overrides: HashMap<PackageKey, u16>,
+    retry_once: HashSet<PackageKey>,
+    drops: HashMap<PackageKey, usize>,
+    package_profiles: HashMap<ProfileKey, String>,
+    profile_statuses: HashMap<ProfileKey, u16>,
+    capture: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+) -> VulnApiStub {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+    let bound_port = listener.local_addr().expect("stub local_addr").port();
+    let base_url = format!("http://127.0.0.1:{bound_port}");
+
+    let handle = thread::spawn(move || {
+        let mut pending_retries = retry_once;
+        let mut pending_drops = drops;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            handle_connection(
+                &mut stream,
+                &package_checks,
+                &status_overrides,
+                &mut pending_retries,
+                &mut pending_drops,
+                &package_profiles,
+                &profile_statuses,
+                capture.as_deref(),
+            );
+        }
+    });
+
+    VulnApiStub {
+        base_url,
+        _handle: handle,
+    }
+}
+
+/// One-shot JSON HTTP response. `Connection: close` is load-bearing: the
+/// stubs serve one response per connection, so without it reqwest pools the
+/// socket and a second request (a gate run makes several) races the close
+/// and fails. `extra_headers` must be empty or end in `\r\n`.
+pub fn http_response(status_line: &str, extra_headers: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status_line,
+        extra_headers,
+        body.len(),
+        body
+    )
+}
+
+/// The value of header `name` in a raw captured HTTP request, if present.
+pub fn header_value(request: &str, name: &str) -> Option<String> {
+    request
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim().to_string())
+}
+
+/// Read one HTTP request off `stream`: the headers, then whatever body they
+/// declare.
+///
+/// The body is drained even though no stub inspects it. Responses carry
+/// `Connection: close`, so answering while the client is still writing its
+/// body resets the connection, and the client reports a request-body error
+/// instead of reading the reply. Small bodies survive on socket buffering
+/// alone; the streamed multipart uploads (`POST /start-scan` and the chunk
+/// `PATCH`) do not, which made the scan e2e tests fail intermittently.
+///
+/// The read timeout keeps a client that never finishes its body from parking
+/// the single-threaded stub thread forever; on expiry the request is served
+/// with whatever arrived.
+pub fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 1024];
+    let mut searched = 0;
+
+    let header_end = loop {
+        // Rescan only the seam plus what just arrived, so a multi-megabyte
+        // upload is not re-walked on every read.
+        if let Some(offset) = buf[searched..].windows(4).position(|w| w == b"\r\n\r\n") {
+            break searched + offset + 4;
+        }
+        searched = buf.len().saturating_sub(3);
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return buf,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    };
+
+    let headers = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+    let chunked = header_value(&headers, "transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
+    // A chunked body ends with a zero-length chunk rather than at a known
+    // offset. Anything else is bounded by Content-Length, absent for bodyless
+    // requests and therefore zero.
+    let body_end = (!chunked).then(|| {
+        header_end
+            + header_value(&headers, "content-length")
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0)
+    });
+
+    loop {
+        let complete = match body_end {
+            Some(end) => buf.len() >= end,
+            None => buf[header_end..].ends_with(b"0\r\n\r\n"),
+        };
+        if complete {
+            return buf;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return buf,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_connection(
+    stream: &mut std::net::TcpStream,
+    package_checks: &HashMap<PackageKey, String>,
+    status_overrides: &HashMap<PackageKey, u16>,
+    pending_retries: &mut HashSet<PackageKey>,
+    pending_drops: &mut HashMap<PackageKey, usize>,
+    package_profiles: &HashMap<ProfileKey, String>,
+    profile_statuses: &HashMap<ProfileKey, u16>,
+    capture: Option<&std::sync::Mutex<Vec<String>>>,
+) {
+    let buf = read_http_request(stream);
+    let req = String::from_utf8_lossy(&buf);
+    if let Some(capture) = capture {
+        capture.lock().unwrap().push(req.clone().into_owned());
+    }
+
+    let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1));
+
+    let (status_code, response_body, retry_after) = match path {
+        Some(path) => {
+            let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+            if parts.len() >= 7
+                && parts[0] == "v1"
+                && parts[1] == "packages"
+                && parts[4] == "versions"
+                && parts[6] == "check"
+            {
+                let key = key(
+                    parts[2],
+                    &urlencoding::decode(parts[3]).unwrap_or_default(),
+                    &urlencoding::decode(parts[5]).unwrap_or_default(),
+                );
+                if let Some(remaining) = pending_drops.get_mut(&key) {
+                    // Close without writing: the request was read, so the
+                    // client sees its connection die mid-exchange — the
+                    // transient `send()` error this mode exists to script.
+                    *remaining -= 1;
+                    if *remaining == 0 {
+                        pending_drops.remove(&key);
+                    }
+                    return;
+                }
+                if pending_retries.remove(&key) {
+                    (429, r#"{"error":"rate limited"}"#.to_string(), true)
+                } else {
+                    let body = package_checks
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| default_clean_response(&key.0, &key.1, &key.2));
+                    let status = status_overrides.get(&key).copied().unwrap_or(200);
+                    (status, body, false)
+                }
+            } else if parts.len() >= 4
+                && parts[0] == "v1"
+                && parts[1] == "packages"
+                && !(parts.len() >= 6 && parts[parts.len() - 2] == "versions")
+            {
+                // Version-route shape excluded by position, not by segment
+                // value, so a package literally named "versions" still
+                // resolves as a profile (matching the worker's catch-all).
+                let name = urlencoding::decode(&parts[3..].join("/"))
+                    .unwrap_or_default()
+                    .into_owned();
+                let key = profile_key(parts[2], &name);
+                match package_profiles.get(&key) {
+                    Some(body) => {
+                        let status = profile_statuses.get(&key).copied().unwrap_or(200);
+                        (status, body.clone(), false)
+                    }
+                    None => match profile_statuses.get(&key) {
+                        // Status-only script (e.g. 500 with a canned error body).
+                        Some(&status) => (status, r#"{"error":"scripted"}"#.to_string(), false),
+                        None => (404, r#"{"error":"Package not found"}"#.to_string(), false),
+                    },
+                }
+            } else {
+                (404, NOT_FOUND_BODY.to_string(), false)
+            }
+        }
+        None => (400, r#"{"error":"bad request"}"#.to_string(), false),
+    };
+
+    let response = http_response(
+        &format!("{} {}", status_code, status_text(status_code)),
+        if retry_after {
+            "Retry-After: 1\r\n"
+        } else {
+            ""
+        },
+        &response_body,
+    );
+    let _ = stream.write_all(response.as_bytes());
+}
+
+/// Reason phrase for a stub status line.
+fn status_text(status_code: u16) -> &'static str {
+    match status_code {
+        404 => "Not Found",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        429 => "Too Many Requests",
+        500..=599 => "Internal Server Error",
+        _ if status_code >= 400 => "Error",
+        _ => "OK",
+    }
+}
+
+fn default_clean_response(eco: &str, name: &str, ver: &str) -> String {
+    format!(
+        r#"{{"ecosystem":"{eco}","package_name":"{name}","version":"{ver}","is_vulnerable":false,"matches":[]}}"#
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    fn get(base_url: &str, path: &str) -> String {
+        let addr = base_url.trim_start_matches("http://");
+        let mut stream = TcpStream::connect(addr).expect("connect stub");
+        let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        resp
+    }
+
+    /// Accept one connection, hand it to `read_http_request`, and return what
+    /// that pulled off the wire while `send` writes the request.
+    fn read_one_request(send: impl FnOnce(&mut TcpStream) + Send + 'static) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            send(&mut stream);
+        });
+        let (mut stream, _) = listener.accept().expect("accept");
+        let buf = read_http_request(&mut stream);
+        client.join().expect("client thread");
+        buf
+    }
+
+    /// A body that lands after the headers is still drained. Stopping at the
+    /// header terminator would let the stub answer and close mid-upload,
+    /// which the client sees as a request-body error rather than a response.
+    #[test]
+    fn reads_content_length_body_arriving_after_the_headers() {
+        let body = "x".repeat(5000);
+        let expected = body.clone();
+        let buf = read_one_request(move |stream| {
+            let headers = format!(
+                "POST /upload HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).unwrap();
+            thread::sleep(std::time::Duration::from_millis(50));
+            stream.write_all(body.as_bytes()).unwrap();
+        });
+
+        let request = String::from_utf8_lossy(&buf);
+        assert!(
+            request.ends_with(&expected),
+            "body truncated at {} bytes",
+            buf.len()
+        );
+    }
+
+    /// Streamed multipart uploads send no Content-Length, so the drain has to
+    /// run to the zero-length chunk instead.
+    #[test]
+    fn reads_chunked_body_to_its_terminator() {
+        let buf = read_one_request(|stream| {
+            stream
+                .write_all(b"POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .unwrap();
+            thread::sleep(std::time::Duration::from_millis(50));
+            stream.write_all(b"5\r\nhello\r\n").unwrap();
+            thread::sleep(std::time::Duration::from_millis(50));
+            stream.write_all(b"0\r\n\r\n").unwrap();
+        });
+
+        let request = String::from_utf8_lossy(&buf);
+        assert!(request.contains("hello"), "chunk missing from: {request}");
+        assert!(
+            request.ends_with("0\r\n\r\n"),
+            "did not stop at the terminator: {request}"
+        );
+    }
+
+    /// A bodyless request returns as soon as the headers are in, rather than
+    /// blocking on EOF or the read timeout.
+    #[test]
+    fn returns_on_the_headers_when_there_is_no_body() {
+        let started = std::time::Instant::now();
+        let buf = read_one_request(|stream| {
+            stream
+                .write_all(b"GET /thing HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            // Held open so a read that waits for EOF would stall here.
+            thread::sleep(std::time::Duration::from_millis(200));
+        });
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "waited on the timeout instead of returning at the headers"
+        );
+        assert!(String::from_utf8_lossy(&buf).starts_with("GET /thing"));
+    }
+
+    #[test]
+    fn scripted_package_check_and_status_override() {
+        let mut checks = HashMap::new();
+        checks.insert(
+            key("pypi", "evil", "1.0.0"),
+            r#"{"ecosystem":"pypi","package_name":"evil","version":"1.0.0","is_vulnerable":true,"matches":[]}"#.to_string(),
+        );
+        checks.insert(key("pypi", "flaky", "1.0.0"), "{}".to_string());
+        let mut statuses = HashMap::new();
+        statuses.insert(key("pypi", "flaky", "1.0.0"), 503u16);
+        let stub = spawn_with_statuses(checks, statuses);
+
+        let resp = get(
+            &stub.base_url,
+            "/v1/packages/pypi/evil/versions/1.0.0/check",
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
+        assert!(resp.contains(r#""is_vulnerable":true"#), "resp: {resp}");
+
+        let resp = get(
+            &stub.base_url,
+            "/v1/packages/pypi/flaky/versions/1.0.0/check",
+        );
+        assert!(resp.starts_with("HTTP/1.1 503"), "resp: {resp}");
+
+        // Unknown package → synthesized clean 200.
+        let resp = get(
+            &stub.base_url,
+            "/v1/packages/pypi/unknown/versions/2.0.0/check",
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
+        assert!(resp.contains(r#""is_vulnerable":false"#), "resp: {resp}");
+    }
+
+    #[test]
+    fn pypi_keys_lowercase_like_the_server() {
+        // A fixture keyed `Flask_Cors` must serve a request for `flask_cors`:
+        // the server's rule is lowercase + trim (worker.js).
+        let checks = HashMap::from([(
+            key("pypi", "Flask_Cors", "4.0.0"),
+            vulnerable_body("pypi", "flask_cors", "4.0.0", "GHSA-test", None),
+        )]);
+        let stub = spawn_with_statuses(checks, HashMap::new());
+        let resp = get(
+            &stub.base_url,
+            "/v1/packages/pypi/flask_cors/versions/4.0.0/check",
+        );
+        assert!(resp.contains(r#""is_vulnerable":true"#), "resp: {resp}");
+    }
+
+    #[test]
+    fn pypi_keys_do_not_collapse_separators_like_the_server() {
+        // The real server does NOT apply PEP 503: a row stored under
+        // `flask_cors` does not answer a lookup for `flask-cors`. The stub
+        // must reproduce that miss (synthesized clean), or tests would hide
+        // exactly the client/server divergence they exist to catch.
+        let checks = HashMap::from([(
+            key("pypi", "flask_cors", "4.0.0"),
+            vulnerable_body("pypi", "flask_cors", "4.0.0", "GHSA-test", None),
+        )]);
+        let stub = spawn_with_statuses(checks, HashMap::new());
+        let resp = get(
+            &stub.base_url,
+            "/v1/packages/pypi/flask-cors/versions/4.0.0/check",
+        );
+        assert!(resp.contains(r#""is_vulnerable":false"#), "resp: {resp}");
+    }
+
+    #[test]
+    fn scripted_profile_and_status_override() {
+        let profiles = HashMap::from([(
+            profile_key("npm", "axios"),
+            profile_body("npm", "axios", r#"[{"id":"GHSA-test"}]"#),
+        )]);
+        let profile_statuses = HashMap::from([(profile_key("npm", "flaky"), 500u16)]);
+        let stub = spawn_with_profiles(HashMap::new(), HashMap::new(), profiles, profile_statuses);
+
+        // Scripted body → 200.
+        let resp = get(&stub.base_url, "/v1/packages/npm/axios");
+        assert!(resp.starts_with("HTTP/1.1 200"), "resp: {resp}");
+        assert!(resp.contains("GHSA-test"), "resp: {resp}");
+
+        // Unknown key → 404 "Package not found" (not default-clean).
+        let resp = get(&stub.base_url, "/v1/packages/npm/unknown");
+        assert!(resp.starts_with("HTTP/1.1 404"), "resp: {resp}");
+        assert!(resp.contains("Package not found"), "resp: {resp}");
+
+        // Status-only override → 500.
+        let resp = get(&stub.base_url, "/v1/packages/npm/flaky");
+        assert!(resp.starts_with("HTTP/1.1 500"), "resp: {resp}");
+
+        // A package literally named "versions" is a profile, not a version route.
+        let resp = get(&stub.base_url, "/v1/packages/npm/versions");
+        assert!(resp.starts_with("HTTP/1.1 404"), "resp: {resp}");
+        assert!(resp.contains("Package not found"), "resp: {resp}");
+    }
+}
