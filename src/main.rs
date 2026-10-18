@@ -1,6 +1,7 @@
 mod authorize;
 mod cicd;
 mod config;
+mod ignore_rules;
 mod images;
 mod include_rules;
 mod incremental;
@@ -13,6 +14,7 @@ mod scan;
 mod setup_hooks;
 mod skill;
 mod skip_scan;
+mod update_check;
 mod wait;
 mod scanners {
     pub mod blast;
@@ -610,6 +612,7 @@ fn main() {
         }
     };
     init_logging(&corgea_config);
+    update_check::notify_if_update_available();
     fn verify_token_and_exit_when_fail(config: &Config) {
         if config.get_token().is_empty() {
             ::log::error!("No token set.\nPlease run 'corgea login' to authenticate.\nFor more info checkout our docs at Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli");

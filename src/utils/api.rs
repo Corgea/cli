@@ -1,4 +1,4 @@
-use crate::incremental::{BaselineRef, IncrementalPlan};
+use crate::incremental::{BaselineRef, FullScanReason, IncrementalPlan};
 use crate::log::debug;
 use crate::manifest::EncodedManifest;
 use crate::utils;
@@ -542,14 +542,16 @@ pub struct UploadZipResult {
 }
 
 /// Per-scan settings travelling with the archive without being part of it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct UploadOptions {
     pub scan_type: Option<String>,
     pub policy: Option<String>,
     pub metadata: Option<String>,
-    /// Set when this run resolved a diff for the server to analyze instead of
-    /// the whole project.
-    pub incremental: Option<IncrementalPlan>,
+    /// The diff for the server to analyze instead of the whole project, or why
+    /// this run has none.
+    pub incremental: Result<IncrementalPlan, FullScanReason>,
+    /// `--disable-incremental`. Stops the server deriving its own SCM diff.
+    pub disable_incremental: bool,
     /// `--include` patterns for this run. The project's own include rules are
     /// already stored server-side, so only the flag values are sent.
     pub include_paths: Vec<String>,
@@ -570,6 +572,7 @@ pub fn upload_zip(
         policy,
         metadata,
         incremental,
+        disable_incremental,
         include_paths,
         file_manifest,
     } = options;
@@ -727,12 +730,25 @@ pub fn upload_zip(
                 if let Some(patterns) = &include_paths_field {
                     form = form.part("include_paths", multipart::Part::text(patterns.clone()));
                 }
-                // Both fields or neither: the list is only safe next to the commit
-                // it was measured from, and a server seeing one without the other
-                // would guess a baseline. A list that will not serialize drops
-                // both, leaving a full scan.
-                if let Some(plan) = &incremental {
-                    match serde_json::to_string(&plan.changed_files) {
+                match &incremental {
+                    // Stored on the scan, so a full scan that was expected to
+                    // be incremental can be explained after the fact.
+                    Err(reason) => {
+                        form = form
+                            .part(
+                                "incremental_skipped_reason",
+                                multipart::Part::text(reason.cause.code()),
+                            )
+                            .part(
+                                "incremental_skipped_detail",
+                                multipart::Part::text(reason.detail.clone()),
+                            );
+                    }
+                    // Both fields or neither: the list is only safe next to the
+                    // commit it was measured from, and a server seeing one
+                    // without the other would guess a baseline. A list that
+                    // will not serialize drops both, leaving a full scan.
+                    Ok(plan) => match serde_json::to_string(&plan.changed_files) {
                         Ok(changed_files) => {
                             // Which scan the diff was measured from. A commit
                             // when git produced it, and the scan itself when
@@ -757,11 +773,26 @@ pub fn upload_zip(
                                     multipart::Part::text("true"),
                                 );
                             }
+                            // Without it, a server seeing that the baseline's
+                            // ignore rules were lifted scans every file, since
+                            // only this says the list covers what they hid.
+                            if let Some(rules) = plan
+                                .ignore_rules
+                                .as_ref()
+                                .and_then(|rules| serde_json::to_string(rules).ok())
+                            {
+                                form = form
+                                    .part("incremental_ignore_rules", multipart::Part::text(rules));
+                            }
                         }
                         Err(e) => debug(&format!(
                         "Could not serialize the incremental file list, scanning every file: {e}"
                     )),
-                    }
+                    },
+                }
+                // No file list means "try the SCM diff". This field means "analyze every file".
+                if disable_incremental {
+                    form = form.part("disable_incremental", multipart::Part::text("true"));
                 }
                 // Root and version travel beside the bytes rather than inside
                 // them: the server recomputes the root from what it
@@ -1397,10 +1428,23 @@ fn request_scan_list(
 pub struct ScanSettings {
     /// Patterns that force files into the scan even when Corgea would classify
     /// them as vendored, third-party, generated or test code.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "patterns_without_nulls")]
     pub include_paths: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "patterns_without_nulls")]
     pub ignore_paths: Vec<String>,
+}
+
+/// A rule saved without a pattern is listed as `null`. It matches nothing, so
+/// it is dropped rather than failing the whole read.
+fn patterns_without_nulls<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<Option<String>>>::deserialize(deserializer)?
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -2059,6 +2103,11 @@ pub struct ScanResponse {
     /// left alone rather than guessed at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_manifest_version: Option<String>,
+    /// The project's ignore rules as they applied to this scan. It holds no
+    /// findings for the files they matched. `None` from a backend predating
+    /// the field, or for a scan predating the rules being recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_paths: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
     /// Why a scan ended without finishing. Only set for failed scans.
@@ -2497,6 +2546,24 @@ mod tests {
     }
 
     #[test]
+    fn scan_settings_drop_rules_saved_without_a_pattern() {
+        let parsed: ScanSettingsResponse = serde_json::from_str(
+            r#"{"settings": {"include_paths": null, "ignore_paths": ["vendor/**", null]}}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            parsed.settings,
+            ScanSettings {
+                include_paths: vec![],
+                ignore_paths: vec!["vendor/**".to_string()],
+            }
+        );
+        let missing: ScanSettingsResponse =
+            serde_json::from_str(r#"{"settings": {}}"#).expect("parses");
+        assert_eq!(missing.settings, ScanSettings::default());
+    }
+
+    #[test]
     fn scan_response_deserializes_git_sha_and_defaults_when_missing() {
         let with_sha = r#"{
             "id": "s1",
@@ -2522,6 +2589,16 @@ mod tests {
         }"#;
         let parsed: ScanResponse = serde_json::from_str(without_sha).unwrap();
         assert_eq!(parsed.git_sha, None);
+        // A backend predating `ignore_paths` omits it; a scan predating the
+        // stamp reports null. Neither may fail the scan list.
+        assert_eq!(parsed.ignore_paths, None);
+        let mut value: serde_json::Value = serde_json::from_str(without_sha).unwrap();
+        value["ignore_paths"] = serde_json::Value::Null;
+        let parsed: ScanResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.ignore_paths, None);
+        value["ignore_paths"] = serde_json::json!(["vendor/**"]);
+        let parsed: ScanResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.ignore_paths, Some(vec!["vendor/**".to_string()]));
     }
 
     #[test]

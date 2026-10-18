@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::images;
+use crate::incremental::{FullScanCause, FullScanReason};
 use crate::manifest::Manifest;
 use crate::scan::build_scan_url;
 use crate::targets;
@@ -139,6 +140,7 @@ pub fn run(
             skip,
             exclude.as_deref(),
             *ignore_dirty_worktree,
+            include_rules.project_ignore_paths.as_deref(),
         )
     });
 
@@ -624,9 +626,20 @@ fn start_new_scan(
     // one of them -- it narrows the same whole-project walk, which the archive's
     // own checksums describe exactly -- so those runs resolve a plan like any
     // other and say what came of it.
-    let targeted_archive = target_str.is_some();
-    let incremental = if *disable_incremental || targeted_archive {
-        None
+    let incremental = if *disable_incremental {
+        Err(FullScanReason::new(
+            FullScanCause::DisabledByFlag,
+            "--disable-incremental was passed",
+        ))
+    } else if target_str.is_some() {
+        Err(FullScanReason::new(
+            FullScanCause::TargetedUpload,
+            if *only_uncommitted {
+                "--only-uncommitted narrowed the upload to uncommitted files"
+            } else {
+                "--target narrowed the upload to the files it selects"
+            },
+        ))
     } else {
         // Reconciled repo info, so a tree that turned out dirty — or a HEAD
         // that moved mid-packaging — refuses rather than diffing against a
@@ -643,12 +656,14 @@ fn start_new_scan(
                 ignore_dirty_worktree: *ignore_dirty_worktree,
                 exclude_narrowed: exclude.is_some(),
                 manifest: archive_contents.manifest.as_ref(),
+                ignore_paths: include_rules.project_ignore_paths.as_deref(),
             },
         )
         // Force-included files are usually unchanged, and the server carries
         // findings forward for whatever the diff omits — so without this an
         // include rule would never get the file looked at on an incremental run.
         .and_then(|plan| plan.including(&repo_relative_strings(&force_included)))
+        .inspect_err(|reason| println!("Scanning every file: {}.", reason.detail))
     };
     // Stored with the scan for a later run to diff against, so it is worth
     // uploading even when this run scans everything. Under
@@ -670,6 +685,7 @@ fn start_new_scan(
             policy,
             metadata,
             incremental,
+            disable_incremental: *disable_incremental,
             include_paths: include_rules.cli_patterns,
             file_manifest,
         },
@@ -1829,6 +1845,7 @@ mod tests {
             scan_errors,
             file_manifest_root: None,
             file_manifest_version: None,
+            ignore_paths: None,
         }
     }
 
