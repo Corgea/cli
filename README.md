@@ -31,6 +31,15 @@ Once the binary is installed, login with your token from the Corgea app.
 corgea login <token>
 ```
 
+### Update notices
+When a newer release is out, an interactive run prints a one-line notice to
+stderr with the upgrade command for how the CLI was installed. The check never
+slows down or fails a command: it reads a cached answer
+(`~/.corgea/update-check.json`) and refreshes it from the GitHub releases API in
+the background at most once a day. If GitHub is unreachable, rate-limited, or
+blocked, the CLI says nothing. No notice is shown when stderr is not a terminal
+or `CI` is set, and `CORGEA_NO_UPDATE_CHECK=1` turns the check off entirely.
+
 ## Scanning
 
 `corgea scan` uploads your project and waits for results. `corgea wait [scan_id]`

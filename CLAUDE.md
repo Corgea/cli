@@ -31,7 +31,7 @@ User-facing reference lives in `skills/corgea/SKILL.md` — keep it in sync when
 </important>
 
 <important if="you are touching auth, config, or the HTTP client">
-- Config persists at `~/.corgea/config.toml` (`config.rs`). Env overrides: `CORGEA_TOKEN`, `CORGEA_URL`, `CORGEA_DEBUG`, `CORGEA_SOURCE`, `CORGEA_ACCEPT_CERT` (skip TLS verification, only honored when `https_proxy` is set).
+- Config persists at `~/.corgea/config.toml` (`config.rs`). Env overrides: `CORGEA_TOKEN`, `CORGEA_URL`, `CORGEA_DEBUG`, `CORGEA_SOURCE`, `CORGEA_ACCEPT_CERT` (skip TLS verification, only honored when `https_proxy` is set), `CORGEA_NO_UPDATE_CHECK` (disable the new-release notice in `update_check.rs`).
 - A single shared `reqwest::blocking::Client` lives in `utils/api.rs` with a 150s timeout and a process-wide cookie jar — reuse it; do not build new clients per call.
 - `corgea login` with no token launches a localhost OAuth callback (`authorize.rs`); with a token (or `CORGEA_TOKEN` env) it verifies and stores. `--scope` selects the tenant subdomain and overrides `--url`.
 </important>
