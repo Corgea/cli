@@ -25,6 +25,8 @@ pip install --upgrade corgea-cli      # installed with pip
 npm install -g @corgea/cli            # installed with npm
 ```
 
+An interactive run may print `A new version of the Corgea CLI is available: <current> -> <latest>` on stderr. It is informational, never an error, and never shown when stderr is piped, in CI, or with `CORGEA_NO_UPDATE_CHECK=1`.
+
 A missing flag is the visible case. A flag whose default or output shape changed will not error, so treat a surprising result on an older CLI as a version difference before treating it as a bug.
 
 ## Commands
