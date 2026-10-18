@@ -1297,7 +1297,8 @@ fn a_failed_lookup_is_not_reported_as_a_missing_baseline() {
     );
 }
 
-/// The opt-out is absolute: no baseline lookup, no diff fields, no message.
+/// The opt-out is absolute: no baseline lookup, no diff, no message, and an
+/// explicit `disable_incremental` so the server does not derive its own.
 /// Someone reaching for it wants every file analyzed, usually because something
 /// outside `corgea.yaml` changed that the server's baseline checks cannot see.
 /// The server is still told why, so the full scan can be explained later.
@@ -1321,6 +1322,7 @@ fn disable_incremental_does_not_even_look_for_a_baseline() {
                 )?;
                 assert_multipart_text_field(request, "sha", &patch_sha)?;
                 assert_multipart_text_field(request, "dirty", "false")?;
+                assert_multipart_text_field(request, "disable_incremental", "true")?;
                 assert_no_multipart_field(request, "incremental_base_sha")?;
                 assert_no_multipart_field(request, "incremental_changed_files")?;
                 assert_multipart_text_field(

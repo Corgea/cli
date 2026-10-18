@@ -2,7 +2,7 @@ use crate::incremental::{BaselineRef, FullScanReason, IncrementalPlan};
 use crate::log::debug;
 use crate::manifest::EncodedManifest;
 use crate::utils;
-use corgea::vuln_api::{auth_header, source};
+use corgea::vuln_api::{auth_header, default_headers, source};
 use reqwest::header::HeaderMap;
 use reqwest::{
     blocking::multipart,
@@ -53,6 +53,7 @@ static SHARED_CLIENT: std::sync::LazyLock<reqwest::blocking::Client> =
     std::sync::LazyLock::new(|| {
         let mut builder = reqwest::blocking::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .default_headers(default_headers())
             .cookie_provider(COOKIE_JAR.clone());
 
         if let Ok(https_proxy) = std::env::var("https_proxy") {
@@ -549,6 +550,8 @@ pub struct UploadOptions {
     /// The diff for the server to analyze instead of the whole project, or why
     /// this run has none.
     pub incremental: Result<IncrementalPlan, FullScanReason>,
+    /// `--disable-incremental`. Stops the server deriving its own SCM diff.
+    pub disable_incremental: bool,
     /// `--include` patterns for this run. The project's own include rules are
     /// already stored server-side, so only the flag values are sent.
     pub include_paths: Vec<String>,
@@ -569,6 +572,7 @@ pub fn upload_zip(
         policy,
         metadata,
         incremental,
+        disable_incremental,
         include_paths,
         file_manifest,
     } = options;
@@ -728,9 +732,7 @@ pub fn upload_zip(
                 }
                 match &incremental {
                     // Stored on the scan, so a full scan that was expected to
-                    // be incremental can be explained after the fact. The
-                    // server also honours `disabled_by_flag` rather than
-                    // diffing through the SCM integration on its own.
+                    // be incremental can be explained after the fact.
                     Err(reason) => {
                         form = form
                             .part(
@@ -776,6 +778,10 @@ pub fn upload_zip(
                         "Could not serialize the incremental file list, scanning every file: {e}"
                     )),
                     },
+                }
+                // No file list means "try the SCM diff". This field means "analyze every file".
+                if disable_incremental {
+                    form = form.part("disable_incremental", multipart::Part::text("true"));
                 }
                 // Root and version travel beside the bytes rather than inside
                 // them: the server recomputes the root from what it
@@ -1785,10 +1791,9 @@ pub fn exchange_code_for_token(
     base_url: &str,
     code: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let client = reqwest::blocking::Client::new();
     let exchange_url = format!("{}{}/authorize", base_url, API_BASE);
 
-    let response = client
+    let response = SHARED_CLIENT
         .get(&exchange_url)
         .header("CORGEA-SOURCE", source())
         .query(&[("code", code)])
@@ -2820,6 +2825,19 @@ mod tests {
             }
         });
         base
+    }
+
+    #[test]
+    fn unauthenticated_requests_send_cli_version() {
+        let (base, requests) = corgea::vuln_api_stub::spawn_capturing_vuln_api_stub();
+        let _ = exchange_code_for_token(&base, "code");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            corgea::vuln_api_stub::header_value(&requests[0], corgea::vuln_api::CLI_VERSION_HEADER)
+                .as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]
