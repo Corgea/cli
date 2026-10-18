@@ -13,6 +13,7 @@ mod scan;
 mod setup_hooks;
 mod skill;
 mod skip_scan;
+mod update_check;
 mod wait;
 mod scanners {
     pub mod blast;
@@ -23,7 +24,6 @@ mod scanners {
 mod utils {
     pub mod api;
     pub mod generic;
-    pub mod github;
     pub mod terminal;
 }
 mod targets;
@@ -575,28 +575,6 @@ impl FromStr for Scanner {
     }
 }
 
-fn check_latest_version() {
-    let latest_version = utils::github::get_latest_release_version("Corgea/cli");
-    let current_version = env!("CARGO_PKG_VERSION");
-
-    if let Ok(latest) = latest_version {
-        if latest != current_version {
-            println!(
-                "{}",
-                utils::terminal::set_text_color(
-                    &format!(
-                        "A new version of Corgea CLI is available: {} (current: {})",
-                        latest, current_version
-                    ),
-                    utils::terminal::TerminalColor::Red
-                )
-            );
-            println!("Update with: pip install --upgrade corgea-cli");
-            println!();
-        }
-    }
-}
-
 /// Initialize the global logger.
 ///
 /// `CORGEA_DEBUG=1` (env var or config file) raises the default verbosity to
@@ -633,7 +611,7 @@ fn main() {
         }
     };
     init_logging(&corgea_config);
-    check_latest_version();
+    update_check::notify_if_update_available();
     fn verify_token_and_exit_when_fail(config: &Config) {
         if config.get_token().is_empty() {
             ::log::error!("No token set.\nPlease run 'corgea login' to authenticate.\nFor more info checkout our docs at Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli");
