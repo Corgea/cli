@@ -163,18 +163,26 @@ fn directory_entry_name(relative_path: &Path) -> String {
 ///   `--include` matched. They override every filter here — the default
 ///   excludes, `--exclude`, and `.gitignore` — because a file left out of the
 ///   archive cannot be scanned whatever the engine later decides about it.
+/// - `uncommitted` are paths, relative to the walk, that git reports changed.
+///   The whole-project walk skips hidden paths and `.gitignore` matches even
+///   when git tracks them, so a change to `.github/workflows/ci.yml` would
+///   never reach the archive a partial scan names its files from. They still
+///   go through the default excludes; `--exclude` was applied when they were
+///   resolved.
 /// - `extra_files` are staged files added to the root of the zip as
 ///   `(source path, zip entry name)`. They come from explicit flags such as
 ///   `--include-image`, so exclude rules don't apply to them.
 /// - `want_manifest` is the caller saying it has a use for the digests. A run
 ///   that cannot scan incrementally should pass `false` and not pay to hash
 ///   every file it packs.
+#[allow(clippy::too_many_arguments)]
 pub fn create_zip_from_target<P: AsRef<Path>>(
     target: Option<&str>,
     output_zip: P,
     exclude_globs: Option<&[&str]>,
     user_exclude: Option<&str>,
     force_include: &[PathBuf],
+    uncommitted: &[PathBuf],
     extra_files: &[(PathBuf, String)],
     want_manifest: bool,
 ) -> Result<ArchiveContents, Box<dyn std::error::Error>> {
@@ -234,15 +242,13 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     };
 
     let forced: HashSet<&Path> = force_include.iter().map(PathBuf::as_path).collect();
-    let already_present: HashSet<PathBuf> = files_to_zip
+    let mut already_present: HashSet<PathBuf> = files_to_zip
         .iter()
         .map(|(_, relative)| relative.clone())
         .collect();
-    for relative in force_include {
-        if already_present.contains(relative) {
-            continue;
-        }
-        if relative.is_file() {
+    let uncommitted = if target.is_none() { uncommitted } else { &[] };
+    for relative in force_include.iter().chain(uncommitted) {
+        if relative.is_file() && already_present.insert(relative.clone()) {
             files_to_zip.push((relative.clone(), relative.clone()));
         }
     }
@@ -261,7 +267,11 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
     // is still read once. Skipped outright when the caller has already decided
     // it wants no manifest, rather than hashing every file in the project for
     // a value that is then dropped.
-    let mut manifest = (want_manifest && archives_whole_project(".", target)).then(Manifest::new);
+    // Uncommitted paths can add files the walk skipped, making the archive more
+    // than the project under its exclude set, which is what a manifest describes.
+    let mut manifest =
+        (want_manifest && uncommitted.is_empty() && archives_whole_project(".", target))
+            .then(Manifest::new);
 
     for (path, relative_path) in files_to_zip {
         // Match repo-relative paths so abs `/tmp/...` targets don't hit `**/tmp/**`.
@@ -1090,6 +1100,7 @@ mod tests {
             None,
             &[],
             &[],
+            &[],
             true,
         )
         .expect("zip creation should succeed");
@@ -1237,6 +1248,7 @@ mod tests {
             None,
             std::slice::from_ref(&forced),
             &[],
+            &[],
             false,
         )
         .expect("zip creation should succeed")
@@ -1280,6 +1292,7 @@ mod tests {
             &output_zip,
             Some(&[]),
             None,
+            &[],
             &[],
             &extra_files,
             true,
@@ -1326,6 +1339,7 @@ mod tests {
             &output_zip,
             Some(&[]),
             None,
+            &[],
             &[],
             &extra_files,
             true,
@@ -1460,7 +1474,8 @@ mod tests {
         let output_zip = root.join("out.zip");
         let previous = env::current_dir().unwrap();
         env::set_current_dir(root).unwrap();
-        let contents = create_zip_from_target(None, "out.zip", None, None, &[], &extra_files, true);
+        let contents =
+            create_zip_from_target(None, "out.zip", None, None, &[], &[], &extra_files, true);
         env::set_current_dir(previous).unwrap();
 
         let manifest = contents
@@ -1520,7 +1535,7 @@ mod tests {
             let previous = env::current_dir().unwrap();
             env::set_current_dir(root).unwrap();
             let contents =
-                create_zip_from_target(None, "out.zip", None, None, &[], &extra_files, true);
+                create_zip_from_target(None, "out.zip", None, None, &[], &[], &extra_files, true);
             env::set_current_dir(previous).unwrap();
 
             let archive = contents.expect("zip creation should succeed");

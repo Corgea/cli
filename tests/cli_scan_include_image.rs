@@ -212,11 +212,22 @@ fn scan_only_uncommitted_with_include_image_uploads_the_archive() {
 /// `--only-uncommitted` uploads the whole project and names the changed files,
 /// the way a pull request scan is registered, so the server records a partial
 /// scan rather than a branch state holding only those files.
+///
+/// Hidden paths and tracked files that match an ignore rule are left out of the
+/// whole-project walk, yet git still reports their changes; they have to be in
+/// the archive for the server to accept them in the list.
 #[test]
 fn scan_only_uncommitted_uploads_the_project_and_names_the_changed_files() {
     let (base_url, uploads) = spawn_recording_scan_stub("scan-uncommitted");
     let project = stub_project();
+    let workflow = project.path().join(".github/workflows/ci.yml");
+    fs::create_dir_all(workflow.parent().unwrap()).expect("create workflow dir");
+    fs::write(&workflow, "on: push\n").expect("write workflow");
+    fs::write(project.path().join("ignored.py"), "print(1)\n").expect("write ignored file");
     commit_everything(project.path());
+    fs::write(project.path().join(".git/info/exclude"), "ignored.py\n").expect("write exclude");
+    fs::write(&workflow, "on: pull_request\n").expect("edit workflow");
+    fs::write(project.path().join("ignored.py"), "print(3)\n").expect("edit ignored file");
     fs::write(project.path().join("edited.py"), "print(2)\n").expect("write new file");
 
     let (mut cmd, _home) = corgea_isolated();
@@ -236,9 +247,60 @@ fn scan_only_uncommitted_uploads_the_project_and_names_the_changed_files() {
     let uploaded = uploaded_text(&uploads);
     assert!(uploaded.contains("main.py"), "committed files upload too");
     assert!(uploaded.contains("name=\"partial_scan\"\r\n\r\ntrue"));
-    assert!(uploaded.contains("name=\"files_to_scan\"\r\n\r\n[\"edited.py\"]"));
+    let field = "name=\"files_to_scan\"\r\n\r\n";
+    let list = uploaded
+        .split_once(field)
+        .and_then(|(_, rest)| rest.split_once("\r\n"))
+        .map(|(list, _)| list)
+        .expect("files_to_scan field");
+    let mut named: Vec<String> = serde_json::from_str(list).expect("files_to_scan is JSON");
+    named.sort();
+    assert_eq!(
+        named,
+        [".github/workflows/ci.yml", "edited.py", "ignored.py"]
+    );
+    let archive = uploaded.replace(&format!("{field}{list}"), "");
+    for name in &named {
+        assert!(archive.contains(name.as_str()), "{name} is in the archive");
+    }
     assert!(uploaded.contains("name=\"dirty\"\r\n\r\ntrue"));
     assert!(!uploaded.contains("name=\"file_manifest\""));
+}
+
+/// An uncommitted file is still held to the default excludes, and one that is
+/// also force-included is packed once: a second entry of the same name would
+/// fail the archive.
+#[test]
+fn scan_only_uncommitted_keeps_default_excludes_and_packs_a_forced_file_once() {
+    let (base_url, uploads) = spawn_recording_scan_stub("scan-uncommitted-forced");
+    let project = stub_project();
+    let script = project.path().join(".github/deploy.sh");
+    fs::create_dir_all(script.parent().unwrap()).expect("create .github");
+    fs::write(&script, "echo 1\n").expect("write script");
+    fs::write(project.path().join("ignored.py"), "print(1)\n").expect("write ignored file");
+    commit_everything(project.path());
+    fs::write(project.path().join(".git/info/exclude"), "ignored.py\n").expect("write exclude");
+    fs::write(&script, "echo 2\n").expect("edit script");
+    fs::write(project.path().join("ignored.py"), "print(3)\n").expect("edit ignored file");
+
+    let (mut cmd, _home) = corgea_isolated();
+    cmd.current_dir(project.path())
+        .env("CORGEA_URL", &base_url)
+        .env("CORGEA_TOKEN", "test-token")
+        .args(["scan", "--only-uncommitted", "--include", "ignored.py"]);
+
+    let output = cmd.output().expect("run corgea scan --only-uncommitted");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(stderr.contains(".github/deploy.sh"), "reported as skipped");
+
+    let uploaded = uploaded_text(&uploads);
+    assert!(uploaded.contains("name=\"files_to_scan\"\r\n\r\n[\"ignored.py\"]"));
+    assert!(!uploaded.contains(".github/deploy.sh"));
 }
 
 /// A copy of an archive living in the repository must not ride along: it would put

@@ -460,6 +460,20 @@ fn start_new_scan(
     } else {
         None
     };
+    let cwd = env::current_dir().unwrap_or_default();
+    // Git reports paths under the repository's resolved root, which differs
+    // from the working directory when it is reached through a symlink.
+    let roots: Vec<PathBuf> = cwd.canonicalize().into_iter().chain([cwd]).collect();
+    let uncommitted_in_walk: Vec<PathBuf> = uncommitted_files
+        .iter()
+        .flatten()
+        .filter_map(|file| {
+            roots
+                .iter()
+                .find_map(|root| file.strip_prefix(root).ok())
+                .map(Path::to_path_buf)
+        })
+        .collect();
 
     // Before packaging: mid-pack HEAD move must not look like a clean new SHA.
     let repo_before = utils::generic::get_repo_info_for_scan("./").unwrap_or_default();
@@ -588,6 +602,7 @@ fn start_new_scan(
         None,
         exclude.as_deref(),
         &force_included,
+        &uncommitted_in_walk,
         &extra_zip_files,
         !*disable_incremental && !*only_uncommitted,
     ) {
@@ -627,10 +642,6 @@ fn start_new_scan(
         utils::terminal::set_text_color("", utils::terminal::TerminalColor::Green)
     );
     let partial_files = uncommitted_files.map(|selected| {
-        let cwd = env::current_dir().unwrap_or_default();
-        // Git reports paths under the repository's resolved root, which differs
-        // from the working directory when it is reached through a symlink.
-        let roots: Vec<PathBuf> = cwd.canonicalize().into_iter().chain([cwd]).collect();
         let (files, skipped) = partial_scan_files(
             &selected,
             &roots,
