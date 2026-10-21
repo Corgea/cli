@@ -6,7 +6,7 @@ The `corgea` CLI ships to three channels, all driven by **one git tag**:
 |---|---|---|
 | npm | `@corgea/cli` (scoped, bundles native binaries) | `npm install -g @corgea/cli` |
 | PyPI | `corgea-cli` (maturin-built wheels) | `pip install corgea-cli` |
-| GitHub Release | `corgea-<target>.zip` (raw binaries) | download from the [Releases page](https://github.com/Corgea/cli/releases) |
+| GitHub Release | `corgea-vX.Y.Z-<target>.zip` (raw binaries) | download from the [Releases page](https://github.com/Corgea/cli/releases) |
 
 Pushing an annotated `vX.Y.Z` tag to `main` fans out to three GitHub Actions workflows that build and publish all three. **Publishing is automated; the changelog is not** (see [Release notes](#release-notes)).
 
@@ -58,7 +58,7 @@ Pushing an annotated `vX.Y.Z` tag to `main` fans out to three GitHub Actions wor
    | # | Workflow | File | Publishes |
    |---|---|---|---|
    | 1 | **CI** | `release.yml` | wheels → **PyPI** (`corgea-cli`), on tag |
-   | 2 | **Native Binary Release** | `release-binaries.yml` | 6 target zips → **GitHub Release** |
+   | 2 | **Native Binary Release** | `release-binaries.yml` | 7 target zips → **GitHub Release** |
    | 3 | **Publish npm Package** | `npm-publish.yml` | bundles binaries → **npm** (`@corgea/cli`) |
 
    Workflow 3 is triggered by workflow 2 completing successfully (and only when the tag is `v`-prefixed). If it does not auto-start, dispatch it manually:
@@ -69,8 +69,8 @@ Pushing an annotated `vX.Y.Z` tag to `main` fans out to three GitHub Actions wor
 ## What gets built
 
 - **PyPI wheels** (`release.yml`): Linux (x86_64, x86), Windows (x64, x86), macOS (x86_64, aarch64), plus an sdist. Asserts `manylinux2014` tags for broad Linux compatibility.
-- **Native binaries** (`release-binaries.yml`): `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`.
-- **npm binary bundling** (`npm-publish.yml` → `scripts/npm/bundle-binaries.js`): downloads the GitHub Release zips and lays them out as `vendor/<target>/corgea/corgea`. At runtime `bin/corgea.js` selects the binary for the host OS/arch. npm ships 5 of the 7 targets (both Linux arches use the musl build).
+- **Native binaries** (`release-binaries.yml`): `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`. Each is zipped as `corgea-<tag>-<target>.zip` (e.g. `corgea-v1.16.0-aarch64-apple-darwin.zip`); branch builds use `v` + the `Cargo.toml` version in place of the tag. Releases before this naming shipped `corgea-<target>.zip`.
+- **npm binary bundling** (`npm-publish.yml` → `scripts/npm/bundle-binaries.js <assets-dir> <tag>`): downloads the GitHub Release zips (versioned name, falling back to the legacy unversioned name) and lays them out as `vendor/<target>/corgea/corgea`. At runtime `bin/corgea.js` selects the binary for the host OS/arch. npm ships 5 of the 7 targets (both Linux arches use the musl build).
 
 ### Linux glibc floor
 

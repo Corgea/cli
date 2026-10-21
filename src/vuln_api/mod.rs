@@ -154,6 +154,21 @@ pub(crate) fn user_agent(label: &str) -> String {
     format!("corgea-cli/{} ({label})", env!("CARGO_PKG_VERSION"))
 }
 
+/// Header carrying the CLI release on every request to Corgea, so the server
+/// can record which version triggered a scan.
+pub const CLI_VERSION_HEADER: &str = "CORGEA-CLI-VERSION";
+
+/// Headers every Corgea client sends regardless of auth state. Installed as
+/// client defaults so no call site can forget them.
+pub fn default_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        CLI_VERSION_HEADER,
+        reqwest::header::HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+    );
+    headers
+}
+
 /// Build (once) and clone the shared vuln-api client. A blocking reqwest
 /// client owns a runtime thread, and a gate run checks many packages —
 /// cache it. `Client` clones share the same pool, so the clone is cheap.
@@ -164,6 +179,7 @@ pub fn http_client() -> Result<reqwest::blocking::Client, String> {
             reqwest::blocking::Client::builder()
                 .timeout(REQUEST_TIMEOUT)
                 .user_agent(user_agent("vuln-api"))
+                .default_headers(default_headers())
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| format!("failed to build vuln-api http client: {}", e))
@@ -796,6 +812,10 @@ mod tests {
         assert_eq!(
             header_value(&request, "CORGEA-SOURCE").as_deref(),
             Some("cli")
+        );
+        assert_eq!(
+            header_value(&request, CLI_VERSION_HEADER).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
         );
     }
 

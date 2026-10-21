@@ -1,12 +1,14 @@
+use crate::incremental::{BaselineRef, FullScanReason, IncrementalPlan};
 use crate::log::debug;
+use crate::manifest::EncodedManifest;
 use crate::utils;
-use corgea::vuln_api::{auth_header, source};
+use corgea::vuln_api::{auth_header, default_headers, source};
 use reqwest::header::HeaderMap;
-use reqwest::StatusCode;
 use reqwest::{
     blocking::multipart,
     blocking::multipart::{Form, Part},
 };
+use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
@@ -15,9 +17,20 @@ use std::error::Error;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::time::Duration;
 
 const CHUNK_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 const API_BASE: &str = "/api/v1";
+const DIRTY_TRUE: &str = "true";
+const DIRTY_FALSE: &str = "false";
+/// How long any one request may take before the client gives up.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// Budget for the pre-scan project-settings lookup. Short on purpose: the run
+/// continues without the project's include rules if it fails, so waiting out
+/// the default would delay every scan for no gain.
+const SETTINGS_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Unversioned on purpose: the webapp serves its own version outside the
 /// versioned API so clients can read it before agreeing on an API version.
 const WEBAPP_VERSION_PATH: &str = "/api/version";
@@ -25,7 +38,7 @@ const WEBAPP_VERSION_PATH: &str = "/api/version";
 /// Far below the shared client's timeout, because this request is advisory and
 /// runs ahead of every authenticated command: a deployment that stalls this one
 /// route must not hold the command the user actually asked for.
-const WEBAPP_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const WEBAPP_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn auth_headers(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -48,7 +61,8 @@ static COOKIE_JAR: std::sync::LazyLock<std::sync::Arc<reqwest::cookie::Jar>> =
 static SHARED_CLIENT: std::sync::LazyLock<reqwest::blocking::Client> =
     std::sync::LazyLock::new(|| {
         let mut builder = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(5 * 30))
+            .timeout(REQUEST_TIMEOUT)
+            .default_headers(default_headers())
             .cookie_provider(COOKIE_JAR.clone());
 
         if let Ok(https_proxy) = std::env::var("https_proxy") {
@@ -130,10 +144,11 @@ impl DebugRequestBuilder {
         }
     }
 
-    /// Override the shared client's timeout for this request alone.
-    pub fn timeout(self, timeout: std::time::Duration) -> Self {
+    /// Shorten this one request's timeout, never lengthen it past
+    /// `REQUEST_TIMEOUT`.
+    pub fn timeout(self, timeout: Duration) -> Self {
         Self {
-            inner: self.inner.timeout(timeout),
+            inner: self.inner.timeout(timeout.min(REQUEST_TIMEOUT)),
             client: self.client,
         }
     }
@@ -141,14 +156,16 @@ impl DebugRequestBuilder {
     pub fn send(self) -> reqwest::Result<reqwest::blocking::Response> {
         use reqwest::cookie::CookieStore;
 
+        let DebugRequestBuilder { client, inner } = self;
+
         let token = AUTH_TOKEN.read().unwrap().clone();
         let builder = if !token.is_empty() {
-            self.inner.headers(auth_headers(&token))
+            inner.headers(auth_headers(&token))
         } else {
-            self.inner
+            inner
         };
 
-        let request = builder.build()?;
+        let mut request = builder.build()?;
 
         debug(&format!("→ {} {}", request.method(), request.url()));
         debug(&format!("  Request headers: {:?}", request.headers()));
@@ -160,12 +177,310 @@ impl DebugRequestBuilder {
             None => debug("  Cookie: (none in jar for this URL)"),
         }
 
-        let response = self.client.execute(request)?;
+        // Read off the request now: sending it consumes it, and the retry
+        // policy needs the method for every attempt.
+        let method = request.method().clone();
+        let mut retries = TransientRetries::new(format!("{} {}", method, request.url().path()));
+        loop {
+            // Cloned before the send, which consumes the request.
+            let replay = request.try_clone();
+            let response = client.execute(request)?;
 
-        debug(&format!("← {} {}", response.status(), response.url()));
-        debug(&format!("  Response headers: {:?}", response.headers()));
+            debug(&format!("← {} {}", response.status(), response.url()));
+            debug(&format!("  Response headers: {:?}", response.headers()));
 
-        Ok(response)
+            let Some(replay) = replay else {
+                // A streamed body has nothing to clone. The uploads that have
+                // one come through `send_with_retries`, which rebuilds the
+                // whole request instead of replaying this one.
+                if should_retry(response.status(), &method) {
+                    debug("  Not retrying here: this request's body cannot be re-sent.");
+                }
+                return Ok(response);
+            };
+            if RetryLoopGuard::outer_loop_active()
+                || !retries.wait_for_retry(
+                    response.status(),
+                    &method,
+                    retry_after(response.headers()),
+                )
+            {
+                return Ok(response);
+            }
+            request = replay;
+        }
+    }
+}
+
+/// Cloudflare's own statuses for failing to get an answer from the origin.
+/// They have no `StatusCode` constants because no RFC defines them.
+const CLOUDFLARE_UNKNOWN_ERROR: u16 = 520;
+const CLOUDFLARE_WEB_SERVER_DOWN: u16 = 521;
+const CLOUDFLARE_CONNECTION_TIMED_OUT: u16 = 522;
+const CLOUDFLARE_ORIGIN_UNREACHABLE: u16 = 523;
+const CLOUDFLARE_TIMEOUT_OCCURRED: u16 = 524;
+
+/// Statuses where a proxy in front of the API failed to get an answer from it.
+///
+/// - `502 Bad Gateway` and `504 Gateway Timeout` from any proxy.
+/// - `520 Unknown Error`: the origin reset the connection or sent back
+///   something that was not an HTTP response.
+/// - `521 Web Server Is Down`: the origin refused Cloudflare's connection.
+/// - `522 Connection Timed Out`: covers the connection never opening, but also
+///   the request going out and never being acknowledged.
+/// - `523 Origin Is Unreachable`: Cloudflare found no route to the origin.
+/// - `524 A Timeout Occurred`: Cloudflare delivered the request and the origin
+///   did not answer within the proxy read timeout (125s by default) — which
+///   is the API still working on it, not the API never seeing it.
+fn is_gateway_error(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT
+    ) || matches!(
+        status.as_u16(),
+        CLOUDFLARE_UNKNOWN_ERROR
+            | CLOUDFLARE_WEB_SERVER_DOWN
+            | CLOUDFLARE_CONNECTION_TIMED_OUT
+            | CLOUDFLARE_ORIGIN_UNREACHABLE
+            | CLOUDFLARE_TIMEOUT_OCCURRED
+    )
+}
+
+/// Statuses the CLI answers with a retry rather than a failure.
+///
+/// A `429` is Corgea's rate limiter turning the request away and a gateway
+/// error is a proxy in front of Corgea failing to get an answer from the API.
+/// Neither is the API rejecting the request on its merits, so under the
+/// parallel scanning load that produces them a retry succeeds where failing the
+/// pipeline would not.
+pub fn is_transient_error(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || is_gateway_error(status)
+}
+
+/// Whether `status` is worth sending this `method` again.
+///
+/// Every transient status is worth retrying, but they promise different things
+/// about what happened to the request, and only one is safe to answer by
+/// re-sending a write:
+///
+/// - `429 Too Many Requests` is the rate limiter declining the request before
+///   the API sees it. Nothing was created, so any method can be sent again —
+///   which matters most for the writes, since a rate-limited upload that failed
+///   the command leaves a pipeline to be re-run by hand.
+/// - A gateway error comes from a proxy, so it is not the API's word on what
+///   happened to the request. Only a request that changes nothing is sent
+///   again, because every write the CLI sends creates something.
+///   `POST /start-scan` mints a transfer, `POST /scan-upload` takes a whole
+///   report, and the archive `PATCH` that fills the last of `Upload-Length` is
+///   the one that answers with `scan_id` — on an archive under `CHUNK_SIZE`,
+///   the only chunk. Re-sending one of those does not finish the first scan,
+///   it starts a second.
+fn should_retry(status: StatusCode, method: &Method) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || (is_gateway_error(status) && method.is_safe())
+}
+
+/// Pauses before each retry: a transient error has to survive four attempts
+/// spread over 90 seconds before a command fails.
+///
+/// The schedule belongs to one request. Any other answer ends it, so the next
+/// transient error — on this request or a later one — starts again at the first
+/// pause.
+const TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(50),
+];
+
+/// The longest a single `Retry-After` may hold up one request, so a header the
+/// CLI cannot sanity-check cannot stall a pipeline indefinitely.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
+
+/// The pause Corgea asked for, when it named one.
+///
+/// Only the delta-seconds form is read. `Retry-After` also allows an HTTP date,
+/// which would need the CLI to trust its own clock against the server's, and
+/// which a rate limiter has no reason to send.
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let seconds: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER))
+}
+
+/// Overrides the pauses above with a comma-separated list of milliseconds, so
+/// the retry path can be exercised end to end without spending 90 seconds.
+const RETRY_DELAYS_OVERRIDE_ENV: &str = "DEBUG_CORGEA_OVERRIDE_RETRY_DELAYS_MS";
+
+fn parse_retry_delays(raw: Option<&str>) -> Vec<Duration> {
+    let Some(raw) = raw else {
+        return TRANSIENT_RETRY_DELAYS.to_vec();
+    };
+    let parsed: Option<Vec<Duration>> = raw
+        .split(',')
+        .map(|part| part.trim().parse::<u64>().ok().map(Duration::from_millis))
+        .collect();
+    match parsed.filter(|delays| !delays.is_empty()) {
+        Some(delays) => delays,
+        // A bad override must not silently take the retries away.
+        None => {
+            log::warn!(
+                "Ignoring {}='{}': expected a comma-separated list of whole milliseconds. Retrying on the default schedule instead.",
+                RETRY_DELAYS_OVERRIDE_ENV,
+                raw
+            );
+            TRANSIENT_RETRY_DELAYS.to_vec()
+        }
+    }
+}
+
+fn transient_retry_delays() -> &'static [Duration] {
+    static DELAYS: std::sync::LazyLock<Vec<Duration>> = std::sync::LazyLock::new(|| {
+        parse_retry_delays(std::env::var(RETRY_DELAYS_OVERRIDE_ENV).ok().as_deref())
+    });
+    DELAYS.as_slice()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The pauses `wait_before_retry` was asked for, so a test can read the
+    /// schedule's decisions off it without spending them.
+    static RECORDED_WAITS: std::cell::RefCell<Vec<Duration>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Unit tests exercise the schedule, not the waiting.
+#[cfg(test)]
+fn wait_before_retry(delay: Duration) {
+    RECORDED_WAITS.with(|waits| waits.borrow_mut().push(delay));
+}
+
+#[cfg(not(test))]
+fn wait_before_retry(delay: Duration) {
+    std::thread::sleep(delay);
+}
+
+fn format_delay(delay: Duration) -> String {
+    if delay >= Duration::from_secs(1) {
+        format!("{}s", delay.as_secs())
+    } else {
+        format!("{}ms", delay.as_millis())
+    }
+}
+
+/// One request's progress through `TRANSIENT_RETRY_DELAYS`, and the log lines a
+/// pipeline needs to tell a retried blip from a real outage.
+struct TransientRetries {
+    operation: String,
+    retries_spent: usize,
+}
+
+impl TransientRetries {
+    fn new(operation: impl Into<String>) -> Self {
+        Self {
+            operation: operation.into(),
+            retries_spent: 0,
+        }
+    }
+
+    /// Whether to send `operation` again, having waited for the next pause.
+    ///
+    /// `false` means this response is the answer: either it is not one this
+    /// method may be retried for — which resets the schedule, so a later
+    /// transient error gets the full run of retries again — or the retries are
+    /// spent and the caller should fail.
+    fn wait_for_retry(
+        &mut self,
+        status: StatusCode,
+        method: &Method,
+        asked_for: Option<Duration>,
+    ) -> bool {
+        if !should_retry(status, method) {
+            self.retries_spent = 0;
+            return false;
+        }
+        let delays = transient_retry_delays();
+        let Some(scheduled) = delays.get(self.retries_spent) else {
+            log::error!(
+                "Corgea answered {} with {} on {} attempts. Giving up.",
+                self.operation,
+                status,
+                delays.len() + 1
+            );
+            return false;
+        };
+        // A rate limiter that names its own window knows better than the
+        // schedule does, and coming back sooner than it asked only spends a
+        // retry to be told the same thing. Never earlier than either, though:
+        // the schedule is the floor that keeps a retry from becoming a hammer.
+        let delay = asked_for.unwrap_or(*scheduled).max(*scheduled);
+        self.retries_spent += 1;
+        log::warn!(
+            "Corgea answered {} with {}. Retrying in {}... ({}/{})",
+            self.operation,
+            status,
+            format_delay(delay),
+            self.retries_spent,
+            delays.len()
+        );
+        wait_before_retry(delay);
+        true
+    }
+}
+
+thread_local! {
+    /// Set while `send_with_retries` is running the schedule itself, so `send`
+    /// does not stack a second one underneath it — four attempts each would be
+    /// sixteen requests and six minutes of waiting.
+    static IN_RETRY_LOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct RetryLoopGuard(bool);
+
+impl RetryLoopGuard {
+    fn enter() -> Self {
+        Self(IN_RETRY_LOOP.with(|active| active.replace(true)))
+    }
+
+    fn outer_loop_active() -> bool {
+        IN_RETRY_LOOP.with(|active| active.get())
+    }
+}
+
+impl Drop for RetryLoopGuard {
+    fn drop(&mut self) {
+        IN_RETRY_LOOP.with(|active| active.set(self.0));
+    }
+}
+
+/// Send a request that has to be rebuilt for every attempt, retrying both
+/// network errors and transient statuses.
+///
+/// `send` replays a request it can clone; a multipart body is a stream with
+/// nothing to clone, so the upload call sites come through here and build a
+/// fresh form each time. `operation` names the request in the retry logs.
+///
+/// `method` is the one the closure sends. `send` reads the method off the
+/// request it built, but a closure is opaque, so the call site has to name it
+/// for `should_retry` to rule on.
+pub fn send_with_retries<F>(
+    operation: &str,
+    method: &Method,
+    mut make_request: F,
+) -> reqwest::Result<reqwest::blocking::Response>
+where
+    F: FnMut() -> reqwest::Result<reqwest::blocking::Response>,
+{
+    let _guard = RetryLoopGuard::enter();
+    let mut retries = TransientRetries::new(operation);
+    loop {
+        let response = retry_on_network_error(operation, &mut make_request)?;
+        if !retries.wait_for_retry(response.status(), method, retry_after(response.headers())) {
+            return Ok(response);
+        }
     }
 }
 
@@ -235,15 +550,51 @@ pub struct UploadZipResult {
     pub project_id: Option<String>,
 }
 
+/// Per-scan settings travelling with the archive without being part of it.
+#[derive(Debug)]
+pub struct UploadOptions {
+    pub scan_type: Option<String>,
+    pub policy: Option<String>,
+    pub metadata: Option<String>,
+    /// The diff for the server to analyze instead of the whole project, or why
+    /// this run has none.
+    pub incremental: Result<IncrementalPlan, FullScanReason>,
+    /// `--disable-incremental`. Stops the server deriving its own SCM diff.
+    pub disable_incremental: bool,
+    /// `--include` patterns for this run. The project's own include rules are
+    /// already stored server-side, so only the flag values are sent.
+    pub include_paths: Vec<String>,
+    /// Digests of everything in the archive, stored with the scan for a later
+    /// run to diff against. Set only when the archive is the whole project.
+    pub file_manifest: Option<EncodedManifest>,
+}
+
 pub fn upload_zip(
     file_path: &str,
     url: &str,
     project_name: &str,
     repo_info: Option<utils::generic::RepoInfo>,
-    scan_type: Option<String>,
-    policy: Option<String>,
-    metadata: Option<String>,
+    options: UploadOptions,
 ) -> Result<UploadZipResult, Box<dyn std::error::Error>> {
+    let UploadOptions {
+        scan_type,
+        policy,
+        metadata,
+        incremental,
+        disable_incremental,
+        include_paths,
+        file_manifest,
+    } = options;
+    let include_paths_field = match include_paths.is_empty() {
+        true => None,
+        false => match serde_json::to_string(&include_paths) {
+            Ok(json) => Some(json),
+            Err(e) => {
+                debug(&format!("Could not serialize the --include patterns: {e}"));
+                None
+            }
+        },
+    };
     let client = http_client();
     let file_size = std::fs::metadata(file_path)?.len();
     let file_name = Path::new(file_path).file_name().unwrap().to_str().unwrap();
@@ -252,18 +603,22 @@ pub fn upload_zip(
         "file_size": file_size
     });
 
-    let form = reqwest::blocking::multipart::Form::new()
-        .part(
-            "files",
-            reqwest::blocking::multipart::Part::bytes(Vec::new()).file_name(file_name.to_string()),
-        )
-        .text("json", json_object.to_string());
-
-    let response_object = client
-        .post(format!("{}{}/start-scan", url, API_BASE))
-        .query(&[("scan_type", "blast")])
-        .multipart(form)
-        .send();
+    // The form is built per attempt: a multipart body is a stream, so a retry
+    // has nothing to replay unless the whole request is made again.
+    let response_object = send_with_retries("the scan start request", &Method::POST, || {
+        let form = reqwest::blocking::multipart::Form::new()
+            .part(
+                "files",
+                reqwest::blocking::multipart::Part::bytes(Vec::new())
+                    .file_name(file_name.to_string()),
+            )
+            .text("json", json_object.to_string());
+        client
+            .post(format!("{}{}/start-scan", url, API_BASE))
+            .query(&[("scan_type", "blast")])
+            .multipart(form)
+            .send()
+    });
     let response_object = match response_object {
         Ok(response) => {
             check_for_warnings(response.headers(), response.status());
@@ -329,62 +684,164 @@ pub fn upload_zip(
         }
 
         let chunk = &buffer[..bytes_read];
+        // The scan is registered on the chunk that completes the archive, and
+        // that is the only request whose fields the server reads. Sending the
+        // manifest with every chunk would re-upload it once per 50 MB for a
+        // server that discards all but the last copy.
+        let final_chunk = offset + bytes_read as u64 >= file_size;
 
-        let mut form = Form::new()
-            .part(
-                "chunk_data",
-                Part::bytes(chunk.to_vec())
-                    .file_name(file_name.to_string())
-                    .mime_str("application/octet-stream")?,
-            )
-            .part(
-                "project_name",
-                multipart::Part::text(project_name.to_string()),
-            )
-            .part("file_size", multipart::Part::text(file_size.to_string()));
-        if let Some(ref info) = repo_info {
-            if let Some(branch) = &info.branch {
-                form = form.part("branch", multipart::Part::text(branch.to_string()));
-            }
-            if let Some(repo_url) = &info.repo_url {
-                form = form.part("repo_url", multipart::Part::text(repo_url.to_string()));
-            }
-            if let Some(sha) = &info.sha {
-                form = form.part("sha", multipart::Part::text(sha.to_string()));
-            }
-        }
-        if let Some(scan_type) = scan_type.clone() {
-            let scan_type = if scan_type.contains("blast") {
-                "base".to_string()
-            } else {
-                scan_type
+        // Rebuilt per attempt: a multipart body is a stream, so a retry has
+        // nothing to replay unless the whole request is made again.
+        let response =
+            match send_with_retries("a scan archive chunk upload", &Method::PATCH, || {
+                let mut form = Form::new()
+                    .part(
+                        "chunk_data",
+                        Part::bytes(chunk.to_vec())
+                            .file_name(file_name.to_string())
+                            .mime_str("application/octet-stream")?,
+                    )
+                    .part(
+                        "project_name",
+                        multipart::Part::text(project_name.to_string()),
+                    )
+                    .part("file_size", multipart::Part::text(file_size.to_string()));
+                if let Some(ref info) = repo_info {
+                    if let Some(branch) = &info.branch {
+                        form = form.part("branch", multipart::Part::text(branch.to_string()));
+                    }
+                    if let Some(repo_url) = &info.repo_url {
+                        form = form.part("repo_url", multipart::Part::text(repo_url.to_string()));
+                    }
+                    if let Some(sha) = &info.sha {
+                        form = form.part("sha", multipart::Part::text(sha.to_string()));
+                    }
+                    // Always send: omitted = old CLI; false = clean HEAD snapshot.
+                    form = form.part(
+                        "dirty",
+                        multipart::Part::text(if info.dirty { DIRTY_TRUE } else { DIRTY_FALSE }),
+                    );
+                }
+                if let Some(scan_type) = scan_type.clone() {
+                    let scan_type = if scan_type.contains("blast") {
+                        "base".to_string()
+                    } else {
+                        scan_type
+                    };
+                    form = form.part("scan_configs", multipart::Part::text(scan_type.to_string()));
+                }
+                if let Some(policy) = policy.clone() {
+                    form = form.part("target_policies", multipart::Part::text(policy.to_string()));
+                }
+                if let Some(meta) = &metadata {
+                    form = form.part("metadata", multipart::Part::text(meta.clone()));
+                }
+                if let Some(patterns) = &include_paths_field {
+                    form = form.part("include_paths", multipart::Part::text(patterns.clone()));
+                }
+                match &incremental {
+                    // Stored on the scan, so a full scan that was expected to
+                    // be incremental can be explained after the fact.
+                    Err(reason) => {
+                        form = form
+                            .part(
+                                "incremental_skipped_reason",
+                                multipart::Part::text(reason.cause.code()),
+                            )
+                            .part(
+                                "incremental_skipped_detail",
+                                multipart::Part::text(reason.detail.clone()),
+                            );
+                    }
+                    // Both fields or neither: the list is only safe next to the
+                    // commit it was measured from, and a server seeing one
+                    // without the other would guess a baseline. A list that
+                    // will not serialize drops both, leaving a full scan.
+                    Ok(plan) => match serde_json::to_string(&plan.changed_files) {
+                        Ok(changed_files) => {
+                            // Which scan the diff was measured from. A commit
+                            // when git produced it, and the scan itself when
+                            // its stored checksums did -- that upload may have
+                            // had no commit to name, and naming the scan is
+                            // exact where a commit several scans share is not.
+                            let (field, value) = match &plan.base {
+                                BaselineRef::Commit(sha) => ("incremental_base_sha", sha),
+                                BaselineRef::Scan(id) => ("incremental_base_scan_id", id),
+                            };
+                            form = form.part(field, multipart::Part::text(value.clone()));
+                            form = form.part(
+                                "incremental_changed_files",
+                                multipart::Part::text(changed_files),
+                            );
+                            // Tells the server the list describes the working tree,
+                            // not just a commit range, which is the only way it can
+                            // accept a diff from a dirty upload.
+                            if plan.covers_worktree {
+                                form = form.part(
+                                    "incremental_covers_worktree",
+                                    multipart::Part::text("true"),
+                                );
+                            }
+                            // Without it, a server seeing that the baseline's
+                            // ignore rules were lifted scans every file, since
+                            // only this says the list covers what they hid.
+                            if let Some(rules) = plan
+                                .ignore_rules
+                                .as_ref()
+                                .and_then(|rules| serde_json::to_string(rules).ok())
+                            {
+                                form = form
+                                    .part("incremental_ignore_rules", multipart::Part::text(rules));
+                            }
+                        }
+                        Err(e) => debug(&format!(
+                        "Could not serialize the incremental file list, scanning every file: {e}"
+                    )),
+                    },
+                }
+                // No file list means "try the SCM diff". This field means "analyze every file".
+                if disable_incremental {
+                    form = form.part("disable_incremental", multipart::Part::text("true"));
+                }
+                // Root and version travel beside the bytes rather than inside
+                // them: the server recomputes the root from what it
+                // decompressed and refuses a mismatch, so a truncated manifest
+                // costs a full scan instead of reading as a tree that shrank.
+                if let (true, Some(manifest)) = (final_chunk, &file_manifest) {
+                    form = form
+                        .part(
+                            "file_manifest",
+                            Part::bytes(manifest.body.clone())
+                                .file_name("file_manifest.txt.gz")
+                                .mime_str("application/gzip")?,
+                        )
+                        .part(
+                            "file_manifest_root",
+                            multipart::Part::text(manifest.root.clone()),
+                        )
+                        .part(
+                            "file_manifest_version",
+                            multipart::Part::text(crate::manifest::MANIFEST_VERSION),
+                        );
+                }
+
+                client
+                    .patch(format!("{}{}/start-scan/{}/", url, API_BASE, transfer_id))
+                    .header("Upload-Offset", offset.to_string())
+                    .header("Upload-Length", file_size.to_string())
+                    .header("Upload-Name", file_name)
+                    .query(&[("scan_type", "blast")])
+                    .multipart(form)
+                    .send()
+            }) {
+                Ok(response) => {
+                    check_for_warnings(response.headers(), response.status());
+                    response
+                }
+                Err(e) => {
+                    return Err(format!("Failed to send request: {}", e).into());
+                }
             };
-            form = form.part("scan_configs", multipart::Part::text(scan_type.to_string()));
-        }
-        if let Some(policy) = policy.clone() {
-            form = form.part("target_policies", multipart::Part::text(policy.to_string()));
-        }
-        if let Some(meta) = &metadata {
-            form = form.part("metadata", multipart::Part::text(meta.clone()));
-        }
-
-        let response = match client
-            .patch(format!("{}{}/start-scan/{}/", url, API_BASE, transfer_id))
-            .header("Upload-Offset", offset.to_string())
-            .header("Upload-Length", file_size.to_string())
-            .header("Upload-Name", file_name)
-            .query(&[("scan_type", "blast")])
-            .multipart(form)
-            .send()
-        {
-            Ok(response) => {
-                check_for_warnings(response.headers(), response.status());
-                response
-            }
-            Err(e) => {
-                return Err(format!("Failed to send request: {}", e).into());
-            }
-        };
         if !response.status().is_success() {
             let status_code = response.status();
             let response_text = response
@@ -514,6 +971,18 @@ pub fn get_scan_issues(
         }
         Err(e) => return Err(format!("Failed to send request: {}", e).into()),
     };
+    // A 5xx body is the gateway's or the server's, not the API's JSON, and
+    // reading it as a parse failure hides the status a pipeline needs. 4xx
+    // still goes through the body, which carries `no_project_found`.
+    let status = response.status();
+    if status.is_server_error() {
+        let body = response.text().unwrap_or_default();
+        debug(&format!(
+            "Issue listing failed: HTTP {}. Response body: {}",
+            status, body
+        ));
+        return Err(format!("Request failed with status: {}", status).into());
+    }
     let response_text = response.text()?;
     let project_issues_response: ProjectIssuesResponse = serde_json::from_str(&response_text)
         .map_err(|e| {
@@ -616,13 +1085,22 @@ pub fn get_quality_issues(
     }
 }
 
-pub fn get_scan(url: &str, scan_id: &str) -> Result<ScanResponse, Box<dyn std::error::Error>> {
+/// `deadline` caps this single read, so a caller polling against a budget is
+/// not held past it by a stalled request. `None` uses `REQUEST_TIMEOUT`.
+pub fn get_scan(
+    url: &str,
+    scan_id: &str,
+    deadline: Option<Duration>,
+) -> Result<ScanResponse, Box<dyn std::error::Error>> {
     let url = format!("{}{}/scan/{}", url, API_BASE, scan_id);
 
     let client = http_client();
     debug(&format!("Sending request to URL: {}", url));
-    let response = client
-        .get(&url)
+    let mut request = client.get(&url);
+    if let Some(deadline) = deadline {
+        request = request.timeout(deadline);
+    }
+    let response = request
         .send()
         .map_err(|e| format!("Failed to send request: {}", e))?;
 
@@ -681,7 +1159,7 @@ pub fn get_scan_report(
 }
 
 pub fn get_issue(url: &str, issue: &str) -> Result<FullIssueResponse, Box<dyn std::error::Error>> {
-    let url = format!("{}{}/issue/{}", url, API_BASE, issue,);
+    let url = format!("{}{}/issue/{}?include_metadata=true", url, API_BASE, issue);
     let client = http_client();
     debug(&format!("Sending request to URL: {}", url));
     let response = match client.get(&url).send() {
@@ -796,18 +1274,140 @@ pub fn query_scan_list(
     page: Option<u16>,
     page_size: Option<u16>,
 ) -> Result<ScansResponse, Box<dyn Error>> {
-    let url = format!("{}{}/scans", url, API_BASE);
     let page = page.unwrap_or(1);
-    let mut query_params = vec![("page", page.to_string())];
-    if let Some(p_size) = page_size {
-        query_params.push(("page_size", p_size.to_string()));
-    } else {
-        query_params.push(("page_size", "30".to_string()));
-    }
+    let mut query_params = vec![
+        ("page", page.to_string()),
+        ("page_size", page_size.unwrap_or(30).to_string()),
+    ];
     if let Some(project) = project {
         query_params.push(("project", project.to_string()));
     }
+    request_scan_list(url, query_params)
+}
 
+/// One page of the project's scans that could be diffed against, newest first.
+///
+/// Filters are server-side, so the answer is usually the first entry of page
+/// one. A backend predating them ignores the unknown parameters and returns
+/// scans of every kind, so the caller must still re-check each scan it acts on
+/// — see `incremental::is_usable_baseline`.
+///
+/// `branch` is `None` for a caller that cannot say which branch is trunk,
+/// which is also the caller whose baseline may name no branch at all. Asking
+/// for one would then exclude exactly the scans it is looking for.
+///
+/// `require_clean` likewise excludes what a git diff cannot use and a checksum
+/// diff can: a scan that reported no dirty flag has unknown scope for a commit
+/// comparison, but its stored checksums describe its contents exactly.
+pub fn query_baseline_scans(
+    url: &str,
+    project: &str,
+    engine: &str,
+    branch: Option<&str>,
+    require_clean: bool,
+    page: u16,
+    page_size: u16,
+) -> Result<ScansResponse, Box<dyn Error>> {
+    let mut query_params = baseline_scan_params(project, engine, require_clean, page, page_size);
+    if let Some(branch) = branch {
+        query_params.push(("branch", branch.to_string()));
+    }
+    request_scan_list(url, query_params)
+}
+
+/// One page of the project's scans of any of `shas` that could be diffed
+/// against, on any branch, newest first.
+///
+/// A backend that takes a single `sha` reads the list as one literal commit
+/// and matches nothing. One predating the `sha` filter ignores it and answers
+/// with scans at any commit, so callers must re-check `git_sha` on every scan
+/// they act on.
+pub fn query_baseline_scans_at_commits(
+    url: &str,
+    project: &str,
+    engine: &str,
+    shas: &[String],
+    require_clean: bool,
+    page: u16,
+    page_size: u16,
+) -> Result<ScansResponse, Box<dyn Error>> {
+    let mut query_params = baseline_scan_params(project, engine, require_clean, page, page_size);
+    query_params.push(("sha", shas.join(",")));
+    request_scan_list(url, query_params)
+}
+
+fn baseline_scan_params(
+    project: &str,
+    engine: &str,
+    require_clean: bool,
+    page: u16,
+    page_size: u16,
+) -> Vec<(&'static str, String)> {
+    let mut query_params = vec![
+        ("page", page.to_string()),
+        ("page_size", page_size.to_string()),
+        ("project", project.to_string()),
+        ("engine", engine.to_string()),
+        ("status", "complete".to_string()),
+        ("exclude_pull_requests", "true".to_string()),
+        // A partial scan's findings cover only the files it was pointed at,
+        // so copying forward from one would drop everything else.
+        ("full_project_state", "true".to_string()),
+    ];
+    if require_clean {
+        query_params.push(("worktree_dirty", "false".to_string()));
+    }
+    query_params
+}
+
+/// One page of the project's scans at exactly `sha`, newest first.
+///
+/// The `sha` filter is server-side, but a backend that predates it ignores the
+/// unknown parameter and answers with the project's scans at any commit, so
+/// callers must re-check `git_sha` on every scan they act on.
+pub fn query_scans_for_commit(
+    url: &str,
+    project: &str,
+    sha: &str,
+    page: u16,
+    page_size: u16,
+) -> Result<ScansResponse, Box<dyn Error>> {
+    request_scan_list(
+        url,
+        vec![
+            ("page", page.to_string()),
+            ("page_size", page_size.to_string()),
+            ("project", project.to_string()),
+            ("sha", sha.to_string()),
+        ],
+    )
+}
+
+/// The gzipped file manifest stored with `scan_id`.
+///
+/// Returned as bytes rather than parsed here: the server keeps them verbatim
+/// and never reads them, so the only thing that can tell whether they survived
+/// is the digest check `Manifest::decode` does against the root the scan list
+/// reported.
+pub fn download_scan_file_manifest(url: &str, scan_id: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    let url = format!("{}{}/scan/{}/file-manifest", url, API_BASE, scan_id);
+    debug(&format!("Sending request to URL: {}", url));
+    let response = http_client()
+        .get(url)
+        .send()
+        .map_err(|e| format!("API request failed: {}", e))?;
+    check_for_warnings(response.headers(), response.status());
+    if !response.status().is_success() {
+        return Err(format!("API request failed with status: {}", response.status()).into());
+    }
+    Ok(response.bytes()?.to_vec())
+}
+
+fn request_scan_list(
+    url: &str,
+    query_params: Vec<(&str, String)>,
+) -> Result<ScansResponse, Box<dyn Error>> {
+    let url = format!("{}{}/scans", url, API_BASE);
     let client = http_client();
     debug(&format!("Sending request to URL: {}", url));
     let response = match client.get(url).query(&query_params).send() {
@@ -829,6 +1429,88 @@ pub fn query_scan_list(
         Ok(api_response)
     } else {
         Err(format!("API request failed with status: {}", response.status()).into())
+    }
+}
+
+/// Project-level path rules a client needs before it packages a scan.
+#[derive(Deserialize, Debug, Default, PartialEq, Eq)]
+pub struct ScanSettings {
+    /// Patterns that force files into the scan even when Corgea would classify
+    /// them as vendored, third-party, generated or test code.
+    #[serde(default, deserialize_with = "patterns_without_nulls")]
+    pub include_paths: Vec<String>,
+    #[serde(default, deserialize_with = "patterns_without_nulls")]
+    pub ignore_paths: Vec<String>,
+}
+
+/// A rule saved without a pattern is listed as `null`. It matches nothing, so
+/// it is dropped rather than failing the whole read.
+fn patterns_without_nulls<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<Option<String>>>::deserialize(deserializer)?
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct ScanSettingsResponse {
+    #[serde(default)]
+    settings: ScanSettings,
+}
+
+/// GET /api/v1/scan/configs — the project's ignore and include rules.
+///
+/// `Ok(None)` only for a 404, which is a backend predating the endpoint: it has
+/// no rules to apply, so the caller proceeds with just its own flags. Anything
+/// else is an `Err`, because reading zero rules from a broken lookup and
+/// reading zero rules from a project that has none are not the same thing.
+pub fn query_scan_settings(
+    url: &str,
+    project_name: &str,
+    repo_url: Option<&str>,
+) -> Result<Option<ScanSettings>, Box<dyn Error>> {
+    let request_url = format!("{}{}/scan/configs", url, API_BASE);
+    let client = http_client();
+    let mut query = vec![("project_name", project_name.to_string())];
+    if let Some(repo_url) = repo_url {
+        // A git origin can embed a token (`https://oauth2:glpat-x@host/...`).
+        // Strip it before it reaches a query string, a proxy log, or --verbose.
+        query.push((
+            "repo_url",
+            utils::generic::strip_remote_credentials(repo_url),
+        ));
+    }
+    debug(&format!(
+        "Reading project scan settings from {} ({:?})",
+        request_url, query
+    ));
+    // Pre-flight lookup whose failure path is "run without the project's
+    // rules", so it must not sit behind the 150s default: a hung endpoint would
+    // otherwise add minutes to every scan before falling back.
+    let response = client
+        .get(&request_url)
+        .query(&query)
+        .timeout(SETTINGS_REQUEST_TIMEOUT)
+        .send()?;
+    check_for_warnings(response.headers(), response.status());
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(format!("/scan/configs request failed: HTTP {}", status).into());
+    }
+    let text = response.text()?;
+    match serde_json::from_str::<ScanSettingsResponse>(&text) {
+        Ok(parsed) => Ok(Some(parsed.settings)),
+        Err(e) => {
+            debug(&format!("/scan/configs response body: {}", text));
+            Err(format!("Failed to parse the /scan/configs response: {}", e).into())
+        }
     }
 }
 
@@ -1142,10 +1824,9 @@ pub fn exchange_code_for_token(
     base_url: &str,
     code: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let client = reqwest::blocking::Client::new();
     let exchange_url = format!("{}{}/authorize", base_url, API_BASE);
 
-    let response = client
+    let response = SHARED_CLIENT
         .get(&exchange_url)
         .header("CORGEA-SOURCE", source())
         .query(&[("code", code)])
@@ -1423,7 +2104,42 @@ pub struct WebappVersionResponse {
     pub version: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+/// One scanner problem reported against a scan, already sanitized server-side.
+///
+/// Every field is optional so a server that omits any of them still parses.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct ScanErrorSummary {
+    pub scan_type: Option<String>,
+    pub level: Option<String>,
+    pub location: Option<String>,
+    pub message: Option<String>,
+}
+
+impl ScanErrorSummary {
+    /// Whether this entry means the scan is missing results.
+    ///
+    /// `info` entries are notes. Everything else counts, including absent or
+    /// unrecognized levels, which the server treats as `error`.
+    pub fn is_problem(&self) -> bool {
+        !self
+            .level
+            .as_deref()
+            .is_some_and(|level| level.trim().eq_ignore_ascii_case("info"))
+    }
+}
+
+/// Reads a missing field, an explicit `null`, and a list all as a list.
+///
+/// `#[serde(default)]` alone only covers the missing case, and the API sends
+/// `"scan_errors": null` for scans with nothing to report.
+fn scan_errors_or_empty<'de, D>(deserializer: D) -> Result<Vec<ScanErrorSummary>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<ScanErrorSummary>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ScanResponse {
     pub id: String,
     pub project: String,
@@ -1434,8 +2150,43 @@ pub struct ScanResponse {
     pub created_at: String,
     #[serde(default)]
     pub git_sha: Option<String>,
+    /// Whether the scanned tree carried uncommitted changes. `None` when the
+    /// scan predates the flag or came from a client that never sent it, which
+    /// is not the same as a known-clean tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_dirty: Option<bool>,
+    /// Set when the scan belongs to a pull request rather than to a branch
+    /// build. Carried by the scan list only; `GET /scan/{id}` omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request_id: Option<String>,
+    /// Digest of the file manifest stored with this scan, `None` when it has
+    /// none — an older client, a partial upload, or a deployment predating the
+    /// field. Its presence is what says the manifest is there to download.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_manifest_root: Option<String>,
+    /// Serialization of that manifest. A version this client does not read is
+    /// left alone rather than guessed at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_manifest_version: Option<String>,
+    /// The project's ignore rules as they applied to this scan. It holds no
+    /// findings for the files they matched. `None` from a backend predating
+    /// the field, or for a scan predating the rules being recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_paths: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// Why a scan ended without finishing. Only set for failed scans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_reason: Option<String>,
+    /// Per-scanner problems, present on completed scans too, where they mean a
+    /// scanner's results are missing. Skipped when empty, since the scan list
+    /// never carries them.
+    #[serde(
+        default,
+        deserialize_with = "scan_errors_or_empty",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub scan_errors: Vec<ScanErrorSummary>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -1473,6 +2224,39 @@ pub struct Issue {
     pub details: Option<Details>,
     pub auto_triage: AutoTriage,
     pub auto_fix_suggestion: Option<AutoFixSuggestion>,
+    /// Scanner identifiers recorded by the fix analysis. List and scan-report
+    /// JSON re-emit this struct, so the maps stay off `Serialize`. `inspect
+    /// --json` copies them back onto the printed object.
+    #[serde(default, skip_serializing)]
+    pub scanner_metadata: Option<serde_json::Map<String, Value>>,
+    /// Identifiers the originating scanner reported for the finding (e.g.
+    /// Fortify `instance_id`, `class_id`, `kingdom`). Sent only when the issue
+    /// is fetched with `include_metadata=true`.
+    #[serde(default, skip_serializing)]
+    pub metadata: Option<serde_json::Map<String, Value>>,
+}
+
+impl Issue {
+    /// Both metadata sources merged for display; the issue's own scanner
+    /// identifiers win over the fix analysis copy on key collisions.
+    pub fn combined_scanner_metadata(&self) -> Vec<(String, String)> {
+        let mut merged = std::collections::BTreeMap::new();
+        for source in [&self.scanner_metadata, &self.metadata]
+            .into_iter()
+            .flatten()
+        {
+            for (key, value) in source {
+                let rendered = match value {
+                    Value::Null => continue,
+                    Value::String(text) if text.trim().is_empty() => continue,
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                merged.insert(key.clone(), rendered);
+            }
+        }
+        merged.into_iter().collect()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -1715,6 +2499,73 @@ mod tests {
     use reqwest::header::{HeaderMap, HeaderValue};
 
     #[test]
+    fn issue_json_omits_scanner_metadata_that_list_and_scan_reports_reemit() {
+        // `corgea list --json` and `corgea scan --out-format json` serialize
+        // `Issue` directly. The list API sends `scanner_metadata`; writing it
+        // back would change those outputs, and the blocking-rules list path
+        // would then drop it again.
+        let raw = r#"{
+            "id": "issue-1",
+            "scan_id": "scan-1",
+            "status": "open",
+            "urgency": "HI",
+            "created_at": "2026-01-01T00:00:00Z",
+            "classification": {"id": "c", "name": "n", "description": null},
+            "location": {
+                "file": {"name": "a.py", "language": "python", "path": "a.py"},
+                "line_number": 1,
+                "project": {"name": "p", "branch": null, "git_sha": null}
+            },
+            "details": null,
+            "auto_triage": {"false_positive_detection": {"status": "pending", "reasoning": null}},
+            "auto_fix_suggestion": null,
+            "scanner_metadata": {"kingdom": "Encapsulation", "scanner": "fortify"},
+            "metadata": {"instance_id": "ABC", "kingdom": "Encapsulation"}
+        }"#;
+
+        let issue: Issue = serde_json::from_str(raw).unwrap();
+        let merged = issue.combined_scanner_metadata();
+        assert_eq!(
+            merged
+                .iter()
+                .find(|(key, _)| key == "kingdom")
+                .map(|(_, value)| value.as_str()),
+            Some("Encapsulation")
+        );
+        assert!(merged.iter().any(|(key, _)| key == "scanner"));
+        assert!(merged.iter().any(|(key, _)| key == "instance_id"));
+
+        let rendered = serde_json::to_value(&issue).unwrap();
+        assert!(rendered.get("scanner_metadata").is_none());
+        assert!(rendered.get("metadata").is_none());
+        assert_eq!(rendered["id"], "issue-1");
+    }
+
+    #[test]
+    fn a_scan_from_a_deployment_without_manifests_parses_as_having_none() {
+        // The fields are absent, not null, on a backend predating them. Without
+        // a default that is a parse error, which would take out the whole
+        // baseline lookup -- including the git diff, which needs nothing new.
+        let legacy = r#"{
+            "id": "scan-1",
+            "project": "proj",
+            "repo": null,
+            "branch": "main",
+            "status": "complete",
+            "engine": "corgea-blast",
+            "created_at": "2026-01-01T00:00:00Z",
+            "git_sha": "abc123",
+            "worktree_dirty": false
+        }"#;
+
+        let parsed: ScanResponse = serde_json::from_str(legacy).unwrap();
+
+        assert_eq!(parsed.file_manifest_root, None);
+        assert_eq!(parsed.file_manifest_version, None);
+        assert_eq!(parsed.git_sha.as_deref(), Some("abc123"));
+    }
+
+    #[test]
     fn blocking_rule_response_defaults_status_when_missing() {
         let legacy = r#"{"block":false,"blocking_issues":[],"total_pages":1}"#;
         let parsed: BlockingRuleResponse = serde_json::from_str(legacy).unwrap();
@@ -1760,6 +2611,24 @@ mod tests {
     }
 
     #[test]
+    fn scan_settings_drop_rules_saved_without_a_pattern() {
+        let parsed: ScanSettingsResponse = serde_json::from_str(
+            r#"{"settings": {"include_paths": null, "ignore_paths": ["vendor/**", null]}}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            parsed.settings,
+            ScanSettings {
+                include_paths: vec![],
+                ignore_paths: vec!["vendor/**".to_string()],
+            }
+        );
+        let missing: ScanSettingsResponse =
+            serde_json::from_str(r#"{"settings": {}}"#).expect("parses");
+        assert_eq!(missing.settings, ScanSettings::default());
+    }
+
+    #[test]
     fn scan_response_deserializes_git_sha_and_defaults_when_missing() {
         let with_sha = r#"{
             "id": "s1",
@@ -1785,6 +2654,16 @@ mod tests {
         }"#;
         let parsed: ScanResponse = serde_json::from_str(without_sha).unwrap();
         assert_eq!(parsed.git_sha, None);
+        // A backend predating `ignore_paths` omits it; a scan predating the
+        // stamp reports null. Neither may fail the scan list.
+        assert_eq!(parsed.ignore_paths, None);
+        let mut value: serde_json::Value = serde_json::from_str(without_sha).unwrap();
+        value["ignore_paths"] = serde_json::Value::Null;
+        let parsed: ScanResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.ignore_paths, None);
+        value["ignore_paths"] = serde_json::json!(["vendor/**"]);
+        let parsed: ScanResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.ignore_paths, Some(vec!["vendor/**".to_string()]));
     }
 
     #[test]
@@ -1928,6 +2807,8 @@ mod tests {
 
     use std::cell::Cell;
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
@@ -2066,6 +2947,19 @@ mod tests {
             }
         });
         base
+    }
+
+    #[test]
+    fn unauthenticated_requests_send_cli_version() {
+        let (base, requests) = corgea::vuln_api_stub::spawn_capturing_vuln_api_stub();
+        let _ = exchange_code_for_token(&base, "code");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            corgea::vuln_api_stub::header_value(&requests[0], corgea::vuln_api::CLI_VERSION_HEADER)
+                .as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]
@@ -2314,6 +3208,407 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    /// Answers the first `failures` requests with 502, then 200. Returns the
+    /// base URL and the request counter.
+    fn spawn_gateway_stub(failures: usize) -> (String, Arc<AtomicUsize>) {
+        // What a proxy in front of the API actually returns: HTML, not the JSON
+        // envelope every endpoint parses.
+        spawn_failing_stub(
+            failures,
+            "502 Bad Gateway",
+            "",
+            "<html><body>502 Bad Gateway</body></html>",
+        )
+    }
+
+    /// Answers the first `failures` requests with 429, then 200.
+    fn spawn_rate_limited_stub(failures: usize) -> (String, Arc<AtomicUsize>) {
+        spawn_failing_stub(
+            failures,
+            "429 Too Many Requests",
+            "",
+            r#"{"message":"rate limit exceeded"}"#,
+        )
+    }
+
+    fn spawn_failing_stub(
+        failures: usize,
+        status_line: &'static str,
+        extra_headers: &'static str,
+        body: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
+        use std::io::Write;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = corgea::vuln_api_stub::read_http_request(&mut stream);
+                let served = counter.fetch_add(1, Ordering::SeqCst);
+                let response = if served < failures {
+                    corgea::vuln_api_stub::http_response(status_line, extra_headers, body)
+                } else {
+                    corgea::vuln_api_stub::http_response("200 OK", "", r#"{"status":"ok"}"#)
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (base, hits)
+    }
+
+    #[test]
+    fn transient_retry_schedule_is_the_documented_one() {
+        // The customer contract: retry after 10s, 30s and 50s, then fail.
+        assert_eq!(
+            TRANSIENT_RETRY_DELAYS,
+            [
+                Duration::from_secs(10),
+                Duration::from_secs(30),
+                Duration::from_secs(50)
+            ]
+        );
+        for code in [429, 502, 504, 520, 521, 522, 523, 524] {
+            assert!(is_transient_error(status(code)), "{code}");
+        }
+        // Everything else is the API answering for itself, including the other
+        // 5xx: those are not what the pipelines are hitting, and replaying an
+        // upload the server did read is not free. 525, 526 and 530 are
+        // Cloudflare too, but a broken certificate or DNS record does not fix
+        // itself within the schedule.
+        for code in [200, 401, 404, 500, 503, 525, 526, 530] {
+            assert!(!is_transient_error(status(code)), "{code}");
+        }
+    }
+
+    fn status(code: u16) -> StatusCode {
+        StatusCode::from_u16(code).unwrap()
+    }
+
+    #[test]
+    fn retry_delay_override_falls_back_to_the_schedule_when_unusable() {
+        assert_eq!(parse_retry_delays(None), TRANSIENT_RETRY_DELAYS.to_vec());
+        assert_eq!(
+            parse_retry_delays(Some("50, 100")),
+            vec![Duration::from_millis(50), Duration::from_millis(100)]
+        );
+        // A typo must not quietly leave the CLI without retries.
+        for raw in ["", "abc", "50,,100", "1.5"] {
+            assert_eq!(
+                parse_retry_delays(Some(raw)),
+                TRANSIENT_RETRY_DELAYS.to_vec(),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_reads_only_a_whole_number_of_seconds_and_is_capped() {
+        let header = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(reqwest::header::RETRY_AFTER, value.parse().unwrap());
+            headers
+        };
+        assert_eq!(
+            retry_after(&header("30")),
+            Some(Duration::from_secs(30)),
+            "the delta-seconds form is what a rate limiter sends"
+        );
+        assert_eq!(
+            retry_after(&header("99999")),
+            Some(MAX_RETRY_AFTER),
+            "one header must not be able to stall a pipeline indefinitely"
+        );
+        assert_eq!(retry_after(&HeaderMap::new()), None);
+        // The HTTP-date form and anything malformed fall back to the schedule
+        // rather than being read as a pause of zero.
+        for raw in ["Wed, 21 Oct 2026 07:28:00 GMT", "", "soon", "1.5", "-5"] {
+            assert_eq!(retry_after(&header(raw)), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn send_retries_bad_gateway_until_the_server_answers() {
+        let (base, hits) = spawn_gateway_stub(2);
+
+        let response = http_client().get(&base).send().expect("send");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "two 502s, then the answer");
+    }
+
+    #[test]
+    fn send_gives_up_after_the_last_retry() {
+        let (base, hits) = spawn_gateway_stub(usize::MAX);
+
+        let response = http_client().get(&base).send().expect("send");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            TRANSIENT_RETRY_DELAYS.len() + 1,
+            "the caller must see the 502 once the retries are spent"
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_is_retried_for_every_method_and_a_gateway_error_only_for_reads() {
+        // 429 is the rate limiter declining the request before the API sees it,
+        // so nothing was created and re-sending finishes the same work.
+        for method in [
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ] {
+            assert!(
+                should_retry(StatusCode::TOO_MANY_REQUESTS, &method),
+                "{method} should be retried after a rate limit"
+            );
+        }
+        // 502 comes from the proxy, which cannot say whether the API acted, and
+        // every write the CLI sends creates something.
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS, Method::TRACE] {
+            assert!(should_retry(StatusCode::BAD_GATEWAY, &method), "{method}");
+        }
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            assert!(
+                !should_retry(StatusCode::BAD_GATEWAY, &method),
+                "{method} must be sent once"
+            );
+        }
+        // Nothing else is retried for any method: the API answering for itself
+        // is an answer.
+        for status in [
+            StatusCode::OK,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(!should_retry(status, &Method::GET), "{status}");
+            assert!(!should_retry(status, &Method::POST), "{status}");
+        }
+    }
+
+    #[test]
+    fn cloudflare_gateway_errors_are_retried_only_for_reads() {
+        // A proxy's word on the request, not the API's: only reads go again.
+        for code in [504, 520, 521, 522, 523, 524] {
+            for method in [Method::GET, Method::HEAD] {
+                assert!(should_retry(status(code), &method), "{code} {method}");
+            }
+            for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+                assert!(
+                    !should_retry(status(code), &method),
+                    "{code} {method} must be sent once"
+                );
+            }
+        }
+        for code in [525, 526, 530] {
+            assert!(!should_retry(status(code), &Method::GET), "{code}");
+        }
+    }
+
+    #[test]
+    fn send_retries_a_cloudflare_timeout_on_a_read() {
+        let (base, hits) = spawn_failing_stub(
+            2,
+            "524 A Timeout Occurred",
+            "",
+            "<html><body>error code: 524</body></html>",
+        );
+
+        let response = http_client().get(&base).send().expect("send");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "two 524s, then the answer");
+    }
+
+    #[test]
+    fn send_leaves_a_post_at_one_attempt_on_a_cloudflare_timeout() {
+        // The origin took the request and was still working on it when
+        // Cloudflare gave up; sending it again would start a second scan.
+        let (base, hits) = spawn_failing_stub(
+            usize::MAX,
+            "524 A Timeout Occurred",
+            "",
+            "<html><body>error code: 524</body></html>",
+        );
+
+        let response = http_client().post(&base).body("{}").send().expect("send");
+
+        assert_eq!(response.status().as_u16(), 524);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn send_leaves_a_post_at_one_attempt_when_the_origin_is_down() {
+        let (base, hits) = spawn_failing_stub(
+            usize::MAX,
+            "521 Web Server Is Down",
+            "",
+            "<html><body>error code: 521</body></html>",
+        );
+
+        let response = http_client().post(&base).body("{}").send().expect("send");
+
+        assert_eq!(response.status().as_u16(), 521);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_schedule_stops_after_its_retries_and_any_other_answer_resets_it() {
+        let mut retries = TransientRetries::new("GET /api/v1/scan/s1");
+        for _ in 0..TRANSIENT_RETRY_DELAYS.len() {
+            assert!(retries.wait_for_retry(StatusCode::BAD_GATEWAY, &Method::GET, None));
+        }
+        assert!(
+            !retries.wait_for_retry(StatusCode::BAD_GATEWAY, &Method::GET, None),
+            "the fourth 502 is the answer, not a fourth retry"
+        );
+
+        // Any other answer puts the full schedule back, so a later blip is
+        // retried rather than counted against the last one.
+        assert!(!retries.wait_for_retry(StatusCode::OK, &Method::GET, None));
+        for _ in 0..TRANSIENT_RETRY_DELAYS.len() {
+            assert!(retries.wait_for_retry(StatusCode::TOO_MANY_REQUESTS, &Method::GET, None));
+        }
+        assert!(!retries.wait_for_retry(StatusCode::TOO_MANY_REQUESTS, &Method::GET, None));
+    }
+
+    /// The pauses the schedule has asked for on this thread, forgetting them.
+    fn drain_recorded_waits() -> Vec<Duration> {
+        RECORDED_WAITS.with(|waits| std::mem::take(&mut *waits.borrow_mut()))
+    }
+
+    #[test]
+    fn a_retry_after_lengthens_the_pause_but_never_shortens_it() {
+        let asked_for = TRANSIENT_RETRY_DELAYS[0] + Duration::from_secs(5);
+        let mut retries = TransientRetries::new("POST /api/v1/scan-upload");
+        drain_recorded_waits();
+
+        let rate_limited = |retries: &mut TransientRetries, header| {
+            assert!(retries.wait_for_retry(StatusCode::TOO_MANY_REQUESTS, &Method::POST, header));
+        };
+        // A window the limiter named, longer than the schedule knows about.
+        rate_limited(&mut retries, Some(asked_for));
+        // "Come back immediately", which the schedule floor overrides: a retry
+        // must not become a hammer.
+        rate_limited(&mut retries, Some(Duration::ZERO));
+        // And no header at all, which is the schedule as written.
+        rate_limited(&mut retries, None);
+
+        assert_eq!(
+            drain_recorded_waits(),
+            vec![
+                asked_for,
+                TRANSIENT_RETRY_DELAYS[1],
+                TRANSIENT_RETRY_DELAYS[2]
+            ]
+        );
+    }
+
+    #[test]
+    fn send_leaves_a_post_at_one_attempt_on_a_gateway_error() {
+        let (base, hits) = spawn_gateway_stub(usize::MAX);
+
+        let response = http_client().post(&base).body("{}").send().expect("send");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a 502 on a create has to reach the caller, not be sent again"
+        );
+    }
+
+    #[test]
+    fn send_leaves_a_patch_at_one_attempt_on_a_gateway_error() {
+        // The archive chunk names the byte range it fills, so a replay would
+        // not double the bytes -- but the chunk that fills the last of them is
+        // also the one that answers with `scan_id`, and on an archive under
+        // `CHUNK_SIZE` that is the only chunk. Replaying it risks the second
+        // scan this whole policy exists to prevent.
+        let (base, hits) = spawn_gateway_stub(usize::MAX);
+
+        let response = http_client().patch(&base).body("{}").send().expect("send");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn send_retries_a_rate_limited_post() {
+        let (base, hits) = spawn_rate_limited_stub(2);
+
+        let response = http_client().post(&base).body("{}").send().expect("send");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "two rate limits, then the upload goes through"
+        );
+    }
+
+    #[test]
+    fn send_with_retries_rebuilds_a_rate_limited_multipart_upload() {
+        // The archive and report uploads have streamed bodies with nothing to
+        // clone, so `send` cannot replay them and the call sites rebuild the
+        // form here instead. A rate limit is the case that needs it: the upload
+        // never reached the API, so the CLI has to send it again or leave the
+        // pipeline to be re-run by hand.
+        let (base, hits) = spawn_rate_limited_stub(2);
+
+        let response = send_with_retries("a scan upload", &Method::POST, || {
+            let form = reqwest::blocking::multipart::Form::new().text("field", "value");
+            http_client().post(&base).multipart(form).send()
+        })
+        .expect("send");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn send_with_retries_leaves_a_multipart_upload_at_one_attempt_on_a_gateway_error() {
+        // Rebuilding the form per attempt must not amount to a licence to
+        // replay: this is the path that turned one `corgea scan` into several
+        // scans.
+        let (base, hits) = spawn_gateway_stub(usize::MAX);
+
+        let response = send_with_retries("a scan upload", &Method::POST, || {
+            let form = reqwest::blocking::multipart::Form::new().text("field", "value");
+            http_client().post(&base).multipart(form).send()
+        })
+        .expect("send");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn nested_retry_loops_do_not_multiply_the_attempts() {
+        // A body `send` can clone, inside `send_with_retries`: the two loops
+        // would otherwise each run the schedule, which is sixteen requests and
+        // six minutes of waiting for one upload.
+        let (base, hits) = spawn_rate_limited_stub(usize::MAX);
+
+        let response = send_with_retries("a retryable body", &Method::POST, || {
+            http_client().post(&base).body("{}").send()
+        })
+        .expect("send");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            TRANSIENT_RETRY_DELAYS.len() + 1
+        );
     }
 
     #[test]

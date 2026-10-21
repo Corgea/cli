@@ -1,14 +1,65 @@
 use crate::config::Config;
+use crate::images;
+use crate::incremental::{FullScanCause, FullScanReason};
+use crate::manifest::Manifest;
+use crate::scan::build_scan_url;
 use crate::targets;
 use crate::utils;
 use crate::utils::api::SCAIssue;
 use std::collections::HashMap;
 use std::env;
-use std::error::Error;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use uuid::Uuid;
+use std::time::{Duration, Instant};
+
+/// How many force-included paths to name before collapsing the rest to a count.
+/// Same shape as the `--target` file preview.
+const FORCE_INCLUDE_PREVIEW: usize = 20;
+
+/// Overrides how long `wait_for_scan` polls before giving up.
+const SCAN_TIMEOUT_ENV: &str = "CORGEA_SCAN_TIMEOUT_SECONDS";
+const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(10 * 60 * 60);
+
+/// How long to pause between scan status reads.
+///
+/// Scans run for minutes, so reading more often than this only adds load: at
+/// one read a second, a single wait against the default 10-hour budget can
+/// reach 36,000 requests, and a pipeline scanning in parallel multiplies that
+/// by every concurrent wait. Three seconds costs a pipeline no more than a few
+/// seconds of extra latency on the final status.
+const SCAN_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Overrides how long the CI gate waits for blocking rules to be evaluated.
+const BLOCKING_RULES_TIMEOUT_ENV: &str = "CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS";
+
+/// Export every `--include-image` reference into the scan bundle. Corgea scans
+/// the archives it finds there instead of resolving base images from the source
+/// tree, so a fully built image is scanned as it ships.
+fn export_included_images(
+    images: &[String],
+    temp_dir: &Path,
+) -> Result<Vec<images::SavedImage>, String> {
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    println!(
+        "Including {} container image(s) in this scan. Corgea will scan them instead of the base images referenced in your code.\n",
+        images.len()
+    );
+
+    let archives = images::save_images(images, &temp_dir.join("images"))?;
+
+    println!("\nContainer images bundled with this scan:");
+    for archive in &archives {
+        println!("  {}", archive.description());
+    }
+    println!();
+
+    Ok(archives)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -17,6 +68,8 @@ pub fn run(
     fail: &bool,
     block_on: Option<String>,
     only_uncommitted: &bool,
+    disable_incremental: &bool,
+    ignore_dirty_worktree_for_run: &bool,
     metadata: Option<String>,
     scan_type: Option<String>,
     policy: Option<String>,
@@ -24,8 +77,12 @@ pub fn run(
     out_file: Option<String>,
     target: Option<String>,
     exclude: Option<String>,
+    include: Vec<String>,
     project_name: Option<String>,
     sbom: Option<String>,
+    include_images: Vec<String>,
+    skip_recent: Option<crate::skip_scan::SkipRecentScan>,
+    ignore_dirty_worktree: &bool,
 ) {
     // Validate that only_uncommitted and target are not used together
     if *only_uncommitted && target.is_some() {
@@ -48,218 +105,70 @@ pub fn run(
             }
         }
     }
-    println!("\nScanning with BLAST 🚀🚀🚀");
 
-    if let Some(scan_type) = &scan_type {
-        println!("Running Scan Type: {}", scan_type);
-    }
-    if let Some(policy) = &policy {
-        println!(
-            "Including only specified policies for policy scan: {}",
-            policy
-        );
-    }
-    println!("\n\n");
-    let temp_dir = env::temp_dir().join(format!("corgea/tmp/{}", Uuid::new_v4()));
-    fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
     let project_name = utils::generic::determine_project_name(project_name.as_deref());
-    let zip_path = format!("{}/{}.zip", temp_dir.display(), project_name);
-    let repo_info = utils::generic::get_repo_info("./").unwrap_or_default();
-    match utils::generic::create_path_if_not_exists(&temp_dir) {
-        Ok(_) => (),
-        Err(e) => {
-            log::error!(
-                "\n\nOops! Something went wrong while creating the directory at '{}'.\nPlease check if you have the necessary permissions or if the path is valid.\nError details:\n{}\n\n", 
-                temp_dir.display(), e
-            );
-            std::process::exit(1);
-        }
-    }
 
-    let stop_signal = Arc::new(Mutex::new(false));
-    let stop_signal_clone = Arc::clone(&stop_signal);
-    let packaging_thread = thread::spawn(move || {
-        utils::terminal::show_loading_message(
-            "Packaging your project... ([T]s)",
-            stop_signal_clone,
-        );
+    // Resolved before the reuse decision, not inside start_new_scan: a
+    // reusable scan predates any include rule, so reusing it would leave the
+    // files the rule forces in unscanned. `--include` already refuses the reuse
+    // flag in clap; the project's own rules are invisible to clap, so they are
+    // checked here.
+    let include_rules = crate::include_rules::resolve(
+        config,
+        &project_name,
+        utils::generic::get_repo_info("./")
+            .unwrap_or_default()
+            .and_then(|info| info.repo_url)
+            .as_deref(),
+        &include,
+    );
+
+    // A reused scan stands in for the new one: everything below this point —
+    // the results table, the blocking-rule gate, the report file — runs against
+    // whichever scan id this resolves to.
+    let reused_scan = skip_recent.as_ref().and_then(|skip| {
+        if let Some(reason) = include_rules.reuse_refusal() {
+            println!("Scanning instead of reusing a previous scan: {reason}.");
+            // The flag promises this marker on every run, and reuse was
+            // declined before resolve_reusable_scan could print it.
+            crate::skip_scan::report_scan_not_skipped();
+            return None;
+        }
+        crate::skip_scan::resolve_reusable_scan(
+            config,
+            &project_name,
+            skip,
+            exclude.as_deref(),
+            *ignore_dirty_worktree,
+            include_rules.project_ignore_paths.as_deref(),
+        )
     });
 
-    let target_str: Option<&str> = if *only_uncommitted {
-        Some("git:staged,git:modified,git:untracked")
-    } else {
-        target.as_deref()
-    };
-
-    if target_str.is_none() && exclude.is_some() {
-        println!("Excluding files matching: {}", exclude.as_deref().unwrap());
-    }
-
-    if let Some(target_value) = target_str {
-        match targets::resolve_targets_with_exclude(target_value, exclude.as_deref()) {
-            Ok(result) => {
-                if result.files.is_empty() {
-                    *stop_signal.lock().unwrap() = true;
-                    let _ = packaging_thread.join();
-                    print!(
-                        "\r{}",
-                        utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
-                    );
-                    log::error!("\n\nError: target resolved to zero files.\n");
-                    log::error!("Target value: {}\n", target_value);
-                    log::error!("Segment results:");
-                    for segment_result in &result.segments {
-                        if let Some(ref error) = segment_result.error {
-                            log::error!("  {}: ERROR - {}", segment_result.segment, error);
-                        } else {
-                            log::error!(
-                                "  {}: {} matches",
-                                segment_result.segment,
-                                segment_result.matches
-                            );
-                        }
-                    }
-                    log::error!("\nPlease check your target specification and try again.\n");
-                    std::process::exit(1);
-                }
-
-                let file_count = result.files.len();
-                if *only_uncommitted {
-                    println!("\rFiles to be submitted for partial scan:\n");
-                    for (index, file) in result.files.iter().enumerate() {
-                        if let Ok(relative) =
-                            file.strip_prefix(std::env::current_dir().unwrap_or_default())
-                        {
-                            println!("{}: {}", index + 1, relative.display());
-                        } else {
-                            println!("{}: {}", index + 1, file.display());
-                        }
-                    }
-                    println!();
-                } else {
-                    println!("Scanning {} files (target mode)", file_count);
-
-                    let display_count = std::cmp::min(20, file_count);
-                    for file in result.files.iter().take(display_count) {
-                        if let Ok(relative) =
-                            file.strip_prefix(std::env::current_dir().unwrap_or_default())
-                        {
-                            println!("  {}", relative.display());
-                        } else {
-                            println!("  {}", file.display());
-                        }
-                    }
-                    if file_count > display_count {
-                        println!("  (+{} more)", file_count - display_count);
-                    }
-                    println!();
-                }
-            }
-            Err(e) => {
-                *stop_signal.lock().unwrap() = true;
-                let _ = packaging_thread.join();
-                print!(
-                    "\r{}",
-                    utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
-                );
-                log::error!("\n\nError resolving targets: {}\n", e);
-                std::process::exit(1);
-            }
-        }
-    }
-
-    match utils::generic::create_zip_from_target(target_str, &zip_path, None, exclude.as_deref()) {
-        Ok(added_files) => {
-            if added_files.is_empty() {
-                *stop_signal.lock().unwrap() = true;
-                let _ = packaging_thread.join();
-                print!(
-                    "\r{}",
-                    utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
-                );
-                if *only_uncommitted {
-                    log::error!(
-                        "\n\nOops! It seems there are no scannable uncommitted changes in your project.\nYou may have uncommitted changes, but none match the types of files we can scan.\n\n"
-                    );
-                } else {
-                    log::error!("\n\nOops! No valid files found to scan after filtering.\n\n");
-                }
-                std::process::exit(1);
-            }
-        }
-        Err(e) => {
-            *stop_signal.lock().unwrap() = true;
-            let _ = packaging_thread.join();
-            print!(
-                "\r{}",
-                utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
-            );
-            log::error!(
-                "\n\nUh-oh! We couldn't package your project at '{}'.\nThis might be due to insufficient permissions, invalid file paths, or a file system error.\nPlease check the directory and try again.\nError details:\n{}\n\n", 
-                zip_path, e
-            );
-            std::process::exit(1);
-        }
-    }
-    *stop_signal.lock().unwrap() = true;
-    let _ = packaging_thread.join();
-    print!(
-        "\r{}Project packaged successfully.\n",
-        utils::terminal::set_text_color("", utils::terminal::TerminalColor::Green)
-    );
-    println!("\n\nSubmitting scan to Corgea:");
-    let upload_result = match utils::api::upload_zip(
-        &zip_path,
-        &config.get_url(),
-        &project_name,
-        repo_info,
-        scan_type,
-        policy,
-        metadata,
-    ) {
-        Ok(result) => result,
-        Err(e) => {
-            log::error!("\n\nOh no! We encountered an issue while uploading the zip file '{}' to the server.\nPlease ensure that:
-    - Blast is enabled on your Corgea account.
-    - Your network connection is stable.
-    - The server URL '{}' is correct.
-    - Your authentication token is valid.\n\n
-    
-    Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli
-
-    Error details:\n\n {}",
-                zip_path,
-                config.get_url(),
-                e
-            );
-            std::process::exit(1);
-        }
-    };
-
-    let scan_id = upload_result.scan_id;
-    let scan_url = match &upload_result.project_id {
-        Some(pid) => format!("{}/project/{}/?scan_id={}", config.get_url(), pid, scan_id),
-        None => format!(
-            "{}/project/{}?scan_id={}",
-            config.get_url(),
-            project_name,
-            scan_id
+    let (scan_id, project_id) = match reused_scan {
+        Some(scan) => (scan.id, None),
+        None => start_new_scan(
+            config,
+            &project_name,
+            only_uncommitted,
+            disable_incremental,
+            ignore_dirty_worktree_for_run,
+            metadata,
+            scan_type,
+            policy,
+            target,
+            exclude,
+            include_rules,
+            include_images,
         ),
     };
 
-    let _ = utils::generic::delete_directory(&temp_dir);
-    print!(
-        "\n\nScan has started with ID: {}.\n\nYou can view it populate at the link:\n{}\n\n",
-        scan_id,
-        utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
+    let scan_url = build_scan_url(
+        &config.get_url(),
+        project_id.as_deref(),
+        &project_name,
+        &scan_id,
     );
 
-    print!(
-       "{}",
-       utils::terminal::set_text_color("Your scan will continue securely in the Corgea cloud.\nYou can safely exit the process now if you prefer not to wait for it to complete.\n\n", utils::terminal::TerminalColor::Blue)
-    );
-
-    wait_for_scan(config, &scan_id);
     let stop_signal = Arc::new(Mutex::new(false));
     let stop_signal_clone = Arc::clone(&stop_signal);
     let results_thread = thread::spawn(move || {
@@ -304,6 +213,22 @@ pub fn run(
             std::process::exit(1);
         }
     };
+    // The report and the SBOM are produced before the blocking-rule gates: a
+    // tripped gate exits 1, and a pipeline that fails on policy is exactly the
+    // one that needs the report, to ingest the findings it failed on.
+    write_scan_report(
+        config,
+        &project_name,
+        &scan_id,
+        &classifications,
+        out_format.as_deref(),
+        out_file.as_deref(),
+    );
+
+    if let Some(sbom_file) = sbom {
+        write_sbom(&sbom_file);
+    }
+
     if *fail {
         log::warn!(
             "\n--fail is deprecated: it evaluates every active blocking rule regardless of whether it applies to pull requests or CI. Use --block-on <slug> to name the CI blocking rules this pipeline should enforce."
@@ -344,117 +269,6 @@ pub fn run(
             "\nNo issues violated the blocking rule(s): {}.",
             utils::terminal::set_text_color(block_on, utils::terminal::TerminalColor::Green)
         );
-    }
-
-    if let Some(out_file) = out_file {
-        if let Some(out_format) = out_format {
-            let stop_signal = Arc::new(Mutex::new(false));
-            let stop_signal_clone = Arc::clone(&stop_signal);
-            let results_thread = thread::spawn(move || {
-                utils::terminal::show_loading_message(
-                    "Generating scan report... ([T]s)",
-                    stop_signal_clone,
-                );
-            });
-
-            if out_format == "json" {
-                let issues = match utils::api::get_all_issues(
-                    &config.get_url(),
-                    &project_name,
-                    Some(scan_id.clone()),
-                ) {
-                    Ok(issues) => issues,
-                    Err(e) => {
-                        log::error!("\n\nFailed to fetch issues: {}\n\n", e);
-                        std::process::exit(1);
-                    }
-                };
-                let sca_issues = match utils::api::get_all_sca_issues(
-                    &config.get_url(),
-                    &project_name,
-                    Some(scan_id.clone()),
-                ) {
-                    Ok(issues) => issues,
-                    Err(e) => {
-                        log::error!("\n\nFailed to fetch SCA issues: {}\n\n", e);
-                        std::process::exit(1);
-                    }
-                };
-                let json = serde_json::to_string_pretty(&issues).unwrap();
-                let sca_json = serde_json::to_string_pretty(&sca_issues).unwrap();
-                let report_json = serde_json::to_string_pretty(&classifications).unwrap();
-                let results_json = format!(
-                    "{{\"issues\": {}, \"sca_issues\": {}, \"report\": {}}}",
-                    json, sca_json, report_json
-                );
-                *stop_signal.lock().unwrap() = true;
-                let _ = results_thread.join();
-                fs::write(out_file.clone(), results_json).expect("Failed to write JSON file, check if the file path is valid and you have the necessary permissions to write to it.");
-                utils::terminal::clear_previous_line();
-                println!("\n\nScan results written to: {}\n\n", out_file.clone());
-            } else if out_format == "html" {
-                let report = match utils::api::get_scan_report(&config.get_url(), &scan_id, None) {
-                    Ok(html) => html,
-                    Err(e) => {
-                        log::error!("\n\nFailed to fetch scan report: {}\n\n", e);
-                        std::process::exit(1);
-                    }
-                };
-                *stop_signal.lock().unwrap() = true;
-                let _ = results_thread.join();
-                fs::write(out_file.clone(), report).expect("\n\nFailed to write HTML file, check if the file path is valid and you have the necessary permissions to write to it.");
-                utils::terminal::clear_previous_line();
-                println!("\n\nScan report written to: {}\n\n", out_file.clone());
-            } else if out_format == "sarif" {
-                let report =
-                    match utils::api::get_scan_report(&config.get_url(), &scan_id, Some("sarif")) {
-                        Ok(sarif) => sarif,
-                        Err(e) => {
-                            log::error!("\n\nFailed to fetch SARIF report: {}\n\n", e);
-                            std::process::exit(1);
-                        }
-                    };
-                *stop_signal.lock().unwrap() = true;
-                let _ = results_thread.join();
-                fs::write(out_file.clone(), report).expect("\n\nFailed to write SARIF file, check if the file path is valid and you have the necessary permissions to write to it.");
-                utils::terminal::clear_previous_line();
-                println!("\n\nScan report written to: {}\n\n", out_file.clone());
-            } else if out_format == "markdown" {
-                let report = match utils::api::get_scan_report(
-                    &config.get_url(),
-                    &scan_id,
-                    Some("markdown"),
-                ) {
-                    Ok(markdown) => markdown,
-                    Err(e) => {
-                        log::error!("\n\nFailed to fetch Markdown report: {}\n\n", e);
-                        std::process::exit(1);
-                    }
-                };
-                *stop_signal.lock().unwrap() = true;
-                let _ = results_thread.join();
-                fs::write(out_file.clone(), report).expect("\n\nFailed to write Markdown file, check if the file path is valid and you have the necessary permissions to write to it.");
-                utils::terminal::clear_previous_line();
-                println!("\n\nScan report written to: {}\n\n", out_file.clone());
-            }
-        }
-    }
-
-    if let Some(sbom_file) = sbom {
-        match corgea::deps::report::sbom(std::path::Path::new(".")) {
-            Ok(doc) => {
-                let json = serde_json::to_string_pretty(&doc).expect("serialize SBOM");
-                if let Err(e) = fs::write(&sbom_file, json) {
-                    log::error!("\n\nFailed to write SBOM to '{}': {}\n\n", sbom_file, e);
-                    std::process::exit(1);
-                }
-                println!("CycloneDX SBOM written to: {}\n", sbom_file);
-            }
-            Err(e) => {
-                log::error!("\n\nFailed to generate SBOM: {}\n\n", e);
-                std::process::exit(1);
-            }
-        }
     }
 
     print!("\n\nThank you for using Corgea! 🐕\n\n");
@@ -498,6 +312,532 @@ pub fn run(
                 "\nExiting with error code 1: scan results matched --fail-on {}.",
                 fail_on
             );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Repo-relative paths as the `/`-separated strings the server's file lists use.
+fn repo_relative_strings(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| {
+            path.components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect()
+}
+
+/// Package the project, upload it, and wait for the scan to finish.
+///
+/// Returns the new scan's id and, when the server reported one, its project id.
+#[allow(clippy::too_many_arguments)]
+fn start_new_scan(
+    config: &Config,
+    project_name: &str,
+    only_uncommitted: &bool,
+    disable_incremental: &bool,
+    ignore_dirty_worktree: &bool,
+    metadata: Option<String>,
+    scan_type: Option<String>,
+    policy: Option<String>,
+    target: Option<String>,
+    exclude: Option<String>,
+    include_rules: crate::include_rules::IncludeRules,
+    include_images: Vec<String>,
+) -> (String, Option<String>) {
+    println!("\nScanning with BLAST 🚀🚀🚀");
+
+    if let Some(scan_type) = &scan_type {
+        println!("Running Scan Type: {}", scan_type);
+    }
+    if let Some(policy) = &policy {
+        println!(
+            "Including only specified policies for policy scan: {}",
+            policy
+        );
+    }
+    println!("\n\n");
+    let temp_dir = match utils::generic::create_private_temp_dir("corgea-scan-") {
+        Ok(dir) => dir,
+        Err(e) => {
+            log::error!(
+                "\n\nOops! Something went wrong while creating a temporary directory in '{}'.\nPlease check if you have the necessary permissions and enough free disk space.\nError details:\n{}\n\n",
+                env::temp_dir().display(),
+                e
+            );
+            std::process::exit(1);
+        }
+    };
+    let zip_path = format!("{}/{}.zip", temp_dir.display(), project_name);
+
+    let image_archives = match export_included_images(&include_images, &temp_dir) {
+        Ok(archives) => archives,
+        Err(message) => {
+            log::error!("\n\n{}\n", message);
+            let _ = utils::generic::delete_directory(&temp_dir);
+            std::process::exit(1);
+        }
+    };
+    let extra_zip_files: Vec<(PathBuf, String)> = image_archives
+        .iter()
+        .map(|archive| (archive.path.clone(), archive.archive_name.clone()))
+        .collect();
+
+    let stop_signal = Arc::new(Mutex::new(false));
+    let stop_signal_clone = Arc::clone(&stop_signal);
+    let packaging_thread = thread::spawn(move || {
+        utils::terminal::show_loading_message(
+            "Packaging your project... ([T]s)",
+            stop_signal_clone,
+        );
+    });
+
+    let target_str: Option<&str> = if *only_uncommitted {
+        Some("git:staged,git:modified,git:untracked")
+    } else {
+        target.as_deref()
+    };
+
+    // Before packaging: mid-pack HEAD move must not look like a clean new SHA.
+    let repo_before = utils::generic::get_repo_info_for_scan("./").unwrap_or_default();
+
+    // The rules were resolved in run(), before the reuse decision; they decide
+    // what goes into the archive, and a file left out of it cannot be scanned
+    // however the engine classifies what it did receive.
+    let force_included = include_rules.matching_files(Path::new("."));
+    if !include_rules.is_empty() && force_included.is_empty() {
+        log::warn!(
+            "\n{}",
+            utils::terminal::set_text_color(
+                "⚠️  No files matched your include rules, so nothing was forced into this scan.",
+                utils::terminal::TerminalColor::Yellow
+            )
+        );
+    } else if !force_included.is_empty() {
+        // Named, not just counted: these paths override .gitignore and the
+        // default excludes (which cover `**/*.env` among others), so whoever
+        // reads the log needs to see what actually went into the archive.
+        println!(
+            "\nForce-including {} file(s) Corgea would otherwise skip:",
+            force_included.len()
+        );
+        for path in force_included.iter().take(FORCE_INCLUDE_PREVIEW) {
+            println!("  {}", path.display());
+        }
+        if force_included.len() > FORCE_INCLUDE_PREVIEW {
+            println!("  (+{} more)", force_included.len() - FORCE_INCLUDE_PREVIEW);
+        }
+    }
+
+    if target_str.is_none() && exclude.is_some() {
+        println!("Excluding files matching: {}", exclude.as_deref().unwrap());
+    }
+
+    if let Some(target_value) = target_str {
+        match targets::resolve_targets_with_exclude(target_value, exclude.as_deref()) {
+            Ok(result) => {
+                if result.files.is_empty() {
+                    // An exported image, or a file an include rule forces in,
+                    // is a complete payload on its own — so a target that
+                    // matches nothing is only fatal without either.
+                    if image_archives.is_empty() && force_included.is_empty() {
+                        *stop_signal.lock().unwrap() = true;
+                        let _ = packaging_thread.join();
+                        print!(
+                            "\r{}",
+                            utils::terminal::set_text_color(
+                                "",
+                                utils::terminal::TerminalColor::Reset
+                            )
+                        );
+                        log::error!("\n\nError: target resolved to zero files.\n");
+                        log::error!("Target value: {}\n", target_value);
+                        log::error!("Segment results:");
+                        for segment_result in &result.segments {
+                            if let Some(ref error) = segment_result.error {
+                                log::error!("  {}: ERROR - {}", segment_result.segment, error);
+                            } else {
+                                log::error!(
+                                    "  {}: {} matches",
+                                    segment_result.segment,
+                                    segment_result.matches
+                                );
+                            }
+                        }
+                        log::error!("\nPlease check your target specification and try again.\n");
+                        let _ = utils::generic::delete_directory(&temp_dir);
+                        std::process::exit(1);
+                    }
+
+                    let covers = match (force_included.is_empty(), image_archives.is_empty()) {
+                        (true, _) => "the included container image(s)",
+                        (false, true) => "the force-included file(s)",
+                        (false, false) => {
+                            "the force-included file(s) and the included container image(s)"
+                        }
+                    };
+                    log::warn!(
+                        "\n{}",
+                        utils::terminal::set_text_color(
+                            &format!(
+                                "⚠️  No scannable files matched your target, so this scan covers only {covers}."
+                            ),
+                            utils::terminal::TerminalColor::Yellow
+                        )
+                    );
+                } else {
+                    let file_count = result.files.len();
+                    if *only_uncommitted {
+                        println!("\rFiles to be submitted for partial scan:\n");
+                        for (index, file) in result.files.iter().enumerate() {
+                            if let Ok(relative) =
+                                file.strip_prefix(std::env::current_dir().unwrap_or_default())
+                            {
+                                println!("{}: {}", index + 1, relative.display());
+                            } else {
+                                println!("{}: {}", index + 1, file.display());
+                            }
+                        }
+                        println!();
+                    } else {
+                        println!("Scanning {} files (target mode)", file_count);
+
+                        let display_count = std::cmp::min(20, file_count);
+                        for file in result.files.iter().take(display_count) {
+                            if let Ok(relative) =
+                                file.strip_prefix(std::env::current_dir().unwrap_or_default())
+                            {
+                                println!("  {}", relative.display());
+                            } else {
+                                println!("  {}", file.display());
+                            }
+                        }
+                        if file_count > display_count {
+                            println!("  (+{} more)", file_count - display_count);
+                        }
+                        println!();
+                    }
+                }
+            }
+            Err(e) => {
+                *stop_signal.lock().unwrap() = true;
+                let _ = packaging_thread.join();
+                print!(
+                    "\r{}",
+                    utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
+                );
+                log::error!("\n\nError resolving targets: {}\n", e);
+                let _ = utils::generic::delete_directory(&temp_dir);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let archive_contents = match utils::generic::create_zip_from_target(
+        target_str,
+        &zip_path,
+        None,
+        exclude.as_deref(),
+        &force_included,
+        &extra_zip_files,
+        !*disable_incremental,
+    ) {
+        Ok(archive) => {
+            if archive.added_files.is_empty() {
+                *stop_signal.lock().unwrap() = true;
+                let _ = packaging_thread.join();
+                print!(
+                    "\r{}",
+                    utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
+                );
+                if *only_uncommitted {
+                    log::error!(
+                        "\n\nOops! It seems there are no scannable uncommitted changes in your project.\nYou may have uncommitted changes, but none match the types of files we can scan.\n\n"
+                    );
+                } else {
+                    log::error!("\n\nOops! No valid files found to scan after filtering.\n\n");
+                }
+                let _ = utils::generic::delete_directory(&temp_dir);
+                std::process::exit(1);
+            }
+            archive
+        }
+        Err(e) => {
+            *stop_signal.lock().unwrap() = true;
+            let _ = packaging_thread.join();
+            print!(
+                "\r{}",
+                utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
+            );
+            log::error!(
+                "\n\nUh-oh! We couldn't package your project at '{}'.\nThis might be due to insufficient permissions, invalid file paths, or a file system error.\nPlease check the directory and try again.\nError details:\n{}\n\n", 
+                zip_path, e
+            );
+            let _ = utils::generic::delete_directory(&temp_dir);
+            std::process::exit(1);
+        }
+    };
+    *stop_signal.lock().unwrap() = true;
+    let _ = packaging_thread.join();
+    print!(
+        "\r{}Project packaged successfully.\n",
+        utils::terminal::set_text_color("", utils::terminal::TerminalColor::Green)
+    );
+    let repo_after = utils::generic::get_repo_info_for_scan("./").unwrap_or_default();
+    // Notice = what `git status` shows, from the raw samples (so neither
+    // --target/--exclude nor SHA drift, which the upload flag also covers).
+    let worktree_dirty = repo_before.as_ref().is_some_and(|i| i.dirty)
+        || repo_after.as_ref().is_some_and(|i| i.dirty);
+    if worktree_dirty {
+        let notice_sha = repo_after
+            .as_ref()
+            .and_then(|i| i.sha.as_deref())
+            .or_else(|| repo_before.as_ref().and_then(|i| i.sha.as_deref()));
+        match notice_sha {
+            Some(sha) => {
+                let short_sha = &sha[..sha.len().min(7)];
+                println!(
+                    "Working tree has uncommitted changes - scanning your local files, not commit {short_sha}."
+                );
+            }
+            None => {
+                println!("Working tree has uncommitted changes - scanning your local files.")
+            }
+        }
+    }
+    let mut repo_info = utils::generic::reconcile_repo_info_for_upload(repo_before, repo_after);
+    // --target/--exclude archives are never an exact HEAD snapshot. For
+    // --exclude that is the whole of what it costs: the flag rules this scan
+    // out as a *commit* baseline, which is right because a git diff from its
+    // commit would describe files it never uploaded, while the checksums it
+    // stores still make it one a later run can subtract from.
+    if target_str.is_some() || exclude.is_some() {
+        if let Some(ref mut info) = repo_info {
+            info.dirty = true;
+        }
+    }
+    // Incremental is the default, so this asks what took it off the table. A
+    // targeted archive is the silent case: carrying findings forward for files
+    // the archive no longer holds would be wrong, but those runs are not
+    // "scanning every file" either, so no message is honest. --exclude is not
+    // one of them -- it narrows the same whole-project walk, which the archive's
+    // own checksums describe exactly -- so those runs resolve a plan like any
+    // other and say what came of it.
+    let incremental = if *disable_incremental {
+        Err(FullScanReason::new(
+            FullScanCause::DisabledByFlag,
+            "--disable-incremental was passed",
+        ))
+    } else if target_str.is_some() {
+        Err(FullScanReason::new(
+            FullScanCause::TargetedUpload,
+            if *only_uncommitted {
+                "--only-uncommitted narrowed the upload to uncommitted files"
+            } else {
+                "--target narrowed the upload to the files it selects"
+            },
+        ))
+    } else {
+        // Reconciled repo info, so a tree that turned out dirty — or a HEAD
+        // that moved mid-packaging — refuses rather than diffing against a
+        // commit this upload is not a snapshot of.
+        crate::incremental::resolve_incremental_plan(
+            config,
+            project_name,
+            crate::incremental::DiffSources {
+                branch: repo_info.as_ref().and_then(|info| info.branch.as_deref()),
+                head_sha: repo_info.as_ref().and_then(|info| info.sha.as_deref()),
+                // Missing repo info is not dirtiness; it is the missing
+                // branch/commit the resolver reports next, by its real name.
+                worktree_dirty: repo_info.as_ref().is_some_and(|info| info.dirty),
+                ignore_dirty_worktree: *ignore_dirty_worktree,
+                exclude_narrowed: exclude.is_some(),
+                manifest: archive_contents.manifest.as_ref(),
+                ignore_paths: include_rules.project_ignore_paths.as_deref(),
+            },
+        )
+        // Force-included files are usually unchanged, and the server carries
+        // findings forward for whatever the diff omits — so without this an
+        // include rule would never get the file looked at on an incremental run.
+        .and_then(|plan| plan.including(&repo_relative_strings(&force_included)))
+        .inspect_err(|reason| println!("Scanning every file: {}.", reason.detail))
+    };
+    // Stored with the scan for a later run to diff against, so it is worth
+    // uploading even when this run scans everything. Under
+    // --disable-incremental packaging was told not to hash at all, so there is
+    // nothing here to encode; skipping a run leaves no gap, since a baseline is
+    // the newest scan carrying a manifest rather than the preceding one.
+    let file_manifest = archive_contents
+        .manifest
+        .as_ref()
+        .and_then(Manifest::encode);
+    println!("\n\nSubmitting scan to Corgea:");
+    let upload_result = match utils::api::upload_zip(
+        &zip_path,
+        &config.get_url(),
+        project_name,
+        repo_info,
+        utils::api::UploadOptions {
+            scan_type,
+            policy,
+            metadata,
+            incremental,
+            disable_incremental: *disable_incremental,
+            include_paths: include_rules.cli_patterns,
+            file_manifest,
+        },
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            log::error!("\n\nOh no! We encountered an issue while uploading the zip file '{}' to the server.\nPlease ensure that:
+    - Blast is enabled on your Corgea account.
+    - Your network connection is stable.
+    - The server URL '{}' is correct.
+    - Your authentication token is valid.\n\n
+    
+    Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli
+
+    Error details:\n\n {}",
+                zip_path,
+                config.get_url(),
+                e
+            );
+            // Exported image archives can be gigabytes; don't leave them behind.
+            let _ = utils::generic::delete_directory(&temp_dir);
+            std::process::exit(1);
+        }
+    };
+
+    let scan_id = upload_result.scan_id;
+    let scan_url = build_scan_url(
+        &config.get_url(),
+        upload_result.project_id.as_deref(),
+        project_name,
+        &scan_id,
+    );
+
+    let _ = utils::generic::delete_directory(&temp_dir);
+    print!(
+        "\n\nScan has started with ID: {}.\n\nYou can view it populate at the link:\n{}\n\n",
+        scan_id,
+        utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
+    );
+
+    print!(
+       "{}",
+       utils::terminal::set_text_color("Your scan will continue securely in the Corgea cloud.\nYou can safely exit the process now if you prefer not to wait for it to complete.\n\n", utils::terminal::TerminalColor::Blue)
+    );
+
+    wait_for_scan(config, &scan_id, WaitBudget::start());
+    (scan_id, upload_result.project_id)
+}
+
+/// Write the `--out-format` report for a completed scan to `--out-file`.
+///
+/// Does nothing unless both are set; `main` rejects one without the other.
+fn write_scan_report(
+    config: &Config,
+    project_name: &str,
+    scan_id: &str,
+    classifications: &HashMap<String, usize>,
+    out_format: Option<&str>,
+    out_file: Option<&str>,
+) {
+    let (Some(out_format), Some(out_file)) = (out_format, out_file) else {
+        return;
+    };
+
+    let stop_signal = Arc::new(Mutex::new(false));
+    let stop_signal_clone = Arc::clone(&stop_signal);
+    let results_thread = thread::spawn(move || {
+        utils::terminal::show_loading_message(
+            "Generating scan report... ([T]s)",
+            stop_signal_clone,
+        );
+    });
+    let stop_spinner = move || {
+        *stop_signal.lock().unwrap() = true;
+        let _ = results_thread.join();
+    };
+
+    if out_format == "json" {
+        let issues =
+            match utils::api::get_all_issues(&config.get_url(), project_name, Some(scan_id.into()))
+            {
+                Ok(issues) => issues,
+                Err(e) => {
+                    stop_spinner();
+                    log::error!("\n\nFailed to fetch issues: {}\n\n", e);
+                    std::process::exit(1);
+                }
+            };
+        let sca_issues = match utils::api::get_all_sca_issues(
+            &config.get_url(),
+            project_name,
+            Some(scan_id.into()),
+        ) {
+            Ok(issues) => issues,
+            Err(e) => {
+                stop_spinner();
+                log::error!("\n\nFailed to fetch SCA issues: {}\n\n", e);
+                std::process::exit(1);
+            }
+        };
+        let json = serde_json::to_string_pretty(&issues).unwrap();
+        let sca_json = serde_json::to_string_pretty(&sca_issues).unwrap();
+        let report_json = serde_json::to_string_pretty(classifications).unwrap();
+        let results_json = format!(
+            "{{\"issues\": {}, \"sca_issues\": {}, \"report\": {}}}",
+            json, sca_json, report_json
+        );
+        stop_spinner();
+        fs::write(out_file, results_json).expect("Failed to write JSON file, check if the file path is valid and you have the necessary permissions to write to it.");
+        utils::terminal::clear_previous_line();
+        println!("\n\nScan results written to: {}\n\n", out_file);
+        return;
+    }
+
+    // The server renders these; `None` is its HTML default.
+    let (report_format, label) = match out_format {
+        "html" => (None, "HTML"),
+        "sarif" => (Some("sarif"), "SARIF"),
+        "markdown" => (Some("markdown"), "Markdown"),
+        _ => {
+            stop_spinner();
+            log::error!("\n\nUnsupported out_format: {}\n\n", out_format);
+            std::process::exit(1);
+        }
+    };
+    let report = match utils::api::get_scan_report(&config.get_url(), scan_id, report_format) {
+        Ok(report) => report,
+        Err(e) => {
+            stop_spinner();
+            log::error!("\n\nFailed to fetch {} report: {}\n\n", label, e);
+            std::process::exit(1);
+        }
+    };
+    stop_spinner();
+    fs::write(out_file, report).unwrap_or_else(|_| panic!("\n\nFailed to write {label} file, check if the file path is valid and you have the necessary permissions to write to it."));
+    utils::terminal::clear_previous_line();
+    println!("\n\nScan report written to: {}\n\n", out_file);
+}
+
+/// Write a CycloneDX SBOM of the working directory to `sbom_file`.
+fn write_sbom(sbom_file: &str) {
+    match corgea::deps::report::sbom(std::path::Path::new(".")) {
+        Ok(doc) => {
+            let json = serde_json::to_string_pretty(&doc).expect("serialize SBOM");
+            if let Err(e) = fs::write(sbom_file, json) {
+                log::error!("\n\nFailed to write SBOM to '{}': {}\n\n", sbom_file, e);
+                std::process::exit(1);
+            }
+            println!("CycloneDX SBOM written to: {}\n", sbom_file);
+        }
+        Err(e) => {
+            log::error!("\n\nFailed to generate SBOM: {}\n\n", e);
             std::process::exit(1);
         }
     }
@@ -627,50 +967,257 @@ pub fn triggered_slug_summary(issues: &[utils::api::BlockingIssue]) -> String {
     names.join(", ")
 }
 
-pub fn wait_for_scan(config: &Config, scan_id: &str) {
-    // Create loading animation
-    let stop_signal = Arc::new(Mutex::new(false));
+/// Whether a scan status means the scan has stopped, and if so, how it ended.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ScanState {
+    Completed,
+    Failed,
+    Running,
+}
 
-    // Spawn a new thread for the spinner animation
+/// Classify the scan status reported by the API.
+///
+/// The contract is a frozen four-value set: `complete`, `incomplete`,
+/// `processing`, `scanning`. `incomplete` is terminal, and treating it as
+/// running is what made the CLI poll a finished scan forever. The extra
+/// aliases are defensive: terminal-sounding statuses must stop the loop.
+pub fn classify_scan_status(status: &str) -> ScanState {
+    match status.trim().to_lowercase().as_str() {
+        "complete" | "completed" => ScanState::Completed,
+        "incomplete" | "failed" | "error" | "cancelled" | "canceled" => ScanState::Failed,
+        _ => ScanState::Running,
+    }
+}
+
+/// Compact duration for a message: `10h`, `15m`, or `90s`.
+fn format_timeout(timeout: Duration) -> String {
+    match timeout.as_secs() {
+        secs if secs > 0 && secs % 3600 == 0 => format!("{}h", secs / 3600),
+        secs if secs > 0 && secs % 60 == 0 => format!("{}m", secs / 60),
+        secs => format!("{}s", secs),
+    }
+}
+
+/// How long to wait, from `var`, falling back to `default` when it is unset or
+/// unusable. Takes the raw value so it is testable without touching the
+/// environment.
+fn parse_timeout(var: &str, raw: Option<&str>, default: Duration) -> Duration {
+    match raw {
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(seconds) if seconds > 0 => Duration::from_secs(seconds),
+            _ => {
+                log::warn!(
+                    "Ignoring {}='{}': expected a positive whole number of seconds. Waiting up to {} instead.",
+                    var,
+                    raw,
+                    format_timeout(default)
+                );
+                default
+            }
+        },
+        None => default,
+    }
+}
+
+fn env_timeout(var: &str, default: Duration) -> Duration {
+    parse_timeout(var, env::var(var).ok().as_deref(), default)
+}
+
+/// The wall-clock budget for one wait, shared by every read it makes so that a
+/// stalled read cannot push the total past what the user asked for.
+pub struct WaitBudget {
+    started_at: Instant,
+    timeout: Duration,
+}
+
+impl WaitBudget {
+    /// Starts the clock, spending up to `SCAN_TIMEOUT_ENV`.
+    ///
+    /// Backstop for a scan that never reports a terminal status. Scans that run
+    /// past the default raise the override.
+    pub fn start() -> Self {
+        Self::with_timeout(env_timeout(SCAN_TIMEOUT_ENV, DEFAULT_SCAN_TIMEOUT))
+    }
+
+    fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            started_at: Instant::now(),
+            timeout,
+        }
+    }
+
+    /// What is left to spend, or `None` once the budget is gone.
+    pub fn remaining(&self) -> Option<Duration> {
+        let remaining = self.timeout.saturating_sub(self.started_at.elapsed());
+        (!remaining.is_zero()).then_some(remaining)
+    }
+}
+
+/// Human-readable explanation of why a scan failed, for the terminal.
+///
+/// Falls back from `failed_reason` to the reported scanner problems, so the
+/// output is always more specific than "the scan failed".
+pub fn format_scan_failure(scan: &utils::api::ScanResponse) -> String {
+    let mut lines = vec![format!("Scan {} did not complete.", scan.id)];
+    if let Some(reason) = scan
+        .failed_reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+    {
+        lines.push(format!("Reason: {}", reason));
+    }
+    let problems = scan_problem_lines(scan);
+    if !problems.is_empty() {
+        lines.push(String::from("Scanner problems:"));
+        lines.extend(problems);
+    }
+    lines.join("\n")
+}
+
+/// Warnings for a scan that finished but is missing some scanner's results.
+///
+/// `None` when nothing degraded. A secondary scanner breaking no longer fails
+/// the scan, so this is the only place coverage loss surfaces.
+pub fn format_scan_warnings(scan: &utils::api::ScanResponse) -> Option<String> {
+    let problems = scan_problem_lines(scan);
+    if problems.is_empty() {
+        return None;
+    }
+    let mut lines = vec![String::from(
+        "Some scanners reported problems, so this scan may be missing results:",
+    )];
+    lines.extend(problems);
+    Some(lines.join("\n"))
+}
+
+/// One bullet per scanner problem, capped so dozens of file-level errors
+/// cannot bury the rest of the output.
+fn scan_problem_lines(scan: &utils::api::ScanResponse) -> Vec<String> {
+    const MAX_LINES: usize = 10;
+    let problems: Vec<&utils::api::ScanErrorSummary> = scan
+        .scan_errors
+        .iter()
+        .filter(|error| error.is_problem())
+        .collect();
+    let mut lines: Vec<String> = problems
+        .iter()
+        .take(MAX_LINES)
+        .map(|error| format_scan_error_line(error))
+        .collect();
+    if problems.len() > MAX_LINES {
+        lines.push(format!(
+            "  ...and {} more; see the scan page for the full list.",
+            problems.len() - MAX_LINES
+        ));
+    }
+    lines
+}
+
+fn format_scan_error_line(error: &utils::api::ScanErrorSummary) -> String {
+    let message = error
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or("No details provided.");
+    let mut prefix = String::new();
+    if let Some(scan_type) = error.scan_type.as_deref().filter(|s| !s.is_empty()) {
+        prefix.push_str(scan_type);
+    }
+    if let Some(location) = error.location.as_deref().filter(|l| !l.is_empty()) {
+        if prefix.is_empty() {
+            prefix.push_str(location);
+        } else {
+            prefix.push_str(&format!(" @ {}", location));
+        }
+    }
+    if prefix.is_empty() {
+        format!("  - {}", message)
+    } else {
+        format!("  - [{}] {}", prefix, message)
+    }
+}
+
+/// Why the wait stopped before the scan reached a terminal state.
+fn poll_timed_out(scan_id: &str, budget: &WaitBudget, last_status: &str) -> String {
+    format!(
+        "Stopped waiting for scan {} after {}s; it was last reported as '{}'.\n\
+         The scan may still finish in the Corgea cloud — check the scan page, \
+         or set {} to wait longer.",
+        scan_id,
+        budget.timeout.as_secs(),
+        last_status,
+        SCAN_TIMEOUT_ENV
+    )
+}
+
+/// Block until the scan reaches a terminal state, then report it.
+///
+/// Exits non-zero on failure or poll timeout, so CI cannot mistake a broken
+/// scan for a clean one.
+pub fn wait_for_scan(config: &Config, scan_id: &str, budget: WaitBudget) {
+    let stop_signal = Arc::new(Mutex::new(false));
     let stop_signal_clone = Arc::clone(&stop_signal);
-    thread::spawn(move || {
+    let spinner = thread::spawn(move || {
         utils::terminal::show_loading_message(
             "Scanning... The Hunt Is On! ([T]s)",
             stop_signal_clone,
         );
     });
 
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        match check_scan_status(scan_id, &config.get_url()) {
-            Ok(true) => {
-                *stop_signal.lock().unwrap() = true;
-                break;
-            }
-            Ok(false) => {}
-            Err(e) => {
-                log::error!(
-                    "\n\nUnable to check the scan status for scan ID '{}'.\nPlease verify that:
-            - The server URL '{}' is reachable.
-            - Your authentication token is valid.
-            - The scan ID '{}' exists and is correct.
+    let mut last_status = String::from("unknown");
 
-            Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli
-            
-            Error details:\n{}",
+    let result = loop {
+        thread::sleep(SCAN_POLL_INTERVAL);
+        // Every read is capped to what is left of the budget: on the client's
+        // own timeout a stalled read would otherwise keep us going long past
+        // the wait the user asked for.
+        let Some(remaining) = budget.remaining() else {
+            break Err(poll_timed_out(scan_id, &budget, &last_status));
+        };
+        match utils::api::get_scan(&config.get_url(), scan_id, Some(remaining)) {
+            Ok(scan) => match classify_scan_status(&scan.status) {
+                ScanState::Completed => break Ok(scan),
+                ScanState::Failed => break Err(format_scan_failure(&scan)),
+                ScanState::Running => last_status = scan.status,
+            },
+            // A read cut short by the deadline is a timeout, not a broken link.
+            Err(_) if budget.remaining().is_none() => {
+                break Err(poll_timed_out(scan_id, &budget, &last_status))
+            }
+            Err(e) => {
+                break Err(format!(
+                    "Unable to check the status of scan '{}'.\n\
+                     Please verify that:\n\
+                     - The server URL '{}' is reachable.\n\
+                     - Your authentication token is valid.\n\
+                     - The scan ID is correct.\n\n\
+                     Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli\n\n\
+                     Error details: {}",
                     scan_id,
                     config.get_url(),
-                    scan_id,
                     e
-                );
-                std::process::exit(1);
+                ))
             }
         }
-    }
+    };
+
+    *stop_signal.lock().unwrap() = true;
+    let _ = spinner.join();
     print!(
-        "{}",
+        "\r{}",
         utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
     );
+
+    let scan = match result {
+        Ok(scan) => scan,
+        Err(message) => {
+            log::error!("\n\n{}\n", message);
+            std::process::exit(1);
+        }
+    };
+
     println!(
         "\r╭────────────────────────────────────────────╮\n\
              │ {: <42} │\n\
@@ -679,11 +1226,18 @@ pub fn wait_for_scan(config: &Config, scan_id: &str) {
              ╰────────────────────────────────────────────╯\n",
         " ", " "
     );
+    if let Some(warnings) = format_scan_warnings(&scan) {
+        log::warn!("{}\n", warnings);
+    }
 }
 
-/// Match doghouse `LICENSE_DEPS_WAIT_TIMEOUT` (15 minutes).
-const BLOCKING_RULES_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
-const BLOCKING_RULES_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Must outlast the longest doghouse wait window, currently
+/// `SCA_REACHABILITY_WAIT_TIMEOUT` (30 minutes), with margin for the poll
+/// interval and request latency. Whichever side's clock expires first decides
+/// the outcome, and this side fails closed: expiring early would hard-fail a
+/// pipeline on data doghouse was about to resolve as non-blocking.
+const DEFAULT_BLOCKING_RULES_TIMEOUT: Duration = Duration::from_secs(35 * 60);
+const BLOCKING_RULES_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 fn stop_blocking_rules_spinner(stop_signal: &Arc<Mutex<bool>>, spinner: thread::JoinHandle<()>) {
     *stop_signal.lock().unwrap() = true;
@@ -708,8 +1262,8 @@ const BLOCKING_RULES_TIMEOUT_MESSAGE: &str =
 /// retry until timeout; permanent errors fail immediately.
 fn decide_blocking_rules_poll(
     result: Result<utils::api::BlockingRuleResponse, String>,
-    elapsed: std::time::Duration,
-    timeout: std::time::Duration,
+    elapsed: Duration,
+    timeout: Duration,
 ) -> BlockingRulesPollDecision {
     match result {
         Ok(rules) if rules.is_complete() => BlockingRulesPollDecision::Complete(rules),
@@ -745,7 +1299,8 @@ fn decide_blocking_rules_poll(
     }
 }
 
-/// Poll until blocking-rules status is `complete` (or 15m timeout).
+/// Poll until blocking-rules status is `complete`, or `BLOCKING_RULES_TIMEOUT_ENV`
+/// (35m by default) runs out.
 /// Older backends omit status (serde defaults to complete: one-shot).
 /// `block_on` is forwarded as the CI rule-slug filter (`--block-on`); `None`
 /// keeps legacy `--fail` "all active rules" behavior.
@@ -763,10 +1318,11 @@ fn wait_for_blocking_rules(
         );
     });
 
-    let started = std::time::Instant::now();
+    let timeout = env_timeout(BLOCKING_RULES_TIMEOUT_ENV, DEFAULT_BLOCKING_RULES_TIMEOUT);
+    let started = Instant::now();
     loop {
         // Do not start another request after the deadline.
-        if started.elapsed() >= BLOCKING_RULES_WAIT_TIMEOUT {
+        if started.elapsed() >= timeout {
             stop_blocking_rules_spinner(&stop_signal, spinner);
             log::error!("\n{} (scan '{}')", BLOCKING_RULES_TIMEOUT_MESSAGE, scan_id);
             std::process::exit(1);
@@ -774,7 +1330,7 @@ fn wait_for_blocking_rules(
 
         let result = utils::api::check_blocking_rules(&config.get_url(), scan_id, None, block_on)
             .map_err(|e| e.to_string());
-        match decide_blocking_rules_poll(result, started.elapsed(), BLOCKING_RULES_WAIT_TIMEOUT) {
+        match decide_blocking_rules_poll(result, started.elapsed(), timeout) {
             BlockingRulesPollDecision::Complete(rules) => {
                 stop_blocking_rules_spinner(&stop_signal, spinner);
                 return rules;
@@ -790,14 +1346,7 @@ fn wait_for_blocking_rules(
                 std::process::exit(1);
             }
         }
-        std::thread::sleep(BLOCKING_RULES_POLL_INTERVAL);
-    }
-}
-
-pub fn check_scan_status(scan_id: &str, url: &str) -> Result<bool, Box<dyn Error>> {
-    match utils::api::get_scan(url, scan_id) {
-        Ok(scan) => Ok(scan.status == "complete"),
-        Err(e) => Err(e),
+        thread::sleep(BLOCKING_RULES_POLL_INTERVAL);
     }
 }
 
@@ -888,7 +1437,6 @@ mod tests {
         BlockOnError, BlockingIssue, BlockingRuleResponse, BlockingRuleStats, SCAIssue,
         SCALocation, SCAPackage, BLOCKING_RULES_STATUS_COMPLETE, BLOCKING_RULES_STATUS_PENDING,
     };
-    use std::time::Duration;
 
     fn counts(pairs: &[(&str, usize)]) -> HashMap<String, usize> {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
@@ -1274,5 +1822,348 @@ mod tests {
             error.describe(),
             "block_on was provided but contained no rule slugs."
         );
+    }
+
+    fn scan_with(
+        status: &str,
+        failed_reason: Option<&str>,
+        scan_errors: Vec<utils::api::ScanErrorSummary>,
+    ) -> utils::api::ScanResponse {
+        utils::api::ScanResponse {
+            id: "scan-123".to_string(),
+            project: "proj".to_string(),
+            repo: None,
+            branch: None,
+            status: status.to_string(),
+            engine: "corgea-blast".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            git_sha: None,
+            worktree_dirty: None,
+            pull_request_id: None,
+            metadata: None,
+            failed_reason: failed_reason.map(|r| r.to_string()),
+            scan_errors,
+            file_manifest_root: None,
+            file_manifest_version: None,
+            ignore_paths: None,
+        }
+    }
+
+    fn scan_error(
+        scan_type: Option<&str>,
+        level: Option<&str>,
+        location: Option<&str>,
+        message: Option<&str>,
+    ) -> utils::api::ScanErrorSummary {
+        utils::api::ScanErrorSummary {
+            scan_type: scan_type.map(|s| s.to_string()),
+            level: level.map(|s| s.to_string()),
+            location: location.map(|s| s.to_string()),
+            message: message.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn incomplete_status_is_terminal_not_still_running() {
+        // The hang: "incomplete" is terminal, and treating it as running meant
+        // polling a finished scan indefinitely.
+        assert_eq!(classify_scan_status("incomplete"), ScanState::Failed);
+    }
+
+    #[test]
+    fn classify_scan_status_covers_the_api_contract() {
+        assert_eq!(classify_scan_status("complete"), ScanState::Completed);
+        assert_eq!(classify_scan_status("processing"), ScanState::Running);
+        assert_eq!(classify_scan_status("scanning"), ScanState::Running);
+        assert_eq!(classify_scan_status("incomplete"), ScanState::Failed);
+    }
+
+    #[test]
+    fn classify_scan_status_ignores_case_and_padding() {
+        // `corgea wait` compared against "Complete" while the API sends
+        // lowercase, so a finished scan was polled again.
+        assert_eq!(classify_scan_status("Complete"), ScanState::Completed);
+        assert_eq!(classify_scan_status("  COMPLETE  "), ScanState::Completed);
+        assert_eq!(classify_scan_status("Incomplete"), ScanState::Failed);
+    }
+
+    #[test]
+    fn unknown_status_keeps_waiting_rather_than_failing_the_build() {
+        assert_eq!(classify_scan_status("queued"), ScanState::Running);
+        assert_eq!(classify_scan_status(""), ScanState::Running);
+    }
+
+    #[test]
+    fn timeout_rejects_overrides_that_are_not_a_positive_number() {
+        // A bad value must not shorten or disable the wait: anything that is
+        // not a positive count of seconds falls back to the default.
+        let default = DEFAULT_SCAN_TIMEOUT;
+        let parse = |raw| parse_timeout(SCAN_TIMEOUT_ENV, raw, default);
+        assert_eq!(parse(None), default);
+        assert_eq!(parse(Some("")), default);
+        assert_eq!(parse(Some("abc")), default);
+        assert_eq!(parse(Some("0")), default);
+        assert_eq!(parse(Some("-30")), default);
+        assert_eq!(parse(Some("1.5")), default);
+        assert_eq!(parse(Some(" 90 ")), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn timeout_defaults_are_the_documented_ones() {
+        // The docs promise these two numbers; drifting from them silently is
+        // the failure mode worth catching.
+        assert_eq!(DEFAULT_SCAN_TIMEOUT, Duration::from_secs(10 * 60 * 60));
+        assert_eq!(DEFAULT_BLOCKING_RULES_TIMEOUT, Duration::from_secs(35 * 60));
+        assert_eq!(format_timeout(DEFAULT_SCAN_TIMEOUT), "10h");
+        assert_eq!(format_timeout(DEFAULT_BLOCKING_RULES_TIMEOUT), "35m");
+        assert_eq!(format_timeout(Duration::from_secs(90)), "90s");
+    }
+
+    #[test]
+    fn poll_interval_is_the_documented_one_and_short_against_the_budget() {
+        assert_eq!(SCAN_POLL_INTERVAL, Duration::from_secs(3));
+        // A pause that ever grew toward the budget would spend the whole wait
+        // asleep and report a finished scan long after it finished.
+        assert!(
+            SCAN_POLL_INTERVAL < DEFAULT_SCAN_TIMEOUT / 100,
+            "poll interval {SCAN_POLL_INTERVAL:?} is not short against the \
+             {DEFAULT_SCAN_TIMEOUT:?} budget it runs inside"
+        );
+    }
+
+    #[test]
+    fn blocking_rules_timeout_outlasts_the_doghouse_wait_windows() {
+        // This side fails closed on its own deadline, so it must never expire
+        // while doghouse is still answering `pending`. The longest doghouse
+        // window is SCA_REACHABILITY_WAIT_TIMEOUT at 30 minutes.
+        let longest_doghouse_window = Duration::from_secs(30 * 60);
+        assert!(
+            DEFAULT_BLOCKING_RULES_TIMEOUT > longest_doghouse_window,
+            "poll deadline {DEFAULT_BLOCKING_RULES_TIMEOUT:?} must outlast the \
+             doghouse wait window {longest_doghouse_window:?}, or a pipeline \
+             hard-fails on a rule doghouse was about to resolve"
+        );
+    }
+
+    #[test]
+    fn budget_reports_what_is_left_and_then_nothing() {
+        let spent = WaitBudget::with_timeout(Duration::ZERO);
+        assert_eq!(spent.remaining(), None, "a spent budget buys no more reads");
+
+        let budget = WaitBudget::with_timeout(Duration::from_secs(60));
+        let remaining = budget.remaining().expect("fresh budget has time left");
+        assert!(
+            remaining <= Duration::from_secs(60),
+            "remaining must count down from the timeout, got {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn scan_failure_reports_reason_and_errors() {
+        let scan = scan_with(
+            "incomplete",
+            Some("Dependency Analysis did not finish."),
+            vec![scan_error(
+                Some("sca"),
+                Some("error"),
+                Some("Project-wide"),
+                Some("Could not reach the public package registry."),
+            )],
+        );
+
+        let output = format_scan_failure(&scan);
+
+        assert!(output.contains("scan-123"));
+        assert!(output.contains("Dependency Analysis did not finish."));
+        assert!(output.contains("[sca @ Project-wide]"));
+        assert!(output.contains("Could not reach the public package registry."));
+    }
+
+    #[test]
+    fn scan_failure_without_reason_still_explains_itself() {
+        let output = format_scan_failure(&scan_with("incomplete", None, vec![]));
+
+        assert!(output.contains("did not complete"));
+        assert!(!output.contains("Reason:"));
+    }
+
+    #[test]
+    fn scan_failure_omits_blank_reason() {
+        let output = format_scan_failure(&scan_with("incomplete", Some("   "), vec![]));
+
+        assert!(!output.contains("Reason:"));
+    }
+
+    #[test]
+    fn scan_output_skips_informational_notes() {
+        // `info` entries are bookkeeping, not missing results.
+        let scan = scan_with(
+            "incomplete",
+            None,
+            vec![
+                scan_error(Some("sca"), Some("info"), None, Some("some info")),
+                scan_error(Some("sca"), Some("warning"), None, Some("a warning")),
+                scan_error(Some("iac"), Some("error"), None, Some("a real error")),
+            ],
+        );
+
+        let output = format_scan_failure(&scan);
+
+        assert!(output.contains("a real error"));
+        assert!(output.contains("a warning"));
+        assert!(!output.contains("some info"));
+    }
+
+    #[test]
+    fn info_only_scan_produces_no_warnings() {
+        let scan = scan_with(
+            "complete",
+            None,
+            vec![scan_error(Some("sca"), Some("info"), None, Some("skipped"))],
+        );
+
+        assert!(format_scan_warnings(&scan).is_none());
+    }
+
+    #[test]
+    fn missing_or_unknown_level_is_still_reported() {
+        // The server defaults an absent level to "error" and may add levels
+        // this client does not know; neither may drop a real failure.
+        assert!(scan_error(Some("sca"), None, None, Some("boom")).is_problem());
+        assert!(scan_error(Some("sca"), Some("critical"), None, Some("boom")).is_problem());
+        assert!(!scan_error(Some("sca"), Some("INFO"), None, Some("fyi")).is_problem());
+    }
+
+    #[test]
+    fn long_error_lists_are_capped() {
+        let errors = (0..25)
+            .map(|i| {
+                scan_error(
+                    Some("sast"),
+                    Some("error"),
+                    None,
+                    Some(&format!("boom {}", i)),
+                )
+            })
+            .collect();
+
+        let output = format_scan_failure(&scan_with("incomplete", None, errors));
+
+        assert!(output.contains("boom 9"));
+        assert!(!output.contains("boom 10"));
+        assert!(output.contains("...and 15 more"));
+    }
+
+    #[test]
+    fn completed_scan_with_scanner_errors_produces_warnings() {
+        // Warnings on a completed scan are the only signal coverage dropped.
+        let scan = scan_with(
+            "complete",
+            None,
+            vec![scan_error(
+                Some("sca"),
+                Some("error"),
+                Some("Project-wide"),
+                Some("Dependency Analysis did not finish."),
+            )],
+        );
+
+        let warnings = format_scan_warnings(&scan).expect("expected warnings");
+
+        assert!(warnings.contains("may be missing results"));
+        assert!(warnings.contains("Dependency Analysis did not finish."));
+    }
+
+    #[test]
+    fn clean_scan_produces_no_warnings() {
+        assert!(format_scan_warnings(&scan_with("complete", None, vec![])).is_none());
+    }
+
+    #[test]
+    fn scan_error_line_survives_missing_fields() {
+        assert_eq!(
+            format_scan_error_line(&scan_error(None, None, None, None)),
+            "  - No details provided."
+        );
+        assert_eq!(
+            format_scan_error_line(&scan_error(None, None, Some("pom.xml"), Some("bad"))),
+            "  - [pom.xml] bad"
+        );
+        assert_eq!(
+            format_scan_error_line(&scan_error(Some("sca"), None, None, Some("bad"))),
+            "  - [sca] bad"
+        );
+    }
+
+    #[test]
+    fn scan_response_deserializes_without_new_fields() {
+        // Older servers do not send failed_reason/scan_errors; the client must
+        // still parse their responses.
+        let json = r#"{
+            "id": "abc",
+            "project": "p",
+            "repo": null,
+            "branch": "main",
+            "status": "complete",
+            "engine": "corgea-blast",
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+
+        let scan: utils::api::ScanResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(classify_scan_status(&scan.status), ScanState::Completed);
+        assert!(scan.failed_reason.is_none());
+        assert!(scan.scan_errors.is_empty());
+        // `corgea ls --json` serializes from the scan list, which never carries
+        // these fields; empty ones there would claim a scan had no problems.
+        let round_tripped = serde_json::to_string(&scan).unwrap();
+        assert!(!round_tripped.contains("scan_errors"));
+        assert!(!round_tripped.contains("failed_reason"));
+    }
+
+    #[test]
+    fn scan_response_deserializes_null_scan_errors() {
+        // The API sends `"scan_errors": null` when there is nothing to report,
+        // including on failed scans, where a parse error would hide the reason.
+        let json = r#"{
+            "id": "abc",
+            "project": "p",
+            "repo": null,
+            "branch": "main",
+            "status": "incomplete",
+            "engine": "corgea-blast",
+            "created_at": "2026-01-01T00:00:00Z",
+            "failed_reason": "the scanner ran out of memory",
+            "scan_errors": null
+        }"#;
+
+        let scan: utils::api::ScanResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(classify_scan_status(&scan.status), ScanState::Failed);
+        assert!(scan.scan_errors.is_empty());
+        assert!(format_scan_failure(&scan).contains("the scanner ran out of memory"));
+    }
+
+    #[test]
+    fn scan_errors_deserialize_with_fields_missing() {
+        // A server that omits any of these must still parse, since an entry we
+        // cannot read is an entry whose missing results go unreported.
+        let json = r#"{
+            "id": "abc",
+            "project": "p",
+            "repo": null,
+            "branch": "main",
+            "status": "complete",
+            "engine": "corgea-blast",
+            "created_at": "2026-01-01T00:00:00Z",
+            "scan_errors": [{"message": "pom.xml could not be resolved"}, {}]
+        }"#;
+
+        let scan: utils::api::ScanResponse = serde_json::from_str(json).unwrap();
+
+        // No level means the entry counts as a problem, so both are reported.
+        let warnings = format_scan_warnings(&scan).unwrap();
+        assert!(warnings.contains("  - pom.xml could not be resolved"));
+        assert!(warnings.contains("  - No details provided."));
     }
 }

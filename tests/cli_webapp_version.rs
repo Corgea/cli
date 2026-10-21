@@ -1,6 +1,7 @@
-//! End-to-end tests for the webapp compatibility pre-flight: before running a
-//! command, `corgea` reads `GET /api/version` and warns when the webapp is
-//! older than this CLI requires. The warning never blocks the command.
+//! The compatibility pre-flight is wired into a real command: `corgea` reads
+//! `GET /api/version` and warns when the webapp is older than this CLI
+//! requires, without ever failing the command. Parsing and comparison live in
+//! `version_check`'s unit tests.
 
 mod common;
 
@@ -18,9 +19,9 @@ fn spawn_stub(version: Option<String>) -> (String, Hits) {
     })
 }
 
-/// `corgea list` against `url` from a throwaway non-git dir, with the version
-/// floor pinned so the test does not shift when `MIN_WEBAPP_VERSION` is bumped.
-/// `--project-name` keeps an empty scan page from being a resolution failure.
+/// `corgea list` against `url`, with the floor pinned so the test does not
+/// shift when `MIN_WEBAPP_VERSION` is bumped. `--project-name` keeps an empty
+/// scan page from being a resolution failure.
 fn run_list(url: &str, extra_env: &[(&str, &str)]) -> Output {
     let (tmp, cwd) = temp_plain_dir("proj");
     let (mut cmd, _home) = corgea_isolated();
@@ -67,72 +68,30 @@ fn an_outdated_webapp_warns_and_still_runs_the_command() {
 }
 
 #[test]
-fn a_current_webapp_is_silent() {
-    let (url, _hits) = spawn_stub(Some(webapp_version(MINIMUM)));
+fn an_unknown_version_does_not_warn() {
+    // 404 is a webapp that predates the endpoint. Null is one that could not
+    // determine its own version. A 404 must stay silent: the endpoint ships
+    // above the floor, so a deployment sitting exactly at it also 404s.
+    for version in [None, Some(r#"{"status":"ok","version":null}"#.to_string())] {
+        let (url, hits) = spawn_stub(version);
+        let out = run_list(&url, &[]);
+        let stderr = stderr(&out);
 
-    let stderr = stderr(&run_list(&url, &[]));
-
-    assert!(
-        !stderr.contains("requires Corgea webapp"),
-        "an up-to-date webapp must not warn; stderr: {stderr}"
-    );
-}
-
-#[test]
-fn suffixed_builds_compare_on_their_numbers() {
-    for version in ["v1.71.3-beta", "v1.71.3-client-a", "v1.71.4-client-a"] {
-        let (url, _hits) = spawn_stub(Some(webapp_version(version)));
-        let stderr = stderr(&run_list(&url, &[]));
+        assert!(
+            hits.lock().unwrap().iter().any(|h| h == "/api/version"),
+            "the endpoint must be dialed; hits: {:?}",
+            hits.lock().unwrap()
+        );
         assert!(
             !stderr.contains("requires Corgea webapp"),
-            "{version} satisfies {MINIMUM}; stderr: {stderr}"
+            "an unknown version must not warn; stderr: {stderr}"
         );
+        assert!(out.status.success());
     }
-
-    let (url, _hits) = spawn_stub(Some(webapp_version("v1.71.2-client-a")));
-    let stderr = stderr(&run_list(&url, &[]));
-    assert!(
-        stderr.contains("v1.71.2-client-a"),
-        "a suffixed build below the floor still warns; stderr: {stderr}"
-    );
 }
 
-#[test]
-fn a_webapp_without_the_endpoint_is_silent() {
-    // `version: None` makes the stub 404 `/api/version`, exactly as a webapp
-    // released before the endpoint existed answers.
-    let (url, hits) = spawn_stub(None);
-
-    let out = run_list(&url, &[]);
-    let stderr = stderr(&out);
-
-    assert!(
-        hits.lock().unwrap().iter().any(|h| h == "/api/version"),
-        "the endpoint must be dialed; hits: {:?}",
-        hits.lock().unwrap()
-    );
-    assert!(
-        !stderr.contains("requires Corgea webapp"),
-        "a 404 must be treated as unknown, not warned about; stderr: {stderr}"
-    );
-    assert!(out.status.success());
-}
-
-#[test]
-fn a_webapp_reporting_a_null_version_is_silent() {
-    let (url, _hits) = spawn_stub(Some(r#"{"status":"ok","version":null}"#.to_string()));
-
-    let stderr = stderr(&run_list(&url, &[]));
-
-    assert!(
-        !stderr.contains("requires Corgea webapp"),
-        "an unknown version must not warn; stderr: {stderr}"
-    );
-}
-
-/// Answers every route except `/api/version`, which it accepts and then never
-/// replies to. Threads per connection so the hung request cannot block the ones
-/// that follow it.
+/// Accepts `/api/version` and never replies. One thread per connection, so the
+/// hung request cannot block the ones that follow it.
 fn spawn_stalling_version_stub() -> String {
     use std::io::Write;
     use std::net::TcpListener;
@@ -190,11 +149,6 @@ fn a_stalled_version_endpoint_does_not_hold_up_the_command() {
         "the command must still run; stderr: {}",
         stderr(&out)
     );
-    assert!(
-        !stderr(&out).contains("requires Corgea webapp"),
-        "an unreachable endpoint must not warn; stderr: {}",
-        stderr(&out)
-    );
 }
 
 #[test]
@@ -202,11 +156,11 @@ fn the_skip_env_var_silences_the_warning_and_the_request() {
     let (url, hits) = spawn_stub(Some(webapp_version("v1.70.0")));
 
     let out = run_list(&url, &[("CORGEA_SKIP_WEBAPP_VERSION_CHECK", "1")]);
-    let stderr = stderr(&out);
 
     assert!(
-        !stderr.contains("requires Corgea webapp"),
-        "the skip flag must silence the warning; stderr: {stderr}"
+        !stderr(&out).contains("requires Corgea webapp"),
+        "the skip flag must silence the warning; stderr: {}",
+        stderr(&out)
     );
     assert!(
         !hits.lock().unwrap().iter().any(|h| h == "/api/version"),

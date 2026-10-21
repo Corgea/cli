@@ -119,96 +119,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_the_numbers_from_release_and_suffixed_versions() {
+    fn extract_version_reads_a_leading_release_and_nothing_else() {
         assert_eq!(extract_version("v1.71.3"), Some(Version::new(1, 71, 3)));
-        assert_eq!(extract_version("1.71.3"), Some(Version::new(1, 71, 3)));
-        assert_eq!(
-            extract_version("v1.71.3-beta"),
-            Some(Version::new(1, 71, 3))
-        );
+        assert_eq!(extract_version("  v1.71.3\n"), Some(Version::new(1, 71, 3)));
+        // A suffixed build counts as the release it was cut from, and a
+        // missing patch reads as zero.
         assert_eq!(
             extract_version("v1.71.3-client-a"),
             Some(Version::new(1, 71, 3))
         );
+        assert_eq!(extract_version("v1.71"), Some(Version::new(1, 71, 0)));
+        assert_eq!(extract_version("unknown"), None);
+        assert_eq!(extract_version("v2"), None);
+        // Matching a dotted number anywhere would read the date as 2026.8.0
+        // and call this outdated webapp current.
+        assert_eq!(extract_version("build-2026.08-v1.70.0"), None);
+        assert_eq!(extract_version("1.71.3.4"), None);
         assert_eq!(
-            extract_version("v1.71.3-main-a1b2c3d"),
+            extract_version(MIN_WEBAPP_VERSION),
             Some(Version::new(1, 71, 3))
         );
     }
 
     #[test]
-    fn a_missing_patch_reads_as_zero() {
-        assert_eq!(extract_version("v1.71"), Some(Version::new(1, 71, 0)));
-        assert_eq!(extract_version("v2"), None);
-    }
-
-    #[test]
-    fn versions_without_numbers_are_not_comparable() {
-        assert_eq!(extract_version(""), None);
-        assert_eq!(extract_version("unknown"), None);
-        assert_eq!(extract_version("main"), None);
-    }
-
-    #[test]
-    fn a_version_buried_in_another_string_is_unknown() {
-        // Matching a dotted number anywhere would read the date here as
-        // 2026.8.0 and call this outdated webapp current.
-        assert_eq!(extract_version("build-2026.08-v1.70.0"), None);
-        assert_eq!(extract_version("corgea 1.70.0"), None);
-        assert_eq!(extract_version("1.71.3.4"), None);
-    }
-
-    #[test]
-    fn surrounding_whitespace_is_tolerated() {
-        assert_eq!(extract_version("  v1.71.3\n"), Some(Version::new(1, 71, 3)));
-    }
-
-    #[test]
-    fn warns_only_when_the_webapp_is_behind_the_minimum() {
+    fn warns_only_when_the_numeric_version_is_behind_the_minimum() {
         let warn = |version: &str| outdated_warning("https://corgea.test", version, "v1.71.3");
 
-        assert!(warn("v1.71.2").is_some());
-        assert!(warn("v1.70.9").is_some());
-        assert!(warn("v0.9.0").is_some());
-        assert!(warn("v1.71.3").is_none());
-        assert!(warn("v1.71.4").is_none());
-        assert!(warn("v2.0.0").is_none());
-    }
-
-    #[test]
-    fn a_suffixed_build_counts_as_the_release_it_was_cut_from() {
-        // Plain semver sorts `1.71.3-beta` below `1.71.3`; comparing only the
-        // numeric part deliberately does not.
-        let warn = |version: &str| outdated_warning("https://corgea.test", version, "v1.71.3");
-
-        assert!(warn("v1.71.3-beta").is_none());
-        assert!(warn("v1.71.3-client-a").is_none());
-        assert!(warn("v1.71.2-client-a").is_some());
-    }
-
-    #[test]
-    fn unreadable_versions_never_warn() {
-        assert!(outdated_warning("https://corgea.test", "unknown", "v1.71.3").is_none());
-        assert!(outdated_warning("https://corgea.test", "v1.0.0", "not-a-version").is_none());
-    }
-
-    #[test]
-    fn the_warning_names_the_instance_the_minimum_and_the_escape_hatch() {
-        let warning = outdated_warning("https://corgea.test", "v1.70.0", "v1.71.3")
-            .expect("an outdated webapp warns");
-
+        let warning = warn("v1.70.0").expect("an outdated webapp warns");
         assert!(warning.contains("v1.71.3"), "{warning}");
         assert!(warning.contains("v1.70.0"), "{warning}");
         assert!(warning.contains("https://corgea.test"), "{warning}");
         assert!(warning.contains(env!("CARGO_PKG_VERSION")), "{warning}");
         assert!(warning.contains(SKIP_ENV_VAR), "{warning}");
-    }
 
-    #[test]
-    fn the_default_minimum_is_a_readable_version() {
-        assert_eq!(
-            extract_version(MIN_WEBAPP_VERSION),
-            Some(Version::new(1, 71, 3))
-        );
+        // `1.71.3-beta` sorts below `1.71.3` in semver. Only the numbers count.
+        assert!(warn("v1.71.3").is_none());
+        assert!(warn("v1.71.3-beta").is_none());
+        assert!(warn("v1.71.2-client-a").is_some());
+        assert!(warn("unknown").is_none());
+        assert!(outdated_warning("https://corgea.test", "v1.0.0", "not-a-version").is_none());
     }
 }

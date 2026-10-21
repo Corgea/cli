@@ -54,31 +54,46 @@ impl Config {
         Ok(file_path)
     }
 
+    /// The settings a fresh install starts from, before anything is persisted.
+    fn defaults() -> Self {
+        Self {
+            url: "https://www.corgea.app".to_string(),
+            debug: 0,
+            token: "".to_string(),
+            default_agent: None,
+            recency_gate: default_recency_gate(),
+            recency_threshold_days: default_recency_threshold_days(),
+        }
+    }
+
+    fn apply_env_overrides(&mut self) {
+        if let Ok(corgea_debug) = env::var("CORGEA_DEBUG") {
+            self.debug = corgea_debug.parse::<i8>().unwrap_or(0);
+        }
+    }
+
     pub fn load() -> io::Result<Self> {
         let file_path = Self::config_path()?;
 
         if !file_path.exists() {
-            let config = Self {
-                url: "https://www.corgea.app".to_string(),
-                debug: 0,
-                token: "".to_string(),
-                default_agent: None,
-                recency_gate: default_recency_gate(),
-                recency_threshold_days: default_recency_threshold_days(),
-            };
-
-            let toml = toml::to_string(&config).expect("Failed to serialize config");
+            let toml = toml::to_string(&Self::defaults()).expect("Failed to serialize config");
 
             fs::write(&file_path, toml)?;
         }
 
         let contents = fs::read_to_string(&file_path)?;
 
-        let mut config: Self = toml::from_str(&contents).expect("Failed to deserialize config");
+        // An unparseable config is a normal error, not a bug: it is a file the
+        // user can edit. Returning it rather than panicking lets the caller
+        // report it as what it is, naming the file to fix.
+        let mut config: Self = toml::from_str(&contents).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse {}: {}", file_path.display(), e),
+            )
+        })?;
 
-        if let Ok(corgea_debug) = env::var("CORGEA_DEBUG") {
-            config.debug = corgea_debug.parse::<i8>().unwrap_or(0);
-        }
+        config.apply_env_overrides();
 
         Ok(config)
     }

@@ -342,7 +342,7 @@ fn get_git_untracked_files(repo_root: &Path) -> Result<Vec<PathBuf>, String> {
     for entry in statuses.iter() {
         let status = entry.status();
         if status.is_wt_new() && !status.is_ignored() {
-            if let Some(path) = entry.path() {
+            if let Ok(path) = entry.path() {
                 files.push(PathBuf::from(path));
             }
         }
@@ -568,6 +568,17 @@ mod tests {
         fs::write(base.join("config.toml"), "[config]").unwrap();
 
         dir
+    }
+
+    #[test]
+    fn git_untracked_files_lists_worktree_paths() {
+        let dir = setup_test_dir();
+        let files = get_git_untracked_files(dir.path()).expect("untracked listing");
+        let names: Vec<_> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect();
+        assert!(names.contains(&"config.toml"), "{names:?}");
     }
 
     #[test]

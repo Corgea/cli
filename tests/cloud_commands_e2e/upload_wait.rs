@@ -68,7 +68,7 @@ fn upload_wait_uses_returned_ids_and_stops_at_complete() {
 fn wait_reports_an_immediately_complete_scan() {
     let project = TempDir::new().expect("create wait project");
     let local_project = temp_project_name(project.path());
-    let mut plan = vec![verify_request(), webapp_version_request()];
+    let mut plan = vec![verify_request()];
     append_wait_plan(
         &mut plan,
         &local_project,
@@ -98,7 +98,6 @@ fn wait_exits_one_when_scan_list_fails() {
     let local_project = temp_project_name(project.path());
     let api = ApiStub::start(vec![
         verify_request(),
-        webapp_version_request(),
         expected_request(
             "reject scan list",
             move |request| assert_scan_list_request(request, &local_project),
@@ -129,7 +128,6 @@ fn wait_exits_one_when_scan_detail_fails() {
     let detail_path = format!("/api/v1/scan/{scan_id}");
     let api = ApiStub::start(vec![
         verify_request(),
-        webapp_version_request(),
         expected_request(
             "reject scan detail",
             move |request| assert_authenticated_request(request, Method::GET, &detail_path),
@@ -147,5 +145,8 @@ fn wait_exits_one_when_scan_detail_fails() {
     let context = output_context(&output, &transcript);
     assert_eq!(output.status.code(), Some(1), "{context}");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Oops! Something went wrong"), "{context}");
+    assert!(
+        stderr.contains(&format!("Unable to read scan '{scan_id}'")),
+        "{context}"
+    );
 }

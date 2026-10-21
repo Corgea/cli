@@ -18,9 +18,25 @@ function fail(message) {
   process.exit(1);
 }
 
-const [assetsDirArg] = process.argv.slice(2);
-if (!assetsDirArg) {
-  fail("usage: bundle-binaries <assets-dir>");
+const [assetsDirArg, releaseTag] = process.argv.slice(2);
+if (!assetsDirArg || !releaseTag) {
+  fail("usage: bundle-binaries <assets-dir> <release-tag>");
+}
+
+// Releases before versioned asset names shipped `corgea-<triple>.zip`; keep
+// accepting it so older tags can still be republished.
+function findArchive(triple) {
+  const candidates = [
+    `corgea-${releaseTag}-${triple}.zip`,
+    `corgea-${triple}.zip`,
+  ];
+  for (const name of candidates) {
+    const archivePath = path.join(assetsDir, name);
+    if (fs.existsSync(archivePath)) {
+      return { archiveName: name, archivePath };
+    }
+  }
+  fail(`missing release asset for ${triple}: tried ${candidates.join(", ")}`);
 }
 
 const repoRoot = path.resolve(__dirname, "..", "..");
@@ -30,12 +46,7 @@ const vendorRoot = path.join(repoRoot, "vendor");
 fs.rmSync(vendorRoot, { recursive: true, force: true });
 
 for (const { triple, binary } of TARGETS) {
-  const archiveName = `corgea-${triple}.zip`;
-  const archivePath = path.join(assetsDir, archiveName);
-
-  if (!fs.existsSync(archivePath)) {
-    fail(`missing release asset: ${archivePath}`);
-  }
+  const { archiveName, archivePath } = findArchive(triple);
 
   const destDir = path.join(vendorRoot, triple, "corgea");
   fs.mkdirSync(destDir, { recursive: true });

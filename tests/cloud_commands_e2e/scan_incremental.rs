@@ -1,0 +1,1647 @@
+//! Incremental scans, attempted by default on every `corgea scan blast`: find
+//! the project's last clean scan, work out what changed since it, send the
+//! changed-file list with the archive.
+//!
+//! The stub asserts the exact wire contract because those two fields are what
+//! the server acts on: the baseline field picks whose findings carry forward,
+//! `incremental_changed_files` picks which files are excluded from that and
+//! analyzed instead.
+//!
+//! Two ways to reach the same list, so both are here. The baseline's stored
+//! file checksums are preferred and name the baseline by scan id; `git diff`
+//! is the fallback and names it by commit. The checksum cases are the ones
+//! that used to be impossible: no `.git`, and a dirty tree without a flag.
+//!
+//! Being the default, the ways it declines matter as much as the way it works,
+//! so each is a case here.
+
+use crate::common::*;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use hyper::{Method, StatusCode};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::io::Write;
+
+const PROJECT: &str = "cloud-e2e";
+const BASELINE_SCAN: &str = "baseline-scan-123";
+
+/// A scan of the branch the fixture is on, which is the first place a baseline
+/// is looked for and so the one most of these cases answer with.
+fn baseline_scan(sha: &str) -> Value {
+    json!({
+        "id": BASELINE_SCAN,
+        "project": PROJECT,
+        "repo": null,
+        "branch": FIXTURE_BRANCH,
+        "status": "complete",
+        "engine": "corgea-blast",
+        "created_at": "2026-07-30T12:00:00Z",
+        "git_sha": sha,
+        "worktree_dirty": false
+    })
+}
+
+/// A baseline scan advertising stored checksums of `files`, and the gzipped
+/// manifest the download then has to serve.
+///
+/// The format is spelled out here rather than built with the CLI's own encoder,
+/// so a change to how a manifest is written shows up as a failing test instead
+/// of agreeing with itself.
+fn baseline_scan_with_checksums(sha: &str, files: &[(&str, &str)]) -> (Value, Vec<u8>) {
+    let mut canonical = String::from("corgea-file-manifest/1 sha256\n");
+    let mut sorted = files.to_vec();
+    sorted.sort();
+    for (path, contents) in sorted {
+        canonical.push_str(&format!(
+            "{:x} {path}\n",
+            Sha256::digest(contents.as_bytes())
+        ));
+    }
+    let root = format!("{:x}", Sha256::digest(canonical.as_bytes()));
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(canonical.as_bytes()).expect("gzip");
+
+    let mut scan = baseline_scan(sha);
+    scan["file_manifest_root"] = json!(root);
+    scan["file_manifest_version"] = json!("1");
+    (scan, encoder.finish().expect("gzip"))
+}
+
+/// A baseline as it looks when the scan that produced it had no git either: no
+/// branch, no commit, no dirty flag. Only its checksums make it usable, and a
+/// project scanned this way has no other kind of history to offer.
+fn without_git(mut scan: Value) -> Value {
+    scan["branch"] = json!(null);
+    scan["git_sha"] = json!(null);
+    scan["worktree_dirty"] = json!(null);
+    scan
+}
+
+fn checksum_download(body: Vec<u8>) -> ExpectedRequest {
+    let path = format!("/api/v1/scan/{BASELINE_SCAN}/file-manifest");
+    expected_request(
+        "download the baseline scan's file checksums",
+        move |request| assert_authenticated_request(request, Method::GET, &path),
+        raw_response(StatusCode::OK, "application/gzip", body),
+    )
+}
+
+fn baseline_lookup(branch: &'static str, scans: Vec<Value>) -> ExpectedRequest {
+    expected_request(
+        "look up a baseline scan to diff against",
+        move |request| assert_baseline_lookup_request(request, PROJECT, Some(branch), false),
+        json_response(scans_response(scans)),
+    )
+}
+
+/// The single lookup a clone with no git makes. It cannot say which branch is
+/// trunk, and the scans it is looking for name none either.
+fn branchless_baseline_lookup(scans: Vec<Value>) -> ExpectedRequest {
+    expected_request(
+        "look up a baseline scan on any branch",
+        move |request| assert_baseline_lookup_request(request, PROJECT, None, false),
+        json_response(scans_response(scans)),
+    )
+}
+
+/// The second walk, which does let the server drop what is not known-clean.
+fn clean_baseline_lookup(branch: &'static str, scans: Vec<Value>) -> ExpectedRequest {
+    expected_request(
+        "look up a clean baseline scan to diff against",
+        move |request| assert_baseline_lookup_request(request, PROJECT, Some(branch), true),
+        json_response(scans_response(scans)),
+    )
+}
+
+/// The lookup by commit, over this checkout's recent history on any branch.
+fn ancestor_lookup(shas: Option<Vec<String>>, scans: Vec<Value>) -> ExpectedRequest {
+    expected_request(
+        "look up a baseline scan of a recent commit",
+        move |request| assert_ancestor_lookup_request(request, PROJECT, shas.as_deref(), false),
+        json_response(scans_response(scans)),
+    )
+}
+
+/// One page of the lookup by commit, for the cases that read more than one.
+fn ancestor_lookup_page(
+    shas: Vec<String>,
+    page: u16,
+    total_pages: u32,
+    scans: Vec<Value>,
+) -> ExpectedRequest {
+    expected_request(
+        "look up a baseline scan of a recent commit",
+        move |request| {
+            assert_authenticated_request(request, Method::GET, "/api/v1/scans")?;
+            assert_query(request, "project", PROJECT)?;
+            assert_query(request, "page", &page.to_string())?;
+            assert_query(request, "page_size", "50")?;
+            assert_query(request, "sha", &shas.join(","))
+        },
+        json_response(json!({
+            "status": "ok",
+            "page": page,
+            "total_pages": total_pages,
+            "scans": scans,
+        })),
+    )
+}
+
+/// The lookup by commit every git run makes first, answered with nothing, for
+/// the cases about what happens once it falls back to branch names.
+fn no_scanned_recent_commit() -> ExpectedRequest {
+    ancestor_lookup(None, vec![])
+}
+
+/// One page of the baseline lookup, for the walk an old backend forces.
+fn baseline_lookup_page(
+    branch: &'static str,
+    page: u16,
+    total_pages: u32,
+    scans: Vec<Value>,
+) -> ExpectedRequest {
+    expected_request(
+        "look up a baseline scan to diff against",
+        move |request| {
+            assert_authenticated_request(request, Method::GET, "/api/v1/scans")?;
+            assert_query(request, "project", PROJECT)?;
+            assert_query(request, "branch", branch)?;
+            assert_query(request, "page", &page.to_string())?;
+            assert_query(request, "engine", "corgea-blast")
+        },
+        json_response(json!({
+            "status": "ok",
+            "page": page,
+            "total_pages": total_pages,
+            "scans": scans,
+        })),
+    )
+}
+
+/// Everything after the archive upload, which incremental does not change.
+fn scan_tail() -> Vec<ExpectedRequest> {
+    let detail_path = "/api/v1/scan/blast-scan-123".to_string();
+    let issue_path = "/api/v1/scan/blast-scan-123/issues".to_string();
+    vec![
+        expected_request(
+            "read completed BLAST scan",
+            move |request| assert_authenticated_request(request, Method::GET, &detail_path),
+            json_response(scan_response("blast-scan-123", PROJECT, "complete")),
+        ),
+        expected_request(
+            "read regular BLAST issues",
+            move |request| {
+                assert_authenticated_request(request, Method::GET, &issue_path)?;
+                assert_query(request, "page", "1")?;
+                assert_query(request, "page_size", "30")
+            },
+            json_response(empty_issue_page()),
+        ),
+    ]
+}
+
+fn start_upload() -> ExpectedRequest {
+    expected_request(
+        "start BLAST upload",
+        |request| {
+            assert_authenticated_request(request, Method::POST, "/api/v1/start-scan")?;
+            assert_query(request, "scan_type", "blast")
+        },
+        json_response(json!({"transfer_id": "transfer-123"})),
+    )
+}
+
+/// Adds a file and edits another, so the diff has more than one entry and a
+/// file the baseline already contained.
+fn second_commit(project: &GitProject) -> String {
+    std::fs::write(project.path().join("helper.py"), "print('helper')\n").expect("write helper");
+    std::fs::write(project.path().join("main.py"), "print('edited')\n").expect("edit main");
+    run_git(project.path(), &["add", "."]);
+    run_git(project.path(), &["commit", "-m", "second"]);
+    String::from_utf8(run_git(project.path(), &["rev-parse", "HEAD"]).stdout)
+        .expect("UTF-8 SHA")
+        .trim()
+        .to_string()
+}
+
+/// Checksums are preferred over `git diff` wherever the baseline has them, so
+/// the upload names the scan rather than its commit. Both arrive at the same
+/// list here; the cases below are the ones where only checksums can.
+#[test]
+fn the_baselines_stored_checksums_are_used_in_preference_to_a_git_diff() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    second_commit(&project);
+
+    let (scan, manifest) = baseline_scan_with_checksums(&base_sha, &[("main.py", SOURCE_BODY)]);
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
+        baseline_lookup(FIXTURE_BRANCH, vec![scan]),
+        checksum_download(manifest),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with the checksum diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                // The scan, not its commit: checksums are stored per scan, and
+                // the upload that wrote them may have had no commit at all.
+                assert_multipart_text_field(request, "incremental_base_scan_id", BASELINE_SCAN)?;
+                assert_no_multipart_field(request, "incremental_base_sha")?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_changed_files",
+                    r#"["helper.py","main.py"]"#,
+                )?;
+                // Checksums are taken over the files on disk, so the list
+                // covers uncommitted work by construction.
+                assert_multipart_text_field(request, "incremental_covers_worktree", "true")?;
+                assert_no_multipart_field(request, "incremental_skipped_reason")?;
+                assert_no_multipart_field(request, "incremental_skipped_detail")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(&format!(
+            "Incremental scan: 2 files changed since the last scan of {FIXTURE_BRANCH}"
+        )),
+        "{context}"
+    );
+}
+
+/// The case this exists for. A pipeline that unpacks a tarball has no commit to
+/// diff from and used to analyze every file on every run, forever; checksums
+/// need no history, so it scans only what changed.
+///
+/// Every scan of such a project records no branch, no commit and no dirty flag,
+/// so the lookup must ask for none of them: a baseline that has to be a clean
+/// commit on trunk describes nothing this project has ever uploaded.
+#[test]
+fn a_directory_with_no_git_scans_incrementally_from_the_stored_checksums() {
+    let project = tempfile::TempDir::new().expect("create project");
+    std::fs::write(project.path().join("main.py"), "print('edited')\n").expect("write source");
+    std::fs::write(project.path().join("helper.py"), "print('helper')\n").expect("write helper");
+
+    let (scan, manifest) = baseline_scan_with_checksums("unused", &[("main.py", "print('hi')\n")]);
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        branchless_baseline_lookup(vec![without_git(scan)]),
+        checksum_download(manifest),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with the checksum diff and no commit",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_no_multipart_field(request, "sha")?;
+                assert_multipart_text_field(request, "incremental_base_scan_id", BASELINE_SCAN)?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_changed_files",
+                    r#"["helper.py","main.py"]"#,
+                )
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains("Incremental scan: 2 files changed since the last scan of this project."),
+        "{context}"
+    );
+}
+
+/// A dirty tree needs no flag when checksums are available: they are taken over
+/// the files as they sit on disk, so the uncommitted edit is named in the list
+/// rather than missing from it.
+#[test]
+fn a_dirty_worktree_is_scanned_incrementally_from_the_stored_checksums() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    std::fs::write(project.path().join("main.py"), "print('uncommitted')\n")
+        .expect("dirty the tree");
+
+    let (scan, manifest) = baseline_scan_with_checksums(&base_sha, &[("main.py", SOURCE_BODY)]);
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
+        baseline_lookup(FIXTURE_BRANCH, vec![scan]),
+        checksum_download(manifest),
+        start_upload(),
+        expected_request(
+            "upload dirty BLAST archive with the checksum diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                // Still reported dirty: the upload is not a snapshot of the
+                // commit, and the scan must never become a baseline itself.
+                assert_multipart_text_field(request, "dirty", "true")?;
+                assert_multipart_text_field(request, "incremental_base_scan_id", BASELINE_SCAN)?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_changed_files",
+                    r#"["main.py"]"#,
+                )?;
+                assert_multipart_text_field(request, "incremental_covers_worktree", "true")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(&format!(
+            "Incremental scan: 1 file changed since the last scan of {FIXTURE_BRANCH}"
+        )),
+        "{context}"
+    );
+}
+
+/// Commits a file the `--exclude` cases then hold back, so the archive and the
+/// repository disagree about a path that is committed and unmodified — the one
+/// a git diff would leave off the list and copy findings forward for.
+fn commit_vendored_file(project: &GitProject) {
+    let vendor = project.path().join("vendor");
+    std::fs::create_dir(&vendor).expect("create vendor");
+    std::fs::write(vendor.join("lib.py"), VENDORED_BODY).expect("write vendored");
+    run_git(project.path(), &["add", "."]);
+    run_git(project.path(), &["commit", "-m", "vendor"]);
+}
+
+const VENDORED_BODY: &str = "print('vendored')\n";
+
+/// `--exclude` narrows the same whole-project walk the built-in glob list
+/// already narrows, so the archive is still a project state and its checksums
+/// still describe it exactly. The file the flag holds back is absent from this
+/// run's manifest and present in the baseline's, so it is named as changed:
+/// its findings are retired rather than carried over a file nothing scanned,
+/// which is the state a full scan under this exclude set would leave.
+#[test]
+fn an_excluded_run_diffs_its_checksums_and_names_what_it_holds_back() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    commit_vendored_file(&project);
+
+    let (scan, manifest) = baseline_scan_with_checksums(
+        &base_sha,
+        &[("main.py", SOURCE_BODY), ("vendor/lib.py", VENDORED_BODY)],
+    );
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
+        baseline_lookup(FIXTURE_BRANCH, vec![scan]),
+        checksum_download(manifest),
+        start_upload(),
+        expected_request(
+            "upload an --exclude archive with the checksum diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                // Not an exact snapshot of the commit, so this scan can never
+                // be a *commit* baseline -- only the checksums it stores below
+                // describe what it actually uploaded.
+                assert_multipart_text_field(request, "dirty", "true")?;
+                assert_multipart_text_field(request, "incremental_base_scan_id", BASELINE_SCAN)?;
+                assert_no_multipart_field(request, "incremental_base_sha")?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_changed_files",
+                    r#"["vendor/lib.py"]"#,
+                )?;
+                assert_multipart_text_field(request, "incremental_covers_worktree", "true")?;
+                // Stored for the next run, which is how a pipeline that passes
+                // the same --exclude every time stays incremental.
+                assert_body_contains(request, b"name=\"file_manifest_root\"")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--exclude",
+        "vendor/**",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(&format!(
+            "Incremental scan: 1 file changed since the last scan of {FIXTURE_BRANCH}"
+        )),
+        "{context}"
+    );
+}
+
+/// The git diff is not a fallback for an `--exclude` run. It measures the
+/// repository, so every excluded file it finds unchanged is left off the list
+/// and the server copies that file's findings forward though this upload does
+/// not contain it — and no later run under the same flag will look at it
+/// either. Without checksums to diff, the run scans everything and says so.
+#[test]
+fn an_excluded_run_with_no_checksums_to_diff_scans_everything() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    commit_vendored_file(&project);
+
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
+        baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
+        start_upload(),
+        expected_request(
+            "upload an --exclude archive with no diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_no_multipart_field(request, "incremental_base_sha")?;
+                assert_no_multipart_field(request, "incremental_base_scan_id")?;
+                assert_no_multipart_field(request, "incremental_changed_files")?;
+                // Classified by what finally refused, explained by everything
+                // that was tried.
+                assert_multipart_text_field(
+                    request,
+                    "incremental_skipped_reason",
+                    "exclude_needs_checksums",
+                )?;
+                assert_body_contains(
+                    request,
+                    b"stored no file checksums to diff against, and --exclude held files back",
+                )?;
+                // Still uploaded: this scan cannot diff, but it leaves the
+                // next one something to diff against.
+                assert_body_contains(request, b"name=\"file_manifest_root\"")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--exclude",
+        "vendor/**",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(&format!(
+            "Scanning every file: the last scan of {FIXTURE_BRANCH} ({}) stored no file \
+             checksums to diff against, and --exclude held files back from this archive",
+            &base_sha[..7]
+        )),
+        "{context}"
+    );
+}
+
+/// A manifest that arrives damaged is not a smaller tree. Reading it as one
+/// would report every file it lost as deleted, dropping their findings; the
+/// run falls back to the git diff instead.
+#[test]
+fn checksums_that_do_not_match_their_digest_fall_back_to_the_git_diff() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    second_commit(&project);
+
+    let (scan, mut manifest) = baseline_scan_with_checksums(&base_sha, &[("main.py", SOURCE_BODY)]);
+    manifest.truncate(manifest.len() / 2);
+
+    let expected_base = base_sha.clone();
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
+        baseline_lookup(FIXTURE_BRANCH, vec![scan]),
+        checksum_download(manifest),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with the git diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_multipart_text_field(request, "incremental_base_sha", &expected_base)?;
+                assert_no_multipart_field(request, "incremental_base_scan_id")?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_changed_files",
+                    r#"["helper.py","main.py"]"#,
+                )
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+}
+
+/// When the checksums that should have answered are unreadable and git then
+/// refuses too, the fault is reported as the cause: a dirty tree is only why
+/// the fallback could not cover for it.
+#[test]
+fn unreadable_checksums_are_the_cause_when_git_cannot_cover_for_them() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    std::fs::write(project.path().join("main.py"), "print('uncommitted')\n")
+        .expect("dirty the tree");
+
+    let (scan, mut manifest) = baseline_scan_with_checksums(&base_sha, &[("main.py", SOURCE_BODY)]);
+    manifest.truncate(manifest.len() / 2);
+
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
+        baseline_lookup(FIXTURE_BRANCH, vec![scan]),
+        checksum_download(manifest),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with no diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_no_multipart_field(request, "incremental_changed_files")?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_skipped_reason",
+                    "baseline_checksums_unreadable",
+                )?;
+                assert_body_contains(request, b"could not be read")?;
+                assert_body_contains(request, b"this worktree has uncommitted changes")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+}
+
+#[test]
+fn the_upload_carries_the_baseline_commit_and_the_files_that_changed_since_it() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    let head_sha = second_commit(&project);
+
+    let patch_sha = head_sha.clone();
+    let expected_base = base_sha.clone();
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
+        baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with the diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_multipart_text_field(request, "sha", &patch_sha)?;
+                assert_multipart_text_field(request, "dirty", "false")?;
+                assert_multipart_text_field(request, "incremental_base_sha", &expected_base)?;
+                // Both sides of the diff, sorted, as JSON — a path may contain a
+                // comma, so the list is never a delimited string.
+                assert_multipart_text_field(
+                    request,
+                    "incremental_changed_files",
+                    r#"["helper.py","main.py"]"#,
+                )?;
+                assert_no_multipart_field(request, "incremental_skipped_reason")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains("Incremental scan: 2 files changed since commit"),
+        "{context}"
+    );
+}
+
+/// No scan to diff against is a full scan, not an error. Every project's first
+/// scan takes this path and must still produce a complete result.
+#[test]
+fn a_project_with_no_baseline_scan_uploads_without_a_diff() {
+    let project = git_project();
+    let head_sha = second_commit(&project);
+
+    let patch_sha = head_sha.clone();
+    let mut plan = vec![verify_request(), scan_settings_request(PROJECT)];
+    plan.extend(baseline_lookups_finding_nothing(PROJECT));
+    plan.extend([
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with no diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_multipart_text_field(request, "sha", &patch_sha)?;
+                // Neither field alone, nor at all: a base commit without a
+                // list lets the server carry everything forward.
+                assert_no_multipart_field(request, "incremental_base_sha")?;
+                assert_no_multipart_field(request, "incremental_changed_files")?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_skipped_reason",
+                    "no_baseline_scan",
+                )?;
+                assert_body_contains(
+                    request,
+                    b"has no completed scan of any of the 2 most recent",
+                )
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ]);
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(&format!(
+            "has no completed scan of any of the 2 most recent commits in this checkout's \
+             history, nor on {FIXTURE_BRANCH}, main or master, that could be diffed against"
+        )),
+        "{context}"
+    );
+}
+
+/// Once no recent commit turns out to have been scanned, the branch being
+/// scanned is asked about next, and its own last scan wins over trunk's.
+///
+/// A branch that has been scanned before has a nearer ancestor than trunk does:
+/// everything it changed before that scan was already analyzed, so diffing
+/// against trunk would list those files again on every run until the branch
+/// merges. Trunk is only reached when this branch has no scan of its own, which
+/// the second half of this case covers.
+#[test]
+fn the_branch_being_scanned_is_preferred_over_trunk_and_falls_back_to_it() {
+    for baseline_branch in [FIXTURE_BRANCH, "main"] {
+        let project = git_project();
+        let base_sha = project.sha.clone();
+        second_commit(&project);
+
+        let mut scan = baseline_scan(&base_sha);
+        scan["branch"] = json!(baseline_branch);
+        // The lookup by commit comes first either way, then the branch being
+        // scanned. When the baseline is trunk's, those come back empty and the
+        // next one finds it -- so the plan is the assertion that the order is
+        // what it is.
+        let mut plan = vec![
+            verify_request(),
+            scan_settings_request(PROJECT),
+            no_scanned_recent_commit(),
+        ];
+        if baseline_branch != FIXTURE_BRANCH {
+            plan.push(baseline_lookup(FIXTURE_BRANCH, vec![]));
+            plan.push(clean_baseline_lookup(FIXTURE_BRANCH, vec![]));
+        }
+        let expected_base = base_sha.clone();
+        plan.extend([
+            baseline_lookup(baseline_branch, vec![scan]),
+            start_upload(),
+            expected_request(
+                "upload BLAST archive with the diff",
+                move |request| {
+                    assert_authenticated_request(
+                        request,
+                        Method::PATCH,
+                        "/api/v1/start-scan/transfer-123/",
+                    )?;
+                    assert_multipart_text_field(request, "incremental_base_sha", &expected_base)
+                },
+                json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+            ),
+        ]);
+        plan.extend(scan_tail());
+
+        let api = ApiStub::start(plan);
+        let (mut command, _home) = cloud_command(&api, project.path());
+        command.args(["scan", "blast", "--project-name", PROJECT]);
+
+        let output = run_with_timeout(command, &api);
+        let transcript = api.assert_finished();
+        let context = output_context(&output, &transcript);
+
+        assert_eq!(output.status.code(), Some(0), "{context}");
+    }
+}
+
+/// The scan of a recent commit is asked about before any branch name, and
+/// taken whatever branch it names -- here a trunk called `develop`, which the
+/// name lookup never asks about. No branch lookup is made at all once it is
+/// found, whether or not the checkout names a branch.
+#[test]
+fn a_scan_of_a_recent_commit_is_the_baseline_before_any_branch_is_asked_about() {
+    for detached in [false, true] {
+        let project = git_project();
+        let base_sha = project.sha.clone();
+        let head_sha = second_commit(&project);
+        if detached {
+            run_git(project.path(), &["checkout", "--detach"]);
+        }
+
+        let (mut scan, manifest) =
+            baseline_scan_with_checksums(&base_sha, &[("main.py", SOURCE_BODY)]);
+        scan["branch"] = json!("develop");
+        let mut plan = vec![verify_request(), scan_settings_request(PROJECT)];
+        plan.extend([
+            ancestor_lookup(Some(vec![head_sha.clone(), base_sha.clone()]), vec![scan]),
+            checksum_download(manifest),
+            start_upload(),
+            expected_request(
+                "upload BLAST archive with the checksum diff",
+                |request| {
+                    assert_authenticated_request(
+                        request,
+                        Method::PATCH,
+                        "/api/v1/start-scan/transfer-123/",
+                    )?;
+                    assert_multipart_text_field(
+                        request,
+                        "incremental_base_scan_id",
+                        BASELINE_SCAN,
+                    )?;
+                    assert_multipart_text_field(
+                        request,
+                        "incremental_changed_files",
+                        r#"["helper.py","main.py"]"#,
+                    )
+                },
+                json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+            ),
+        ]);
+        plan.extend(scan_tail());
+
+        let api = ApiStub::start(plan);
+        let (mut command, _home) = cloud_command(&api, project.path());
+        command.args(["scan", "blast", "--project-name", PROJECT]);
+
+        let output = run_with_timeout(command, &api);
+        let transcript = api.assert_finished();
+        let context = output_context(&output, &transcript);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert_eq!(output.status.code(), Some(0), "{context}");
+        assert!(
+            stdout.contains(&format!(
+                "Incremental scan: 2 files changed since the scan of ancestor commit {} (1 \
+                 commit back).",
+                &base_sha[..7]
+            )),
+            "{context}"
+        );
+    }
+}
+
+/// Commits `count` new files on top of the fixture, one per commit, and
+/// returns this checkout's history nearest first.
+fn commit_steps(project: &GitProject, count: usize) -> Vec<String> {
+    for step in 0..count {
+        let name = format!("step{step}.py");
+        std::fs::write(project.path().join(&name), format!("print({step})\n")).expect("write step");
+        run_git(project.path(), &["add", &name]);
+        run_git(project.path(), &["commit", "-m", &name]);
+    }
+    String::from_utf8(run_git(project.path(), &["rev-list", "HEAD"]).stdout)
+        .expect("UTF-8 SHAs")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Upload asserting the checksum diff named [`BASELINE_SCAN`].
+fn checksum_diff_upload() -> ExpectedRequest {
+    expected_request(
+        "upload BLAST archive with the checksum diff",
+        |request| {
+            assert_authenticated_request(
+                request,
+                Method::PATCH,
+                "/api/v1/start-scan/transfer-123/",
+            )?;
+            assert_multipart_text_field(request, "incremental_base_scan_id", BASELINE_SCAN)
+        },
+        json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+    )
+}
+
+/// Commits are asked about ten at a time, nearest first, so a scan of a commit
+/// further back than the first ten is still found -- by a second request for
+/// the next ten, and before any branch is asked about.
+#[test]
+fn a_scan_beyond_the_first_ten_commits_is_found_by_the_second_batch() {
+    let project = git_project();
+    let history = commit_steps(&project, 11);
+    let base_sha = history.last().expect("fixture commit").clone();
+    assert_eq!(history.len(), 12);
+
+    let (scan, manifest) = baseline_scan_with_checksums(&base_sha, &[("main.py", SOURCE_BODY)]);
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        ancestor_lookup(Some(history[..10].to_vec()), vec![]),
+        ancestor_lookup(Some(history[10..].to_vec()), vec![scan]),
+        checksum_download(manifest),
+        start_upload(),
+        checksum_diff_upload(),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(&format!(
+            "Incremental scan: 11 files changed since the scan of ancestor commit {} (11 \
+             commits back).",
+            &base_sha[..7]
+        )),
+        "{context}"
+    );
+}
+
+/// The server lists scans newest first, not nearest first, so the scan of the
+/// closer commit can come back on a later page than one further back. The
+/// batch is read to the end, and the closer commit wins.
+#[test]
+fn the_closest_commit_wins_even_when_its_scan_is_on_a_later_page() {
+    let project = git_project();
+    let history = commit_steps(&project, 2);
+    let (near_sha, far_sha) = (history[1].clone(), history[2].clone());
+
+    let (mut far, _) = baseline_scan_with_checksums(&far_sha, &[("main.py", SOURCE_BODY)]);
+    far["id"] = json!("farther-scan");
+    let (near, manifest) = baseline_scan_with_checksums(
+        &near_sha,
+        &[("main.py", SOURCE_BODY), ("step0.py", "print(0)\n")],
+    );
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        ancestor_lookup_page(history.clone(), 1, 2, vec![far]),
+        ancestor_lookup_page(history.clone(), 2, 2, vec![near]),
+        checksum_download(manifest),
+        start_upload(),
+        checksum_diff_upload(),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(&format!(
+            "Incremental scan: 1 file changed since the scan of ancestor commit {} (1 commit \
+             back).",
+            &near_sha[..7]
+        )),
+        "{context}"
+    );
+}
+
+/// A depth-1 clone, the `actions/checkout` default, holds only HEAD. The lookup
+/// by commit asks about that one commit rather than history the clone does not
+/// have, then falls back to the branch. The branch's scan is of a commit this
+/// clone cannot reach, so only its stored checksums can diff against it; without
+/// them the run scans everything and says why.
+#[test]
+fn a_shallow_clone_asks_about_the_commits_it_holds_then_falls_back_to_the_branch() {
+    for stored_checksums in [true, false] {
+        let project = git_project();
+        let base_sha = project.sha.clone();
+        let head_sha = second_commit(&project);
+        let clone = tempfile::TempDir::new().expect("create clone");
+        run_git(
+            project.path(),
+            &[
+                "clone",
+                "--quiet",
+                "--depth",
+                "1",
+                "--branch",
+                FIXTURE_BRANCH,
+                &format!("file://{}", project.path().display()),
+                &clone.path().display().to_string(),
+            ],
+        );
+
+        let mut plan = vec![
+            verify_request(),
+            scan_settings_request(PROJECT),
+            ancestor_lookup(Some(vec![head_sha.clone()]), vec![]),
+        ];
+        if stored_checksums {
+            let (scan, manifest) =
+                baseline_scan_with_checksums(&base_sha, &[("main.py", SOURCE_BODY)]);
+            plan.extend([
+                baseline_lookup(FIXTURE_BRANCH, vec![scan]),
+                checksum_download(manifest),
+                start_upload(),
+                checksum_diff_upload(),
+            ]);
+        } else {
+            plan.extend([
+                baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
+                start_upload(),
+                expected_request(
+                    "upload BLAST archive with no diff",
+                    |request| {
+                        assert_authenticated_request(
+                            request,
+                            Method::PATCH,
+                            "/api/v1/start-scan/transfer-123/",
+                        )?;
+                        assert_no_multipart_field(request, "incremental_base_sha")?;
+                        assert_no_multipart_field(request, "incremental_changed_files")
+                    },
+                    json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+                ),
+            ]);
+        }
+        plan.extend(scan_tail());
+
+        let api = ApiStub::start(plan);
+        let (mut command, _home) = cloud_command(&api, clone.path());
+        command.args(["scan", "blast", "--project-name", PROJECT]);
+
+        let output = run_with_timeout(command, &api);
+        let transcript = api.assert_finished();
+        let context = output_context(&output, &transcript);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert_eq!(output.status.code(), Some(0), "{context}");
+        let expected = if stored_checksums {
+            format!(
+                "Incremental scan: 2 files changed since the last scan of {FIXTURE_BRANCH} ({})",
+                &base_sha[..7]
+            )
+        } else {
+            "A shallow clone cannot diff against it".to_string()
+        };
+        assert!(stdout.contains(&expected), "{context}");
+    }
+}
+
+/// A detached HEAD has no branch lookup to make, and when none of its recent
+/// commits was scanned it still reaches trunk -- through a git diff here, which
+/// needs the two commits and no branch.
+///
+/// So does a lookup by commit that fails. A backend that cannot answer a list
+/// of commits must not cost the trunk baseline every earlier release found.
+#[test]
+fn a_detached_head_with_no_scanned_recent_commit_falls_back_to_trunk() {
+    for lookup_by_commit_fails in [false, true] {
+        assert_detached_head_falls_back_to_trunk(lookup_by_commit_fails);
+    }
+}
+
+fn assert_detached_head_falls_back_to_trunk(lookup_by_commit_fails: bool) {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    let head_sha = second_commit(&project);
+    run_git(project.path(), &["checkout", "--detach"]);
+
+    let mut scan = baseline_scan(&base_sha);
+    scan["branch"] = json!("main");
+    let expected_base = base_sha.clone();
+    let shas = vec![head_sha, base_sha];
+    let lookup_by_commit = if lookup_by_commit_fails {
+        expected_request(
+            "fail the baseline lookup by commit",
+            move |request| assert_ancestor_lookup_request(request, PROJECT, Some(&shas), false),
+            json_response_with_status(StatusCode::BAD_REQUEST, json!({"error": "bad sha"})),
+        )
+    } else {
+        ancestor_lookup(Some(shas), vec![])
+    };
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        lookup_by_commit,
+        baseline_lookup("main", vec![scan]),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with the git diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_multipart_text_field(request, "incremental_base_sha", &expected_base)?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_changed_files",
+                    r#"["helper.py","main.py"]"#,
+                )
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains("Incremental scan: 2 files changed since commit"),
+        "{context}"
+    );
+}
+
+/// A backend predating the server-side filters returns scans of every kind, so
+/// a page can hold nothing usable. The walk is what stops that project from
+/// being permanently unable to find a baseline it has.
+#[test]
+fn a_baseline_on_a_later_page_is_still_found() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    let head_sha = second_commit(&project);
+
+    let mut unusable = baseline_scan(&head_sha);
+    unusable["worktree_dirty"] = json!(true);
+    let expected_base = base_sha.clone();
+
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
+        baseline_lookup_page(FIXTURE_BRANCH, 1, 2, vec![unusable]),
+        baseline_lookup_page(FIXTURE_BRANCH, 2, 2, vec![baseline_scan(&base_sha)]),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with the diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_multipart_text_field(request, "incremental_base_sha", &expected_base)
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+}
+
+/// A lookup that failed says so. Reporting it as "no earlier scan" tells someone
+/// with years of scan history that they have none, and now that incremental is
+/// the default, any network blip would say it.
+#[test]
+fn a_failed_lookup_is_not_reported_as_a_missing_baseline() {
+    let project = git_project();
+    second_commit(&project);
+
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
+        expected_request(
+            "fail the baseline lookup",
+            |request| assert_baseline_lookup_request(request, PROJECT, Some(FIXTURE_BRANCH), false),
+            json_response_with_status(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "boom"})),
+        ),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with no diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_no_multipart_field(request, "incremental_base_sha")?;
+                assert_no_multipart_field(request, "incremental_changed_files")?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_skipped_reason",
+                    "baseline_lookup_failed",
+                )
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(stdout.contains("could not be looked up"), "{context}");
+    assert!(
+        !stdout.contains("has no completed scan"),
+        "a lookup failure must not claim the project has no scan history\n{context}"
+    );
+}
+
+/// The opt-out is absolute: no baseline lookup, no diff, no message, and an
+/// explicit `disable_incremental` so the server does not derive its own.
+/// Someone reaching for it wants every file analyzed, usually because something
+/// outside `corgea.yaml` changed that the server's baseline checks cannot see.
+/// The server is still told why, so the full scan can be explained later.
+#[test]
+fn disable_incremental_does_not_even_look_for_a_baseline() {
+    let project = git_project();
+    let head_sha = second_commit(&project);
+
+    let patch_sha = head_sha.clone();
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with no diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_multipart_text_field(request, "sha", &patch_sha)?;
+                assert_multipart_text_field(request, "dirty", "false")?;
+                assert_multipart_text_field(request, "disable_incremental", "true")?;
+                assert_no_multipart_field(request, "incremental_base_sha")?;
+                assert_no_multipart_field(request, "incremental_changed_files")?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_skipped_reason",
+                    "disabled_by_flag",
+                )?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_skipped_detail",
+                    "--disable-incremental was passed",
+                )
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--disable-incremental",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(!stdout.contains("Scanning every file:"), "{context}");
+    assert!(!stdout.contains("Incremental scan:"), "{context}");
+}
+
+/// `--target` already uploads a chosen subset. Carrying findings forward for
+/// files the archive no longer holds would be wrong, so incremental is skipped
+/// — silently, since "scanning every file" would be a lie here.
+#[test]
+fn a_narrowed_archive_skips_incremental_without_claiming_a_full_scan() {
+    let project = git_project();
+    second_commit(&project);
+
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        start_upload(),
+        expected_request(
+            "upload narrowed BLAST archive",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                // A partial archive is never an exact snapshot of the commit.
+                assert_multipart_text_field(request, "dirty", "true")?;
+                assert_no_multipart_field(request, "incremental_base_sha")?;
+                assert_no_multipart_field(request, "incremental_changed_files")?;
+                // Silent in the terminal, not to the server.
+                assert_multipart_text_field(
+                    request,
+                    "incremental_skipped_reason",
+                    "targeted_upload",
+                )
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--target",
+        "main.py",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(!stdout.contains("Scanning every file:"), "{context}");
+}
+
+/// A clean baseline behind a page of dirty scans is still found.
+///
+/// The first walk cannot ask the server for clean scans only, because that is
+/// how a git-less scan reports itself and those are the ones worth having. The
+/// cost is that dirty scans now reach the client, and a project with enough of
+/// them could bury the clean scan it does have past the page budget. Every
+/// project looks like that in the window before any of its scans has stored
+/// checksums, so the second walk asks for what the first could not.
+#[test]
+fn a_clean_baseline_is_found_even_when_dirty_scans_come_back_first() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    let head_sha = second_commit(&project);
+
+    let mut dirty = baseline_scan(&"d".repeat(40));
+    dirty["worktree_dirty"] = json!(true);
+
+    let expected_base = base_sha.clone();
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
+        baseline_lookup(FIXTURE_BRANCH, vec![dirty]),
+        clean_baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with the diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_multipart_text_field(request, "incremental_base_sha", &expected_base)
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert_ne!(head_sha, base_sha);
+    assert!(
+        stdout.contains("Incremental scan: 2 files changed since commit"),
+        "{context}"
+    );
+}
+
+/// No git repository and a baseline that stored no checksums leaves nothing to
+/// compare either way, which must not stall or fail the scan.
+#[test]
+fn a_directory_that_is_not_a_git_repository_scans_everything() {
+    let project = tempfile::TempDir::new().expect("create project");
+    std::fs::write(project.path().join("main.py"), "print('hi')\n").expect("write source");
+
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        branchless_baseline_lookup(vec![without_git(baseline_scan("unused"))]),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with no repo metadata",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_no_multipart_field(request, "incremental_base_sha")?;
+                assert_no_multipart_field(request, "incremental_base_scan_id")?;
+                assert_no_multipart_field(request, "incremental_changed_files")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(
+            "Scanning every file: project 'cloud-e2e' has no completed scan of its whole \
+             state that could be diffed against"
+        ),
+        "{context}"
+    );
+}
+
+/// `--ignore-dirty-worktree` does not pretend the tree is clean: it moves the
+/// far side of the diff to the working tree, so the edited file is named and
+/// rescanned rather than keeping findings nothing analyzed.
+#[test]
+fn ignore_dirty_worktree_diffs_the_working_tree_instead_of_refusing() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    std::fs::write(project.path().join("main.py"), "print('uncommitted')\n")
+        .expect("dirty the tree");
+
+    let expected_base = base_sha.clone();
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
+        baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with a worktree diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                // Still reported dirty: the upload is not a snapshot of the
+                // commit, and the scan must never become a baseline itself.
+                assert_multipart_text_field(request, "dirty", "true")?;
+                assert_multipart_text_field(request, "incremental_base_sha", &expected_base)?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_changed_files",
+                    r#"["main.py"]"#,
+                )?;
+                assert_multipart_text_field(request, "incremental_covers_worktree", "true")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--ignore-dirty-worktree",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(stdout.contains("and your uncommitted changes"), "{context}");
+}
+
+/// Without checksums to fall back on, a dirty tree still scans everything: a
+/// commit-to-commit diff cannot see uncommitted edits, so their old findings
+/// would be carried forward over content nothing analyzed.
+///
+/// Both reasons are printed, and this is the case that shows why. Someone who
+/// edits a file and reruns expects the checksum diff to handle it -- it is
+/// built to -- so a message naming only the dirty tree sends them looking for a
+/// bug in the dirty-tree rule, when what actually happened is that the baseline
+/// has no checksums to diff against.
+#[test]
+fn a_dirty_worktree_with_no_stored_checksums_scans_everything() {
+    let project = git_project();
+    let base_sha = project.sha.clone();
+    let head_sha = second_commit(&project);
+    std::fs::write(project.path().join("main.py"), "print('uncommitted')\n")
+        .expect("dirty the tree");
+
+    let patch_sha = head_sha.clone();
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        no_scanned_recent_commit(),
+        baseline_lookup(FIXTURE_BRANCH, vec![baseline_scan(&base_sha)]),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with no diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_multipart_text_field(request, "sha", &patch_sha)?;
+                assert_multipart_text_field(request, "dirty", "true")?;
+                assert_no_multipart_field(request, "incremental_base_sha")?;
+                assert_no_multipart_field(request, "incremental_changed_files")?;
+                assert_multipart_text_field(request, "incremental_skipped_reason", "dirty_worktree")
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": 91})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(&format!(
+            "Scanning every file: the last scan of {FIXTURE_BRANCH} ({}) stored no file \
+             checksums to diff against, and this worktree has uncommitted changes that a \
+             commit-to-commit diff cannot see.",
+            &base_sha[..7]
+        )),
+        "{context}"
+    );
+}

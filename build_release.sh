@@ -22,6 +22,12 @@ else
   exit 1
 fi
 
+VERSION="v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "corgea") | .version')"
+if [ "$VERSION" == "v" ]; then
+  echo "Could not read the corgea version from Cargo.toml (is jq installed?)"
+  exit 1
+fi
+
 for target in "${TARGETS[@]}"
 do
     if [ $BUILD_OS == "Darwin" ]; then
@@ -37,7 +43,7 @@ do
         ./scripts/check-linux-binary.sh "target/$target/release/corgea" "$target" || exit 1
     fi
 
-    zip_file_name="corgea-$target.zip"
+    zip_file_name="corgea-$VERSION-$target.zip"
 
     # if zip_file_name exists, remove it
     if [ -f $zip_file_name ]; then

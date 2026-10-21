@@ -83,6 +83,37 @@ fn list_uses_canonical_name_from_repo() {
 }
 
 #[test]
+fn list_issues_json_omits_scanner_metadata_from_the_list_payload() {
+    let issues = r#"{"status":"ok","page":1,"total_pages":1,"total_issues":1,"issues":[{"id":"issue-abc","scan_id":"scan-123","status":"open","urgency":"high","created_at":"2026-01-01T00:00:00Z","classification":{"id":"CWE-89","name":"SQL Injection","description":null},"location":{"file":{"name":"app.py","language":"python","path":"src/app.py"},"line_number":42,"project":{"name":"bohappdev/dotnet-azure-web-tsb","branch":null,"git_sha":null}},"details":null,"auto_triage":{"false_positive_detection":{"status":"none","reasoning":null}},"auto_fix_suggestion":null,"scanner_metadata":{"kingdom":"Encapsulation","instance_id":"6B481068"},"metadata":{"build_id":"TODS"}}]}"#;
+    let (url, _hits) = spawn_stub(projects_match(), scans_one(CANON), issues.to_string());
+    let (_tmp, repo) = temp_git_repo("build-123", REMOTE);
+    let out = run_list(&["--issues", "--json"], &url, &repo);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout not JSON ({e}): {stdout}"));
+    let issue = &body["results"][0];
+    assert_eq!(issue["id"], "issue-abc");
+    assert!(
+        issue.get("scanner_metadata").is_none(),
+        "list JSON must not re-emit scanner_metadata; stdout: {stdout}"
+    );
+    assert!(
+        issue.get("metadata").is_none(),
+        "list JSON must not re-emit metadata; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Encapsulation"),
+        "scanner metadata leaked into list JSON; stdout: {stdout}"
+    );
+}
+
+#[test]
 fn list_issues_uses_canonical_name_from_repo() {
     let (url, hits) = spawn_stub(projects_match(), scans_one(CANON), issues_one());
     let (_tmp, repo) = temp_git_repo("build-123", REMOTE);

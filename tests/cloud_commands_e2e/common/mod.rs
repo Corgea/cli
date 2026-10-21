@@ -30,8 +30,19 @@ pub(crate) type RequestCheck = dyn Fn(&CapturedRequest) -> Result<(), String> + 
 pub(crate) struct ExpectedRequest {
     label: &'static str,
     check: Box<RequestCheck>,
+    response: StubResponse,
+}
+
+/// What the stub answers a matched request with.
+///
+/// Bytes rather than a string because not every endpoint serves JSON: a file
+/// manifest is gzip, and handing it back as text would corrupt it into
+/// something the client is right to reject.
+#[derive(Clone)]
+pub(crate) struct StubResponse {
     status: StatusCode,
-    body: String,
+    content_type: &'static str,
+    body: Vec<u8>,
 }
 
 pub(crate) struct ApiState {
@@ -186,47 +197,43 @@ pub(crate) async fn handle_request(
         body,
     };
 
-    let (status, body) = {
+    let response = {
         let mut state = state.lock().expect("lock API request state");
         state.captured.push(captured.clone());
-        match state.expected.pop_front() {
+        let failure = match state.expected.pop_front() {
             Some(expected) => match (expected.check)(&captured) {
-                Ok(()) => (expected.status, expected.body),
-                Err(error) => {
-                    state
-                        .failures
-                        .push(format!("{}: {}", expected.label, error));
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        json!({"status": "error", "message": error}).to_string(),
-                    )
-                }
-            },
-            None => {
-                let error = format!(
-                    "unexpected extra request: {} {}",
-                    captured.method, captured.target
-                );
+                Ok(()) => None,
+                Err(error) => Some(format!("{}: {}", expected.label, error)),
+            }
+            .map_or_else(|| Ok(expected.response), Err),
+            None => Err(format!(
+                "unexpected extra request: {} {}",
+                captured.method, captured.target
+            )),
+        };
+        match failure {
+            Ok(response) => response,
+            Err(error) => {
                 state.failures.push(error.clone());
-                (
+                json_response_with_status(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    json!({"status": "error", "message": error}).to_string(),
+                    json!({"status": "error", "message": error}),
                 )
             }
         }
     };
 
     Ok(Response::builder()
-        .status(status)
-        .header(hyper::header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(body)))
+        .status(response.status)
+        .header(hyper::header::CONTENT_TYPE, response.content_type)
+        .body(Full::new(Bytes::from(response.body)))
         .expect("build API response"))
 }
 
 pub(crate) fn expected_request<F>(
     label: &'static str,
     check: F,
-    response: (StatusCode, String),
+    response: StubResponse,
 ) -> ExpectedRequest
 where
     F: Fn(&CapturedRequest) -> Result<(), String> + Send + 'static,
@@ -234,17 +241,33 @@ where
     ExpectedRequest {
         label,
         check: Box::new(check),
-        status: response.0,
-        body: response.1,
+        response,
     }
 }
 
-pub(crate) fn json_response(body: Value) -> (StatusCode, String) {
-    (StatusCode::OK, body.to_string())
+pub(crate) fn json_response(body: Value) -> StubResponse {
+    json_response_with_status(StatusCode::OK, body)
 }
 
-pub(crate) fn json_response_with_status(status: StatusCode, body: Value) -> (StatusCode, String) {
-    (status, body.to_string())
+pub(crate) fn json_response_with_status(status: StatusCode, body: Value) -> StubResponse {
+    StubResponse {
+        status,
+        content_type: "application/json",
+        body: body.to_string().into_bytes(),
+    }
+}
+
+/// A body served verbatim, for endpoints that do not answer in JSON.
+pub(crate) fn raw_response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: impl Into<Vec<u8>>,
+) -> StubResponse {
+    StubResponse {
+        status,
+        content_type,
+        body: body.into(),
+    }
 }
 
 pub(crate) fn target_path_and_query(target: &str) -> (&str, Vec<(String, String)>) {
@@ -308,6 +331,145 @@ pub(crate) fn assert_scan_list_request(
     assert_query(request, "page", "1")?;
     assert_query(request, "page_size", "30")?;
     assert_query(request, "project", project)
+}
+
+/// Where a labelled step sits in a plan, for a test that has to answer one of
+/// them differently from the rest.
+pub(crate) fn plan_step(plan: &[ExpectedRequest], label: &str) -> usize {
+    plan.iter()
+        .position(|step| step.label == label)
+        .unwrap_or_else(|| panic!("no {label:?} step in this plan"))
+}
+
+/// Every baseline lookup a fixture repo makes when nothing turns up.
+///
+/// The scans of this checkout's recent commits on any branch first, since the
+/// nearest scanned ancestor is the best baseline there could be; the fixture's
+/// history fits in one batch. Then the branch being scanned, then the two trunk
+/// names, since the fixture records no origin/HEAD. Each branch lookup is two
+/// walks. The first takes a baseline of either kind,
+/// so it cannot let the server drop scans that are not known-clean; the second
+/// asks for exactly those once no checksums have been found, so a clean scan
+/// behind a page budget's worth of dirty ones is still reachable.
+pub(crate) fn baseline_lookups_finding_nothing(project: &'static str) -> Vec<ExpectedRequest> {
+    let (own, trunks) = BASELINE_BRANCH_ORDER.split_at(1);
+    let branch_walks = |branches: &[&'static str]| -> Vec<ExpectedRequest> {
+        [false, true]
+            .into_iter()
+            .flat_map(|require_clean| {
+                branches.iter().map(move |&branch| {
+                    expected_request(
+                        "look up a baseline scan to diff against",
+                        move |request| {
+                            assert_baseline_lookup_request(
+                                request,
+                                project,
+                                Some(branch),
+                                require_clean,
+                            )
+                        },
+                        json_response(scans_response(Vec::new())),
+                    )
+                })
+            })
+            .collect()
+    };
+    let mut lookups = vec![expected_request(
+        "look up a baseline scan of a recent commit",
+        move |request| assert_ancestor_lookup_request(request, project, None, false),
+        json_response(scans_response(Vec::new())),
+    )];
+    lookups.extend(branch_walks(own));
+    lookups.extend(branch_walks(trunks));
+    lookups
+}
+
+/// The lookup by commit: the checkout's recent commits in one `sha` list, on
+/// any branch. `shas`, when given, is the exact list expected, nearest first;
+/// otherwise any list of full commit hashes passes.
+pub(crate) fn assert_ancestor_lookup_request(
+    request: &CapturedRequest,
+    project: &str,
+    shas: Option<&[String]>,
+    require_clean: bool,
+) -> Result<(), String> {
+    assert_authenticated_request(request, Method::GET, "/api/v1/scans")?;
+    assert_query(request, "page", "1")?;
+    assert_query(request, "page_size", "50")?;
+    assert_query(request, "project", project)?;
+    assert_query(request, "engine", "corgea-blast")?;
+    assert_query(request, "status", "complete")?;
+    assert_query(request, "exclude_pull_requests", "true")?;
+    assert_query(request, "full_project_state", "true")?;
+    if let Ok(branch) = query_value(request, "branch") {
+        return Err(format!(
+            "a lookup by commit must not ask for branch {branch}"
+        ));
+    }
+    match (require_clean, query_value(request, "worktree_dirty")) {
+        (true, Ok(value)) if value == "false" => {}
+        (false, Err(_)) => {}
+        (_, value) => return Err(format!("unexpected worktree_dirty filter {value:?}")),
+    }
+    let sent = query_value(request, "sha")?;
+    match shas {
+        Some(shas) if sent != shas.join(",") => {
+            Err(format!("expected sha={}, got {sent}", shas.join(",")))
+        }
+        Some(_) => Ok(()),
+        None if sent
+            .split(',')
+            .all(|sha| sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())) =>
+        {
+            Ok(())
+        }
+        None => Err(format!("expected a list of commit hashes, got sha={sent}")),
+    }
+}
+
+/// One baseline lookup an incremental scan makes before uploading.
+///
+/// Asserting the filters is the point: they keep this to one request per
+/// candidate branch instead of a page walk, and a server dropping them silently
+/// returns pull-request scans for the client to reject. `branch` is asserted
+/// because a baseline may only come from the branch being scanned or from
+/// trunk; pass `None` for the lookup a clone with no git makes, which can name
+/// neither.
+///
+/// `require_clean` says which of the two walks this is, and is asserted either
+/// way. A run carrying its own file checksums can diff against a scan that
+/// reported no dirty flag -- every scan uploaded without git reports none -- so
+/// the first walk must not let the server drop them. The second must, or a
+/// clean scan sitting behind a page budget's worth of dirty ones is a baseline
+/// the project has and this never finds.
+pub(crate) fn assert_baseline_lookup_request(
+    request: &CapturedRequest,
+    project: &str,
+    branch: Option<&str>,
+    require_clean: bool,
+) -> Result<(), String> {
+    assert_scan_list_request(request, project)?;
+    assert_query(request, "engine", "corgea-blast")?;
+    assert_query(request, "status", "complete")?;
+    assert_query(request, "exclude_pull_requests", "true")?;
+    match (require_clean, query_value(request, "worktree_dirty")) {
+        (true, Ok(value)) if value == "false" => {}
+        (true, _) => return Err("the second walk must ask for clean scans only".to_string()),
+        (false, Ok(_)) => {
+            return Err("the first walk must not filter on worktree_dirty".to_string())
+        }
+        (false, Err(_)) => {}
+    }
+    let Some(branch) = branch else {
+        return match query_value(request, "branch") {
+            Ok(branch) => Err(format!(
+                "baseline lookup without a trunk to name must not ask for branch {branch}"
+            )),
+            Err(_) => Ok(()),
+        };
+    };
+    assert_query(request, "full_project_state", "true")?;
+    assert_query(request, "branch", branch)
 }
 
 pub(crate) fn query_value(request: &CapturedRequest, key: &str) -> Result<String, String> {
@@ -379,6 +541,23 @@ pub(crate) fn assert_multipart_text_field(
     } else {
         Err(format!("missing multipart field {name}={value:?}"))
     }
+}
+
+/// Proves a field was left off the form entirely. Some fields are only safe in
+/// pairs, so "absent" is as much the contract as any value.
+pub(crate) fn assert_no_multipart_field(
+    request: &CapturedRequest,
+    name: &str,
+) -> Result<(), String> {
+    let needle = format!("name=\"{name}\"");
+    if request
+        .body
+        .windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+    {
+        return Err(format!("unexpected multipart field {name}"));
+    }
+    Ok(())
 }
 
 pub(crate) fn format_transcript(requests: &[CapturedRequest]) -> String {
@@ -460,7 +639,10 @@ pub(crate) fn cloud_command(api: &ApiStub, path: &Path) -> (Command, TempDir) {
     command
         .current_dir(path)
         .env("CORGEA_TOKEN", TOKEN)
-        .env("CORGEA_URL", api.base_url());
+        .env("CORGEA_URL", api.base_url())
+        // Covered by `cli_webapp_version`. These contracts pin each command's
+        // own requests, so the advisory pre-flight stays out of them.
+        .env("CORGEA_SKIP_WEBAPP_VERSION_CHECK", "1");
     (command, home)
 }
 
@@ -468,6 +650,15 @@ pub(crate) struct ReportProject {
     root: TempDir,
     report_path: PathBuf,
 }
+
+/// The fixture repo's branch. Deliberately neither `main` nor `master`, so a
+/// lookup that asked about trunk when it should have asked about the branch
+/// being scanned shows up as a failure rather than agreeing by coincidence.
+pub(crate) const FIXTURE_BRANCH: &str = "e2e-main";
+
+/// Branches the fixture repo's scans ask about, in order: the one being
+/// scanned, then the trunk names, since the fixture records no origin/HEAD.
+pub(crate) const BASELINE_BRANCH_ORDER: [&str; 3] = [FIXTURE_BRANCH, "main", "master"];
 
 pub(crate) struct GitProject {
     root: TempDir,
@@ -500,13 +691,31 @@ pub(crate) fn report_project() -> ReportProject {
     ReportProject { root, report_path }
 }
 
+/// A report referencing two source files, so a test can tell "one upload
+/// stopped" from "every upload was attempted".
+pub(crate) fn two_source_report_project() -> ReportProject {
+    let root = TempDir::new().expect("create report project");
+    let source_dir = root.path().join("src");
+    std::fs::create_dir(&source_dir).expect("create source directory");
+    for name in ["main.py", "helper.py"] {
+        std::fs::write(source_dir.join(name), SOURCE_BODY).expect("write source");
+    }
+    let report_path = root.path().join("semgrep.json");
+    std::fs::write(
+        &report_path,
+        r#"{"version":"semgrep.dev/v1","results":[{"path":"src/main.py"},{"path":"src/helper.py"}]}"#,
+    )
+    .expect("write report");
+    ReportProject { root, report_path }
+}
+
 pub(crate) fn git_project() -> GitProject {
     let root = TempDir::new().expect("create Git project");
     for args in [
         vec!["init"],
         vec!["config", "user.email", "cloud-e2e@example.com"],
         vec!["config", "user.name", "Cloud E2E"],
-        vec!["checkout", "-b", "e2e-main"],
+        vec!["checkout", "-b", FIXTURE_BRANCH],
         vec![
             "remote",
             "add",
@@ -559,15 +768,28 @@ pub(crate) fn verify_request() -> ExpectedRequest {
     )
 }
 
-/// The compatibility pre-flight every authenticated command makes right after
-/// verifying the token. It answers with a null version — "this deployment does
-/// not know" — so these contracts stay independent of the CLI's minimum-version
-/// floor. `cli_webapp_version.rs` covers the comparison itself.
-pub(crate) fn webapp_version_request() -> ExpectedRequest {
+/// Every BLAST run reads the project's include rules before deciding whether a
+/// previous scan can be reused and before packaging, so files Corgea would
+/// classify away can still be forced into the archive.
+pub(crate) fn scan_settings_request(project: &str) -> ExpectedRequest {
+    scan_settings_request_with(project, &[])
+}
+
+/// `scan_settings_request` answering with the given project include rules.
+pub(crate) fn scan_settings_request_with(project: &str, include_paths: &[&str]) -> ExpectedRequest {
+    let project = project.to_string();
+    let body = json!({
+        "status": "ok",
+        "project": null,
+        "settings": {"include_paths": include_paths, "ignore_paths": []}
+    });
     expected_request(
-        "read webapp version",
-        |request| assert_authenticated_request(request, Method::GET, "/api/version"),
-        json_response(json!({"status": "ok", "version": null})),
+        "read project include rules",
+        move |request| {
+            assert_authenticated_request(request, Method::GET, "/api/v1/scan/configs")?;
+            assert_query(request, "project_name", &project)
+        },
+        json_response(body),
     )
 }
 
@@ -688,7 +910,6 @@ pub(crate) fn upload_plan(scan_id: &str, project_id: i64) -> Vec<ExpectedRequest
     let scan_run_id = Arc::clone(&run_id);
     vec![
         verify_request(),
-        webapp_version_request(),
         expected_request(
             "upload referenced source",
             move |request| {
@@ -780,14 +1001,50 @@ pub(crate) fn assert_issue_summary(stdout: &str, context: &str) {
 }
 
 pub(crate) fn blast_plan(sha: &str) -> Vec<ExpectedRequest> {
+    blast_upload_plan(sha, false, true)
+}
+
+/// BLAST upload contract. `include_sca` covers `--fail-on malicious` (SCA fetch).
+pub(crate) fn blast_upload_plan(sha: &str, dirty: bool, include_sca: bool) -> Vec<ExpectedRequest> {
+    blast_plan_for(sha, dirty, include_sca, true)
+}
+
+/// The same contract for `--target`, which names the files to upload and so
+/// never looks for a baseline: findings cannot be carried forward for files
+/// the archive no longer holds.
+pub(crate) fn blast_targeted_upload_plan(sha: &str) -> Vec<ExpectedRequest> {
+    blast_plan_for(sha, true, false, false)
+}
+
+/// The same contract for `--exclude`, which narrows the whole-project walk
+/// rather than choosing what to pack. Its archive is still a project state, so
+/// it looks for a baseline like any other run — and reports dirty, because it
+/// is not an exact snapshot of the commit.
+pub(crate) fn blast_excluded_upload_plan(sha: &str) -> Vec<ExpectedRequest> {
+    blast_plan_for(sha, true, false, true)
+}
+
+fn blast_plan_for(
+    sha: &str,
+    dirty: bool,
+    include_sca: bool,
+    look_for_baseline: bool,
+) -> Vec<ExpectedRequest> {
     let patch_sha = sha.to_string();
+    let dirty_value = if dirty { "true" } else { "false" }.to_string();
     let patch_path = "/api/v1/start-scan/transfer-123/".to_string();
     let detail_path = "/api/v1/scan/blast-scan-123".to_string();
     let issue_path = "/api/v1/scan/blast-scan-123/issues".to_string();
-    let sca_path = "/api/v1/scan/blast-scan-123/issues/sca".to_string();
-    vec![
-        verify_request(),
-        webapp_version_request(),
+    let mut plan = vec![verify_request(), scan_settings_request("cloud-e2e")];
+    // Scans are incremental by default, so every run looks for a baseline
+    // before uploading -- once per candidate branch. A dirty tree asks too: the
+    // baseline's stored checksums describe the files on disk, so they can diff
+    // one. Answering with no scans keeps this the full-scan contract: nothing
+    // to diff from, no incremental fields on the upload.
+    if look_for_baseline {
+        plan.extend(baseline_lookups_finding_nothing("cloud-e2e"));
+    }
+    plan.extend([
         expected_request(
             "start BLAST upload",
             |request| {
@@ -815,13 +1072,14 @@ pub(crate) fn blast_plan(sha: &str) -> Vec<ExpectedRequest> {
                 }
                 assert_multipart_text_field(request, "file_size", upload_length)?;
                 assert_multipart_text_field(request, "project_name", "cloud-e2e")?;
-                assert_multipart_text_field(request, "branch", "e2e-main")?;
+                assert_multipart_text_field(request, "branch", FIXTURE_BRANCH)?;
                 assert_multipart_text_field(
                     request,
                     "repo_url",
                     "https://github.com/corgea/cloud-e2e.git",
                 )?;
                 assert_multipart_text_field(request, "sha", &patch_sha)?;
+                assert_multipart_text_field(request, "dirty", &dirty_value)?;
                 assert_body_contains(request, b"name=\"chunk_data\"")
             },
             json_response(json!({
@@ -843,7 +1101,10 @@ pub(crate) fn blast_plan(sha: &str) -> Vec<ExpectedRequest> {
             },
             json_response(empty_issue_page()),
         ),
-        expected_request(
+    ]);
+    if include_sca {
+        let sca_path = "/api/v1/scan/blast-scan-123/issues/sca".to_string();
+        plan.push(expected_request(
             "read malicious SCA issues",
             move |request| {
                 assert_authenticated_request(request, Method::GET, &sca_path)?;
@@ -851,6 +1112,7 @@ pub(crate) fn blast_plan(sha: &str) -> Vec<ExpectedRequest> {
                 assert_query(request, "page_size", "30")
             },
             json_response(malicious_sca_issue_page()),
-        ),
-    ]
+        ));
+    }
+    plan
 }

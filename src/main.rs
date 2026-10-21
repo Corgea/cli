@@ -1,17 +1,26 @@
 mod authorize;
 mod cicd;
 mod config;
+mod ignore_rules;
+mod images;
+mod include_rules;
+mod incremental;
 mod inspect;
 mod list;
 mod log;
+mod manifest;
+mod mcp;
 mod scan;
 mod setup_hooks;
 mod skill;
+mod skip_scan;
+mod update_check;
 mod wait;
 mod scanners {
     pub mod blast;
     pub mod fortify;
     pub mod parsers;
+    pub mod report_paths;
 }
 mod utils {
     pub mod api;
@@ -37,6 +46,11 @@ struct Cli {
     args: Vec<String>,
 }
 
+// `Scan` carries by far the largest flag set of any subcommand, and exactly one
+// `Commands` value exists per process — parsed once at startup and destructured
+// immediately — so the wasted stack in the other variants costs nothing that
+// boxing would recover.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Authenticate to Corgea
@@ -87,6 +101,12 @@ enum Commands {
 
         #[arg(long, help = "Only scan uncommitted changes.")]
         only_uncommitted: bool,
+
+        #[arg(
+            long = "disable-incremental",
+            help = "Analyze every file, even when Corgea could have analyzed only what changed. Scans are incremental by default: the whole project is still uploaded, but only files that changed since this project's last scan are analyzed, and unchanged files keep their existing findings, so the result is a full picture either way. Use this to force a fresh analysis of every file — after changing scanner configuration outside corgea.yaml, for example. Incremental is skipped on its own, with a reason, when there is no git repository or commit to diff from, when the worktree is dirty, when no earlier scan of a clean worktree exists, or when the last scanned commit is missing from a shallow clone; and silently when --only-uncommitted or --target already narrow the upload to chosen files. With --exclude it still runs, from the stored file checksums of an earlier scan rather than a git diff."
+        )]
+        disable_incremental: bool,
 
         #[arg(
             long = "metadata",
@@ -149,6 +169,13 @@ enum Commands {
         exclude: Option<String>,
 
         #[arg(
+            long = "include",
+            value_name = "PATH",
+            help = "Force files into the scan that Corgea would otherwise skip as vendored, third-party, generated or test code (repeatable), e.g. --include src/myProj/MyClass.java --include 'vendor/our-fork/**'. Accepts a path, a directory, or a glob pattern, and overrides this command's packaging filters, .gitignore, --exclude and the engine's own classification. Force-included files are analyzed on every run, including incremental ones. Your project's include rules in Corgea apply too; this flag adds to them for one run."
+        )]
+        include: Vec<String>,
+
+        #[arg(
             long,
             help = "The name of the Corgea project. Defaults to git repository name if found, otherwise to the current directory name."
         )]
@@ -162,6 +189,34 @@ enum Commands {
             help = "Generate a CycloneDX SBOM of the project after the scan completes, alongside any report. Optionally specify the output file. Defaults to bom.json."
         )]
         sbom: Option<String>,
+
+        #[arg(
+            long = "include-image",
+            value_name = "IMAGE:TAG",
+            help = "Scan a fully built container image (repeatable), e.g. --include-image myapp:1.2.3 --include-image ghcr.io/acme/api:latest. Each image is exported with docker (or podman), pulled first if it isn't available locally, and uploaded with your project. Corgea scans the images you pass instead of searching your code for base images. Requires container scanning to be enabled for your account."
+        )]
+        include_image: Vec<String>,
+
+        #[arg(
+            long = "skip-if-commit-scanned-recently",
+            conflicts_with_all = ["only_uncommitted", "target", "scan_type", "policy", "include_image", "include", "disable_incremental"],
+            help = "Do not start a new scan when this commit already has a recent completed scan in the project. That scan then drives the rest of the command — results table, --block-on gate, --out-file report — so the pipeline behaves the same either way. Prints CORGEA_SCAN_SKIPPED=true/false so a pipeline can tell the two apart, and fails if no git commit can be resolved. What can be reused is a scan of the whole commit, and no API tells this run how a past scan was scoped or configured, so the flag is refused with --only-uncommitted, --target, --scan-type, --policy, --include-image, --include and --disable-incremental; with --exclude it warns instead, since a reused scan covers files this run would have skipped."
+        )]
+        skip_if_commit_scanned_recently: bool,
+
+        #[arg(
+            long = "scanned-within",
+            value_name = "DURATION",
+            requires = "skip_if_commit_scanned_recently",
+            help = "How recent a prior scan of the same commit must be for --skip-if-commit-scanned-recently to reuse it, e.g. 90s, 30m, 24h, 7d (a bare number means hours). Defaults to 24h, because unchanged code is still exposed to advisories published since it was last scanned."
+        )]
+        scanned_within: Option<String>,
+
+        #[arg(
+            long = "ignore-dirty-worktree",
+            help = "Do not let uncommitted changes stop this run from taking a shortcut. For an incremental scan, the diff is measured against the working tree instead of the last commit, so edited and untracked files are analyzed rather than skipped. With --skip-if-commit-scanned-recently, a recent scan of this commit may be reused even though this worktree is dirty or the prior scan recorded worktree_dirty. A new scan still reports the real dirty status."
+        )]
+        ignore_dirty_worktree: bool,
     },
     /// Wait for the latest in progress scan
     Wait {
@@ -276,6 +331,11 @@ enum Commands {
     Skill {
         #[command(subcommand)]
         command: SkillCommands,
+    },
+    /// Install the Corgea MCP server into an agent's config
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
     },
     /// Offline dependency inventory: scan, graph, explain, diff, sbom, policy
     Deps {
@@ -466,6 +526,37 @@ enum SkillCommands {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum McpCommands {
+    /// Install (or reinstall) the Corgea MCP server in an agent's JSON config
+    Install {
+        #[arg(
+            long,
+            help = "Agent to install for (e.g. cursor, claude, claude-code). Defaults to the configured default agent."
+        )]
+        agent: Option<String>,
+
+        #[arg(
+            long,
+            default_value = "user",
+            help = "Installation scope: user or project."
+        )]
+        scope: String,
+
+        #[arg(
+            long,
+            help = "Write to a custom JSON file (overrides the agent's default path)."
+        )]
+        dir: Option<String>,
+
+        #[arg(
+            long,
+            help = "Persist the provided --agent as the default for future installs."
+        )]
+        set_default: bool,
+    },
+}
+
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 enum Scanner {
     Snyk,
@@ -512,8 +603,17 @@ fn default_log_level(debug_flag: i8) -> &'static str {
 
 fn main() {
     let cli = Cli::parse();
-    let mut corgea_config = Config::load().expect("Failed to load config");
+    let mut corgea_config = match Config::load() {
+        Ok(config) => config,
+        // `config.toml` is a file the user can edit, so a bad one is theirs to
+        // fix, not a Rust panic with a backtrace note.
+        Err(e) => {
+            eprintln!("Failed to load config: {}", e);
+            std::process::exit(1);
+        }
+    };
     init_logging(&corgea_config);
+    update_check::notify_if_update_available();
     fn verify_token_and_exit_when_fail(config: &Config) {
         if config.get_token().is_empty() {
             ::log::error!("No token set.\nPlease run 'corgea login' to authenticate.\nFor more info checkout our docs at Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli");
@@ -631,6 +731,7 @@ fn main() {
             fail,
             block_on,
             only_uncommitted,
+            disable_incremental,
             metadata,
             scan_type,
             policy,
@@ -638,8 +739,13 @@ fn main() {
             out_file,
             target,
             exclude,
+            include,
             project_name,
             sbom,
+            include_image,
+            skip_if_commit_scanned_recently,
+            scanned_within,
+            ignore_dirty_worktree,
         }) => {
             verify_token_and_exit_when_fail(&corgea_config);
             if let Some(level) = fail_on {
@@ -665,6 +771,11 @@ fn main() {
 
             if *only_uncommitted && *scanner != Scanner::Blast {
                 ::log::error!("only_uncommitted is only supported with blast scanner.");
+                std::process::exit(1);
+            }
+
+            if *disable_incremental && *scanner != Scanner::Blast {
+                ::log::error!("--disable-incremental is only supported with blast scanner.");
                 std::process::exit(1);
             }
 
@@ -758,10 +869,55 @@ fn main() {
                 std::process::exit(1);
             }
 
+            if !include.is_empty() && *scanner != Scanner::Blast {
+                ::log::error!("--include is only supported with the blast scanner.");
+                std::process::exit(1);
+            }
+
+            // Checked up front rather than dropped later: a pattern that cannot
+            // compile packages nothing, so the scan would appear to succeed
+            // having silently ignored what was asked for.
+            if let Err(msg) = include_rules::validate_cli_patterns(include) {
+                ::log::error!("{}", msg);
+                std::process::exit(1);
+            }
+
             if sbom.is_some() && *scanner != Scanner::Blast {
                 ::log::error!("sbom is only supported with blast scanner.");
                 std::process::exit(1);
             }
+
+            if !include_image.is_empty() && *scanner != Scanner::Blast {
+                ::log::error!("--include-image is only supported with the blast scanner.");
+                std::process::exit(1);
+            }
+
+            let include_images = match images::normalize_image_refs(include_image) {
+                Ok(refs) => refs,
+                Err(e) => {
+                    ::log::error!("{}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            if *skip_if_commit_scanned_recently && *scanner != Scanner::Blast {
+                ::log::error!(
+                    "skip-if-commit-scanned-recently is only supported with blast scanner."
+                );
+                std::process::exit(1);
+            }
+
+            let skip_recent = if *skip_if_commit_scanned_recently {
+                match skip_scan::SkipRecentScan::new(scanned_within.as_deref()) {
+                    Ok(skip) => Some(skip),
+                    Err(msg) => {
+                        ::log::error!("{}", msg);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                None
+            };
 
             match scanner {
                 Scanner::Snyk => scan::run_snyk(&corgea_config, project_name.clone()),
@@ -772,6 +928,8 @@ fn main() {
                     fail,
                     block_on,
                     only_uncommitted,
+                    disable_incremental,
+                    ignore_dirty_worktree,
                     metadata_json,
                     scan_type.clone(),
                     policy.clone(),
@@ -779,8 +937,12 @@ fn main() {
                     out_file.clone(),
                     target.clone(),
                     exclude.clone(),
+                    include.clone(),
                     project_name.clone(),
                     sbom.clone(),
+                    include_images,
+                    skip_recent,
+                    ignore_dirty_worktree,
                 ),
             }
         }
@@ -881,6 +1043,23 @@ fn main() {
             }
             SkillCommands::SetDefaultAgent { agent } => {
                 skill::run_set_default_agent(&mut corgea_config, agent);
+            }
+        },
+        Some(Commands::Mcp { command }) => match command {
+            McpCommands::Install {
+                agent,
+                scope,
+                dir,
+                set_default,
+            } => {
+                verify_token_and_exit_when_fail(&corgea_config);
+                mcp::run_install(
+                    &mut corgea_config,
+                    agent.clone(),
+                    scope,
+                    dir.clone(),
+                    *set_default,
+                );
             }
         },
         Some(Commands::Deps { command }) => {

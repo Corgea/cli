@@ -39,6 +39,7 @@ pub fn corgea_isolated() -> (Command, TempDir) {
         .env_remove("CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL")
         .env_remove("CORGEA_MIN_WEBAPP_VERSION")
         .env_remove("CORGEA_SKIP_WEBAPP_VERSION_CHECK")
+        .env_remove("CORGEA_CONTAINER_ENGINE")
         .env_remove("AI_AGENT")
         .env_remove("CODEX_SANDBOX")
         .env_remove("CLAUDECODE")
@@ -53,6 +54,7 @@ pub fn corgea_isolated() -> (Command, TempDir) {
         .env_remove("GITHUB_PR")
         .env_remove("REPO_DATA")
         .env_remove("DEBUG_CORGEA_OVERRIDE_REPORT_CHUNK_SIZE")
+        .env_remove("DEBUG_CORGEA_OVERRIDE_RETRY_DELAYS_MS")
         .env_remove("RUST_LOG")
         .env_remove("CORGEA_DEBUG")
         .env_remove("HTTP_PROXY")
@@ -563,7 +565,7 @@ pub struct Routes {
     pub sca_issues: Option<String>,
     /// `GET /issues/code-quality` — the project-scoped `--code-quality` route.
     pub code_quality_issues: Option<String>,
-    /// `GET /scan/{id}` — `check_scan_status`.
+    /// `GET /scan/{id}` — the scan read behind `wait` and its polling loop.
     pub scan: Option<String>,
     /// `GET /scan/{id}/issues` — `report_scan_status` and the `--scan-id`
     /// issue route.
@@ -636,8 +638,8 @@ pub fn webapp_version(version: &str) -> String {
     format!(r#"{{"status":"ok","version":"{version}"}}"#)
 }
 
-/// `GET /api/v1/scan/{id}` returning a completed scan (`check_scan_status`
-/// checks the lowercase `complete`).
+/// `GET /api/v1/scan/{id}` returning a completed scan. Statuses are lowercase,
+/// as `classify_scan_status` expects.
 #[allow(dead_code)]
 pub fn scan_complete() -> String {
     r#"{"id":"scan-123","project":"bohappdev/dotnet-azure-web-tsb","repo":"https://github.com/bohappdev/dotnet-azure-web-tsb","branch":"main","status":"complete","engine":"blast","created_at":"2026-01-01T00:00:00Z"}"#.to_string()

@@ -8,6 +8,27 @@ allowed-tools: Shell, Read, Grep, Glob, StrReplace
 
 Find and fix security vulnerabilities using AI-powered scanning (BLAST), third-party scanners, and AI-generated fixes.
 
+## Check the installed version first
+
+This file describes a CLI version, not the one on the machine. Run `corgea --version` before relying on anything below.
+
+```bash
+corgea --version
+```
+
+`corgea --help` and `corgea <command> --help` come from the installed binary, so they are authoritative about which commands and flags exist. **Where this file and `--help` disagree, `--help` is right.** Confirm any command from here that you have not seen in `--help` before running it.
+
+If a command or flag is missing, the CLI is likely older than this reference. Report that to the user with the upgrade for how it was installed, rather than upgrading unprompted — CI runners and self-hosted installs are often pinned deliberately.
+
+```bash
+pip install --upgrade corgea-cli      # installed with pip
+npm install -g @corgea/cli            # installed with npm
+```
+
+An interactive run may print `A new version of the Corgea CLI is available: <current> -> <latest>` on stderr. It is informational, never an error, and never shown when stderr is piped, in CI, or with `CORGEA_NO_UPDATE_CHECK=1`.
+
+A missing flag is the visible case. A flag whose default or output shape changed will not error, so treat a surprising result on an older CLI as a version difference before treating it as a bug.
+
 ## Commands
 
 ### Scan — `corgea scan [scanner]`
@@ -29,6 +50,9 @@ corgea scan --target "src/**/*.py"             # Glob patterns
 corgea scan --target git:diff=origin/main...HEAD  # Git diff range
 corgea scan --target git:staged,git:modified   # Git selectors
 corgea scan --target -                         # File list from stdin
+corgea scan --exclude "tests/**,*.md"          # Exclude glob patterns (comma-separated)
+corgea scan --include src/myProj/MyClass.java  # Force a file in that Corgea would skip as vendored
+corgea scan --include 'vendor/our-fork/**' --include generated/  # Repeatable; path, directory or glob
 corgea scan --scan-type secrets                # Single scan type
 corgea scan --scan-type blast,policy,secrets,pii  # Multiple scan types
 corgea scan --scan-type policy --policy 1      # Specific policy ID
@@ -41,7 +65,12 @@ corgea scan --fail                             # Deprecated: exit 1 based on eve
 corgea scan --out-format json --out-file r.json   # Export (json, html, sarif, markdown)
 corgea scan --sbom                             # Also write a CycloneDX SBOM to bom.json
 corgea scan --sbom sbom.cdx.json               # SBOM to a custom file
+corgea scan --include-image myapp:1.2.3        # Also scan a fully built container image
+corgea scan --include-image myapp:1.2.3 --include-image ghcr.io/acme/api:latest  # Repeatable
 corgea scan --project-name my-service          # Override project name
+corgea scan --skip-if-commit-scanned-recently  # Reuse a recent scan of this commit instead of scanning again
+corgea scan --skip-if-commit-scanned-recently --scanned-within 4h  # Window for "recently" (default 24h)
+corgea scan --skip-if-commit-scanned-recently --ignore-dirty-worktree  # Reuse even if this tree or the prior scan is dirty
 ```
 
 Scan types: `blast` (base AI), `policy` (PolicyIQ), `malicious`, `secrets`, `pii`.
@@ -52,7 +81,25 @@ Scan types: `blast` (base AI), `policy` (PolicyIQ), `malicious`, `secrets`, `pii
 
 `--fail` is deprecated. It evaluates every active blocking rule regardless of what it applies to; use `--block-on` to name the CI rules a pipeline should enforce.
 
+`--include-image` scans the image you actually ship. Without it, container scanning discovers the base images referenced by Dockerfiles and Compose files in the repo and scans those. With it, each image is exported to a tar archive with `docker save` (or `podman save`), bundled with the project, and scanned as a whole — base-image discovery is skipped for that scan. Images that aren't available locally are pulled first, so build (or pull) the image before the scan and stay logged in to its registry. Set `CORGEA_CONTAINER_ENGINE` to choose a specific container CLI. Container scanning must be enabled for your account.
+
+An included image is enough on its own: when it is combined with `--only-uncommitted` or `--target` and no source files match (a clean working tree, for example), the scan warns and covers just the image rather than failing. An archive named `corgea-image-scanning-*.tar` that is committed to the repository is ignored — only images passed on the command line are scanned.
+
+`--include` forces files into the scan that Corgea would otherwise skip because it classified them as vendored, third-party, generated or test code. It overrides the CLI's own packaging filters, `.gitignore`, `--exclude`, and the engine's classification, and force-included files are analyzed on every run — including incremental ones, where an unchanged file would normally have its previous findings carried forward. Use it when proprietary code lives somewhere Corgea assumes dependencies live, e.g. a fork checked into `vendor/`. Project-level include rules configured in the web app (scan settings → File Include Rules) are fetched at the start of every run and applied too; `--include` adds to them for one run. The paths actually forced in are printed, because they override `.gitignore` and the default excludes (which cover `**/*.env` among others).
+
+A pattern that matches the whole repository (`**`, `*`, `/**`) is refused, by both the flag and the web app: include beats exclude, so it would disable every configured exclusion for the scan, including ones set to keep sensitive paths out. Name a directory or file instead.
+
+Include rules also take scan reuse off the table. A reusable scan ran before the rules existed, so its results cannot cover the files they force in — a run with any include rule (from the flag or the project) starts a real scan and prints `CORGEA_SCAN_SKIPPED=false`, as does a run whose rule lookup failed. Ignore rules work the same way: a scan that ran under different project ignore rules than the project has now is not reused.
+
+Removing, disabling or editing a project ignore rule (scan settings → File Ignore Rules) makes the next incremental run also analyze the files the old rule matched and the current rules do not, and it says how many. Earlier scans hold no findings for those files, so carrying findings forward alone would leave them unscanned. If those files would push the run past the incremental limit, or the project's rules cannot be read, it scans every file and says why. Adding an ignore rule does not cost anything extra: the findings it hides are dropped when they are carried forward. Scans started from an integration rather than the CLI scan every file after a rule is lifted.
+
 `--only-uncommitted` and `--target` are mutually exclusive. `--fail-on`, `--fail`, and `--block-on` are mutually exclusive.
+
+`--out-format`/`--out-file` and `--sbom` are honored regardless of the gate: the report and the SBOM are written before `--fail`/`--block-on` are evaluated, so a scan that exits 1 on a blocking rule still leaves the report file behind for the pipeline to ingest.
+
+`--skip-if-commit-scanned-recently` reuses the project's most recent reusable scan of the current commit instead of starting a duplicate, when one ran inside the `--scanned-within` window (default `24h`; accepts `90s`, `30m`, `4h`, `7d`, and a bare number as hours). The reused scan takes the new scan's place for the rest of the command — results table, `--block-on` gate and its exit code, `--out-file` report — so the pipeline behaves the same either way. It prints `CORGEA_SCAN_SKIPPED=true` plus `CORGEA_SCAN_ID=<id>` on a reuse and `CORGEA_SCAN_SKIPPED=false` when a scan runs, so a later step can branch on it.
+
+Reuse requires a candidate that answers the same question: a completed `corgea-blast` scan of that commit, on a branch rather than a pull request, from an explicitly clean worktree, reporting no scanner problems. Anything else runs a real scan (nothing in the window, a failed or still-running scan, a worktree `git status` reports changes in, or a failed lookup). `--ignore-dirty-worktree` (requires `--skip-if-commit-scanned-recently`) overrides the dirty-worktree half of that test: reuse proceeds even if this worktree is dirty or the prior scan recorded `worktree_dirty=true`. A prior scan that never reported the flag is still not reused. A new scan still reports the real dirty status. An unresolvable commit is a hard error (exit 1). Because the API exposes neither a scan's configured scan types and target policies nor whether it bundled a container image, a run that changes what gets scanned cannot be matched against a candidate, so the flag cannot be combined with `--scan-type`, `--policy`, `--include-image`, `--include`, `--only-uncommitted`, or `--target`. `--exclude` is allowed but warns on a skip: what gets reused is a scan of the whole commit, so the results and the gate can cover files the run would have skipped (over-reporting, never under-reporting).
 
 ### Upload — `corgea upload [report]`
 
@@ -74,8 +121,15 @@ By default `upload` prints the scan page URL so you can track the results. Pass 
 
 ```bash
 corgea wait                                    # Wait for latest scan
-corgea wait --scan-id SCAN_ID                  # Wait for specific scan
+corgea wait SCAN_ID                            # Wait for a specific scan
 ```
+
+Waiting (`corgea scan`, `corgea wait`, `corgea upload --wait`) exits 1 if the
+scan fails, printing why. A scan missing one scanner's results exits 0 with a
+warning. Polling gives up after 10 hours; override with
+`CORGEA_SCAN_TIMEOUT_SECONDS`. `--fail`/`--block-on` then wait up to 15 minutes
+for blocking rules to be evaluated, and exit 1 if that runs out; override with
+`CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS`.
 
 ### List — `corgea list` (alias: `corgea ls`)
 
@@ -108,6 +162,8 @@ corgea inspect --issue --fix ISSUE_ID          # Fix explanation only
 corgea inspect --issue --diff ISSUE_ID         # Diff only
 corgea inspect --issue --json ISSUE_ID         # JSON output
 ```
+
+Issue summaries include a "Scanner Metadata" section when the originating scanner reported identifiers (for Fortify: `instance_id`, `class_id`, `kingdom`, `category`, `analyzer`, `build_id`). With `--json` they appear under `issue.metadata` (the issue's scanner identifiers) and `issue.scanner_metadata` (the fix analysis copy).
 
 | Flag | Short | Description |
 |------|-------|-------------|
@@ -346,6 +402,13 @@ corgea scan
 corgea scan --only-uncommitted --fail-on HI
 ```
 
+### Scan the container image a build produced
+
+```bash
+docker build -t myapp:1.2.3 .
+corgea scan --include-image myapp:1.2.3
+```
+
 ### Scan a PR diff
 
 ```bash
@@ -365,7 +428,11 @@ corgea inspect --issue --diff ISSUE_ID
 corgea scan --fail-on CR --out-format sarif --out-file results.sarif
 corgea scan --fail-on CR,malicious --out-format sarif --out-file results.sarif  # also block malicious dependencies
 corgea scan --block-on criticals --out-format sarif --out-file results.sarif  # gate on a CI blocking rule from the web app
+corgea scan --block-on criticals --skip-if-commit-scanned-recently  # re-runs of an already-scanned commit gate on that scan instead of rescanning
 ```
+
+The report is written whether or not the gate trips, so a pipeline can both fail
+on policy and ingest the results file.
 
 ### Upload third-party reports
 

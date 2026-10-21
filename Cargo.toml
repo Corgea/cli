@@ -1,6 +1,6 @@
 [package]
 name = "corgea"
-version = "1.10.0"
+version = "1.16.2"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -16,7 +16,7 @@ test-stub = []
 
 [dev-dependencies]
 corgea = { path = ".", features = ["test-stub"] }
-tempfile = "3.12.0"
+tempfile = "3.20.0"
 
 [dependencies]
 clap = { version = "4.4.13", features = ["derive"] }
@@ -39,13 +39,13 @@ serde_json = "1.0.111"
 serde_derive = "1.0.195"
 uuid = { version = "1.7.0", features = ["v4"] }
 which = "6.0.0"
-zip = "2.3.0"
-tempfile = "3.12.0"
+zip = "9.0.5"
+tempfile = "3.20.0"
 quick-xml = "0.41"
 ignore = "0.4"
 globset = "0.4"
 termcolor = "1.1"
-git2 = { version = "0.20.4", default-features = false }
+git2 = { version = "0.21", default-features = false }
 regex = "1"
 chrono = "0.4"
 tokio = { version = "1.0", features = ["full"] }
@@ -57,6 +57,8 @@ url = "2.5"
 open = "5.0"
 urlencoding = "2.1"
 serde_yaml_ng = "0.10"
+sha2 = "0.10"
+flate2 = "1.1"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
