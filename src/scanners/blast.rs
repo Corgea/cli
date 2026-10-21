@@ -143,6 +143,7 @@ pub fn run(
             skip,
             exclude.as_deref(),
             *ignore_dirty_worktree,
+            include_rules.project_ignore_paths.as_deref(),
         )
     });
 
@@ -758,6 +759,7 @@ fn start_new_scan(
                 ignore_dirty_worktree: *ignore_dirty_worktree,
                 exclude_narrowed: exclude.is_some(),
                 manifest: archive_contents.manifest.as_ref(),
+                ignore_paths: include_rules.project_ignore_paths.as_deref(),
             },
         )
         // Force-included files are usually unchanged, and the server carries
@@ -1947,6 +1949,7 @@ mod tests {
             scan_errors,
             file_manifest_root: None,
             file_manifest_version: None,
+            ignore_paths: None,
         }
     }
 

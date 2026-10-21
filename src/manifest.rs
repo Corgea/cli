@@ -187,6 +187,11 @@ impl Manifest {
         self.entries.insert(path, digest);
     }
 
+    /// Every archived path, as its zip entry name, in path order.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
     /// Canonical bytes: the header, then one `<digest> <path>` line per entry
     /// in path order. Two runs over the same file set produce the same bytes,
     /// which is what lets the server compare two scans on the root alone.

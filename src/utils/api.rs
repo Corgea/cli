@@ -31,6 +31,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
 /// the default would delay every scan for no gain.
 const SETTINGS_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Unversioned on purpose: the webapp serves its own version outside the
+/// versioned API so clients can read it before agreeing on an API version.
+const WEBAPP_VERSION_PATH: &str = "/api/version";
+
+/// Far below the shared client's timeout, because this request is advisory and
+/// runs ahead of every authenticated command: a deployment that stalls this one
+/// route must not hold the command the user actually asked for.
+const WEBAPP_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn auth_headers(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     let (name, value) = auth_header(token);
@@ -792,6 +801,17 @@ pub fn upload_zip(
                                     multipart::Part::text("true"),
                                 );
                             }
+                            // Without it, a server seeing that the baseline's
+                            // ignore rules were lifted scans every file, since
+                            // only this says the list covers what they hid.
+                            if let Some(rules) = plan
+                                .ignore_rules
+                                .as_ref()
+                                .and_then(|rules| serde_json::to_string(rules).ok())
+                            {
+                                form = form
+                                    .part("incremental_ignore_rules", multipart::Part::text(rules));
+                            }
                         }
                         Err(e) => debug(&format!(
                         "Could not serialize the incremental file list, scanning every file: {e}"
@@ -1436,10 +1456,23 @@ fn request_scan_list(
 pub struct ScanSettings {
     /// Patterns that force files into the scan even when Corgea would classify
     /// them as vendored, third-party, generated or test code.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "patterns_without_nulls")]
     pub include_paths: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "patterns_without_nulls")]
     pub ignore_paths: Vec<String>,
+}
+
+/// A rule saved without a pattern is listed as `null`. It matches nothing, so
+/// it is dropped rather than failing the whole read.
+fn patterns_without_nulls<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<Option<String>>>::deserialize(deserializer)?
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -1864,6 +1897,55 @@ pub fn verify_token(corgea_url: &str) -> Result<bool, Box<dyn Error>> {
     }
 }
 
+/// The version the webapp at `corgea_url` reports for itself.
+///
+/// `Ok(None)` means the deployment did not tell us: either it predates
+/// `/api/version` (404) or it could not determine its own version (null).
+///
+/// A 404 is not evidence of an outdated webapp and callers must not treat it as
+/// one. The endpoint ships in a release *above* `MIN_WEBAPP_VERSION`, so every
+/// deployment sitting exactly at the floor answers 404 while being perfectly
+/// compatible. A 404 only narrows the version to "older than the release that
+/// added this route", which spans both sides of the floor.
+///
+/// Deliberately skips `check_for_warnings`: this runs as a pre-flight before
+/// the command the user asked for, and it must not be what terminates the
+/// process. The command's own requests still surface deprecation signals.
+pub fn get_webapp_version(corgea_url: &str) -> Result<Option<String>, Box<dyn Error>> {
+    let url = format!("{}{}", corgea_url, WEBAPP_VERSION_PATH);
+    let client = http_client();
+    debug(&format!("Sending request to URL: {}", url));
+
+    let response = client.get(&url).timeout(WEBAPP_VERSION_TIMEOUT).send()?;
+    let status = response.status();
+
+    if status == StatusCode::NOT_FOUND {
+        debug("Webapp does not serve /api/version");
+        return Ok(None);
+    }
+
+    if !status.is_success() {
+        return Err(format!("Request failed with status: {}", status).into());
+    }
+
+    let body_text = response.text()?;
+    let body: WebappVersionResponse = match serde_json::from_str(&body_text) {
+        Ok(json) => json,
+        Err(e) => {
+            debug(&format!(
+                "Failed to parse response as JSON: {}. Response body: {}",
+                e, body_text
+            ));
+            return Err("Failed to parse response".to_string().into());
+        }
+    };
+
+    Ok(body
+        .version
+        .map(|version| version.trim().to_string())
+        .filter(|version| !version.is_empty()))
+}
+
 /// Evaluate a scan against blocking rules.
 ///
 /// `block_on` is a comma-separated list of CI rule slugs. When omitted the
@@ -2034,6 +2116,13 @@ pub fn get_all_sca_issues(
     Ok(all_issues)
 }
 
+#[derive(Deserialize, Serialize, Debug)]
+pub struct WebappVersionResponse {
+    /// Null on deployments that cannot determine their own version.
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
 /// One scanner problem reported against a scan, already sanitized server-side.
 ///
 /// Every field is optional so a server that omits any of them still parses.
@@ -2098,6 +2187,11 @@ pub struct ScanResponse {
     /// left alone rather than guessed at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_manifest_version: Option<String>,
+    /// The project's ignore rules as they applied to this scan. It holds no
+    /// findings for the files they matched. `None` from a backend predating
+    /// the field, or for a scan predating the rules being recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_paths: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
     /// Why a scan ended without finishing. Only set for failed scans.
@@ -2536,6 +2630,24 @@ mod tests {
     }
 
     #[test]
+    fn scan_settings_drop_rules_saved_without_a_pattern() {
+        let parsed: ScanSettingsResponse = serde_json::from_str(
+            r#"{"settings": {"include_paths": null, "ignore_paths": ["vendor/**", null]}}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            parsed.settings,
+            ScanSettings {
+                include_paths: vec![],
+                ignore_paths: vec!["vendor/**".to_string()],
+            }
+        );
+        let missing: ScanSettingsResponse =
+            serde_json::from_str(r#"{"settings": {}}"#).expect("parses");
+        assert_eq!(missing.settings, ScanSettings::default());
+    }
+
+    #[test]
     fn scan_response_deserializes_git_sha_and_defaults_when_missing() {
         let with_sha = r#"{
             "id": "s1",
@@ -2561,6 +2673,16 @@ mod tests {
         }"#;
         let parsed: ScanResponse = serde_json::from_str(without_sha).unwrap();
         assert_eq!(parsed.git_sha, None);
+        // A backend predating `ignore_paths` omits it; a scan predating the
+        // stamp reports null. Neither may fail the scan list.
+        assert_eq!(parsed.ignore_paths, None);
+        let mut value: serde_json::Value = serde_json::from_str(without_sha).unwrap();
+        value["ignore_paths"] = serde_json::Value::Null;
+        let parsed: ScanResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.ignore_paths, None);
+        value["ignore_paths"] = serde_json::json!(["vendor/**"]);
+        let parsed: ScanResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.ignore_paths, Some(vec!["vendor/**".to_string()]));
     }
 
     #[test]

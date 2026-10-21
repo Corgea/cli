@@ -31,6 +31,10 @@ pub struct IncludeRules {
     /// Whether the project's rules could not be read. Distinct from "no rules":
     /// this run does not know what the project asked for.
     pub lookup_failed: bool,
+    /// The project's ignore rules, read in the same request. An incremental
+    /// scan checks its baseline against them. `None` when they could not be
+    /// read.
+    pub project_ignore_paths: Option<Vec<String>>,
 }
 
 impl IncludeRules {
@@ -210,9 +214,11 @@ pub fn resolve(
     let cli_patterns = normalize_patterns(cli_include);
     let mut patterns = Vec::new();
     let mut lookup_failed = false;
+    let mut project_ignore_paths = None;
 
     match api::query_scan_settings(&config.get_url(), project_name, repo_url) {
         Ok(Some(settings)) => {
+            project_ignore_paths = Some(settings.ignore_paths);
             for pattern in normalize_patterns(&settings.include_paths) {
                 push_unique(&mut patterns, pattern);
             }
@@ -242,6 +248,7 @@ pub fn resolve(
         patterns,
         cli_patterns,
         lookup_failed,
+        project_ignore_paths,
     }
 }
 
