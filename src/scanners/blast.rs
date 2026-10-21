@@ -6,7 +6,7 @@ use crate::scan::build_scan_url;
 use crate::targets;
 use crate::utils;
 use crate::utils::api::SCAIssue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,15 @@ use std::time::{Duration, Instant};
 /// How many force-included paths to name before collapsing the rest to a count.
 /// Same shape as the `--target` file preview.
 const FORCE_INCLUDE_PREVIEW: usize = 20;
+
+/// What `--only-uncommitted` analyzes.
+const UNCOMMITTED_SELECTORS: &str = "git:staged,git:modified,git:untracked";
+
+/// Doghouse first registers a CLI partial scan — `partial_scan` plus a JSON
+/// `files_to_scan` — in this release (Corgea/doghouse#2348, tagged v1.82.0).
+/// An older server splits that field on commas, cannot find the JSON text in
+/// the archive, and rejects the upload.
+const PARTIAL_SCAN_WEBAPP_VERSION: &str = "v1.82.0";
 
 /// Overrides how long `wait_for_scan` polls before giving up.
 const SCAN_TIMEOUT_ENV: &str = "CORGEA_SCAN_TIMEOUT_SECONDS";
@@ -317,17 +326,105 @@ pub fn run(
     }
 }
 
-/// Repo-relative paths as the `/`-separated strings the server's file lists use.
+/// A repo-relative path as the `/`-separated string the server's file lists use.
+fn repo_relative_string(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn repo_relative_strings(paths: &[PathBuf]) -> Vec<String> {
     paths
         .iter()
-        .map(|path| {
-            path.components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/")
-        })
+        .map(|path| repo_relative_string(path))
         .collect()
+}
+
+/// Whether `version` is a webapp release that registers CLI partial scans.
+///
+/// `None`, and any text that is not a release number, count as too old.
+/// Sending the partial-scan upload to a server that cannot read it fails
+/// `--only-uncommitted` outright, including the pre-commit hook. The previous
+/// upload still succeeds on a newer server; it is just recorded as the
+/// branch's latest full scan.
+fn webapp_registers_cli_partial_scans(version: Option<&str>) -> bool {
+    let Some(running) = version.and_then(crate::version_check::extract_version) else {
+        return false;
+    };
+    let Some(required) = crate::version_check::extract_version(PARTIAL_SCAN_WEBAPP_VERSION) else {
+        return false;
+    };
+    running >= required
+}
+
+/// Read the webapp version and decide whether this `--only-uncommitted` run
+/// can be registered as a partial scan. Warns when it cannot, because that run
+/// then uploads only the changed files and the server records them as the
+/// branch's latest full scan.
+fn server_registers_cli_partial_scans(corgea_url: &str) -> bool {
+    let reported = match utils::api::get_webapp_version(corgea_url) {
+        Ok(version) => version,
+        Err(error) => {
+            log::warn!(
+                "Could not read the Corgea server version ({error}). Uploading only the uncommitted files; partial scans need webapp {PARTIAL_SCAN_WEBAPP_VERSION} or newer."
+            );
+            return false;
+        }
+    };
+    match reported.as_deref() {
+        Some(version) if webapp_registers_cli_partial_scans(Some(version)) => true,
+        Some(version) => {
+            log::warn!(
+                "This Corgea server ({version}) does not register partial scans yet (needs {PARTIAL_SCAN_WEBAPP_VERSION}). Uploading only the uncommitted files; this scan stands in for the branch's latest full scan until the server is upgraded."
+            );
+            false
+        }
+        None => {
+            log::warn!(
+                "This Corgea server did not report a version this CLI understands. Uploading only the uncommitted files; partial scans need webapp {PARTIAL_SCAN_WEBAPP_VERSION} or newer."
+            );
+            false
+        }
+    }
+}
+
+/// The files a partial scan asks the server to analyze, as the archive names
+/// them, and the selected files the archive does not hold.
+///
+/// `selected` are absolute paths, matched against the archive relative to the
+/// first of `roots` they sit under. The archive leaves out what packaging
+/// filters (vendored, generated and other unscannable files) and anything
+/// outside the directory it walked; naming one of those would fail the whole
+/// upload server-side, so they are reported as skipped instead. Force-included
+/// files follow the selection: every run analyzes them.
+fn partial_scan_files(
+    selected: &[PathBuf],
+    roots: &[PathBuf],
+    force_included: &[PathBuf],
+    archived: &HashSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut to_scan = Vec::new();
+    let mut skipped = Vec::new();
+    for file in selected {
+        let Some(relative) = roots.iter().find_map(|root| file.strip_prefix(root).ok()) else {
+            skipped.push(file.display().to_string());
+            continue;
+        };
+        let name = repo_relative_string(relative);
+        if archived.contains(&name) {
+            to_scan.push(name);
+        } else {
+            skipped.push(name);
+        }
+    }
+    let mut seen: HashSet<String> = to_scan.iter().cloned().collect();
+    to_scan.extend(
+        repo_relative_strings(force_included)
+            .into_iter()
+            .filter(|name| archived.contains(name) && seen.insert(name.clone())),
+    );
+    (to_scan, skipped)
 }
 
 /// Package the project, upload it, and wait for the scan to finish.
@@ -395,11 +492,50 @@ fn start_new_scan(
         );
     });
 
-    let target_str: Option<&str> = if *only_uncommitted {
-        Some("git:staged,git:modified,git:untracked")
+    // A server that registers partial scans gets the whole project, with the
+    // changed files named in the upload: an archive of just those files reads
+    // as the branch's full state and hides every finding outside them. An
+    // older server rejects that upload, so it is sent only the changed files,
+    // which is how `--only-uncommitted` behaved before partial scans existed.
+    let register_partial =
+        *only_uncommitted && server_registers_cli_partial_scans(&config.get_url());
+    let target_str: Option<&str> = if *only_uncommitted && !register_partial {
+        Some(UNCOMMITTED_SELECTORS)
     } else {
         target.as_deref()
     };
+    let uncommitted_files = if register_partial {
+        match targets::resolve_targets_with_exclude(UNCOMMITTED_SELECTORS, exclude.as_deref()) {
+            Ok(result) => Some(result.files),
+            Err(e) => {
+                *stop_signal.lock().unwrap() = true;
+                let _ = packaging_thread.join();
+                print!(
+                    "\r{}",
+                    utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
+                );
+                log::error!("\n\nError resolving uncommitted changes: {}\n", e);
+                let _ = utils::generic::delete_directory(&temp_dir);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    let cwd = env::current_dir().unwrap_or_default();
+    // Git reports paths under the repository's resolved root, which differs
+    // from the working directory when it is reached through a symlink.
+    let roots: Vec<PathBuf> = cwd.canonicalize().into_iter().chain([cwd]).collect();
+    let uncommitted_in_walk: Vec<PathBuf> = uncommitted_files
+        .iter()
+        .flatten()
+        .filter_map(|file| {
+            roots
+                .iter()
+                .find_map(|root| file.strip_prefix(root).ok())
+                .map(Path::to_path_buf)
+        })
+        .collect();
 
     // Before packaging: mid-pack HEAD move must not look like a clean new SHA.
     let repo_before = utils::generic::get_repo_info_for_scan("./").unwrap_or_default();
@@ -488,38 +624,36 @@ fn start_new_scan(
                             utils::terminal::TerminalColor::Yellow
                         )
                     );
+                } else if *only_uncommitted {
+                    println!("\rFiles to be submitted for partial scan:\n");
+                    for (index, file) in result.files.iter().enumerate() {
+                        if let Ok(relative) =
+                            file.strip_prefix(std::env::current_dir().unwrap_or_default())
+                        {
+                            println!("{}: {}", index + 1, relative.display());
+                        } else {
+                            println!("{}: {}", index + 1, file.display());
+                        }
+                    }
+                    println!();
                 } else {
                     let file_count = result.files.len();
-                    if *only_uncommitted {
-                        println!("\rFiles to be submitted for partial scan:\n");
-                        for (index, file) in result.files.iter().enumerate() {
-                            if let Ok(relative) =
-                                file.strip_prefix(std::env::current_dir().unwrap_or_default())
-                            {
-                                println!("{}: {}", index + 1, relative.display());
-                            } else {
-                                println!("{}: {}", index + 1, file.display());
-                            }
-                        }
-                        println!();
-                    } else {
-                        println!("Scanning {} files (target mode)", file_count);
+                    println!("Scanning {} files (target mode)", file_count);
 
-                        let display_count = std::cmp::min(20, file_count);
-                        for file in result.files.iter().take(display_count) {
-                            if let Ok(relative) =
-                                file.strip_prefix(std::env::current_dir().unwrap_or_default())
-                            {
-                                println!("  {}", relative.display());
-                            } else {
-                                println!("  {}", file.display());
-                            }
+                    let display_count = std::cmp::min(20, file_count);
+                    for file in result.files.iter().take(display_count) {
+                        if let Ok(relative) =
+                            file.strip_prefix(std::env::current_dir().unwrap_or_default())
+                        {
+                            println!("  {}", relative.display());
+                        } else {
+                            println!("  {}", file.display());
                         }
-                        if file_count > display_count {
-                            println!("  (+{} more)", file_count - display_count);
-                        }
-                        println!();
                     }
+                    if file_count > display_count {
+                        println!("  (+{} more)", file_count - display_count);
+                    }
+                    println!();
                 }
             }
             Err(e) => {
@@ -542,8 +676,9 @@ fn start_new_scan(
         None,
         exclude.as_deref(),
         &force_included,
+        &uncommitted_in_walk,
         &extra_zip_files,
-        !*disable_incremental,
+        !*disable_incremental && !register_partial,
     ) {
         Ok(archive) => {
             if archive.added_files.is_empty() {
@@ -553,7 +688,7 @@ fn start_new_scan(
                     "\r{}",
                     utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
                 );
-                if *only_uncommitted {
+                if *only_uncommitted && !register_partial {
                     log::error!(
                         "\n\nOops! It seems there are no scannable uncommitted changes in your project.\nYou may have uncommitted changes, but none match the types of files we can scan.\n\n"
                     );
@@ -586,6 +721,49 @@ fn start_new_scan(
         "\r{}Project packaged successfully.\n",
         utils::terminal::set_text_color("", utils::terminal::TerminalColor::Green)
     );
+    let partial_files = uncommitted_files.map(|selected| {
+        let (files, skipped) = partial_scan_files(
+            &selected,
+            &roots,
+            &force_included,
+            &archive_contents.entry_names,
+        );
+        if !skipped.is_empty() {
+            log::warn!(
+                "\n{}",
+                utils::terminal::set_text_color(
+                    "⚠️  Skipping uncommitted files Corgea does not analyze (vendored, generated, outside this directory, or not source code):",
+                    utils::terminal::TerminalColor::Yellow
+                )
+            );
+            for file in &skipped {
+                log::warn!("   • {file}");
+            }
+        }
+        if files.is_empty() {
+            if image_archives.is_empty() {
+                log::error!(
+                    "\n\nOops! It seems there are no scannable uncommitted changes in your project.\nYou may have uncommitted changes, but none match the types of files we can scan.\n\n"
+                );
+                let _ = utils::generic::delete_directory(&temp_dir);
+                std::process::exit(1);
+            }
+            log::warn!(
+                "\n{}",
+                utils::terminal::set_text_color(
+                    "⚠️  No scannable uncommitted changes, so this scan covers only the included container image(s).",
+                    utils::terminal::TerminalColor::Yellow
+                )
+            );
+        } else {
+            println!("\nFiles to be submitted for partial scan:\n");
+            for (index, file) in files.iter().enumerate() {
+                println!("{}: {}", index + 1, file);
+            }
+            println!();
+        }
+        files
+    });
     let repo_after = utils::generic::get_repo_info_for_scan("./").unwrap_or_default();
     // Notice = what `git status` shows, from the raw samples (so neither
     // --target/--exclude nor SHA drift, which the upload flag also covers).
@@ -613,8 +791,10 @@ fn start_new_scan(
     // --exclude that is the whole of what it costs: the flag rules this scan
     // out as a *commit* baseline, which is right because a git diff from its
     // commit would describe files it never uploaded, while the checksums it
-    // stores still make it one a later run can subtract from.
-    if target_str.is_some() || exclude.is_some() {
+    // stores still make it one a later run can subtract from. A partial scan
+    // covers only its files, so it must not pass for the commit's full scan:
+    // the server dedupes a scan only against clean uploads of the same commit.
+    if target_str.is_some() || exclude.is_some() || partial_files.is_some() {
         if let Some(ref mut info) = repo_info {
             info.dirty = true;
         }
@@ -625,7 +805,8 @@ fn start_new_scan(
     // "scanning every file" either, so no message is honest. --exclude is not
     // one of them -- it narrows the same whole-project walk, which the archive's
     // own checksums describe exactly -- so those runs resolve a plan like any
-    // other and say what came of it.
+    // other and say what came of it. A partial scan already names what to
+    // analyze and carries nothing forward, so it is silent too.
     let incremental = if *disable_incremental {
         Err(FullScanReason::new(
             FullScanCause::DisabledByFlag,
@@ -639,6 +820,11 @@ fn start_new_scan(
             } else {
                 "--target narrowed the upload to the files it selects"
             },
+        ))
+    } else if partial_files.is_some() {
+        Err(FullScanReason::new(
+            FullScanCause::TargetedUpload,
+            "--only-uncommitted narrowed the analysis to uncommitted files",
         ))
     } else {
         // Reconciled repo info, so a tree that turned out dirty — or a HEAD
@@ -688,6 +874,7 @@ fn start_new_scan(
             disable_incremental: *disable_incremental,
             include_paths: include_rules.cli_patterns,
             file_manifest,
+            partial_files,
         },
     ) {
         Ok(result) => result,
@@ -2165,5 +2352,55 @@ mod tests {
         let warnings = format_scan_warnings(&scan).unwrap();
         assert!(warnings.contains("  - pom.xml could not be resolved"));
         assert!(warnings.contains("  - No details provided."));
+    }
+
+    #[test]
+    fn partial_scan_files_names_archived_files_and_reports_the_rest() {
+        let root = PathBuf::from("/work/repo");
+        let archived: HashSet<String> = ["src/app.py", "src/forced.py", "src/also.py"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let selected = [
+            root.join("src/app.py"),
+            root.join("vendor/lib.js"),
+            PathBuf::from("/elsewhere/other.py"),
+        ];
+        let force_included = [PathBuf::from("src/forced.py"), PathBuf::from("src/app.py")];
+
+        let (to_scan, skipped) = partial_scan_files(
+            &selected,
+            &[PathBuf::from("/resolved/repo"), root.clone()],
+            &force_included,
+            &archived,
+        );
+
+        assert_eq!(to_scan, ["src/app.py", "src/forced.py"]);
+        assert_eq!(skipped, ["vendor/lib.js", "/elsewhere/other.py"]);
+    }
+
+    #[test]
+    fn partial_scans_start_at_webapp_1_82_0() {
+        for version in ["v1.82.0", "v1.82.2", "v1.82", "v1.82.0-eu", "v2.0.0"] {
+            assert!(
+                webapp_registers_cli_partial_scans(Some(version)),
+                "{version} registers partial scans"
+            );
+        }
+        // A suffixed build counts as the release it was cut from, so a
+        // customer build of v1.81.3 is still too old, and a version this CLI
+        // cannot read is too — sending the new upload there fails the scan.
+        for version in [
+            "v1.81.3",
+            "v1.81.3-client-a",
+            "v1.81.1-sonae",
+            "not-a-version",
+        ] {
+            assert!(
+                !webapp_registers_cli_partial_scans(Some(version)),
+                "{version} keeps the previous upload"
+            );
+        }
+        assert!(!webapp_registers_cli_partial_scans(None));
     }
 }

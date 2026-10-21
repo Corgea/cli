@@ -2,7 +2,8 @@
 //! binary through the blast scan flow against a stubbed HTTP server with a
 //! stubbed container CLI, and asserts the exported image archive is bundled
 //! into the uploaded project zip under the name the backend greps for
-//! (`corgea-image-scanning-*.tar`).
+//! (`corgea-image-scanning-*.tar`). Also covers how `--only-uncommitted`
+//! registers its upload as a partial scan.
 
 mod common;
 
@@ -32,13 +33,23 @@ exit 1
 /// Stub container CLI that has nothing and can't pull.
 const BROKEN_ENGINE: &str = "#!/bin/sh\necho 'no such image' 1>&2\nexit 1\n";
 
+/// The blast scan route table against a webapp new enough to register partial
+/// scans (doghouse v1.82.0).
+fn spawn_recording_scan_stub(scan_id: &'static str) -> (String, Uploads) {
+    spawn_recording_scan_stub_at(scan_id, Some("v1.82.0"))
+}
+
 /// The blast scan route table (verify -> upload -> poll -> issues), with the
 /// upload chunk bodies captured so a test can inspect what was bundled.
-fn spawn_recording_scan_stub(scan_id: &'static str) -> (String, Uploads) {
+///
+/// `version` is the release `GET /api/version` reports. `None` answers 404,
+/// the way a webapp predating that endpoint does.
+fn spawn_recording_scan_stub_at(scan_id: &'static str, version: Option<&str>) -> (String, Uploads) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
     let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let uploads: Uploads = Default::default();
     let recorder = Arc::clone(&uploads);
+    let version_body = version.map(common::webapp_version);
 
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -76,6 +87,11 @@ fn spawn_recording_scan_stub(scan_id: &'static str) -> (String, Uploads) {
                     r#"{"status":"ok","issues":[],"page":1,"total_pages":1,"total_issues":0}"#
                         .to_string(),
                 )
+            } else if path == "/api/version" {
+                match &version_body {
+                    Some(body) => ("200 OK", body.clone()),
+                    None => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
+                }
             } else {
                 ("404 Not Found", r#"{"message":"not found"}"#.to_string())
             };
@@ -200,7 +216,157 @@ fn scan_only_uncommitted_with_include_image_uploads_the_archive() {
         stderr.contains("only the included container image"),
         "should say the scan covers only the image, got:\n{stderr}"
     );
-    assert!(uploaded_text(&uploads).contains("corgea-image-scanning-myapp-1.0.tar"));
+    let uploaded = uploaded_text(&uploads);
+    assert!(uploaded.contains("corgea-image-scanning-myapp-1.0.tar"));
+    assert!(
+        uploaded.contains("name=\"files_to_scan\"\r\n\r\n[]"),
+        "still a partial scan, of no source files"
+    );
+}
+
+/// `--only-uncommitted` uploads the whole project and names the changed files,
+/// the way a pull request scan is registered, so the server records a partial
+/// scan rather than a branch state holding only those files.
+///
+/// Hidden paths and tracked files that match an ignore rule are left out of the
+/// whole-project walk, yet git still reports their changes; they have to be in
+/// the archive for the server to accept them in the list.
+#[test]
+fn scan_only_uncommitted_uploads_the_project_and_names_the_changed_files() {
+    let (base_url, uploads) = spawn_recording_scan_stub("scan-uncommitted");
+    let project = stub_project();
+    let workflow = project.path().join(".github/workflows/ci.yml");
+    fs::create_dir_all(workflow.parent().unwrap()).expect("create workflow dir");
+    fs::write(&workflow, "on: push\n").expect("write workflow");
+    fs::write(project.path().join("ignored.py"), "print(1)\n").expect("write ignored file");
+    commit_everything(project.path());
+    fs::write(project.path().join(".git/info/exclude"), "ignored.py\n").expect("write exclude");
+    fs::write(&workflow, "on: pull_request\n").expect("edit workflow");
+    fs::write(project.path().join("ignored.py"), "print(3)\n").expect("edit ignored file");
+    fs::write(project.path().join("edited.py"), "print(2)\n").expect("write new file");
+
+    let (mut cmd, _home) = corgea_isolated();
+    cmd.current_dir(project.path())
+        .env("CORGEA_URL", &base_url)
+        .env("CORGEA_TOKEN", "test-token")
+        .args(["scan", "--only-uncommitted"]);
+
+    let output = cmd.output().expect("run corgea scan --only-uncommitted");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let uploaded = uploaded_text(&uploads);
+    assert!(uploaded.contains("main.py"), "committed files upload too");
+    assert!(uploaded.contains("name=\"partial_scan\"\r\n\r\ntrue"));
+    let field = "name=\"files_to_scan\"\r\n\r\n";
+    let list = uploaded
+        .split_once(field)
+        .and_then(|(_, rest)| rest.split_once("\r\n"))
+        .map(|(list, _)| list)
+        .expect("files_to_scan field");
+    let mut named: Vec<String> = serde_json::from_str(list).expect("files_to_scan is JSON");
+    named.sort();
+    assert_eq!(
+        named,
+        [".github/workflows/ci.yml", "edited.py", "ignored.py"]
+    );
+    let archive = uploaded.replace(&format!("{field}{list}"), "");
+    for name in &named {
+        assert!(archive.contains(name.as_str()), "{name} is in the archive");
+    }
+    assert!(uploaded.contains("name=\"dirty\"\r\n\r\ntrue"));
+    assert!(!uploaded.contains("name=\"file_manifest\""));
+}
+
+/// A webapp older than v1.82.0 splits a JSON `files_to_scan` on commas and
+/// rejects the upload, so `--only-uncommitted` keeps the previous request:
+/// an archive of only the changed files, with no partial-scan marker. A
+/// missing version takes the same path, because that server would reject the
+/// new upload too.
+#[test]
+fn scan_only_uncommitted_on_an_older_webapp_uploads_only_the_changed_files() {
+    for version in [Some("v1.81.3"), None] {
+        let (base_url, uploads) = spawn_recording_scan_stub_at("scan-uncommitted-old", version);
+        let project = stub_project();
+        commit_everything(project.path());
+        fs::write(project.path().join("edited.py"), "print(2)\n").expect("write new file");
+
+        let (mut cmd, _home) = corgea_isolated();
+        cmd.current_dir(project.path())
+            .env("CORGEA_URL", &base_url)
+            .env("CORGEA_TOKEN", "test-token")
+            .args(["scan", "--only-uncommitted"]);
+
+        let output = cmd.output().expect("run corgea scan --only-uncommitted");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "version {version:?}\nstdout:\n{}\nstderr:\n{stderr}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert!(
+            stderr.contains("Uploading only the uncommitted files"),
+            "version {version:?} should explain the fallback, got:\n{stderr}"
+        );
+        if let Some(version) = version {
+            assert!(
+                stderr.contains(version),
+                "the warning should name the server version, got:\n{stderr}"
+            );
+        }
+
+        let uploaded = uploaded_text(&uploads);
+        assert!(
+            uploaded.contains("edited.py"),
+            "the changed file is uploaded"
+        );
+        assert!(
+            !uploaded.contains("main.py"),
+            "a committed file stays out of the archive on an older server"
+        );
+        assert!(!uploaded.contains("name=\"partial_scan\""));
+        assert!(!uploaded.contains("name=\"files_to_scan\""));
+    }
+}
+
+/// An uncommitted file is still held to the default excludes, and one that is
+/// also force-included is packed once: a second entry of the same name would
+/// fail the archive.
+#[test]
+fn scan_only_uncommitted_keeps_default_excludes_and_packs_a_forced_file_once() {
+    let (base_url, uploads) = spawn_recording_scan_stub("scan-uncommitted-forced");
+    let project = stub_project();
+    let script = project.path().join(".github/deploy.sh");
+    fs::create_dir_all(script.parent().unwrap()).expect("create .github");
+    fs::write(&script, "echo 1\n").expect("write script");
+    fs::write(project.path().join("ignored.py"), "print(1)\n").expect("write ignored file");
+    commit_everything(project.path());
+    fs::write(project.path().join(".git/info/exclude"), "ignored.py\n").expect("write exclude");
+    fs::write(&script, "echo 2\n").expect("edit script");
+    fs::write(project.path().join("ignored.py"), "print(3)\n").expect("edit ignored file");
+
+    let (mut cmd, _home) = corgea_isolated();
+    cmd.current_dir(project.path())
+        .env("CORGEA_URL", &base_url)
+        .env("CORGEA_TOKEN", "test-token")
+        .args(["scan", "--only-uncommitted", "--include", "ignored.py"]);
+
+    let output = cmd.output().expect("run corgea scan --only-uncommitted");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(stderr.contains(".github/deploy.sh"), "reported as skipped");
+
+    let uploaded = uploaded_text(&uploads);
+    assert!(uploaded.contains("name=\"files_to_scan\"\r\n\r\n[\"ignored.py\"]"));
+    assert!(!uploaded.contains(".github/deploy.sh"));
 }
 
 /// A copy of an archive living in the repository must not ride along: it would put

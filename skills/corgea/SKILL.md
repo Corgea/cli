@@ -95,6 +95,8 @@ Removing, disabling or editing a project ignore rule (scan settings → File Ign
 
 `--only-uncommitted` and `--target` are mutually exclusive. `--fail-on`, `--fail`, and `--block-on` are mutually exclusive.
 
+On Corgea webapp v1.82.0 or newer, `--only-uncommitted` uploads the whole project and names the changed files, so the server records a partial scan and does not replace the branch's latest full scan. An older webapp is sent only the changed files — the previous behavior — which it records as the branch's latest scan. The CLI reads `GET /api/version` to choose; a missing or unreadable version takes the older upload, because that server would reject the partial-scan one.
+
 `--out-format`/`--out-file` and `--sbom` are honored regardless of the gate: the report and the SBOM are written before `--fail`/`--block-on` are evaluated, so a scan that exits 1 on a blocking rule still leaves the report file behind for the pipeline to ingest.
 
 `--skip-if-commit-scanned-recently` reuses the project's most recent reusable scan of the current commit instead of starting a duplicate, when one ran inside the `--scanned-within` window (default `24h`; accepts `90s`, `30m`, `4h`, `7d`, and a bare number as hours). The reused scan takes the new scan's place for the rest of the command — results table, `--block-on` gate and its exit code, `--out-file` report — so the pipeline behaves the same either way. It prints `CORGEA_SCAN_SKIPPED=true` plus `CORGEA_SCAN_ID=<id>` on a reuse and `CORGEA_SCAN_SKIPPED=false` when a scan runs, so a later step can branch on it.
