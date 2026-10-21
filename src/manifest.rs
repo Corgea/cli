@@ -45,8 +45,10 @@
 //! as every other file having been deleted -- every one of their findings
 //! dropped without anything having looked at them. Those runs build no
 //! manifest, which is the same reason they already skip incremental. An
-//! `--only-uncommitted` run packs the whole project but is a partial scan, which
-//! the server never stores a manifest for, so it skips hashing too.
+//! `--only-uncommitted` run against a webapp that registers partial scans packs
+//! the whole project but is a partial scan, which the server never stores a
+//! manifest for, so it skips hashing too. An older webapp is sent only the
+//! changed files, the same shape as `--target`, and builds no manifest either.
 
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;

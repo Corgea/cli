@@ -101,7 +101,7 @@ enum Commands {
 
         #[arg(
             long,
-            help = "Only scan uncommitted changes. The whole project is still uploaded, so the analysis has the surrounding code for context, but only staged, modified and untracked files are analyzed. Corgea records this as a partial scan, like a pull request scan, so it never replaces the branch's latest full scan."
+            help = "Only scan uncommitted changes. On Corgea webapp v1.82.0 or newer, the whole project is still uploaded so the analysis has the surrounding code for context, but only staged, modified and untracked files are analyzed, and Corgea records this as a partial scan, like a pull request scan, so it never replaces the branch's latest full scan. An older webapp is sent only the changed files, which it records as the branch's latest scan."
         )]
         only_uncommitted: bool,
 

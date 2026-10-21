@@ -21,6 +21,12 @@ const FORCE_INCLUDE_PREVIEW: usize = 20;
 /// What `--only-uncommitted` analyzes.
 const UNCOMMITTED_SELECTORS: &str = "git:staged,git:modified,git:untracked";
 
+/// Doghouse first registers a CLI partial scan — `partial_scan` plus a JSON
+/// `files_to_scan` — in this release (Corgea/doghouse#2348, tagged v1.82.0).
+/// An older server splits that field on commas, cannot find the JSON text in
+/// the archive, and rejects the upload.
+const PARTIAL_SCAN_WEBAPP_VERSION: &str = "v1.82.0";
+
 /// Overrides how long `wait_for_scan` polls before giving up.
 const SCAN_TIMEOUT_ENV: &str = "CORGEA_SCAN_TIMEOUT_SECONDS";
 const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(10 * 60 * 60);
@@ -335,6 +341,54 @@ fn repo_relative_strings(paths: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
+/// Whether `version` is a webapp release that registers CLI partial scans.
+///
+/// `None`, and any text that is not a release number, count as too old.
+/// Sending the partial-scan upload to a server that cannot read it fails
+/// `--only-uncommitted` outright, including the pre-commit hook. The previous
+/// upload still succeeds on a newer server; it is just recorded as the
+/// branch's latest full scan.
+fn webapp_registers_cli_partial_scans(version: Option<&str>) -> bool {
+    let Some(running) = version.and_then(crate::version_check::extract_version) else {
+        return false;
+    };
+    let Some(required) = crate::version_check::extract_version(PARTIAL_SCAN_WEBAPP_VERSION) else {
+        return false;
+    };
+    running >= required
+}
+
+/// Read the webapp version and decide whether this `--only-uncommitted` run
+/// can be registered as a partial scan. Warns when it cannot, because that run
+/// then uploads only the changed files and the server records them as the
+/// branch's latest full scan.
+fn server_registers_cli_partial_scans(corgea_url: &str) -> bool {
+    let reported = match utils::api::get_webapp_version(corgea_url) {
+        Ok(version) => version,
+        Err(error) => {
+            log::warn!(
+                "Could not read the Corgea server version ({error}). Uploading only the uncommitted files; partial scans need webapp {PARTIAL_SCAN_WEBAPP_VERSION} or newer."
+            );
+            return false;
+        }
+    };
+    match reported.as_deref() {
+        Some(version) if webapp_registers_cli_partial_scans(Some(version)) => true,
+        Some(version) => {
+            log::warn!(
+                "This Corgea server ({version}) does not register partial scans yet (needs {PARTIAL_SCAN_WEBAPP_VERSION}). Uploading only the uncommitted files; this scan stands in for the branch's latest full scan until the server is upgraded."
+            );
+            false
+        }
+        None => {
+            log::warn!(
+                "This Corgea server did not report a version this CLI understands. Uploading only the uncommitted files; partial scans need webapp {PARTIAL_SCAN_WEBAPP_VERSION} or newer."
+            );
+            false
+        }
+    }
+}
+
 /// The files a partial scan asks the server to analyze, as the archive names
 /// them, and the selected files the archive does not hold.
 ///
@@ -438,12 +492,19 @@ fn start_new_scan(
         );
     });
 
-    // Only --target narrows the archive. --only-uncommitted packs the whole
-    // project and names its files in the upload, the way a pull request scan is
-    // registered: an archive of just those files reads to the server as the
-    // branch's full state, hiding every finding outside them.
-    let target_str: Option<&str> = target.as_deref();
-    let uncommitted_files = if *only_uncommitted {
+    // A server that registers partial scans gets the whole project, with the
+    // changed files named in the upload: an archive of just those files reads
+    // as the branch's full state and hides every finding outside them. An
+    // older server rejects that upload, so it is sent only the changed files,
+    // which is how `--only-uncommitted` behaved before partial scans existed.
+    let register_partial =
+        *only_uncommitted && server_registers_cli_partial_scans(&config.get_url());
+    let target_str: Option<&str> = if *only_uncommitted && !register_partial {
+        Some(UNCOMMITTED_SELECTORS)
+    } else {
+        target.as_deref()
+    };
+    let uncommitted_files = if register_partial {
         match targets::resolve_targets_with_exclude(UNCOMMITTED_SELECTORS, exclude.as_deref()) {
             Ok(result) => Some(result.files),
             Err(e) => {
@@ -563,6 +624,18 @@ fn start_new_scan(
                             utils::terminal::TerminalColor::Yellow
                         )
                     );
+                } else if *only_uncommitted {
+                    println!("\rFiles to be submitted for partial scan:\n");
+                    for (index, file) in result.files.iter().enumerate() {
+                        if let Ok(relative) =
+                            file.strip_prefix(std::env::current_dir().unwrap_or_default())
+                        {
+                            println!("{}: {}", index + 1, relative.display());
+                        } else {
+                            println!("{}: {}", index + 1, file.display());
+                        }
+                    }
+                    println!();
                 } else {
                     let file_count = result.files.len();
                     println!("Scanning {} files (target mode)", file_count);
@@ -605,7 +678,7 @@ fn start_new_scan(
         &force_included,
         &uncommitted_in_walk,
         &extra_zip_files,
-        !*disable_incremental && !*only_uncommitted,
+        !*disable_incremental && !register_partial,
     ) {
         Ok(archive) => {
             if archive.added_files.is_empty() {
@@ -615,7 +688,13 @@ fn start_new_scan(
                     "\r{}",
                     utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
                 );
-                log::error!("\n\nOops! No valid files found to scan after filtering.\n\n");
+                if *only_uncommitted && !register_partial {
+                    log::error!(
+                        "\n\nOops! It seems there are no scannable uncommitted changes in your project.\nYou may have uncommitted changes, but none match the types of files we can scan.\n\n"
+                    );
+                } else {
+                    log::error!("\n\nOops! No valid files found to scan after filtering.\n\n");
+                }
                 let _ = utils::generic::delete_directory(&temp_dir);
                 std::process::exit(1);
             }
@@ -736,7 +815,11 @@ fn start_new_scan(
     } else if target_str.is_some() {
         Err(FullScanReason::new(
             FullScanCause::TargetedUpload,
-            "--target narrowed the upload to the files it selects",
+            if *only_uncommitted {
+                "--only-uncommitted narrowed the upload to uncommitted files"
+            } else {
+                "--target narrowed the upload to the files it selects"
+            },
         ))
     } else if partial_files.is_some() {
         Err(FullScanReason::new(
@@ -2294,5 +2377,30 @@ mod tests {
 
         assert_eq!(to_scan, ["src/app.py", "src/forced.py"]);
         assert_eq!(skipped, ["vendor/lib.js", "/elsewhere/other.py"]);
+    }
+
+    #[test]
+    fn partial_scans_start_at_webapp_1_82_0() {
+        for version in ["v1.82.0", "v1.82.2", "v1.82", "v1.82.0-eu", "v2.0.0"] {
+            assert!(
+                webapp_registers_cli_partial_scans(Some(version)),
+                "{version} registers partial scans"
+            );
+        }
+        // A suffixed build counts as the release it was cut from, so a
+        // customer build of v1.81.3 is still too old, and a version this CLI
+        // cannot read is too — sending the new upload there fails the scan.
+        for version in [
+            "v1.81.3",
+            "v1.81.3-client-a",
+            "v1.81.1-sonae",
+            "not-a-version",
+        ] {
+            assert!(
+                !webapp_registers_cli_partial_scans(Some(version)),
+                "{version} keeps the previous upload"
+            );
+        }
+        assert!(!webapp_registers_cli_partial_scans(None));
     }
 }
