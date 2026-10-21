@@ -1,6 +1,7 @@
 mod authorize;
 mod cicd;
 mod config;
+mod ignore_rules;
 mod images;
 mod include_rules;
 mod incremental;
@@ -14,6 +15,7 @@ mod scan;
 mod setup_hooks;
 mod skill;
 mod skip_scan;
+mod update_check;
 mod wait;
 mod scanners {
     pub mod blast;
@@ -27,6 +29,7 @@ mod utils {
     pub mod terminal;
 }
 mod targets;
+mod version_check;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use config::Config;
@@ -111,12 +114,15 @@ enum Commands {
         )]
         fail_on: Option<String>,
 
-        #[arg(long, help = "Only scan uncommitted changes.")]
+        #[arg(
+            long,
+            help = "Only scan uncommitted changes. On Corgea webapp v1.82.0 or newer, the whole project is still uploaded so the analysis has the surrounding code for context, but only staged, modified and untracked files are analyzed, and Corgea records this as a partial scan, like a pull request scan, so it never replaces the branch's latest full scan. An older webapp is sent only the changed files, which it records as the branch's latest scan."
+        )]
         only_uncommitted: bool,
 
         #[arg(
             long = "disable-incremental",
-            help = "Analyze every file, even when Corgea could have analyzed only what changed. Scans are incremental by default: the whole project is still uploaded, but only files that changed since this project's last scan are analyzed, and unchanged files keep their existing findings, so the result is a full picture either way. Use this to force a fresh analysis of every file — after changing scanner configuration outside corgea.yaml, for example. Incremental is skipped on its own, with a reason, when there is no git repository or commit to diff from, when the worktree is dirty, when no earlier scan of a clean worktree exists, or when the last scanned commit is missing from a shallow clone; and silently when --only-uncommitted or --target already narrow the upload to chosen files. With --exclude it still runs, from the stored file checksums of an earlier scan rather than a git diff."
+            help = "Analyze every file, even when Corgea could have analyzed only what changed. Scans are incremental by default: the whole project is still uploaded, but only files that changed since this project's last scan are analyzed, and unchanged files keep their existing findings, so the result is a full picture either way. Use this to force a fresh analysis of every file — after changing scanner configuration outside corgea.yaml, for example. Incremental is skipped on its own, with a reason, when there is no git repository or commit to diff from, when the worktree is dirty, when no earlier scan of a clean worktree exists, or when the last scanned commit is missing from a shallow clone; and silently when --target narrows the upload to chosen files or --only-uncommitted narrows the analysis to them. With --exclude it still runs, from the stored file checksums of an earlier scan rather than a git diff."
         )]
         disable_incremental: bool,
 
@@ -651,6 +657,7 @@ fn main() {
         }
     };
     init_logging(&corgea_config);
+    update_check::notify_if_update_available();
     fn verify_token_and_exit_when_fail(config: &Config) {
         if config.get_token().is_empty() {
             ::log::error!("No token set.\nPlease run 'corgea login' to authenticate.\nFor more info checkout our docs at Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli");
@@ -658,7 +665,7 @@ fn main() {
         }
         utils::api::set_auth_token(&config.get_token());
         match utils::api::verify_token(config.get_url().as_str()) {
-            Ok(true) => {}
+            Ok(true) => version_check::warn_if_webapp_outdated(config.get_url().as_str()),
             Ok(false) => {
                 println!("Invalid token provided.\nPlease run 'corgea login' to authenticate.\nFor more info checkout our docs at Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli");
                 std::process::exit(1);

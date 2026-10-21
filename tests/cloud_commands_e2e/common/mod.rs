@@ -639,7 +639,10 @@ pub(crate) fn cloud_command(api: &ApiStub, path: &Path) -> (Command, TempDir) {
     command
         .current_dir(path)
         .env("CORGEA_TOKEN", TOKEN)
-        .env("CORGEA_URL", api.base_url());
+        .env("CORGEA_URL", api.base_url())
+        // Covered by `cli_webapp_version`. These contracts pin each command's
+        // own requests, so the advisory pre-flight stays out of them.
+        .env("CORGEA_SKIP_WEBAPP_VERSION_CHECK", "1");
     (command, home)
 }
 

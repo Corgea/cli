@@ -25,6 +25,8 @@ pip install --upgrade corgea-cli      # installed with pip
 npm install -g @corgea/cli            # installed with npm
 ```
 
+An interactive run may print `A new version of the Corgea CLI is available: <current> -> <latest>` on stderr. It is informational, never an error, and never shown when stderr is piped, in CI, or with `CORGEA_NO_UPDATE_CHECK=1`.
+
 A missing flag is the visible case. A flag whose default or output shape changed will not error, so treat a surprising result on an older CLI as a version difference before treating it as a bug.
 
 ## Commands
@@ -88,11 +90,15 @@ An included image is enough on its own: when it is combined with `--only-uncommi
 
 A pattern that matches the whole repository (`**`, `*`, `/**`) is refused, by both the flag and the web app: include beats exclude, so it would disable every configured exclusion for the scan, including ones set to keep sensitive paths out. Name a directory or file instead.
 
-Include rules also take scan reuse off the table. A reusable scan ran before the rules existed, so its results cannot cover the files they force in — a run with any include rule (from the flag or the project) starts a real scan and prints `CORGEA_SCAN_SKIPPED=false`, as does a run whose rule lookup failed.
+Include rules also take scan reuse off the table. A reusable scan ran before the rules existed, so its results cannot cover the files they force in — a run with any include rule (from the flag or the project) starts a real scan and prints `CORGEA_SCAN_SKIPPED=false`, as does a run whose rule lookup failed. Ignore rules work the same way: a scan that ran under different project ignore rules than the project has now is not reused.
+
+Removing, disabling or editing a project ignore rule (scan settings → File Ignore Rules) makes the next incremental run also analyze the files the old rule matched and the current rules do not, and it says how many. Earlier scans hold no findings for those files, so carrying findings forward alone would leave them unscanned. If those files would push the run past the incremental limit, or the project's rules cannot be read, it scans every file and says why. Adding an ignore rule does not cost anything extra: the findings it hides are dropped when they are carried forward. Scans started from an integration rather than the CLI scan every file after a rule is lifted.
 
 `--project-naming-mode sparse-postfixed` names the project for a monorepo service cloned with a sparse checkout: the default project name (the repository name) followed by the checked-out top-level folders, joined with dots — `monorepo-jsoar-agent`, or `monorepo-common.jsoar-agent` for two folders. A nested folder counts as its top-level folder (`services/payments` gives `monorepo-services`), root files listed in the sparse checkout (`package.json`) are left out, characters outside `A-Za-z0-9._-` become `_`, and the name is cut at 100 characters. It only applies at the repository root of a sparse checkout; anywhere else it warns and the default name is used. It cannot be combined with `--project-name`. `upload`, `list` and `wait` take the same flag, so pass it there too to reach the same project.
 
 `--only-uncommitted` and `--target` are mutually exclusive. `--fail-on`, `--fail`, and `--block-on` are mutually exclusive.
+
+On Corgea webapp v1.82.0 or newer, `--only-uncommitted` uploads the whole project and names the changed files, so the server records a partial scan and does not replace the branch's latest full scan. An older webapp is sent only the changed files — the previous behavior — which it records as the branch's latest scan. The CLI reads `GET /api/version` to choose; a missing or unreadable version takes the older upload, because that server would reject the partial-scan one.
 
 `--out-format`/`--out-file` and `--sbom` are honored regardless of the gate: the report and the SBOM are written before `--fail`/`--block-on` are evaluated, so a scan that exits 1 on a blocking rule still leaves the report file behind for the pipeline to ingest.
 

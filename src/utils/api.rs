@@ -1,8 +1,8 @@
-use crate::incremental::{BaselineRef, IncrementalPlan};
+use crate::incremental::{BaselineRef, FullScanReason, IncrementalPlan};
 use crate::log::debug;
 use crate::manifest::EncodedManifest;
 use crate::utils;
-use corgea::vuln_api::{auth_header, source};
+use corgea::vuln_api::{auth_header, default_headers, source};
 use reqwest::header::HeaderMap;
 use reqwest::{
     blocking::multipart,
@@ -31,6 +31,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
 /// the default would delay every scan for no gain.
 const SETTINGS_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Unversioned on purpose: the webapp serves its own version outside the
+/// versioned API so clients can read it before agreeing on an API version.
+const WEBAPP_VERSION_PATH: &str = "/api/version";
+
+/// Far below the shared client's timeout, because this request is advisory and
+/// runs ahead of every authenticated command: a deployment that stalls this one
+/// route must not hold the command the user actually asked for.
+const WEBAPP_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn auth_headers(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     let (name, value) = auth_header(token);
@@ -53,6 +62,7 @@ static SHARED_CLIENT: std::sync::LazyLock<reqwest::blocking::Client> =
     std::sync::LazyLock::new(|| {
         let mut builder = reqwest::blocking::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .default_headers(default_headers())
             .cookie_provider(COOKIE_JAR.clone());
 
         if let Ok(https_proxy) = std::env::var("https_proxy") {
@@ -541,20 +551,27 @@ pub struct UploadZipResult {
 }
 
 /// Per-scan settings travelling with the archive without being part of it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct UploadOptions {
     pub scan_type: Option<String>,
     pub policy: Option<String>,
     pub metadata: Option<String>,
-    /// Set when this run resolved a diff for the server to analyze instead of
-    /// the whole project.
-    pub incremental: Option<IncrementalPlan>,
+    /// The diff for the server to analyze instead of the whole project, or why
+    /// this run has none.
+    pub incremental: Result<IncrementalPlan, FullScanReason>,
+    /// `--disable-incremental`. Stops the server deriving its own SCM diff.
+    pub disable_incremental: bool,
     /// `--include` patterns for this run. The project's own include rules are
     /// already stored server-side, so only the flag values are sent.
     pub include_paths: Vec<String>,
     /// Digests of everything in the archive, stored with the scan for a later
     /// run to diff against. Set only when the archive is the whole project.
     pub file_manifest: Option<EncodedManifest>,
+    /// Zip entry names to analyze out of a whole-project archive. Set, even
+    /// when empty, for a partial scan, which the server registers the way it
+    /// does a pull request scan: findings for these files only, never standing
+    /// in for the branch's state.
+    pub partial_files: Option<Vec<String>>,
 }
 
 pub fn upload_zip(
@@ -569,8 +586,10 @@ pub fn upload_zip(
         policy,
         metadata,
         incremental,
+        disable_incremental,
         include_paths,
         file_manifest,
+        partial_files,
     } = options;
     let include_paths_field = match include_paths.is_empty() {
         true => None,
@@ -582,6 +601,14 @@ pub fn upload_zip(
             }
         },
     };
+    // JSON rather than the comma-separated form the server also accepts: a
+    // path may contain a comma. Failing here, rather than dropping the list,
+    // keeps a partial scan from registering as a full one.
+    let partial_files_field = partial_files
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| format!("Could not serialize the files to scan: {e}"))?;
     let client = http_client();
     let file_size = std::fs::metadata(file_path)?.len();
     let file_name = Path::new(file_path).file_name().unwrap().to_str().unwrap();
@@ -726,12 +753,30 @@ pub fn upload_zip(
                 if let Some(patterns) = &include_paths_field {
                     form = form.part("include_paths", multipart::Part::text(patterns.clone()));
                 }
-                // Both fields or neither: the list is only safe next to the commit
-                // it was measured from, and a server seeing one without the other
-                // would guess a baseline. A list that will not serialize drops
-                // both, leaving a full scan.
-                if let Some(plan) = &incremental {
-                    match serde_json::to_string(&plan.changed_files) {
+                if let Some(files) = &partial_files_field {
+                    form = form
+                        .part("partial_scan", multipart::Part::text("true"))
+                        .part("files_to_scan", multipart::Part::text(files.clone()));
+                }
+                match &incremental {
+                    // Stored on the scan, so a full scan that was expected to
+                    // be incremental can be explained after the fact.
+                    Err(reason) => {
+                        form = form
+                            .part(
+                                "incremental_skipped_reason",
+                                multipart::Part::text(reason.cause.code()),
+                            )
+                            .part(
+                                "incremental_skipped_detail",
+                                multipart::Part::text(reason.detail.clone()),
+                            );
+                    }
+                    // Both fields or neither: the list is only safe next to the
+                    // commit it was measured from, and a server seeing one
+                    // without the other would guess a baseline. A list that
+                    // will not serialize drops both, leaving a full scan.
+                    Ok(plan) => match serde_json::to_string(&plan.changed_files) {
                         Ok(changed_files) => {
                             // Which scan the diff was measured from. A commit
                             // when git produced it, and the scan itself when
@@ -756,11 +801,26 @@ pub fn upload_zip(
                                     multipart::Part::text("true"),
                                 );
                             }
+                            // Without it, a server seeing that the baseline's
+                            // ignore rules were lifted scans every file, since
+                            // only this says the list covers what they hid.
+                            if let Some(rules) = plan
+                                .ignore_rules
+                                .as_ref()
+                                .and_then(|rules| serde_json::to_string(rules).ok())
+                            {
+                                form = form
+                                    .part("incremental_ignore_rules", multipart::Part::text(rules));
+                            }
                         }
                         Err(e) => debug(&format!(
                         "Could not serialize the incremental file list, scanning every file: {e}"
                     )),
-                    }
+                    },
+                }
+                // No file list means "try the SCM diff". This field means "analyze every file".
+                if disable_incremental {
+                    form = form.part("disable_incremental", multipart::Part::text("true"));
                 }
                 // Root and version travel beside the bytes rather than inside
                 // them: the server recomputes the root from what it
@@ -1396,10 +1456,23 @@ fn request_scan_list(
 pub struct ScanSettings {
     /// Patterns that force files into the scan even when Corgea would classify
     /// them as vendored, third-party, generated or test code.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "patterns_without_nulls")]
     pub include_paths: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "patterns_without_nulls")]
     pub ignore_paths: Vec<String>,
+}
+
+/// A rule saved without a pattern is listed as `null`. It matches nothing, so
+/// it is dropped rather than failing the whole read.
+fn patterns_without_nulls<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<Option<String>>>::deserialize(deserializer)?
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -1770,10 +1843,9 @@ pub fn exchange_code_for_token(
     base_url: &str,
     code: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let client = reqwest::blocking::Client::new();
     let exchange_url = format!("{}{}/authorize", base_url, API_BASE);
 
-    let response = client
+    let response = SHARED_CLIENT
         .get(&exchange_url)
         .header("CORGEA-SOURCE", source())
         .query(&[("code", code)])
@@ -1823,6 +1895,55 @@ pub fn verify_token(corgea_url: &str) -> Result<bool, Box<dyn Error>> {
     } else {
         Err(format!("Request failed with status: {}", response.status()).into())
     }
+}
+
+/// The version the webapp at `corgea_url` reports for itself.
+///
+/// `Ok(None)` means the deployment did not tell us: either it predates
+/// `/api/version` (404) or it could not determine its own version (null).
+///
+/// A 404 is not evidence of an outdated webapp and callers must not treat it as
+/// one. The endpoint ships in a release *above* `MIN_WEBAPP_VERSION`, so every
+/// deployment sitting exactly at the floor answers 404 while being perfectly
+/// compatible. A 404 only narrows the version to "older than the release that
+/// added this route", which spans both sides of the floor.
+///
+/// Deliberately skips `check_for_warnings`: this runs as a pre-flight before
+/// the command the user asked for, and it must not be what terminates the
+/// process. The command's own requests still surface deprecation signals.
+pub fn get_webapp_version(corgea_url: &str) -> Result<Option<String>, Box<dyn Error>> {
+    let url = format!("{}{}", corgea_url, WEBAPP_VERSION_PATH);
+    let client = http_client();
+    debug(&format!("Sending request to URL: {}", url));
+
+    let response = client.get(&url).timeout(WEBAPP_VERSION_TIMEOUT).send()?;
+    let status = response.status();
+
+    if status == StatusCode::NOT_FOUND {
+        debug("Webapp does not serve /api/version");
+        return Ok(None);
+    }
+
+    if !status.is_success() {
+        return Err(format!("Request failed with status: {}", status).into());
+    }
+
+    let body_text = response.text()?;
+    let body: WebappVersionResponse = match serde_json::from_str(&body_text) {
+        Ok(json) => json,
+        Err(e) => {
+            debug(&format!(
+                "Failed to parse response as JSON: {}. Response body: {}",
+                e, body_text
+            ));
+            return Err("Failed to parse response".to_string().into());
+        }
+    };
+
+    Ok(body
+        .version
+        .map(|version| version.trim().to_string())
+        .filter(|version| !version.is_empty()))
 }
 
 /// Evaluate a scan against blocking rules.
@@ -1995,6 +2116,13 @@ pub fn get_all_sca_issues(
     Ok(all_issues)
 }
 
+#[derive(Deserialize, Serialize, Debug)]
+pub struct WebappVersionResponse {
+    /// Null on deployments that cannot determine their own version.
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
 /// One scanner problem reported against a scan, already sanitized server-side.
 ///
 /// Every field is optional so a server that omits any of them still parses.
@@ -2059,6 +2187,11 @@ pub struct ScanResponse {
     /// left alone rather than guessed at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_manifest_version: Option<String>,
+    /// The project's ignore rules as they applied to this scan. It holds no
+    /// findings for the files they matched. `None` from a backend predating
+    /// the field, or for a scan predating the rules being recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_paths: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
     /// Why a scan ended without finishing. Only set for failed scans.
@@ -2497,6 +2630,24 @@ mod tests {
     }
 
     #[test]
+    fn scan_settings_drop_rules_saved_without_a_pattern() {
+        let parsed: ScanSettingsResponse = serde_json::from_str(
+            r#"{"settings": {"include_paths": null, "ignore_paths": ["vendor/**", null]}}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            parsed.settings,
+            ScanSettings {
+                include_paths: vec![],
+                ignore_paths: vec!["vendor/**".to_string()],
+            }
+        );
+        let missing: ScanSettingsResponse =
+            serde_json::from_str(r#"{"settings": {}}"#).expect("parses");
+        assert_eq!(missing.settings, ScanSettings::default());
+    }
+
+    #[test]
     fn scan_response_deserializes_git_sha_and_defaults_when_missing() {
         let with_sha = r#"{
             "id": "s1",
@@ -2522,6 +2673,16 @@ mod tests {
         }"#;
         let parsed: ScanResponse = serde_json::from_str(without_sha).unwrap();
         assert_eq!(parsed.git_sha, None);
+        // A backend predating `ignore_paths` omits it; a scan predating the
+        // stamp reports null. Neither may fail the scan list.
+        assert_eq!(parsed.ignore_paths, None);
+        let mut value: serde_json::Value = serde_json::from_str(without_sha).unwrap();
+        value["ignore_paths"] = serde_json::Value::Null;
+        let parsed: ScanResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.ignore_paths, None);
+        value["ignore_paths"] = serde_json::json!(["vendor/**"]);
+        let parsed: ScanResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.ignore_paths, Some(vec!["vendor/**".to_string()]));
     }
 
     #[test]
@@ -2805,6 +2966,19 @@ mod tests {
             }
         });
         base
+    }
+
+    #[test]
+    fn unauthenticated_requests_send_cli_version() {
+        let (base, requests) = corgea::vuln_api_stub::spawn_capturing_vuln_api_stub();
+        let _ = exchange_code_for_token(&base, "code");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            corgea::vuln_api_stub::header_value(&requests[0], corgea::vuln_api::CLI_VERSION_HEADER)
+                .as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]
