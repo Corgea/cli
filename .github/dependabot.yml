@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Keeps the SHA-pinned actions current through reviewed PRs. The cooldown
+  # holds back releases younger than a week, the usual window in which a
+  # compromised version is caught and pulled. Security updates skip it.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns:
+          - "*"

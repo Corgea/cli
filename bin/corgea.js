@@ -38,7 +38,7 @@ const binaryPath = path.join(vendorRoot, targetTriple, "corgea", binaryName);
 if (!existsSync(binaryPath)) {
   throw new Error(
     `Corgea binary not found at ${binaryPath}.\n` +
-      `Try reinstalling: npm install -g corgea-cli@latest`,
+      `Try reinstalling: npm install -g @corgea/cli@latest`,
   );
 }
 

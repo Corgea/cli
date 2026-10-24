@@ -16,12 +16,12 @@ Pushing an annotated `vX.Y.Z` tag to `main` fans out to three GitHub Actions wor
 - **PyPI** reads it automatically: `pyproject.toml` sets `dynamic = ["version"]`, so maturin takes the version from `Cargo.toml`.
 - **npm** does *not* read `Cargo.toml`. `package.json` pins a placeholder (`0.0.0`); the real version is set from the **tag name** at publish time (`npm version <X.Y.Z> --no-git-tag-version` in `npm-publish.yml`).
 - **The tag, `Cargo.toml`, and the published version must agree.** Bump `Cargo.toml` to `X.Y.Z` *before* tagging `vX.Y.Z`, or PyPI ships a different version than npm/GitHub.
-- **Tags must be `v`-prefixed** (`v1.9.1`, not `1.9.1`). npm auto-publish keys off the tag starting with `v`; a non-`v` tag skips the npm publish entirely (this happened once with `1.8.8`).
+- **Tags must be `vX.Y.Z`** (`v1.9.1`, not `1.9.1`). The release workflows only run on `v*` tags, and the publish steps reject anything that is not a plain `vX.Y.Z`. Only maintainers and admins can create `v*` tags.
 
 ## Prerequisites
 
 - Write access to `Corgea/cli` and the [`gh`](https://cli.github.com/) CLI authenticated.
-- These repository secrets are already configured in CI (no per-release action needed): `PYPI_API_TOKEN`, `NPM_TOKEN`, `GITHUB_TOKEN`.
+- Approval rights on the `release` environment. Each publish job waits there until a required reviewer approves it; the environment only admits `main` and `v*` tags. npm publishes through **trusted publishing** (GitHub OIDC).
 - A clean checkout of `main` with all release-bound PRs already merged.
 
 ## Release procedure
@@ -61,7 +61,7 @@ Pushing an annotated `vX.Y.Z` tag to `main` fans out to three GitHub Actions wor
    | 2 | **Native Binary Release** | `release-binaries.yml` | 7 target zips → **GitHub Release** |
    | 3 | **Publish npm Package** | `npm-publish.yml` | bundles binaries → **npm** (`@corgea/cli`) |
 
-   Workflow 3 is triggered by workflow 2 completing successfully (and only when the tag is `v`-prefixed). If it does not auto-start, dispatch it manually:
+   The **Release** job (PyPI) and the **Publish @corgea/cli** job (npm) each pause for approval in the `release` environment; approve them from the run page. Workflow 3 is triggered by workflow 2 completing successfully on a `vX.Y.Z` tag push. If it does not auto-start, dispatch it manually:
    ```bash
    gh workflow run npm-publish.yml -f tag=vX.Y.Z
    ```
@@ -134,12 +134,6 @@ gh release view vX.Y.Z
 ## Rollback
 
 Published package versions are **immutable** — you cannot overwrite `X.Y.Z` on npm or PyPI. **Roll forward:** fix, bump to the next patch (`X.Y.Z+1`), and release again. If a bad npm version must be discouraged, `npm deprecate '@corgea/cli@X.Y.Z' "reason"`.
-
-## Known issues
-
-- **npm idempotency guard checks the wrong name.** `npm-publish.yml` runs `npm view "corgea-cli@<version>"` (unscoped) to decide whether to skip, but the package is `@corgea/cli` (scoped). The guard never matches, so it never skips; re-running on an already-published version fails at `npm publish` instead of skipping cleanly. **Publishing itself is correct** (`npm publish` uses `package.json` → `@corgea/cli`), which is why releases succeed — only the skip optimization is broken. Fix: query `@corgea/cli`.
-- **`bin/corgea.js` reinstall hint is wrong.** Its "binary missing" message says `npm install -g corgea-cli@latest`; the npm package is `@corgea/cli`. (`corgea-cli` is the *PyPI* name.)
-- **npm auto-publish requires a `v`-prefixed tag.** Non-`v` tags build PyPI + binaries but skip npm; use the manual dispatch in step 5.
 
 ## Reference
 
