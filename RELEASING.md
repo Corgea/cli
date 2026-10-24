@@ -135,10 +135,6 @@ gh release view vX.Y.Z
 
 Published package versions are **immutable** — you cannot overwrite `X.Y.Z` on npm or PyPI. **Roll forward:** fix, bump to the next patch (`X.Y.Z+1`), and release again. If a bad npm version must be discouraged, `npm deprecate '@corgea/cli@X.Y.Z' "reason"`.
 
-## Known issues
-
-- **`bin/corgea.js` reinstall hint is wrong.** Its "binary missing" message says `npm install -g corgea-cli@latest`; the npm package is `@corgea/cli`. (`corgea-cli` is the *PyPI* name.)
-
 ## Reference
 
 - Workflows: `.github/workflows/release.yml`, `release-binaries.yml`, `npm-publish.yml`
