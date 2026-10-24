@@ -43,6 +43,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_TAG: ${{ inputs.tag }}
           RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             TAG_NAME="$INPUT_TAG"
@@ -56,10 +57,23 @@ jobs:
             exit 1
           fi
 
-          # The workflow_run head_branch can name a branch as well as a tag.
-          # Require the release tag to exist.
-          if ! git ls-remote --exit-code --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${TAG_NAME}" >/dev/null; then
+          # Require the release tag to exist. Peeled (^{}) entries resolve
+          # annotated tags to their commit.
+          TAG_REFS="$(git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${TAG_NAME}" "refs/tags/${TAG_NAME}^{}")"
+          TAG_SHA="$(awk '$2 ~ /\^\{\}$/ { print $1 }' <<<"$TAG_REFS")"
+          if [ -z "$TAG_SHA" ]; then
+            TAG_SHA="$(awk '{ print $1; exit }' <<<"$TAG_REFS")"
+          fi
+          if [ -z "$TAG_SHA" ]; then
             echo "Tag $TAG_NAME does not exist" >&2
+            exit 1
+          fi
+
+          # The workflow_run head_branch can name a branch as well as a tag, so a
+          # branch named like a release tag would also pass the checks above.
+          # Require the triggering run to have built the tagged commit.
+          if [ "$EVENT_NAME" != "workflow_dispatch" ] && [ "$RUN_HEAD_SHA" != "$TAG_SHA" ]; then
+            echo "Run commit $RUN_HEAD_SHA does not match tag $TAG_NAME ($TAG_SHA)" >&2
             exit 1
           fi
 
