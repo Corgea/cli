@@ -48,8 +48,9 @@ third-party report.
 
 All three exit 1 if the scan fails, printing the reason and the scanners that hit
 problems. A scan that completes with a scanner missing exits 0 with a warning.
-While waiting, the scan's status is read every 3 seconds. Waiting gives up after
-10 hours; override with `CORGEA_SCAN_TIMEOUT_SECONDS`.
+While waiting, the scan's status is read every 3 seconds. A 404 for a scan Corgea
+just reported is read again for up to 90 seconds before the wait fails. Waiting
+gives up after 10 hours; override with `CORGEA_SCAN_TIMEOUT_SECONDS`.
 `--fail`/`--block-on` then wait up to 15 minutes for blocking rules to be
 evaluated; override with `CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS`.
 

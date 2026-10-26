@@ -132,7 +132,8 @@ corgea wait --project-naming-mode sparse-postfixed  # Latest scan of the sparse-
 
 Waiting (`corgea scan`, `corgea wait`, `corgea upload --wait`) exits 1 if the
 scan fails, printing why. A scan missing one scanner's results exits 0 with a
-warning. Polling gives up after 10 hours; override with
+warning. A 404 for a scan Corgea just reported is read again for up to 90
+seconds before the wait fails. Polling gives up after 10 hours; override with
 `CORGEA_SCAN_TIMEOUT_SECONDS`. `--fail`/`--block-on` then wait up to 15 minutes
 for blocking rules to be evaluated, and exit 1 if that runs out; override with
 `CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS`.
