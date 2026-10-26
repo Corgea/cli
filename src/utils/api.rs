@@ -2257,10 +2257,36 @@ where
     Ok(Option::<Vec<ScanErrorSummary>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// A project id as the server sends it: a number from doghouse, a string
+/// from older or proxied answers. Both become the string that goes into the
+/// results link. Anything else, including an empty string, counts as absent.
+fn id_as_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+                Some(s.trim().to_string())
+            }
+            _ => None,
+        },
+    )
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ScanResponse {
     pub id: String,
     pub project: String,
+    /// The project's numeric id, when the server sends one. Older servers
+    /// carry only the name, and the results link then falls back to it.
+    #[serde(
+        default,
+        deserialize_with = "id_as_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub project_id: Option<String>,
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub status: String,
@@ -2782,6 +2808,40 @@ mod tests {
         value["ignore_paths"] = serde_json::json!(["vendor/**"]);
         let parsed: ScanResponse = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.ignore_paths, Some(vec!["vendor/**".to_string()]));
+    }
+
+    #[test]
+    fn scan_response_keeps_the_project_id_as_a_string_whatever_the_server_sends() {
+        let base = r#"{
+            "id": "s1",
+            "project": "p",
+            "repo": null,
+            "branch": "main",
+            "status": "complete",
+            "engine": "corgea-blast",
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let mut value: serde_json::Value = serde_json::from_str(base).unwrap();
+
+        // A server predating the field omits it.
+        let parsed: ScanResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.project_id, None);
+
+        // Doghouse sends the primary key as a number.
+        value["project_id"] = serde_json::json!(7040);
+        let parsed: ScanResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.project_id.as_deref(), Some("7040"));
+
+        // A string id is kept as written; blank and null mean absent.
+        value["project_id"] = serde_json::json!("7040");
+        let parsed: ScanResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.project_id.as_deref(), Some("7040"));
+        value["project_id"] = serde_json::json!("  ");
+        let parsed: ScanResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.project_id, None);
+        value["project_id"] = serde_json::Value::Null;
+        let parsed: ScanResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.project_id, None);
     }
 
     #[test]

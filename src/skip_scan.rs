@@ -521,6 +521,7 @@ mod tests {
         ScanResponse {
             id: id.to_string(),
             project: "proj".to_string(),
+            project_id: None,
             repo: None,
             branch: None,
             status: status.to_string(),

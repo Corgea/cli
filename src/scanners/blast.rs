@@ -144,7 +144,9 @@ pub fn run(
 
     // A reused scan stands in for the new one: everything below this point —
     // the results table, the blocking-rule gate, the report file — runs against
-    // whichever scan id this resolves to.
+    // whichever scan id this resolves to. Its project id is whatever the scan
+    // record carries, so the results link is the id-based one whenever the
+    // server reports it, as it is for a fresh upload.
     let reused_scan = skip_recent.as_ref().and_then(|skip| {
         if let Some(reason) = include_rules.reuse_refusal() {
             println!("Scanning instead of reusing a previous scan: {reason}.");
@@ -164,7 +166,7 @@ pub fn run(
     });
 
     let (scan_id, project_id) = match reused_scan {
-        Some(scan) => (scan.id, None),
+        Some(scan) => (scan.id, scan.project_id),
         None => start_new_scan(
             config,
             &project_name,
@@ -2122,6 +2124,7 @@ mod tests {
         utils::api::ScanResponse {
             id: "scan-123".to_string(),
             project: "proj".to_string(),
+            project_id: None,
             repo: None,
             branch: None,
             status: status.to_string(),

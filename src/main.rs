@@ -271,7 +271,7 @@ enum Commands {
             long,
             requires = "scan_id",
             value_parser = clap::builder::NonEmptyStringValueParser::new(),
-            help = "Use this known Corgea project id for the result link, skipping project resolution. Requires a scan id, which is what the id then belongs to."
+            help = "Use this Corgea project id for the result link instead of the one the server reports for the scan, skipping project resolution. Requires a scan id, which is what the id then belongs to."
         )]
         project_id: Option<String>,
     },
