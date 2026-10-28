@@ -223,18 +223,36 @@ impl Manifest {
     /// in the archive unexamined. Refusing the manifest costs this project
     /// checksum diffing and nothing else.
     pub fn encode(&self) -> Option<EncodedManifest> {
+        let canonical = self.uploadable_canonical()?;
+        let root = format!("{:x}", Sha256::digest(&canonical));
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&canonical).ok()?;
+        let body = encoder.finish().ok()?;
+        Some(EncodedManifest { body, root })
+    }
+
+    /// The root `encode` would upload, without packing the body, or `None`
+    /// when it would upload nothing.
+    ///
+    /// The server records this digest with the scan, so it is what says
+    /// whether an earlier scan uploaded exactly these files. It has to answer
+    /// the same way as `encode`: a root for a manifest that is then not
+    /// uploaded would match a scan this run does not resemble to the server.
+    pub fn root(&self) -> Option<String> {
+        let canonical = self.uploadable_canonical()?;
+        Some(format!("{:x}", Sha256::digest(&canonical)))
+    }
+
+    /// The canonical bytes when this manifest can be uploaded. See `encode`
+    /// for why empty, oversized and ambiguous manifests are refused whole.
+    fn uploadable_canonical(&self) -> Option<Vec<u8>> {
         if self.entries.is_empty() || self.entries.len() > MAX_ENTRIES {
             return None;
         }
         if !self.entries.keys().all(|path| path_is_unambiguous(path)) {
             return None;
         }
-        let canonical = self.canonical();
-        let root = format!("{:x}", Sha256::digest(&canonical));
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&canonical).ok()?;
-        let body = encoder.finish().ok()?;
-        Some(EncodedManifest { body, root })
+        Some(self.canonical())
     }
 
     /// Read back a manifest packed by `encode`, or say why it cannot be read.
@@ -500,6 +518,21 @@ pub mod tests {
             encoded.root,
             format!("{:x}", Sha256::digest(entries.canonical()))
         );
+    }
+
+    #[test]
+    fn root_is_the_root_encode_uploads_and_refuses_when_encode_does() {
+        let mut manifest = Manifest::new();
+        assert_eq!(manifest.root(), None, "an empty manifest is not uploaded");
+
+        manifest.insert("src/main.rs".to_string(), "a".repeat(64));
+        manifest.insert("README.md".to_string(), "b".repeat(64));
+        let encoded = manifest.encode().expect("encode");
+        assert_eq!(manifest.root(), Some(encoded.root));
+
+        manifest.insert("bad\nname".to_string(), "c".repeat(64));
+        assert!(manifest.encode().is_none());
+        assert_eq!(manifest.root(), None);
     }
 
     #[test]
