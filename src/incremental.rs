@@ -734,6 +734,10 @@ impl BaselineScan {
     /// -- a subset of the modules, a tree with uncommitted edits -- and each
     /// of those inherited from a different baseline in turn, so two runs of
     /// the same bytes diffing against different ones report different rows.
+    /// That empty diff is only had by subtracting the scan's checksums, which
+    /// this client does only for a manifest version it reads, so a scan
+    /// storing the digest under any other version is not the same upload
+    /// here: it would be diffed by git instead, from its commit.
     ///
     /// The first-parent line breaks the tie a merge makes, whose parents are
     /// both one commit back. The diff from the first parent is the merge
@@ -742,10 +746,11 @@ impl BaselineScan {
     fn ancestor_rank(&self, checksums_usable: bool, own_root: Option<&str>) -> AncestorRank {
         let readable_checksums = self.manifest_root.is_some()
             && self.manifest_version.as_deref() == Some(MANIFEST_VERSION);
-        let same_upload = match (own_root, self.manifest_root.as_deref()) {
-            (Some(own), Some(theirs)) => own.eq_ignore_ascii_case(theirs),
-            _ => false,
-        };
+        let same_upload = readable_checksums
+            && match (own_root, self.manifest_root.as_deref()) {
+                (Some(own), Some(theirs)) => own.eq_ignore_ascii_case(theirs),
+                _ => false,
+            };
         (
             self.commits_back.unwrap_or(usize::MAX),
             !same_upload,
@@ -1122,10 +1127,13 @@ fn find_ancestor_baseline(
 /// The server orders by recency, not by distance from HEAD, so a page full of
 /// re-runs of one commit can push a nearer commit's scan onto the next page.
 /// Pages are read until none is left, the budget runs out, or the best so far
-/// is a scan of the batch's nearest commit, which nothing later can beat. A
-/// run with a manifest only stops early on a scan of its own upload, since an
-/// older one of those on a later page beats every scan of the commit read so
-/// far; without one it reads to the page budget, as before manifests.
+/// is a scan of the batch's nearest commit, which nothing later can beat. For
+/// a run with a manifest that is only a scan of its own upload, since an
+/// older one of those on a later page beats every other scan of the commit
+/// read so far, so such a run reads to the page budget unless it finds one.
+/// A run without a manifest stops on the nearest commit's best scan, as it
+/// did before manifests: no scan can be its upload, so none is ranked above
+/// the rest on that account.
 fn search_ancestor_batch(
     url: &str,
     project_name: &str,
@@ -1996,6 +2004,37 @@ mod tests {
             .expect("a baseline");
 
         assert_eq!(picked.id, "same-upload");
+    }
+
+    /// The same digest under a manifest version this client does not read is
+    /// not the same upload: its checksums cannot be subtracted, so the diff
+    /// would come from git, not be empty. It must not outrank a scan whose
+    /// checksums this run can read, nor the first parent.
+    #[test]
+    fn the_same_root_under_an_unreadable_version_is_not_the_same_upload() {
+        let l = lineage();
+        let side_tip = commit_on(&l.repo, &[git2::Oid::from_str(&l.side).unwrap()], "tip.txt");
+        let merge = commit_on(
+            &l.repo,
+            &[git2::Oid::from_str(&l.near).unwrap(), side_tip],
+            "merge.txt",
+        );
+        let ancestry = Ancestry::walk(&l.repo, &merge.to_string()).expect("head in clone");
+        let own_root = "c".repeat(64);
+        // Newest first, so recency alone would pick it too.
+        let mut foreign = with_checksums(scan("feature", &side_tip.to_string()));
+        foreign.id = "foreign-version".to_string();
+        foreign.file_manifest_root = Some(own_root.clone());
+        foreign.file_manifest_version = Some("999".to_string());
+        let mut readable = with_checksums(scan("main", &l.near));
+        readable.id = "readable".to_string();
+        let scans = [foreign, readable];
+
+        let picked = nearest_ancestor_baseline(&scans, &ancestry, true, Some(&own_root), true)
+            .expect("a baseline");
+
+        assert_eq!(picked.id, "readable");
+        assert!(picked.on_first_parent);
     }
 
     /// Both parents of a merge are one commit back. The same upload is the
