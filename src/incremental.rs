@@ -8,10 +8,13 @@
 //! Finding what to diff *against* is the same in both directions: ask the
 //! server for scans of the commits nearest behind HEAD in this checkout's
 //! history, whatever branch they were recorded under, and take the one of the
-//! closest commit. Only when none of those was scanned -- or there is no
-//! history to walk -- fall back to the newest completed scan of this branch,
-//! then of trunk. What changed since the baseline can then be measured two
-//! ways.
+//! closest commit. Among several scans of that commit, one that uploaded
+//! exactly these files wins: its diff is empty, so the findings carried
+//! forward are its own, not those an earlier scan of some other upload of the
+//! commit had accumulated. Only when none of those commits was scanned -- or
+//! there is no history to walk -- fall back to the newest completed scan of
+//! this branch, then of trunk. What changed since the baseline can then be
+//! measured two ways.
 //!
 //! The first is the file checksums that scan uploaded, fetched and subtracted
 //! from this run's. It needs no git history, so it is the only one that works
@@ -296,6 +299,9 @@ fn plan_diff(
     // below does, and it reports its absence by its real name.
     let repo = Repository::discover(".").ok();
     let checksums_usable = sources.manifest.is_some();
+    // The digest the upload will record, so a scan that stored the same one
+    // can be recognized among the candidates.
+    let own_root = sources.manifest.and_then(Manifest::root);
     // Branch names are only meaningful where there is a clone to read them
     // from. Without one, take the project's newest usable scan whatever branch
     // it names -- including none, which is what a scan uploaded from a
@@ -324,6 +330,7 @@ fn plan_diff(
             project_name,
             ancestry,
             checksums_usable,
+            own_root.as_deref(),
             git_diff_refusal(sources).is_none(),
         ) {
             // A backend that cannot answer a list of commits must not cost
@@ -694,9 +701,9 @@ struct BaselineScan {
     on_first_parent: bool,
 }
 
-/// `BaselineScan::ancestor_rank`: commits back, off the first-parent line,
-/// diffable only without checksums. Lowest is best.
-type AncestorRank = (usize, bool, bool);
+/// `BaselineScan::ancestor_rank`: commits back, not this run's upload, off the
+/// first-parent line, diffable only without checksums. Lowest is best.
+type AncestorRank = (usize, bool, bool, bool);
 
 impl BaselineScan {
     fn from_response(scan: &ScanResponse) -> Self {
@@ -716,18 +723,37 @@ impl BaselineScan {
     }
 
     /// Order among scans found by ancestry, lowest best: fewest commits back,
-    /// then one on HEAD's first-parent line, then one this run can diff by its
-    /// checksums over one it cannot.
+    /// then one that uploaded the same files as this run, then one on HEAD's
+    /// first-parent line, then one this run can diff by its checksums over
+    /// one it cannot.
+    ///
+    /// `own_root` is the digest this run's manifest will upload. A scan
+    /// storing the same digest scanned these very bytes, so the diff against
+    /// it is empty and the server copies that scan's findings and nothing
+    /// else. One commit can have several such scans with different uploads
+    /// -- a subset of the modules, a tree with uncommitted edits -- and each
+    /// of those inherited from a different baseline in turn, so two runs of
+    /// the same bytes diffing against different ones report different rows.
+    /// That empty diff is only had by subtracting the scan's checksums, which
+    /// this client does only for a manifest version it reads, so a scan
+    /// storing the digest under any other version is not the same upload
+    /// here: it would be diffed by git instead, from its commit.
     ///
     /// The first-parent line breaks the tie a merge makes, whose parents are
     /// both one commit back. The diff from the first parent is the merge
     /// itself; the diff from the other is everything the first line did since
     /// the fork, which can outgrow an incremental scan.
-    fn ancestor_rank(&self, checksums_usable: bool) -> AncestorRank {
+    fn ancestor_rank(&self, checksums_usable: bool, own_root: Option<&str>) -> AncestorRank {
         let readable_checksums = self.manifest_root.is_some()
             && self.manifest_version.as_deref() == Some(MANIFEST_VERSION);
+        let same_upload = readable_checksums
+            && match (own_root, self.manifest_root.as_deref()) {
+                (Some(own), Some(theirs)) => own.eq_ignore_ascii_case(theirs),
+                _ => false,
+            };
         (
             self.commits_back.unwrap_or(usize::MAX),
+            !same_upload,
             !self.on_first_parent,
             !(checksums_usable && readable_checksums),
         )
@@ -1075,6 +1101,7 @@ fn find_ancestor_baseline(
     project_name: &str,
     ancestry: &Ancestry,
     checksums_usable: bool,
+    own_root: Option<&str>,
     git_diffable: bool,
 ) -> BaselineLookup {
     let url = config.get_url();
@@ -1085,6 +1112,7 @@ fn find_ancestor_baseline(
             ancestry,
             batch,
             checksums_usable,
+            own_root,
             git_diffable,
         ) {
             BaselineLookup::NotFound => continue,
@@ -1099,13 +1127,20 @@ fn find_ancestor_baseline(
 /// The server orders by recency, not by distance from HEAD, so a page full of
 /// re-runs of one commit can push a nearer commit's scan onto the next page.
 /// Pages are read until none is left, the budget runs out, or the best so far
-/// is a scan of the batch's nearest commit, which nothing later can beat.
+/// is a scan of the batch's nearest commit, which nothing later can beat. For
+/// a run with a manifest that is only a scan of its own upload, since an
+/// older one of those on a later page beats every other scan of the commit
+/// read so far, so such a run reads to the page budget unless it finds one.
+/// A run without a manifest stops on the nearest commit's best scan, as it
+/// did before manifests: no scan can be its upload, so none is ranked above
+/// the rest on that account.
 fn search_ancestor_batch(
     url: &str,
     project_name: &str,
     ancestry: &Ancestry,
     batch: &[String],
     checksums_usable: bool,
+    own_root: Option<&str>,
     git_diffable: bool,
 ) -> BaselineLookup {
     // Over the whole batch, not its first commit: that one can sit off the
@@ -1118,7 +1153,12 @@ fn search_ancestor_batch(
         })
         .min()
         .map(|(commits_back, off_first_parent)| {
-            (commits_back, off_first_parent, !checksums_usable)
+            (
+                commits_back,
+                own_root.is_none(),
+                off_first_parent,
+                !checksums_usable,
+            )
         });
     let mut best: Option<BaselineScan> = None;
     for page in 1..=SCAN_LOOKUP_MAX_PAGES {
@@ -1145,19 +1185,20 @@ fn search_ancestor_batch(
             break;
         }
         if let Some(scan) =
-            nearest_ancestor_baseline(&scans, ancestry, checksums_usable, git_diffable)
+            nearest_ancestor_baseline(&scans, ancestry, checksums_usable, own_root, git_diffable)
         {
             // Strictly better only: earlier pages are newer, and recency
             // breaks a tie.
             if best.as_ref().is_none_or(|kept| {
-                scan.ancestor_rank(checksums_usable) < kept.ancestor_rank(checksums_usable)
+                scan.ancestor_rank(checksums_usable, own_root)
+                    < kept.ancestor_rank(checksums_usable, own_root)
             }) {
                 best = Some(scan);
             }
         }
         if best
             .as_ref()
-            .is_some_and(|kept| Some(kept.ancestor_rank(checksums_usable)) == unbeatable)
+            .is_some_and(|kept| Some(kept.ancestor_rank(checksums_usable, own_root)) == unbeatable)
         {
             break;
         }
@@ -1177,12 +1218,14 @@ fn search_ancestor_batch(
 /// the filter would otherwise hand back a scan of any commit. A scan only
 /// diffable by its commit is no use to a run that cannot git diff (a dirty
 /// tree without `--ignore-dirty-worktree`, or an `--exclude`d archive), so
-/// there it has to carry checksums. Between scans of the same commit,
-/// checksums win, then recency.
+/// there it has to carry checksums. Between scans of the same commit, one
+/// that uploaded the same files as this run (`own_root`) wins, then
+/// checksums, then recency.
 fn nearest_ancestor_baseline(
     scans: &[ScanResponse],
     ancestry: &Ancestry,
     checksums_usable: bool,
+    own_root: Option<&str>,
     git_diffable: bool,
 ) -> Option<BaselineScan> {
     scans
@@ -1199,7 +1242,7 @@ fn nearest_ancestor_baseline(
                 ..BaselineScan::from_response(scan)
             };
             Some((
-                (baseline.ancestor_rank(checksums_usable), position),
+                (baseline.ancestor_rank(checksums_usable, own_root), position),
                 baseline,
             ))
         })
@@ -1891,7 +1934,8 @@ mod tests {
             detached_scan(&l.near),
         ];
 
-        let picked = nearest_ancestor_baseline(&scans, &ancestry, false, true).expect("a baseline");
+        let picked =
+            nearest_ancestor_baseline(&scans, &ancestry, false, None, true).expect("a baseline");
 
         assert_eq!(picked.sha.as_deref(), Some(l.near.as_str()));
         assert_eq!(picked.commits_back, Some(1));
@@ -1907,7 +1951,8 @@ mod tests {
         let ancestry = Ancestry::walk(&l.repo, &l.head).expect("head in clone");
         let scans = vec![scan("main", &l.near), detached_scan(&l.head)];
 
-        let picked = nearest_ancestor_baseline(&scans, &ancestry, false, true).expect("a baseline");
+        let picked =
+            nearest_ancestor_baseline(&scans, &ancestry, false, None, true).expect("a baseline");
 
         assert_eq!(picked.commits_back, Some(0));
     }
@@ -1919,7 +1964,7 @@ mod tests {
         let scans = vec![scan("feature", &l.side), scan_without_git("no-git")];
 
         assert_eq!(
-            nearest_ancestor_baseline(&scans, &ancestry, true, true),
+            nearest_ancestor_baseline(&scans, &ancestry, true, None, true),
             None
         );
     }
@@ -1933,10 +1978,131 @@ mod tests {
         let mut hashed = with_checksums(detached_scan(&l.near));
         hashed.id = "hashed".to_string();
 
-        let picked =
-            nearest_ancestor_baseline(&[plain, hashed], &ancestry, true, true).expect("a baseline");
+        let picked = nearest_ancestor_baseline(&[plain, hashed], &ancestry, true, None, true)
+            .expect("a baseline");
 
         assert_eq!(picked.id, "hashed");
+    }
+
+    /// A scan storing the digest this run will upload scanned these very
+    /// bytes, so its rows are the rows this run should inherit. A newer scan
+    /// of the same commit may have come from a different upload -- a module
+    /// subset, a dirty tree -- and carry another lineage's drift.
+    #[test]
+    fn between_scans_of_one_commit_the_same_upload_beats_a_newer_one() {
+        let l = lineage();
+        let ancestry = Ancestry::walk(&l.repo, &l.head).expect("head in clone");
+        let own_root = "c".repeat(64);
+        // Newest first, so recency alone would pick the other upload.
+        let mut other_upload = with_checksums(detached_scan(&l.near));
+        other_upload.id = "other-upload".to_string();
+        let mut same_upload = with_checksums(detached_scan(&l.near));
+        same_upload.id = "same-upload".to_string();
+        same_upload.file_manifest_root = Some(own_root.to_ascii_uppercase());
+        let scans = [other_upload, same_upload];
+
+        let picked = nearest_ancestor_baseline(&scans, &ancestry, true, Some(&own_root), true)
+            .expect("a baseline");
+
+        assert_eq!(picked.id, "same-upload");
+    }
+
+    /// The same digest under a manifest version this client does not read is
+    /// not the same upload: its checksums cannot be subtracted, so the diff
+    /// would come from git, not be empty. It must not outrank a scan whose
+    /// checksums this run can read, nor the first parent.
+    #[test]
+    fn the_same_root_under_an_unreadable_version_is_not_the_same_upload() {
+        let l = lineage();
+        let side_tip = commit_on(&l.repo, &[git2::Oid::from_str(&l.side).unwrap()], "tip.txt");
+        let merge = commit_on(
+            &l.repo,
+            &[git2::Oid::from_str(&l.near).unwrap(), side_tip],
+            "merge.txt",
+        );
+        let ancestry = Ancestry::walk(&l.repo, &merge.to_string()).expect("head in clone");
+        let own_root = "c".repeat(64);
+        // Newest first, so recency alone would pick it too.
+        let mut foreign = with_checksums(scan("feature", &side_tip.to_string()));
+        foreign.id = "foreign-version".to_string();
+        foreign.file_manifest_root = Some(own_root.clone());
+        foreign.file_manifest_version = Some("999".to_string());
+        let mut readable = with_checksums(scan("main", &l.near));
+        readable.id = "readable".to_string();
+        let scans = [foreign, readable];
+
+        let picked = nearest_ancestor_baseline(&scans, &ancestry, true, Some(&own_root), true)
+            .expect("a baseline");
+
+        assert_eq!(picked.id, "readable");
+        assert!(picked.on_first_parent);
+    }
+
+    /// Both parents of a merge are one commit back. The same upload is the
+    /// same bytes whichever parent it was recorded under, so it beats the
+    /// first-parent preference, which only guesses at the smaller diff.
+    #[test]
+    fn the_same_upload_beats_the_first_parent_at_equal_distance() {
+        let l = lineage();
+        let side_tip = commit_on(&l.repo, &[git2::Oid::from_str(&l.side).unwrap()], "tip.txt");
+        let merge = commit_on(
+            &l.repo,
+            &[git2::Oid::from_str(&l.near).unwrap(), side_tip],
+            "merge.txt",
+        );
+        let ancestry = Ancestry::walk(&l.repo, &merge.to_string()).expect("head in clone");
+        let own_root = "c".repeat(64);
+        let mut same_upload = with_checksums(scan("feature", &side_tip.to_string()));
+        same_upload.file_manifest_root = Some(own_root.clone());
+        let scans = [with_checksums(scan("main", &l.near)), same_upload];
+
+        let picked = nearest_ancestor_baseline(&scans, &ancestry, true, Some(&own_root), true)
+            .expect("a baseline");
+
+        assert_eq!(picked.sha, Some(side_tip.to_string()));
+        assert!(!picked.on_first_parent);
+    }
+
+    /// The upload only decides among scans at the same distance: a nearer
+    /// commit's scan differs by less than the same bytes farther back do
+    /// from the commits since.
+    #[test]
+    fn a_nearer_commit_still_beats_the_same_upload_farther_back() {
+        let l = lineage();
+        let ancestry = Ancestry::walk(&l.repo, &l.head).expect("head in clone");
+        let own_root = "c".repeat(64);
+        let mut same_upload = with_checksums(detached_scan(&l.root));
+        same_upload.file_manifest_root = Some(own_root.clone());
+        let scans = [same_upload, with_checksums(detached_scan(&l.near))];
+
+        let picked = nearest_ancestor_baseline(&scans, &ancestry, true, Some(&own_root), true)
+            .expect("a baseline");
+
+        assert_eq!(picked.sha.as_deref(), Some(l.near.as_str()));
+    }
+
+    /// Without a scan of this upload, or without an upload to compare -- a
+    /// run whose archive carries no manifest -- the order is the one before:
+    /// checksums, then recency.
+    #[test]
+    fn without_a_matching_upload_checksums_then_recency_decide() {
+        let l = lineage();
+        let ancestry = Ancestry::walk(&l.repo, &l.head).expect("head in clone");
+        let own_root = "c".repeat(64);
+        let mut newest = with_checksums(detached_scan(&l.near));
+        newest.id = "newest".to_string();
+        let mut older = with_checksums(detached_scan(&l.near));
+        older.id = "older".to_string();
+        older.file_manifest_root = Some("b".repeat(64));
+        let mut plain = detached_scan(&l.near);
+        plain.id = "plain".to_string();
+        let scans = [plain, newest, older];
+
+        for own_root in [Some(own_root.as_str()), None] {
+            let picked = nearest_ancestor_baseline(&scans, &ancestry, true, own_root, true)
+                .expect("a baseline");
+            assert_eq!(picked.id, "newest", "own root {own_root:?}");
+        }
     }
 
     #[test]
@@ -1950,7 +2116,8 @@ mod tests {
             with_checksums(detached_scan(&l.root)),
         ];
 
-        let picked = nearest_ancestor_baseline(&scans, &ancestry, true, false).expect("a baseline");
+        let picked =
+            nearest_ancestor_baseline(&scans, &ancestry, true, None, false).expect("a baseline");
 
         assert_eq!(picked.sha.as_deref(), Some(l.root.as_str()));
         assert_eq!(picked.commits_back, Some(2));
@@ -2044,15 +2211,15 @@ mod tests {
         let scans = vec![other_side, scan("main", &l.near)];
 
         for checksums_usable in [false, true] {
-            let picked = nearest_ancestor_baseline(&scans, &ancestry, checksums_usable, true)
+            let picked = nearest_ancestor_baseline(&scans, &ancestry, checksums_usable, None, true)
                 .expect("a baseline");
             assert_eq!(picked.sha.as_deref(), Some(l.near.as_str()));
             assert_eq!(picked.commits_back, Some(1));
         }
 
         // Still the baseline when the first parent was never scanned.
-        let picked =
-            nearest_ancestor_baseline(&scans[..1], &ancestry, true, true).expect("a baseline");
+        let picked = nearest_ancestor_baseline(&scans[..1], &ancestry, true, None, true)
+            .expect("a baseline");
         assert_eq!(picked.sha, Some(side_tip.to_string()));
     }
 
