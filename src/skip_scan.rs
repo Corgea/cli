@@ -55,7 +55,7 @@ const SCAN_LOOKUP_MAX_PAGES: u16 = 3;
 /// The engine every blast scan carries, whoever started it — CLI, platform
 /// integration, or scheduled run. An uploaded third-party report carries its
 /// own scanner's name and cannot stand in for `corgea scan blast`.
-const BLAST_ENGINE: &str = "corgea-blast";
+pub(crate) const BLAST_ENGINE: &str = "corgea-blast";
 
 /// Grep-able signal for pipelines: printed exactly once per run whenever the
 /// flag is on, so a step can branch on whether a scan actually happened.
@@ -387,7 +387,7 @@ pub fn select_reusable_scan<'a>(
 }
 
 /// True when `scan` records exactly the commit being scanned.
-fn scan_matches_commit(scan: &ScanResponse, sha: &str) -> bool {
+pub(crate) fn scan_matches_commit(scan: &ScanResponse, sha: &str) -> bool {
     scan.git_sha
         .as_deref()
         .is_some_and(|scan_sha| scan_sha.eq_ignore_ascii_case(sha))
@@ -471,7 +471,7 @@ fn age_since(created_at: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
 
 /// Timestamps arrive as RFC 3339 from the scan list, but Django can also
 /// serialize a naive datetime, which the RFC 3339 parser rejects.
-fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
     let raw = raw.trim();
     if let Ok(parsed) = DateTime::parse_from_rfc3339(raw) {
         return Some(parsed.with_timezone(&Utc));
@@ -506,7 +506,7 @@ fn format_age(age: Duration) -> String {
 
 /// First 7 characters, by char boundary rather than byte index. The value comes
 /// from the API, so a non-ASCII one must shorten, not panic mid-scan.
-fn short_sha(sha: &str) -> &str {
+pub(crate) fn short_sha(sha: &str) -> &str {
     match sha.char_indices().nth(7) {
         Some((byte, _)) => &sha[..byte],
         None => sha,

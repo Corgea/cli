@@ -873,10 +873,6 @@ fn start_new_scan(
         .as_ref()
         .and_then(Manifest::encode);
     println!("\n\nSubmitting scan to Corgea:");
-    // What ties the registered scan back to this upload if its answer never
-    // arrives: the commit, and when the upload began (see `scan_recovery`).
-    let upload_sha = repo_info.as_ref().and_then(|info| info.sha.clone());
-    let upload_started_at = chrono::Utc::now();
     let upload_result = match utils::api::upload_zip(
         &zip_path,
         &config.get_url(),
@@ -893,14 +889,12 @@ fn start_new_scan(
             partial_files,
         },
     ) {
-        Ok(result) => result,
-        Err(utils::api::UploadZipError::RegistrationUnanswered { cause }) => {
+        Ok(utils::api::UploadOutcome::Registered(result)) => result,
+        Ok(utils::api::UploadOutcome::Unanswered(unanswered)) => {
             match crate::scan_recovery::recover_registered_scan(
-                config,
+                &config.get_url(),
                 project_name,
-                upload_sha.as_deref(),
-                upload_started_at,
-                &cause,
+                &unanswered,
             ) {
                 Ok(scan) => utils::api::UploadZipResult {
                     scan_id: scan.id,

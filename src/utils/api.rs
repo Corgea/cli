@@ -2,6 +2,7 @@ use crate::incremental::{BaselineRef, FullScanReason, IncrementalPlan};
 use crate::log::debug;
 use crate::manifest::EncodedManifest;
 use crate::utils;
+use chrono::{DateTime, Utc};
 use corgea::vuln_api::{auth_header, default_headers, source};
 use reqwest::header::HeaderMap;
 use reqwest::{
@@ -25,6 +26,11 @@ const DIRTY_TRUE: &str = "true";
 const DIRTY_FALSE: &str = "false";
 /// How long any one request may take before the client gives up.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
+/// How long opening the TCP connection may take. Without its own limit a
+/// connection that never opens runs out the whole request timeout and
+/// reports as a timeout, which the retry policy treats differently: a
+/// request that never reached the server is always safe to send again.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Budget for the pre-scan project-settings lookup. Short on purpose: the run
 /// continues without the project's include rules if it fails, so waiting out
@@ -62,6 +68,7 @@ static SHARED_CLIENT: std::sync::LazyLock<reqwest::blocking::Client> =
     std::sync::LazyLock::new(|| {
         let mut builder = reqwest::blocking::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .default_headers(default_headers())
             .cookie_provider(COOKIE_JAR.clone());
 
@@ -481,7 +488,7 @@ where
 /// sends the request once when the read times out, for a request whose
 /// repeat would do its work twice (the archive chunk that registers a scan).
 /// Connection failures are still retried, since nothing reached the server.
-pub fn send_with_retry_policy<F>(
+fn send_with_retry_policy<F>(
     operation: &str,
     method: &Method,
     resend_on_timeout: bool,
@@ -493,8 +500,7 @@ where
     let _guard = RetryLoopGuard::enter();
     let mut retries = TransientRetries::new(operation);
     loop {
-        let response =
-            retry_on_network_error_with_policy(operation, resend_on_timeout, &mut make_request)?;
+        let response = retry_on_network_error(operation, resend_on_timeout, &mut make_request)?;
         if !retries.wait_for_retry(response.status(), method, retry_after(response.headers())) {
             return Ok(response);
         }
@@ -526,16 +532,9 @@ const RETRY_BACKOFF_SECS: &[u64] = &[1, 2, 4, 8, 16, 32];
 #[cfg(test)]
 const RETRY_BACKOFF_SECS: &[u64] = &[0, 0, 0, 0, 0, 0];
 
-#[cfg(test)]
-fn retry_on_network_error<F, T>(operation: &str, make_request: F) -> reqwest::Result<T>
-where
-    F: FnMut() -> reqwest::Result<T>,
-{
-    retry_on_network_error_with_policy(operation, true, make_request)
-}
-
-/// `retry_on_network_error`, retrying a timeout only when `resend_on_timeout`.
-fn retry_on_network_error_with_policy<F, T>(
+/// Sends again, with backoff, after a connection failure, and after a timeout
+/// when `resend_on_timeout`.
+fn retry_on_network_error<F, T>(
     operation: &str,
     resend_on_timeout: bool,
     mut make_request: F,
@@ -608,56 +607,48 @@ pub struct UploadOptions {
     pub partial_files: Option<Vec<String>>,
 }
 
-/// Why `upload_zip` failed.
+/// How `upload_zip` ended once every byte was sent.
 #[derive(Debug)]
-pub enum UploadZipError {
-    /// The request that registers the scan was sent and nothing from the API
-    /// came back for it: a proxy answered with a gateway error, or the read
-    /// timed out. That request is the chunk completing the archive, and the
-    /// server registers the scan while it runs, so the scan may exist, or
-    /// come to exist, without the CLI ever learning its id. Re-sending the
-    /// chunk would register a second scan, which is why the caller recovers
-    /// the first one instead. `cause` says what came back, for the message.
-    RegistrationUnanswered { cause: String },
-    /// Any other failure, already worded for the user.
-    Other(String),
+pub enum UploadOutcome {
+    /// The server answered the registering request with the scan's id.
+    Registered(UploadZipResult),
+    Unanswered(UnansweredRegistration),
 }
 
-impl std::fmt::Display for UploadZipError {
+/// The request that registers the scan was sent and nothing from the API came
+/// back for it: a proxy answered with a gateway error, or the read timed out.
+/// That request is the chunk completing the archive, and the server registers
+/// the scan while it runs, so the scan may exist, or come to exist, without
+/// the CLI ever learning its id. Re-sending the chunk would register a second
+/// scan, which is why the caller recovers the first one instead, by what the
+/// server knows about this upload, carried here.
+#[derive(Debug)]
+pub struct UnansweredRegistration {
+    /// What came back instead of an answer, for the message.
+    pub cause: String,
+    /// The commit the upload was a snapshot of, which the scan list is asked
+    /// for. Without one the scan cannot be told from the project's others.
+    pub sha: Option<String>,
+    /// Whether the tree carried uncommitted changes, as sent with the upload.
+    pub worktree_dirty: bool,
+    /// The root digest of the manifest the server stored for this upload: the
+    /// upload's own for a full scan, none for a partial one, since the server
+    /// keeps no manifest for a subset of the project. A digest of the uploaded
+    /// files, so it tells this upload's scan from another upload of the same
+    /// commit with other bytes.
+    pub manifest_root: Option<String>,
+    /// The earliest stamp the scan this upload registered can carry, on the
+    /// server's clock: see `registered_no_earlier_than`.
+    pub registered_no_earlier_than: DateTime<Utc>,
+}
+
+impl std::fmt::Display for UnansweredRegistration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::RegistrationUnanswered { cause } => write!(
-                f,
-                "The upload completed, but the request registering the scan went unanswered: {cause}"
-            ),
-            Self::Other(message) => f.write_str(message),
-        }
-    }
-}
-
-impl Error for UploadZipError {}
-
-impl From<String> for UploadZipError {
-    fn from(message: String) -> Self {
-        Self::Other(message)
-    }
-}
-
-impl From<&str> for UploadZipError {
-    fn from(message: &str) -> Self {
-        Self::Other(message.to_string())
-    }
-}
-
-impl From<std::io::Error> for UploadZipError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Other(e.to_string())
-    }
-}
-
-impl From<reqwest::Error> for UploadZipError {
-    fn from(e: reqwest::Error) -> Self {
-        Self::Other(e.to_string())
+        write!(
+            f,
+            "The upload completed, but the request registering the scan went unanswered: {}",
+            self.cause
+        )
     }
 }
 
@@ -676,13 +667,48 @@ fn gateway_status_summary(status: StatusCode) -> String {
     format!("{} ({})", status.as_u16(), meaning)
 }
 
+/// The server's clock, from the `Date` header an origin or proxy puts on
+/// every answer.
+fn server_time(headers: &HeaderMap) -> Option<DateTime<Utc>> {
+    let raw = headers.get(reqwest::header::DATE)?.to_str().ok()?;
+    DateTime::parse_from_rfc2822(raw)
+        .ok()
+        .map(|time| time.with_timezone(&Utc))
+}
+
+/// How far before the upload opened a scan may be stamped and still be this
+/// upload's, when the opening is known on the server's clock: the proxy that
+/// dated the answer and the database that stamps the scan keep clocks of
+/// their own, but close ones.
+const SERVER_CLOCK_ALLOWANCE: Duration = Duration::from_secs(60);
+
+/// The same, when the opening is known only on this machine's clock, which
+/// need not agree with the server's at all.
+const CLIENT_CLOCK_ALLOWANCE: Duration = Duration::from_secs(300);
+
+/// The earliest stamp a scan this upload registered can carry: the server's
+/// clock when the upload opened, read off the `Date` header of the answer
+/// that opened it, else this machine's when it began, each less what that
+/// clock may be off by. The scan is stamped later than either, on the
+/// server's clock, which is what tells it from an earlier scan of the commit.
+fn registered_no_earlier_than(
+    server_time_at_start: Option<DateTime<Utc>>,
+    started_at: DateTime<Utc>,
+) -> DateTime<Utc> {
+    match server_time_at_start {
+        Some(opened) => opened - SERVER_CLOCK_ALLOWANCE,
+        None => started_at - CLIENT_CLOCK_ALLOWANCE,
+    }
+}
+
 pub fn upload_zip(
     file_path: &str,
     url: &str,
     project_name: &str,
     repo_info: Option<utils::generic::RepoInfo>,
     options: UploadOptions,
-) -> Result<UploadZipResult, UploadZipError> {
+) -> Result<UploadOutcome, Box<dyn Error>> {
+    let started_at = Utc::now();
     let UploadOptions {
         scan_type,
         policy,
@@ -749,6 +775,7 @@ pub fn upload_zip(
         }
     };
     let response_status = response_object.status();
+    let server_time_at_start = server_time(response_object.headers());
     let response_text = response_object.text()?;
 
     if response_status != StatusCode::OK {
@@ -788,6 +815,24 @@ pub fn upload_zip(
             "Failed to retrieve transfer ID. Please check the request parameters and try again."
                 .into(),
         ),
+    };
+    // What the server knows about this upload, kept for finding the scan it
+    // registered should the request that registers it go unanswered.
+    let unanswered = |cause: String| -> Result<UploadOutcome, Box<dyn Error>> {
+        Ok(UploadOutcome::Unanswered(UnansweredRegistration {
+            cause,
+            sha: repo_info.as_ref().and_then(|info| info.sha.clone()),
+            worktree_dirty: repo_info.as_ref().is_some_and(|info| info.dirty),
+            manifest_root: if partial_files.is_some() {
+                None
+            } else {
+                file_manifest.as_ref().map(|manifest| manifest.root.clone())
+            },
+            registered_no_earlier_than: registered_no_earlier_than(
+                server_time_at_start,
+                started_at,
+            ),
+        }))
     };
     let mut file = File::open(file_path)?;
     let mut buffer = vec![0; CHUNK_SIZE];
@@ -969,14 +1014,15 @@ pub fn upload_zip(
                     check_for_warnings(response.headers(), response.status());
                     response
                 }
-                Err(e) if final_chunk && e.is_timeout() => {
-                    return Err(UploadZipError::RegistrationUnanswered {
-                        cause: format!(
-                            "no answer within {} seconds ({})",
-                            REQUEST_TIMEOUT.as_secs(),
-                            e
-                        ),
-                    });
+                // A connection that never opened is a connection failure the
+                // retries already spent, not a request the server may have
+                // acted on.
+                Err(e) if final_chunk && e.is_timeout() && !e.is_connect() => {
+                    return unanswered(format!(
+                        "no answer within {} seconds ({})",
+                        REQUEST_TIMEOUT.as_secs(),
+                        e
+                    ));
                 }
                 Err(e) => {
                     return Err(format!("Failed to send request: {}", e).into());
@@ -985,13 +1031,7 @@ pub fn upload_zip(
         if !response.status().is_success() {
             let status_code = response.status();
             if final_chunk && is_gateway_error(status_code) {
-                debug(&format!(
-                    "Final chunk upload answered by a proxy with status: {}",
-                    status_code
-                ));
-                return Err(UploadZipError::RegistrationUnanswered {
-                    cause: gateway_status_summary(status_code),
-                });
+                return unanswered(gateway_status_summary(status_code));
             }
             let response_text = response
                 .text()
@@ -1034,10 +1074,10 @@ pub fn upload_zip(
                         .map(|s| s.to_string())
                         .or_else(|| v.as_i64().map(|n| n.to_string()))
                 });
-                return Ok(UploadZipResult {
+                return Ok(UploadOutcome::Registered(UploadZipResult {
                     scan_id,
                     project_id,
-                });
+                }));
             } else {
                 return Err("Failed to get scan_id from response".into());
             }
@@ -3176,7 +3216,7 @@ mod tests {
     fn retry_on_network_error_returns_ok_on_first_success() {
         let attempts = Cell::new(0);
 
-        let result = retry_on_network_error("test operation", || {
+        let result = retry_on_network_error("test operation", true, || {
             attempts.set(attempts.get() + 1);
             Ok("success")
         });
@@ -3189,7 +3229,7 @@ mod tests {
     fn retry_on_network_error_retries_connect_errors_then_succeeds() {
         let attempts = Cell::new(0);
 
-        let result = retry_on_network_error("test operation", || {
+        let result = retry_on_network_error("test operation", true, || {
             let attempt = attempts.get() + 1;
             attempts.set(attempt);
             if attempt < 3 {
@@ -3207,7 +3247,7 @@ mod tests {
     fn retry_on_network_error_retries_timeout_errors() {
         let attempts = Cell::new(0);
 
-        let result = retry_on_network_error("test operation", || {
+        let result = retry_on_network_error("test operation", true, || {
             let attempt = attempts.get() + 1;
             attempts.set(attempt);
             if attempt == 1 {
@@ -3225,7 +3265,7 @@ mod tests {
     fn retry_on_network_error_does_not_retry_non_network_errors() {
         let attempts = Cell::new(0);
 
-        let result: reqwest::Result<()> = retry_on_network_error("test operation", || {
+        let result: reqwest::Result<()> = retry_on_network_error("test operation", true, || {
             attempts.set(attempts.get() + 1);
             Err(non_retryable_error())
         });
@@ -3586,7 +3626,7 @@ mod tests {
                 let response = if request.starts_with(b"POST ") {
                     corgea::vuln_api_stub::http_response(
                         "200 OK",
-                        "",
+                        "Date: Fri, 30 Oct 2026 09:13:00 GMT\r\n",
                         r#"{"status":"ok","transfer_id":"t-1"}"#,
                     )
                 } else {
@@ -3633,25 +3673,51 @@ mod tests {
         );
         let archive = small_archive();
 
-        let err = upload_zip(
+        let outcome = upload_zip(
             archive.path().to_str().unwrap(),
             &base,
             "proj",
             None,
             plain_upload_options(),
         )
-        .expect_err("524 fails the upload");
+        .expect("a 524 leaves a scan to look for, not a failed upload");
 
-        match &err {
-            UploadZipError::RegistrationUnanswered { cause } => {
-                assert!(cause.starts_with("524 ("), "{cause}");
-                assert!(cause.contains("100 seconds"), "{cause}");
-            }
-            other => panic!("expected RegistrationUnanswered, got {other:?}"),
-        }
+        let UploadOutcome::Unanswered(unanswered) = outcome else {
+            panic!("expected Unanswered, got {outcome:?}");
+        };
+        assert!(
+            unanswered.cause.starts_with("524 ("),
+            "{}",
+            unanswered.cause
+        );
+        let opened = DateTime::parse_from_rfc3339("2026-10-30T09:13:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            unanswered.registered_no_earlier_than,
+            opened - SERVER_CLOCK_ALLOWANCE,
+            "the server's clock when the upload opened comes off the Date header"
+        );
         // Sent once: a second send would register a second scan.
         assert_eq!(chunk_hits.load(Ordering::SeqCst), 1);
-        assert!(err.to_string().contains("went unanswered"), "{err}");
+    }
+
+    #[test]
+    fn without_the_servers_clock_this_machines_counts_with_a_wider_allowance() {
+        let started = DateTime::parse_from_rfc3339("2026-10-30T09:13:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            registered_no_earlier_than(None, started),
+            started - CLIENT_CLOCK_ALLOWANCE
+        );
+        // A machine eight minutes fast still finds its scan when the server
+        // said when the upload opened.
+        let opened = started - Duration::from_secs(8 * 60);
+        assert_eq!(
+            registered_no_earlier_than(Some(opened), started),
+            opened - SERVER_CLOCK_ALLOWANCE
+        );
     }
 
     #[test]
@@ -3672,10 +3738,6 @@ mod tests {
         )
         .expect_err("500 fails the upload");
 
-        assert!(
-            matches!(err, UploadZipError::Other(_)),
-            "expected Other, got {err:?}"
-        );
         assert!(err.to_string().contains("500"), "{err}");
         assert_eq!(chunk_hits.load(Ordering::SeqCst), 1);
     }
@@ -3684,11 +3746,10 @@ mod tests {
     fn a_timeout_is_not_resent_when_the_policy_forbids_it() {
         let attempts = Cell::new(0);
 
-        let result: reqwest::Result<()> =
-            retry_on_network_error_with_policy("final chunk", false, || {
-                attempts.set(attempts.get() + 1);
-                Err(timeout_error())
-            });
+        let result: reqwest::Result<()> = retry_on_network_error("final chunk", false, || {
+            attempts.set(attempts.get() + 1);
+            Err(timeout_error())
+        });
 
         assert!(result.unwrap_err().is_timeout());
         assert_eq!(
@@ -3702,7 +3763,7 @@ mod tests {
     fn a_connection_failure_is_resent_whatever_the_timeout_policy() {
         let attempts = Cell::new(0);
 
-        let result = retry_on_network_error_with_policy("final chunk", false, || {
+        let result = retry_on_network_error("final chunk", false, || {
             let attempt = attempts.get() + 1;
             attempts.set(attempt);
             if attempt < 2 {
@@ -4120,7 +4181,7 @@ mod tests {
     fn retry_on_network_error_gives_up_after_max_retries() {
         let attempts = Cell::new(0);
 
-        let result: reqwest::Result<()> = retry_on_network_error("test operation", || {
+        let result: reqwest::Result<()> = retry_on_network_error("test operation", true, || {
             attempts.set(attempts.get() + 1);
             Err(connection_refused_error())
         });

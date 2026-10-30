@@ -5,6 +5,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -707,6 +708,29 @@ pub(crate) fn two_source_report_project() -> ReportProject {
     )
     .expect("write report");
     ReportProject { root, report_path }
+}
+
+/// The canonical text of a file manifest over `files` (path, contents), as
+/// the CLI writes it. Spelled out here rather than built with the CLI's own
+/// encoder, so a change to how a manifest is written shows up as a failing
+/// test instead of agreeing with itself.
+pub(crate) fn canonical_manifest(files: &[(&str, &str)]) -> String {
+    let mut canonical = String::from("corgea-file-manifest/1 sha256\n");
+    let mut sorted = files.to_vec();
+    sorted.sort();
+    for (path, contents) in sorted {
+        canonical.push_str(&format!(
+            "{:x} {path}\n",
+            Sha256::digest(contents.as_bytes())
+        ));
+    }
+    canonical
+}
+
+/// The root digest the server stores for the manifest over `files`, and
+/// reports on the scan list.
+pub(crate) fn manifest_root(files: &[(&str, &str)]) -> String {
+    format!("{:x}", Sha256::digest(canonical_manifest(files).as_bytes()))
 }
 
 pub(crate) fn git_project() -> GitProject {

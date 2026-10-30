@@ -313,7 +313,12 @@ fn a_rejected_archive_chunk_is_not_sent_again_but_its_scan_is_recovered() {
         "engine": "corgea-blast",
         "created_at": chrono::Utc::now().to_rfc3339(),
         "git_sha": project.sha,
-        "worktree_dirty": false
+        "worktree_dirty": false,
+        // What the server stored from this upload: the digest of the one
+        // file the fixture committed. A scan of the commit with other bytes
+        // would not be this upload's.
+        "file_manifest_root": manifest_root(&[("main.py", SOURCE_BODY)]),
+        "file_manifest_version": "1"
     });
     plan.push(expected_request(
         "look up the scan registered for the commit",

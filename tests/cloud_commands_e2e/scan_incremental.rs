@@ -20,7 +20,6 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use hyper::{Method, StatusCode};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::io::Write;
 
 const PROJECT: &str = "cloud-e2e";
@@ -44,21 +43,9 @@ fn baseline_scan(sha: &str) -> Value {
 
 /// A baseline scan advertising stored checksums of `files`, and the gzipped
 /// manifest the download then has to serve.
-///
-/// The format is spelled out here rather than built with the CLI's own encoder,
-/// so a change to how a manifest is written shows up as a failing test instead
-/// of agreeing with itself.
 fn baseline_scan_with_checksums(sha: &str, files: &[(&str, &str)]) -> (Value, Vec<u8>) {
-    let mut canonical = String::from("corgea-file-manifest/1 sha256\n");
-    let mut sorted = files.to_vec();
-    sorted.sort();
-    for (path, contents) in sorted {
-        canonical.push_str(&format!(
-            "{:x} {path}\n",
-            Sha256::digest(contents.as_bytes())
-        ));
-    }
-    let root = format!("{:x}", Sha256::digest(canonical.as_bytes()));
+    let canonical = canonical_manifest(files);
+    let root = manifest_root(files);
 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(canonical.as_bytes()).expect("gzip");
