@@ -40,6 +40,16 @@ const DEFAULT_SCAN_TIMEOUT: Duration = Duration::from_secs(10 * 60 * 60);
 /// seconds of extra latency on the final status.
 const SCAN_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
+/// How long `wait_for_scan` keeps reading a scan the server answers 404 for.
+///
+/// Every caller enters the wait with a scan the server itself reported a
+/// moment earlier, so a 404 there is a scan the server cannot see yet, or one
+/// this token cannot see, rather than a mistyped id. A pipeline hit this: the
+/// first read, 3 seconds after the upload registered the scan, answered 404,
+/// and the scan went on to complete. Bounded so a scan that really is gone
+/// still fails the wait, at the 90 seconds a transient 5xx is given.
+const SCAN_NOT_FOUND_GRACE: Duration = Duration::from_secs(90);
+
 /// Overrides how long the CI gate waits for blocking rules to be evaluated.
 const BLOCKING_RULES_TIMEOUT_ENV: &str = "CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS";
 
@@ -134,7 +144,9 @@ pub fn run(
 
     // A reused scan stands in for the new one: everything below this point —
     // the results table, the blocking-rule gate, the report file — runs against
-    // whichever scan id this resolves to.
+    // whichever scan id this resolves to. Its project id is whatever the scan
+    // record carries, so the results link is the id-based one whenever the
+    // server reports it, as it is for a fresh upload.
     let reused_scan = skip_recent.as_ref().and_then(|skip| {
         if let Some(reason) = include_rules.reuse_refusal() {
             println!("Scanning instead of reusing a previous scan: {reason}.");
@@ -154,7 +166,7 @@ pub fn run(
     });
 
     let (scan_id, project_id) = match reused_scan {
-        Some(scan) => (scan.id, None),
+        Some(scan) => (scan.id, scan.project_id),
         None => start_new_scan(
             config,
             &project_name,
@@ -1339,6 +1351,114 @@ fn poll_timed_out(scan_id: &str, budget: &WaitBudget, last_status: &str) -> Stri
     )
 }
 
+#[derive(Debug)]
+enum ScanPollDecision {
+    Done(Box<utils::api::ScanResponse>),
+    KeepWaiting,
+    Fail(String),
+}
+
+/// What the wait remembers between status reads.
+struct ScanPoll {
+    server_url: String,
+    scan_id: String,
+    /// The last non-terminal status the server reported, for the timeout line.
+    last_status: String,
+    /// When the server began answering 404 for the scan. Cleared by any other
+    /// answer, so a scan that reappears gets the whole grace again.
+    not_found_since: Option<Instant>,
+}
+
+impl ScanPoll {
+    fn new(server_url: &str, scan_id: &str) -> Self {
+        Self {
+            server_url: server_url.to_string(),
+            scan_id: scan_id.to_string(),
+            last_status: String::from("unknown"),
+            not_found_since: None,
+        }
+    }
+
+    /// What one status read, taken at `now`, means for the wait.
+    ///
+    /// A terminal status ends it. A 404 is read again until it has lasted
+    /// `SCAN_NOT_FOUND_GRACE`; every other failure ends the wait at once, as
+    /// the client has already retried what is worth retrying.
+    fn decide(
+        &mut self,
+        read: Result<utils::api::ScanResponse, utils::api::ScanStatusError>,
+        now: Instant,
+    ) -> ScanPollDecision {
+        match read {
+            Ok(scan) => {
+                self.not_found_since = None;
+                match classify_scan_status(&scan.status) {
+                    ScanState::Completed => ScanPollDecision::Done(Box::new(scan)),
+                    ScanState::Failed => ScanPollDecision::Fail(format_scan_failure(&scan)),
+                    ScanState::Running => {
+                        self.last_status = scan.status;
+                        ScanPollDecision::KeepWaiting
+                    }
+                }
+            }
+            Err(e) if e.is_not_found() => {
+                let Some(since) = self.not_found_since else {
+                    self.not_found_since = Some(now);
+                    log::warn!(
+                        "\nCorgea answered 404 Not Found for scan '{}', which it reported a \
+                         moment ago. Reading again for up to {}s before giving up.\n",
+                        self.scan_id,
+                        SCAN_NOT_FOUND_GRACE.as_secs()
+                    );
+                    return ScanPollDecision::KeepWaiting;
+                };
+                let not_found_for = now.saturating_duration_since(since);
+                if not_found_for < SCAN_NOT_FOUND_GRACE {
+                    log::debug!(
+                        "Scan '{}' still answers 404 after {}s; reading again.",
+                        self.scan_id,
+                        not_found_for.as_secs()
+                    );
+                    ScanPollDecision::KeepWaiting
+                } else {
+                    ScanPollDecision::Fail(self.scan_not_found(not_found_for, &e))
+                }
+            }
+            Err(e) => ScanPollDecision::Fail(self.status_unreadable(&e)),
+        }
+    }
+
+    fn scan_not_found(&self, not_found_for: Duration, e: &utils::api::ScanStatusError) -> String {
+        format!(
+            "Corgea reported scan '{}' earlier but has answered 404 Not Found for its status \
+             for {}s.\n\
+             The scan may still run to completion in the Corgea cloud; check its page.\n\
+             Corgea answers 404 for a scan outside the token's company or project access, \
+             so if the scan is visible in the Corgea web app, check that this token's user \
+             can access the project.\n\n\
+             Server URL: {}\n\
+             Error details: {}",
+            self.scan_id,
+            not_found_for.as_secs(),
+            self.server_url,
+            e
+        )
+    }
+
+    fn status_unreadable(&self, e: &utils::api::ScanStatusError) -> String {
+        format!(
+            "Unable to check the status of scan '{}'.\n\
+             Please verify that:\n\
+             - The server URL '{}' is reachable.\n\
+             - Your authentication token is valid.\n\
+             - The scan ID is correct.\n\n\
+             Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli\n\n\
+             Error details: {}",
+            self.scan_id, self.server_url, e
+        )
+    }
+}
+
 /// Block until the scan reaches a terminal state, then report it.
 ///
 /// Exits non-zero on failure or poll timeout, so CI cannot mistake a broken
@@ -1353,7 +1473,7 @@ pub fn wait_for_scan(config: &Config, scan_id: &str, budget: WaitBudget) {
         );
     });
 
-    let mut last_status = String::from("unknown");
+    let mut poll = ScanPoll::new(&config.get_url(), scan_id);
 
     let result = loop {
         thread::sleep(SCAN_POLL_INTERVAL);
@@ -1361,32 +1481,17 @@ pub fn wait_for_scan(config: &Config, scan_id: &str, budget: WaitBudget) {
         // own timeout a stalled read would otherwise keep us going long past
         // the wait the user asked for.
         let Some(remaining) = budget.remaining() else {
-            break Err(poll_timed_out(scan_id, &budget, &last_status));
+            break Err(poll_timed_out(scan_id, &budget, &poll.last_status));
         };
-        match utils::api::get_scan(&config.get_url(), scan_id, Some(remaining)) {
-            Ok(scan) => match classify_scan_status(&scan.status) {
-                ScanState::Completed => break Ok(scan),
-                ScanState::Failed => break Err(format_scan_failure(&scan)),
-                ScanState::Running => last_status = scan.status,
-            },
-            // A read cut short by the deadline is a timeout, not a broken link.
-            Err(_) if budget.remaining().is_none() => {
-                break Err(poll_timed_out(scan_id, &budget, &last_status))
-            }
-            Err(e) => {
-                break Err(format!(
-                    "Unable to check the status of scan '{}'.\n\
-                     Please verify that:\n\
-                     - The server URL '{}' is reachable.\n\
-                     - Your authentication token is valid.\n\
-                     - The scan ID is correct.\n\n\
-                     Check out our docs at https://docs.corgea.app/install_cli#login-with-the-cli\n\n\
-                     Error details: {}",
-                    scan_id,
-                    config.get_url(),
-                    e
-                ))
-            }
+        let read = utils::api::read_scan_status(&config.get_url(), scan_id, Some(remaining));
+        // A read cut short by the deadline is a timeout, not a broken link.
+        if read.is_err() && budget.remaining().is_none() {
+            break Err(poll_timed_out(scan_id, &budget, &poll.last_status));
+        }
+        match poll.decide(read, Instant::now()) {
+            ScanPollDecision::Done(scan) => break Ok(*scan),
+            ScanPollDecision::KeepWaiting => {}
+            ScanPollDecision::Fail(message) => break Err(message),
         }
     };
 
@@ -2019,6 +2124,7 @@ mod tests {
         utils::api::ScanResponse {
             id: "scan-123".to_string(),
             project: "proj".to_string(),
+            project_id: None,
             repo: None,
             branch: None,
             status: status.to_string(),
@@ -2104,6 +2210,130 @@ mod tests {
         assert_eq!(format_timeout(DEFAULT_SCAN_TIMEOUT), "10h");
         assert_eq!(format_timeout(DEFAULT_BLOCKING_RULES_TIMEOUT), "35m");
         assert_eq!(format_timeout(Duration::from_secs(90)), "90s");
+    }
+
+    fn scan_with_status(status: &str) -> utils::api::ScanResponse {
+        serde_json::from_str(&format!(
+            r#"{{"id":"s1","project":"p","repo":null,"branch":"main","status":"{status}",
+                "engine":"corgea-blast","created_at":"2026-01-01T00:00:00Z"}}"#
+        ))
+        .unwrap()
+    }
+
+    fn rejected(code: u16) -> utils::api::ScanStatusError {
+        utils::api::ScanStatusError::Rejected {
+            status: reqwest::StatusCode::from_u16(code).unwrap(),
+            message: Some("Scan doesn't exist".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_scan_the_server_cannot_see_yet_is_read_again_until_the_grace_runs_out() {
+        // The field case: the first read after the upload answered 404, and
+        // the scan went on to complete. One 404 must not end the wait.
+        let mut poll = ScanPoll::new("https://acme.corgea.app", "s1");
+        let first_404 = Instant::now();
+
+        assert!(matches!(
+            poll.decide(Err(rejected(404)), first_404),
+            ScanPollDecision::KeepWaiting
+        ));
+        assert!(matches!(
+            poll.decide(
+                Err(rejected(404)),
+                first_404 + SCAN_NOT_FOUND_GRACE - Duration::from_secs(1)
+            ),
+            ScanPollDecision::KeepWaiting
+        ));
+        match poll.decide(Err(rejected(404)), first_404 + SCAN_NOT_FOUND_GRACE) {
+            ScanPollDecision::Fail(message) => {
+                assert!(
+                    message.contains("404 Not Found for its status for 90s"),
+                    "{message}"
+                );
+                assert!(message.contains("Scan doesn't exist"), "{message}");
+                assert!(message.contains("https://acme.corgea.app"), "{message}");
+                assert!(message.contains("access the project"), "{message}");
+            }
+            other => panic!("the grace ran out, so the wait should fail: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_answer_in_between_restarts_the_not_found_clock() {
+        let mut poll = ScanPoll::new("https://acme.corgea.app", "s1");
+        let t0 = Instant::now();
+
+        assert!(matches!(
+            poll.decide(Err(rejected(404)), t0),
+            ScanPollDecision::KeepWaiting
+        ));
+        assert!(matches!(
+            poll.decide(
+                Ok(scan_with_status("processing")),
+                t0 + Duration::from_secs(10)
+            ),
+            ScanPollDecision::KeepWaiting
+        ));
+        assert_eq!(poll.last_status, "processing");
+        // Well past the first grace, but the scan was seen since: a new one.
+        let again = t0 + SCAN_NOT_FOUND_GRACE + Duration::from_secs(5);
+        assert!(matches!(
+            poll.decide(Err(rejected(404)), again),
+            ScanPollDecision::KeepWaiting
+        ));
+        assert!(matches!(
+            poll.decide(Err(rejected(404)), again + SCAN_NOT_FOUND_GRACE),
+            ScanPollDecision::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn every_other_failure_ends_the_wait_at_once() {
+        let mut poll = ScanPoll::new("https://acme.corgea.app", "s1");
+        let now = Instant::now();
+
+        match poll.decide(Err(rejected(401)), now) {
+            ScanPollDecision::Fail(message) => {
+                assert!(message.contains("401 Unauthorized"), "{message}");
+                assert!(message.contains("authentication token"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let unreachable = utils::api::ScanStatusError::Transport("connection refused".into());
+        match poll.decide(Err(unreachable), now) {
+            ScanPollDecision::Fail(message) => {
+                assert!(message.contains("connection refused"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_statuses_end_the_wait() {
+        let mut poll = ScanPoll::new("https://acme.corgea.app", "s1");
+        let now = Instant::now();
+
+        assert!(matches!(
+            poll.decide(Ok(scan_with_status("complete")), now),
+            ScanPollDecision::Done(_)
+        ));
+        match poll.decide(Ok(scan_with_status("incomplete")), now) {
+            ScanPollDecision::Fail(message) => {
+                assert!(message.contains("did not complete"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn not_found_grace_is_bounded_and_short_against_the_budget() {
+        assert_eq!(SCAN_NOT_FOUND_GRACE, Duration::from_secs(90));
+        // Long enough to outlast a server that is a few reads behind its own
+        // upload, short enough that a scan that really is gone fails the
+        // pipeline in well under the budget.
+        assert!(SCAN_NOT_FOUND_GRACE >= 10 * SCAN_POLL_INTERVAL);
+        assert!(SCAN_NOT_FOUND_GRACE < DEFAULT_SCAN_TIMEOUT / 100);
     }
 
     #[test]

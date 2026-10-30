@@ -1378,6 +1378,7 @@ mod tests {
         ScanResponse {
             id: format!("scan-{sha}"),
             project: "proj".to_string(),
+            project_id: None,
             repo: None,
             branch: Some(branch.to_string()),
             status: "complete".to_string(),

@@ -9,7 +9,9 @@ pub struct WaitArgs {
     pub scan_id: Option<String>,
     pub selector: ProjectSelector,
     /// Known project id — `--project-id`, or straight from an upload response.
-    /// Clap requires it to be paired with a scan id.
+    /// Clap requires it to be paired with a scan id. When absent, the id the
+    /// server reports for the scan is used, and only a server predating that
+    /// field leaves the link to fall back to the project name.
     pub project_id: Option<String>,
 }
 
@@ -89,6 +91,11 @@ pub fn run(config: &Config, args: WaitArgs) {
             std::process::exit(1);
         }
     };
+
+    // An explicit id wins; otherwise the scan record names its project by id
+    // on a server that sends one. The name below is then only the fallback for
+    // a server that does not.
+    let project_id = project_id.or_else(|| scan.project_id.clone());
 
     // A resolved name already drove the listing query, so keep it. Otherwise an
     // explicit `--project-name` (or an uploaded name passed in) wins, then the

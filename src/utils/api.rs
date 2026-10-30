@@ -1104,13 +1104,99 @@ pub fn get_quality_issues(
     }
 }
 
+/// Why a status read failed, kept apart so a poll can tell a scan the server
+/// cannot see from a server it cannot reach.
+#[derive(Debug)]
+pub enum ScanStatusError {
+    /// No answer came back: the request could not be sent, or timed out.
+    Transport(String),
+    /// The server answered with something other than the scan. `message` is
+    /// what its body said about it, when the body said anything readable.
+    Rejected {
+        status: StatusCode,
+        message: Option<String>,
+    },
+    /// The server answered 2xx with a body that is not a scan.
+    Malformed(String),
+}
+
+impl ScanStatusError {
+    /// The status the server rejected the read with, if it answered at all.
+    pub fn status(&self) -> Option<StatusCode> {
+        match self {
+            Self::Rejected { status, .. } => Some(*status),
+            Self::Transport(_) | Self::Malformed(_) => None,
+        }
+    }
+
+    pub fn is_not_found(&self) -> bool {
+        self.status() == Some(StatusCode::NOT_FOUND)
+    }
+}
+
+impl std::fmt::Display for ScanStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(e) => write!(f, "Failed to send request: {}", e),
+            Self::Rejected {
+                status,
+                message: Some(message),
+            } => write!(
+                f,
+                "Unable to fetch scan status. Status code: {} ({})",
+                status, message
+            ),
+            Self::Rejected {
+                status,
+                message: None,
+            } => write!(f, "Unable to fetch scan status. Status code: {}", status),
+            Self::Malformed(e) => write!(f, "Failed to parse response: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for ScanStatusError {}
+
+/// What an error body said, in a form fit for one terminal line.
+///
+/// Corgea answers `{"status": "error", "message": "..."}`; a proxy in front
+/// of it answers an HTML page. Which one spoke is the difference between "the
+/// scan is not visible to this token" and "the request never reached Corgea",
+/// and a status code alone cannot tell them apart.
+fn server_message(body: &str) -> Option<String> {
+    const MAX_CHARS: usize = 200;
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        if let Some(message) = ["message", "error", "detail"]
+            .iter()
+            .find_map(|key| value.get(key).and_then(Value::as_str))
+        {
+            return Some(message.to_string());
+        }
+    }
+    if body.starts_with('<') {
+        return Some("an HTML page rather than JSON, so the answer may not be Corgea's".into());
+    }
+    let one_line = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(if one_line.chars().count() > MAX_CHARS {
+        format!("{}…", one_line.chars().take(MAX_CHARS).collect::<String>())
+    } else {
+        one_line
+    })
+}
+
+/// `GET /scan/{id}`, with the failure kept typed for `wait_for_scan`.
+///
 /// `deadline` caps this single read, so a caller polling against a budget is
 /// not held past it by a stalled request. `None` uses `REQUEST_TIMEOUT`.
-pub fn get_scan(
+pub fn read_scan_status(
     url: &str,
     scan_id: &str,
     deadline: Option<Duration>,
-) -> Result<ScanResponse, Box<dyn std::error::Error>> {
+) -> Result<ScanResponse, ScanStatusError> {
     let url = format!("{}{}/scan/{}", url, API_BASE, scan_id);
 
     let client = http_client();
@@ -1121,27 +1207,40 @@ pub fn get_scan(
     }
     let response = request
         .send()
-        .map_err(|e| format!("Failed to send request: {}", e))?;
+        .map_err(|e| ScanStatusError::Transport(e.to_string()))?;
 
     check_for_warnings(response.headers(), response.status());
 
-    if response.status().is_success() {
-        let response_text = response.text()?;
-        let scan_response: ScanResponse = serde_json::from_str(&response_text).map_err(|e| {
-            debug(&format!(
-                "Failed to parse response: {}. Response body: {}",
-                e, response_text
-            ));
-            format!("Failed to parse response: {}", e)
-        })?;
-        Ok(scan_response)
-    } else {
-        Err(format!(
-            "Error: Unable to fetch scan status. Status code: {}",
-            response.status()
-        )
-        .into())
+    let status = response.status();
+    let response_text = response
+        .text()
+        .map_err(|e| ScanStatusError::Transport(e.to_string()))?;
+    if !status.is_success() {
+        debug(&format!(
+            "Scan status read answered {}. Response body: {}",
+            status, response_text
+        ));
+        return Err(ScanStatusError::Rejected {
+            status,
+            message: server_message(&response_text),
+        });
     }
+    serde_json::from_str(&response_text).map_err(|e| {
+        debug(&format!(
+            "Failed to parse response: {}. Response body: {}",
+            e, response_text
+        ));
+        ScanStatusError::Malformed(e.to_string())
+    })
+}
+
+/// `read_scan_status` for callers that only need the failure's message.
+pub fn get_scan(
+    url: &str,
+    scan_id: &str,
+    deadline: Option<Duration>,
+) -> Result<ScanResponse, Box<dyn std::error::Error>> {
+    read_scan_status(url, scan_id, deadline).map_err(Into::into)
 }
 
 pub fn get_scan_report(
@@ -2158,10 +2257,36 @@ where
     Ok(Option::<Vec<ScanErrorSummary>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// A project id as the server sends it: a number from doghouse, a string
+/// from older or proxied answers. Both become the string that goes into the
+/// results link. Anything else, including an empty string, counts as absent.
+fn id_as_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+                Some(s.trim().to_string())
+            }
+            _ => None,
+        },
+    )
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ScanResponse {
     pub id: String,
     pub project: String,
+    /// The project's numeric id, when the server sends one. Older servers
+    /// carry only the name, and the results link then falls back to it.
+    #[serde(
+        default,
+        deserialize_with = "id_as_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub project_id: Option<String>,
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub status: String,
@@ -2683,6 +2808,40 @@ mod tests {
         value["ignore_paths"] = serde_json::json!(["vendor/**"]);
         let parsed: ScanResponse = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.ignore_paths, Some(vec!["vendor/**".to_string()]));
+    }
+
+    #[test]
+    fn scan_response_keeps_the_project_id_as_a_string_whatever_the_server_sends() {
+        let base = r#"{
+            "id": "s1",
+            "project": "p",
+            "repo": null,
+            "branch": "main",
+            "status": "complete",
+            "engine": "corgea-blast",
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let mut value: serde_json::Value = serde_json::from_str(base).unwrap();
+
+        // A server predating the field omits it.
+        let parsed: ScanResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.project_id, None);
+
+        // Doghouse sends the primary key as a number.
+        value["project_id"] = serde_json::json!(7040);
+        let parsed: ScanResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.project_id.as_deref(), Some("7040"));
+
+        // A string id is kept as written; blank and null mean absent.
+        value["project_id"] = serde_json::json!("7040");
+        let parsed: ScanResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.project_id.as_deref(), Some("7040"));
+        value["project_id"] = serde_json::json!("  ");
+        let parsed: ScanResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.project_id, None);
+        value["project_id"] = serde_json::Value::Null;
+        let parsed: ScanResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.project_id, None);
     }
 
     #[test]
@@ -3277,6 +3436,51 @@ mod tests {
             }
         });
         (base, hits)
+    }
+
+    #[test]
+    fn server_message_keeps_what_the_body_said() {
+        assert_eq!(
+            server_message(r#"{"status":"error","message":"Scan doesn't exist"}"#).as_deref(),
+            Some("Scan doesn't exist")
+        );
+        assert_eq!(
+            server_message(r#"{"error":"SAST scan not found"}"#).as_deref(),
+            Some("SAST scan not found")
+        );
+        // A proxy's error page is named as such rather than dumped.
+        let html = server_message("<html><body>error code: 1010</body></html>").unwrap();
+        assert!(html.contains("HTML page"), "{html}");
+        assert_eq!(server_message("  \n "), None);
+        // Plain text is flattened to one line and kept short.
+        assert_eq!(
+            server_message("gateway\n  timed out").as_deref(),
+            Some("gateway timed out")
+        );
+        let long = "x".repeat(500);
+        let kept = server_message(&long).unwrap();
+        assert_eq!(kept.chars().count(), 201);
+        assert!(kept.ends_with('…'));
+    }
+
+    #[test]
+    fn a_status_read_keeps_the_status_code_and_the_servers_message() {
+        let (base, hits) = spawn_failing_stub(
+            usize::MAX,
+            "404 Not Found",
+            "",
+            r#"{"status":"error","message":"Scan doesn't exist"}"#,
+        );
+
+        let err = read_scan_status(&base, "s1", None).unwrap_err();
+
+        assert!(err.is_not_found(), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "Unable to fetch scan status. Status code: 404 Not Found (Scan doesn't exist)"
+        );
+        // The decision to read again belongs to the poll, not to the client.
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[test]
