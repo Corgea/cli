@@ -25,9 +25,12 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          - runner: ubuntu-latest
+          # Pinned: on the ubuntu-26.04 image the manylinux2014 i686 container
+          # cannot resolve vault.centos.org, so its libatomic install fails
+          # before maturin runs.
+          - runner: ubuntu-24.04
             target: x86_64
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04
             target: x86
 
     steps:
