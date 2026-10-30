@@ -51,6 +51,13 @@ problems. A scan that completes with a scanner missing exits 0 with a warning.
 While waiting, the scan's status is read every 3 seconds. A 404 for a scan Corgea
 just reported is read again for up to 90 seconds before the wait fails. Waiting
 gives up after 10 hours; override with `CORGEA_SCAN_TIMEOUT_SECONDS`.
+
+Corgea registers a scan while the upload's final request runs, so when that
+request goes unanswered (a proxy's gateway error such as Cloudflare's 524, or a
+timeout) the CLI does not upload again, which would register a second scan. It
+looks up the scan Corgea registered for the commit instead, for up to 2
+minutes, and waits on that one. An upload without a commit cannot be matched
+to a scan and fails with a pointer to the project's scans.
 `--fail`/`--block-on` then wait up to 15 minutes for blocking rules to be
 evaluated; override with `CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS`.
 

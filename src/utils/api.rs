@@ -469,6 +469,22 @@ impl Drop for RetryLoopGuard {
 pub fn send_with_retries<F>(
     operation: &str,
     method: &Method,
+    make_request: F,
+) -> reqwest::Result<reqwest::blocking::Response>
+where
+    F: FnMut() -> reqwest::Result<reqwest::blocking::Response>,
+{
+    send_with_retry_policy(operation, method, true, make_request)
+}
+
+/// `send_with_retries` with a say on timeouts: `resend_on_timeout` false
+/// sends the request once when the read times out, for a request whose
+/// repeat would do its work twice (the archive chunk that registers a scan).
+/// Connection failures are still retried, since nothing reached the server.
+pub fn send_with_retry_policy<F>(
+    operation: &str,
+    method: &Method,
+    resend_on_timeout: bool,
     mut make_request: F,
 ) -> reqwest::Result<reqwest::blocking::Response>
 where
@@ -477,7 +493,8 @@ where
     let _guard = RetryLoopGuard::enter();
     let mut retries = TransientRetries::new(operation);
     loop {
-        let response = retry_on_network_error(operation, &mut make_request)?;
+        let response =
+            retry_on_network_error_with_policy(operation, resend_on_timeout, &mut make_request)?;
         if !retries.wait_for_retry(response.status(), method, retry_after(response.headers())) {
             return Ok(response);
         }
@@ -509,7 +526,20 @@ const RETRY_BACKOFF_SECS: &[u64] = &[1, 2, 4, 8, 16, 32];
 #[cfg(test)]
 const RETRY_BACKOFF_SECS: &[u64] = &[0, 0, 0, 0, 0, 0];
 
-pub fn retry_on_network_error<F, T>(operation: &str, mut make_request: F) -> reqwest::Result<T>
+#[cfg(test)]
+fn retry_on_network_error<F, T>(operation: &str, make_request: F) -> reqwest::Result<T>
+where
+    F: FnMut() -> reqwest::Result<T>,
+{
+    retry_on_network_error_with_policy(operation, true, make_request)
+}
+
+/// `retry_on_network_error`, retrying a timeout only when `resend_on_timeout`.
+fn retry_on_network_error_with_policy<F, T>(
+    operation: &str,
+    resend_on_timeout: bool,
+    mut make_request: F,
+) -> reqwest::Result<T>
 where
     F: FnMut() -> reqwest::Result<T>,
 {
@@ -517,7 +547,10 @@ where
     loop {
         match make_request() {
             Ok(result) => return Ok(result),
-            Err(e) if (e.is_connect() || e.is_timeout()) && attempt < RETRY_BACKOFF_SECS.len() => {
+            Err(e)
+                if (e.is_connect() || (resend_on_timeout && e.is_timeout()))
+                    && attempt < RETRY_BACKOFF_SECS.len() =>
+            {
                 let delay = RETRY_BACKOFF_SECS[attempt];
                 log::warn!(
                     "Network error during {}: {}. Retrying in {}s... ({}/{})",
@@ -545,6 +578,7 @@ fn check_for_warnings(headers: &HeaderMap, status: StatusCode) {
     }
 }
 
+#[derive(Debug)]
 pub struct UploadZipResult {
     pub scan_id: String,
     pub project_id: Option<String>,
@@ -574,13 +608,81 @@ pub struct UploadOptions {
     pub partial_files: Option<Vec<String>>,
 }
 
+/// Why `upload_zip` failed.
+#[derive(Debug)]
+pub enum UploadZipError {
+    /// The request that registers the scan was sent and nothing from the API
+    /// came back for it: a proxy answered with a gateway error, or the read
+    /// timed out. That request is the chunk completing the archive, and the
+    /// server registers the scan while it runs, so the scan may exist, or
+    /// come to exist, without the CLI ever learning its id. Re-sending the
+    /// chunk would register a second scan, which is why the caller recovers
+    /// the first one instead. `cause` says what came back, for the message.
+    RegistrationUnanswered { cause: String },
+    /// Any other failure, already worded for the user.
+    Other(String),
+}
+
+impl std::fmt::Display for UploadZipError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RegistrationUnanswered { cause } => write!(
+                f,
+                "The upload completed, but the request registering the scan went unanswered: {cause}"
+            ),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl Error for UploadZipError {}
+
+impl From<String> for UploadZipError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl From<&str> for UploadZipError {
+    fn from(message: &str) -> Self {
+        Self::Other(message.to_string())
+    }
+}
+
+impl From<std::io::Error> for UploadZipError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Other(e.to_string())
+    }
+}
+
+impl From<reqwest::Error> for UploadZipError {
+    fn from(e: reqwest::Error) -> Self {
+        Self::Other(e.to_string())
+    }
+}
+
+/// What a gateway status says happened, for the recovery message.
+fn gateway_status_summary(status: StatusCode) -> String {
+    let meaning = match status.as_u16() {
+        502 => "a proxy in front of Corgea got a bad answer from it",
+        504 => "a proxy in front of Corgea timed out waiting for it",
+        520 => "Cloudflare got an unreadable answer from Corgea",
+        521 => "Corgea refused Cloudflare's connection",
+        522 => "Cloudflare's connection to Corgea timed out",
+        523 => "Cloudflare could not reach Corgea",
+        524 => "Cloudflare gave up waiting for Corgea to answer, which takes 100 seconds",
+        _ => "a proxy in front of Corgea failed to get its answer",
+    };
+    format!("{} ({})", status.as_u16(), meaning)
+}
+
 pub fn upload_zip(
     file_path: &str,
     url: &str,
     project_name: &str,
     repo_info: Option<utils::generic::RepoInfo>,
     options: UploadOptions,
-) -> Result<UploadZipResult, Box<dyn std::error::Error>> {
+) -> Result<UploadZipResult, UploadZipError> {
     let UploadOptions {
         scan_type,
         policy,
@@ -705,9 +807,19 @@ pub fn upload_zip(
         let final_chunk = offset + bytes_read as u64 >= file_size;
 
         // Rebuilt per attempt: a multipart body is a stream, so a retry has
-        // nothing to replay unless the whole request is made again.
+        // nothing to replay unless the whole request is made again. A chunk
+        // the server already holds is overwritten in place when re-sent, so a
+        // timeout on one is retried; the final chunk is the request that
+        // registers the scan, and re-sending it after a timeout would
+        // register another, so that one is sent once and recovered instead.
+        let operation = if final_chunk {
+            "the scan archive's final chunk upload"
+        } else {
+            "a scan archive chunk upload"
+        };
+        let resend_on_timeout = !final_chunk;
         let response =
-            match send_with_retries("a scan archive chunk upload", &Method::PATCH, || {
+            match send_with_retry_policy(operation, &Method::PATCH, resend_on_timeout, || {
                 let mut form = Form::new()
                     .part(
                         "chunk_data",
@@ -857,12 +969,30 @@ pub fn upload_zip(
                     check_for_warnings(response.headers(), response.status());
                     response
                 }
+                Err(e) if final_chunk && e.is_timeout() => {
+                    return Err(UploadZipError::RegistrationUnanswered {
+                        cause: format!(
+                            "no answer within {} seconds ({})",
+                            REQUEST_TIMEOUT.as_secs(),
+                            e
+                        ),
+                    });
+                }
                 Err(e) => {
                     return Err(format!("Failed to send request: {}", e).into());
                 }
             };
         if !response.status().is_success() {
             let status_code = response.status();
+            if final_chunk && is_gateway_error(status_code) {
+                debug(&format!(
+                    "Final chunk upload answered by a proxy with status: {}",
+                    status_code
+                ));
+                return Err(UploadZipError::RegistrationUnanswered {
+                    cause: gateway_status_summary(status_code),
+                });
+            }
             let response_text = response
                 .text()
                 .unwrap_or_else(|_| "Unable to read response body".to_string());
@@ -3436,6 +3566,158 @@ mod tests {
             }
         });
         (base, hits)
+    }
+
+    /// A doghouse that hands out a transfer id and then answers every chunk
+    /// with `status_line`: the upload's own path to a proxy error.
+    fn spawn_chunk_failing_stub(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
+        use std::io::Write;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let request = corgea::vuln_api_stub::read_http_request(&mut stream);
+                let response = if request.starts_with(b"POST ") {
+                    corgea::vuln_api_stub::http_response(
+                        "200 OK",
+                        "",
+                        r#"{"status":"ok","transfer_id":"t-1"}"#,
+                    )
+                } else {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    corgea::vuln_api_stub::http_response(status_line, "", body)
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (base, hits)
+    }
+
+    /// A full, non-incremental upload with nothing else attached.
+    fn plain_upload_options() -> UploadOptions {
+        UploadOptions {
+            scan_type: None,
+            policy: None,
+            metadata: None,
+            incremental: Err(FullScanReason::new(
+                crate::incremental::FullScanCause::DisabledByFlag,
+                "test",
+            )),
+            disable_incremental: true,
+            include_paths: Vec::new(),
+            file_manifest: None,
+            partial_files: None,
+        }
+    }
+
+    fn small_archive() -> tempfile::NamedTempFile {
+        let mut file = tempfile::Builder::new()
+            .suffix(".zip")
+            .tempfile()
+            .expect("temp archive");
+        std::io::Write::write_all(&mut file, b"PK\x05\x06not really a zip").unwrap();
+        file
+    }
+
+    #[test]
+    fn a_gateway_error_on_the_final_chunk_is_an_unanswered_registration() {
+        let (base, chunk_hits) = spawn_chunk_failing_stub(
+            "524 A Timeout Occurred",
+            "<html><body>error code: 524</body></html>",
+        );
+        let archive = small_archive();
+
+        let err = upload_zip(
+            archive.path().to_str().unwrap(),
+            &base,
+            "proj",
+            None,
+            plain_upload_options(),
+        )
+        .expect_err("524 fails the upload");
+
+        match &err {
+            UploadZipError::RegistrationUnanswered { cause } => {
+                assert!(cause.starts_with("524 ("), "{cause}");
+                assert!(cause.contains("100 seconds"), "{cause}");
+            }
+            other => panic!("expected RegistrationUnanswered, got {other:?}"),
+        }
+        // Sent once: a second send would register a second scan.
+        assert_eq!(chunk_hits.load(Ordering::SeqCst), 1);
+        assert!(err.to_string().contains("went unanswered"), "{err}");
+    }
+
+    #[test]
+    fn a_server_error_on_the_final_chunk_is_still_a_plain_failure() {
+        // The API itself answered, so there is no scan to go looking for.
+        let (base, chunk_hits) = spawn_chunk_failing_stub(
+            "500 Internal Server Error",
+            r#"{"status":"error","message":"boom"}"#,
+        );
+        let archive = small_archive();
+
+        let err = upload_zip(
+            archive.path().to_str().unwrap(),
+            &base,
+            "proj",
+            None,
+            plain_upload_options(),
+        )
+        .expect_err("500 fails the upload");
+
+        assert!(
+            matches!(err, UploadZipError::Other(_)),
+            "expected Other, got {err:?}"
+        );
+        assert!(err.to_string().contains("500"), "{err}");
+        assert_eq!(chunk_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_timeout_is_not_resent_when_the_policy_forbids_it() {
+        let attempts = Cell::new(0);
+
+        let result: reqwest::Result<()> =
+            retry_on_network_error_with_policy("final chunk", false, || {
+                attempts.set(attempts.get() + 1);
+                Err(timeout_error())
+            });
+
+        assert!(result.unwrap_err().is_timeout());
+        assert_eq!(
+            attempts.get(),
+            1,
+            "a request whose repeat registers a second scan is sent once"
+        );
+    }
+
+    #[test]
+    fn a_connection_failure_is_resent_whatever_the_timeout_policy() {
+        let attempts = Cell::new(0);
+
+        let result = retry_on_network_error_with_policy("final chunk", false, || {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            if attempt < 2 {
+                Err(connection_refused_error())
+            } else {
+                Ok("registered")
+            }
+        });
+
+        assert_eq!(result.unwrap(), "registered");
+        assert_eq!(
+            attempts.get(),
+            2,
+            "nothing reached the server, so sending again is safe"
+        );
     }
 
     #[test]

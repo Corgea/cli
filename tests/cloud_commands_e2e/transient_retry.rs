@@ -278,17 +278,23 @@ fn a_rejected_source_upload_stops_the_whole_upload_walk() {
 }
 
 #[test]
-fn a_rejected_archive_chunk_is_not_sent_again() {
+fn a_rejected_archive_chunk_is_not_sent_again_but_its_scan_is_recovered() {
     // The archive chunk names the byte range it fills, so a replay would not
     // double the bytes. It is excluded anyway: the chunk that fills the last of
-    // `Upload-Length` is the one that answers with `scan_id`, and an archive
+    // `Upload-Length` is the one that registers the scan, and an archive
     // under the 50 MB chunk size — which this fixture, and most repos, is — has
-    // only that one chunk. Replaying it risks the second scan.
+    // only that one chunk. Replaying it would register a second scan.
+    //
+    // The server registers the scan while that request runs, so a gateway
+    // error there (Cloudflare giving up on a long registration) leaves a scan
+    // the CLI never heard of. It looks that scan up by project and commit and
+    // waits on it as if the upload had answered.
     let project = git_project();
-    // Everything from the chunk PATCH on is dropped, since the rejected chunk
-    // ends the command.
     let mut plan = blast_upload_plan(&project.sha, false, false);
-    plan.truncate(plan_step(&plan, "upload BLAST archive"));
+    // Everything after the chunk PATCH stays: the recovered scan is read and
+    // its issues listed exactly as the answered upload's would have been.
+    let after_upload = plan.split_off(plan_step(&plan, "upload BLAST archive") + 1);
+    plan.pop();
     plan.push(expected_request(
         "reject the archive chunk with a gateway error",
         |request| {
@@ -296,6 +302,30 @@ fn a_rejected_archive_chunk_is_not_sent_again() {
         },
         bad_gateway(),
     ));
+    let sha = project.sha.clone();
+    let registered = json!({
+        "id": "blast-scan-123",
+        "project": "cloud-e2e",
+        "project_id": 91,
+        "repo": null,
+        "branch": FIXTURE_BRANCH,
+        "status": "scanning",
+        "engine": "corgea-blast",
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "git_sha": project.sha,
+        "worktree_dirty": false
+    });
+    plan.push(expected_request(
+        "look up the scan registered for the commit",
+        move |request| {
+            assert_authenticated_request(request, Method::GET, "/api/v1/scans")?;
+            assert_query(request, "project", "cloud-e2e")?;
+            assert_query(request, "page", "1")?;
+            assert_query(request, "sha", &sha)
+        },
+        json_response(scans_response(vec![registered])),
+    ));
+    plan.extend(after_upload);
     let api = ApiStub::start(plan);
     let (mut command, _home) = cloud_command(&api, project.path());
     command.env(FAST_RETRIES.0, FAST_RETRIES.1);
@@ -306,7 +336,17 @@ fn a_rejected_archive_chunk_is_not_sent_again() {
     // plan on it.
     let transcript = api.assert_finished();
     let context = output_context(&output, &transcript);
-    assert_ne!(output.status.code(), Some(0), "{context}");
+    assert_eq!(output.status.code(), Some(0), "{context}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("Retrying in"), "{context}");
+    assert!(stderr.contains("went unanswered: 502 ("), "{context}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Corgea registered scan blast-scan-123 for commit"),
+        "{context}"
+    );
+    assert!(
+        stdout.contains("/project/91/?scan_id=blast-scan-123"),
+        "{context}"
+    );
 }

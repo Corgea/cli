@@ -873,6 +873,10 @@ fn start_new_scan(
         .as_ref()
         .and_then(Manifest::encode);
     println!("\n\nSubmitting scan to Corgea:");
+    // What ties the registered scan back to this upload if its answer never
+    // arrives: the commit, and when the upload began (see `scan_recovery`).
+    let upload_sha = repo_info.as_ref().and_then(|info| info.sha.clone());
+    let upload_started_at = chrono::Utc::now();
     let upload_result = match utils::api::upload_zip(
         &zip_path,
         &config.get_url(),
@@ -890,6 +894,25 @@ fn start_new_scan(
         },
     ) {
         Ok(result) => result,
+        Err(utils::api::UploadZipError::RegistrationUnanswered { cause }) => {
+            match crate::scan_recovery::recover_registered_scan(
+                config,
+                project_name,
+                upload_sha.as_deref(),
+                upload_started_at,
+                &cause,
+            ) {
+                Ok(scan) => utils::api::UploadZipResult {
+                    scan_id: scan.id,
+                    project_id: scan.project_id,
+                },
+                Err(message) => {
+                    log::error!("\n\n{}\n", message);
+                    let _ = utils::generic::delete_directory(&temp_dir);
+                    std::process::exit(1);
+                }
+            }
+        }
         Err(e) => {
             log::error!("\n\nOh no! We encountered an issue while uploading the zip file '{}' to the server.\nPlease ensure that:
     - Blast is enabled on your Corgea account.
