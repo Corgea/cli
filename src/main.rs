@@ -12,6 +12,7 @@ mod manifest;
 mod mcp;
 mod project_naming;
 mod scan;
+mod scan_recovery;
 mod setup_hooks;
 mod skill;
 mod skip_scan;

@@ -889,7 +889,24 @@ fn start_new_scan(
             partial_files,
         },
     ) {
-        Ok(result) => result,
+        Ok(utils::api::UploadOutcome::Registered(result)) => result,
+        Ok(utils::api::UploadOutcome::Unanswered(unanswered)) => {
+            match crate::scan_recovery::recover_registered_scan(
+                &config.get_url(),
+                project_name,
+                &unanswered,
+            ) {
+                Ok(scan) => utils::api::UploadZipResult {
+                    scan_id: scan.id,
+                    project_id: scan.project_id,
+                },
+                Err(message) => {
+                    log::error!("\n\n{}\n", message);
+                    let _ = utils::generic::delete_directory(&temp_dir);
+                    std::process::exit(1);
+                }
+            }
+        }
         Err(e) => {
             log::error!("\n\nOh no! We encountered an issue while uploading the zip file '{}' to the server.\nPlease ensure that:
     - Blast is enabled on your Corgea account.
