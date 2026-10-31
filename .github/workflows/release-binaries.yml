@@ -29,16 +29,18 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          # Pinned: the ubuntu-26.04 image offers no qemu-user-static
+          # candidate, which the aarch64 smoke test needs.
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             binary_name: corgea
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             binary_name: corgea
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
             binary_name: corgea
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: aarch64-unknown-linux-musl
             binary_name: corgea
           - os: macos-latest
