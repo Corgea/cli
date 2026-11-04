@@ -37,9 +37,7 @@ pub const GIT_LOCAL_ENV_VARS: &[&str] = &[
 
 // Global exclude globs used across multiple functions
 const DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
-    "**/tests/**",
     "**/.corgea/**",
-    "**/test/**",
     "**/spec/**",
     "**/specs/**",
     "**/node_modules/**",
@@ -332,7 +330,7 @@ pub fn create_zip_from_target<P: AsRef<Path>>(
         log::warn!(
             "   {}",
             set_text_color(
-                "We skipped files that typically aren't useful for analysis (like vendor/dependency code, test fixtures, style assets, and other non-source files).",
+                "We skipped files that typically aren't useful for analysis (like vendor/dependency code, spec directories, style assets, and other non-source files).",
                 TerminalColor::Yellow
             )
         );
@@ -1366,6 +1364,22 @@ mod tests {
     }
 
     #[test]
+    fn default_exclude_globs_keep_test_dirs_but_not_spec_dirs() {
+        // Solution and build files reference projects under test dirs, so
+        // dependency restore on the server fails if the archive drops them.
+        let mut builder = GlobSetBuilder::new();
+        for &pattern in DEFAULT_EXCLUDE_GLOBS {
+            builder.add(Glob::new(pattern).unwrap());
+        }
+        let set = builder.build().unwrap();
+        assert!(!set.is_match(Path::new("tests/Api.Tests/Api.Tests.csproj")));
+        assert!(!set.is_match(Path::new("test/test_app.py")));
+        assert!(!set.is_match(Path::new("src/test/java/AppTest.java")));
+        assert!(set.is_match(Path::new("spec/models/user_spec.rb")));
+        assert!(set.is_match(Path::new("web/specs/app.spec.ts")));
+    }
+
+    #[test]
     fn extract_repo_path_handles_common_remote_forms() {
         for url in [
             "https://github.com/org/repo.git",
@@ -1648,7 +1662,7 @@ mod tests {
                 &[
                     ("keep.py", b"k"),
                     ("style.css", b"css"),
-                    ("test/t.py", b"t"),
+                    ("spec/t.py", b"t"),
                     ("node_modules/x.py", b"n"),
                     ("corgea-image-scanning-repo-copy.tar", b"repo copy"),
                     ("nested/corgea-image-scanning-deep.tar", b"deep copy"),
