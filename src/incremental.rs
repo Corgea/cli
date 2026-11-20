@@ -2141,7 +2141,15 @@ mod tests {
 
         for depth in [1, 2] {
             let clone = dir.path().join(format!("depth-{depth}"));
-            let status = std::process::Command::new("git")
+            let mut git = std::process::Command::new("git");
+            // A pre-commit hook exports GIT_DIR/GIT_INDEX_FILE; left in place,
+            // the clone would write into the developer's repo.
+            for (name, _) in std::env::vars() {
+                if name.starts_with("GIT_") {
+                    git.env_remove(name);
+                }
+            }
+            let status = git
                 .args(["clone", "--quiet", "--depth", &depth.to_string()])
                 .arg(format!("file://{}", origin.display()))
                 .arg(&clone)

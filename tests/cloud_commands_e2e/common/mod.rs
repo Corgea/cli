@@ -738,11 +738,16 @@ pub(crate) fn git_project() -> GitProject {
 }
 
 pub(crate) fn run_git(path: &Path, args: &[&str]) -> Output {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(path)
-        .output()
-        .expect("run git");
+    // Git exports GIT_DIR/GIT_INDEX_FILE/etc. to hooks; scrub them so the
+    // fixture's git commands touch the temp repo, not the developer's, when
+    // the suite runs inside a pre-commit hook.
+    let mut cmd = Command::new("git");
+    for (name, _) in std::env::vars() {
+        if name.starts_with("GIT_") {
+            cmd.env_remove(name);
+        }
+    }
+    let output = cmd.args(args).current_dir(path).output().expect("run git");
     assert!(
         output.status.success(),
         "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
