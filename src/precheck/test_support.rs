@@ -33,6 +33,7 @@ pub(crate) fn verdict_opts(base_url: &str) -> PrecheckOptions {
                 token: "test-token".to_string(),
             },
             public_hint: None,
+            fail_closed_without_token: false,
         }),
         ..stub_opts()
     }
@@ -45,6 +46,7 @@ pub(crate) fn public_opts(force: bool) -> PrecheckOptions {
             base_url: "http://127.0.0.1:9".to_string(),
             mode: VerdictMode::Public,
             public_hint: Some(super::PublicHint::NoToken),
+            fail_closed_without_token: false,
         }),
         ..stub_opts()
     }

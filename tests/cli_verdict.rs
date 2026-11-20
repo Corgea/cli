@@ -636,3 +636,223 @@ fn small_set_progress_keeps_json_stdout_clean() {
         serde_json::from_slice(&out.stdout).expect("stdout must be exactly one JSON document");
     assert_eq!(parsed["schema_version"], 2);
 }
+
+// --- install_gate_fail_closed: fail closed without sending a token ---------
+
+const FAIL_CLOSED_ENV: &str = "CORGEA_INSTALL_GATE_FAIL_CLOSED";
+
+/// Public mode (no token) with a full pip tree, where vuln-api answers 503
+/// for the named `oldpkg`. The tree pass succeeds, so a block here is the
+/// unverifiable verdict's doing, not a degraded tree.
+fn named_503_full_tree() -> common::GateHarness {
+    let mut statuses = HashMap::new();
+    statuses.insert(key("pypi", "oldpkg", "1.0.0"), 503u16);
+    common::tree_harness("pip", HashMap::new(), statuses, common::TREE_REPORT)
+}
+
+/// Point `h` at a fresh HOME whose `~/.corgea/config.toml` holds `extra`
+/// on top of the required fields. Returns the dir to keep it alive.
+fn with_config_file(h: &mut common::GateHarness, extra: &str) -> tempfile::TempDir {
+    let home = tempfile::TempDir::new().expect("temp HOME");
+    let dir = home.path().join(".corgea");
+    std::fs::create_dir_all(&dir).expect("mkdir .corgea");
+    std::fs::write(
+        dir.join("config.toml"),
+        format!("url = \"https://www.corgea.app\"\ndebug = 0\ntoken = \"\"\n{extra}\n"),
+    )
+    .expect("write config.toml");
+    h.cmd
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path());
+    home
+}
+
+#[test]
+fn fail_closed_setting_blocks_unverifiable_verdict_without_token() {
+    let mut h = named_503_full_tree();
+    h.cmd.env(FAIL_CLOSED_ENV, "1");
+    let out = h
+        .cmd
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the setting must fail closed on a 503 without a token; stderr: {stderr}"
+    );
+    assert_eq!(h.recorded_argv(), None, "pip must not run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("could not be verified"), "stdout: {stdout}");
+    assert!(
+        stderr.contains("--force"),
+        "block must name --force: {stderr}"
+    );
+    assert!(
+        !stderr.contains("fail-open") && !stderr.contains("continuing"),
+        "a fail-closed run must not claim it continues: {stderr}"
+    );
+    assert!(
+        !stderr.contains("login enables authenticated enforcement"),
+        "enforcement is already on; the hint must not offer it: {stderr}"
+    );
+}
+
+#[test]
+fn fail_closed_setting_blocks_resolution_error_without_token() {
+    // `==2.0.0` is unknown to the wildcard registry (it serves 1.0.0 only):
+    // a resolution error. The pip tree pass succeeds, so only the error can
+    // block.
+    let mut h = common::GateHarness::new()
+        .fake_tree_pm("pip", common::TREE_REPORT, 0)
+        .wildcard_pypi_registry()
+        .build();
+    h.cmd.env(FAIL_CLOSED_ENV, "true");
+    let out = h
+        .cmd
+        .args(["pip", "install", "nosuchpkg==2.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the setting must fail closed on a resolution error; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.recorded_argv(), None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("1 errors"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("ungated"),
+        "a blocked target is gated; output must not say otherwise: {stdout}"
+    );
+}
+
+#[test]
+fn fail_closed_setting_with_custom_url_blocks_and_never_sends_the_token() {
+    // Token + custom vuln-api URL + no send-token opt-in: public mode. The
+    // setting makes it fail closed (pip_harness's tree pass degrades to
+    // named-only, which a manager with a resolver blocks on) without sending
+    // the token anywhere.
+    let (base_url, requests) = spawn_capturing_vuln_api_stub();
+    let mut h = pip_harness(HashMap::new(), HashMap::new(), Some("opaque-token"), 0);
+    h.cmd
+        .env("CORGEA_VULN_API_URL", &base_url)
+        .env(FAIL_CLOSED_ENV, "1");
+    let out = h
+        .cmd
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert_eq!(h.recorded_argv(), None);
+    let captured = requests.lock().unwrap();
+    assert!(
+        !captured.is_empty(),
+        "the named verdict must still be looked up"
+    );
+    for request in captured.iter() {
+        assert!(header_value(request, "Authorization").is_none());
+        assert!(header_value(request, "CORGEA-TOKEN").is_none());
+    }
+    assert!(
+        stderr.contains("your token is not sent to this vuln-api"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("warn instead of blocking"),
+        "with the setting on, failures block: {stderr}"
+    );
+}
+
+#[test]
+fn fail_closed_setting_yields_to_force() {
+    let mut h = named_503_full_tree();
+    h.cmd.env(FAIL_CLOSED_ENV, "1");
+    let out = h
+        .cmd
+        .args(["pip", "--force", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--force must proceed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.recorded_argv().as_deref(), Some("install oldpkg==1.0.0"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("public mode is fail-open"),
+        "it proceeds because of --force, not fail-open: {stderr}"
+    );
+    assert!(
+        stderr.contains("continuing under --force"),
+        "stderr must say why it proceeds: {stderr}"
+    );
+}
+
+#[test]
+fn fail_closed_setting_reads_config_file_and_env_overrides_it_both_ways() {
+    // (config file line, env value, expected exit). Exit 1 = blocked.
+    let cases = [
+        ("install_gate_fail_closed = true", None, 1),
+        ("install_gate_fail_closed = true", Some("0"), 0),
+        ("install_gate_fail_closed = false", Some("1"), 1),
+        ("install_gate_fail_closed = false", None, 0),
+        // A config written before the field existed loads with it off.
+        ("", None, 0),
+    ];
+    for (line, env, expected) in cases {
+        let mut h = named_503_full_tree();
+        let _home = with_config_file(&mut h, line);
+        if let Some(v) = env {
+            h.cmd.env(FAIL_CLOSED_ENV, v);
+        }
+        let out = h
+            .cmd
+            .args(["pip", "install", "oldpkg==1.0.0"])
+            .output()
+            .expect("run corgea");
+        assert_eq!(
+            out.status.code(),
+            Some(expected),
+            "config {line:?}, env {env:?}; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn json_reports_fail_closed_alongside_unchanged_verdict_mode() {
+    for (env, expected) in [(None, false), (Some("1"), true)] {
+        let mut h = named_503_full_tree();
+        if let Some(v) = env {
+            h.cmd.env(FAIL_CLOSED_ENV, v);
+        }
+        let out = h
+            .cmd
+            .args(["pip", "--json", "install", "oldpkg==1.0.0"])
+            .output()
+            .expect("run corgea");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+        assert_eq!(parsed["verdict_mode"], "public", "the token-send mode");
+        assert_eq!(parsed["fail_closed"], expected, "env {env:?}");
+    }
+}
+
+#[test]
+fn withheld_token_hint_names_the_fail_closed_setting() {
+    // Setting off: the warning must offer the token-free way to enforce.
+    let mut h = pip_harness(HashMap::new(), HashMap::new(), Some("opaque-token"), 0);
+    let out = h
+        .cmd
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(FAIL_CLOSED_ENV), "stderr: {stderr}");
+}

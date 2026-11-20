@@ -66,16 +66,19 @@ pub(super) fn verdict_pool(
     jobs.into_iter().zip(verdicts).collect()
 }
 
-/// Authenticated mode fails closed: lookup errors block instead of warning.
-pub(super) fn authenticated_verdict(opts: &PrecheckOptions) -> bool {
+/// Whether the gate fails closed: lookup errors, resolution errors, skipped
+/// targets and a degraded tree block instead of warning. True in
+/// authenticated mode or with the `install_gate_fail_closed` setting. The
+/// one definition of fail-closed; it never decides whether a token is sent.
+pub(super) fn fail_closed(opts: &PrecheckOptions) -> bool {
     opts.verdict
         .as_ref()
-        .is_some_and(|cfg| cfg.mode.auth_token().is_some())
+        .is_some_and(|cfg| cfg.mode.auth_token().is_some() || cfg.fail_closed_without_token)
 }
 
-/// The verdict config when running in fail-open public mode; `None` when
-/// verdicts are off or authenticated. The one definition of "public mode",
-/// dual of `authenticated_verdict`.
+/// The verdict config when running in public mode (no token sent); `None`
+/// when verdicts are off or authenticated. The one definition of "public
+/// mode". Whether it fails open is `fail_closed`'s call.
 pub(super) fn public_verdict(opts: &PrecheckOptions) -> Option<&VerdictConfig> {
     opts.verdict
         .as_ref()
@@ -242,14 +245,14 @@ pub(super) fn block_reason(report: &PrecheckReport, opts: &PrecheckOptions) -> O
         return None;
     }
     // A resolution error means no verdict was obtained for that target, so
-    // in authenticated mode it fails closed like `Unverifiable` — otherwise a
+    // a fail-closed gate blocks it like `Unverifiable` — otherwise a
     // registry outage silently bypasses the gate. A `Skipped` outcome is a
     // git/URL/path direct reference with no registry `name@version` to check
-    // at all; authenticated mode blocks that unverifiable target too, so the
+    // at all; a fail-closed gate blocks that unverifiable target too, so the
     // org guarantee can't be sidestepped with `pip install git+https://…`.
     // `--force` is the escape for all of these.
-    let fail_closed = authenticated_verdict(opts);
-    // Authenticated mode also fails closed when a manager that HAS a tree
+    let fail_closed = fail_closed(opts);
+    // A fail-closed gate also blocks when a manager that HAS a tree
     // resolver (pip/npm/uv) degraded to `NamedOnly`: the whole transitive set
     // went unverified, which can hide the vulnerable package the gate exists
     // to catch. (yarn/pnpm have no resolver, so their NamedOnly is inherent
@@ -309,7 +312,7 @@ pub(super) fn fresh_named_targets(
 /// (`report.bare_install`) or manifest-declared `PreExisting` findings may
 /// blame the existing tree.
 fn blames_existing_tree(report: &PrecheckReport, opts: &PrecheckOptions) -> bool {
-    let fail_closed = authenticated_verdict(opts);
+    let fail_closed = fail_closed(opts);
     let named_blocks = report.named_verdicts().any(|v| v.blocks(fail_closed));
     if report.vulnerable_count() == 0 || named_blocks {
         return false;
@@ -402,8 +405,8 @@ mod tests {
     }
 
     /// Predicate matrix: force ⇒ never block; vulnerable blocks in every
-    /// verdict mode; unverifiable/error/skipped findings block only in
-    /// authenticated mode.
+    /// verdict mode; unverifiable/error/skipped findings block only when the
+    /// gate fails closed (authenticated mode or the setting).
     #[test]
     fn block_predicate_matrix() {
         let clean = {
@@ -498,6 +501,43 @@ mod tests {
             );
             assert!(!should_block_install(report, &authenticated_opts(true)));
         }
+
+        // The install_gate_fail_closed setting: public mode (no token) blocks
+        // exactly what authenticated mode blocks, and --force still escapes.
+        let mut degraded_tree = {
+            let mut o = resolved_outcome("pkg", "1.0.0");
+            set_verdict(&mut o, VerdictStatus::Clean);
+            report_with(vec![o])
+        };
+        degraded_tree.tree = Some(TreeReport::NamedOnly {
+            reason: "pip dry-run failed".to_string(),
+        });
+        let fail_closed_public = |force| {
+            let mut opts = public_opts(force);
+            opts.verdict.as_mut().unwrap().fail_closed_without_token = true;
+            opts
+        };
+        for report in [
+            &clean,
+            &vulnerable,
+            &malicious,
+            &unverifiable,
+            &resolution_error,
+            &skipped,
+            &degraded_tree,
+        ] {
+            assert_eq!(
+                should_block_install(report, &fail_closed_public(false)),
+                should_block_install(report, &authenticated_opts(false)),
+                "the setting must block exactly what authenticated mode blocks"
+            );
+            assert!(!should_block_install(report, &fail_closed_public(true)));
+        }
+        assert!(should_block_install(
+            &degraded_tree,
+            &fail_closed_public(false)
+        ));
+        assert!(!should_block_install(&degraded_tree, &public_opts(false)));
     }
 
     /// A clean named outcome plus a vulnerable transitive tree finding must
@@ -787,6 +827,7 @@ mod tests {
                 token: "test-token".to_string(),
             },
             public_hint: None,
+            fail_closed_without_token: false,
         };
 
         let jobs: Vec<tree::TreePackage> = ["a", "b", "evil", "c", "d", "e"]

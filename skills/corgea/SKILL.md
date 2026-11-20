@@ -370,7 +370,12 @@ Baseline CVE checks need no token. The default vuln-api
 uses `CORGEA_TOKEN` (or the `corgea login` token) when present. A custom
 `CORGEA_VULN_API_URL` is public by default, even when a token exists; set
 `CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` to send the token to that
-custom URL and make lookup failures fail closed. Recency gate:
+custom URL and make lookup failures fail closed. To fail closed without
+sending a token anywhere, set `install_gate_fail_closed = true` in
+`~/.corgea/config.toml` (or `CORGEA_INSTALL_GATE_FAIL_CLOSED=1`; default off):
+unverifiable verdicts, lookup and resolution errors, skipped git/URL/path
+targets and a degraded dependency tree then block unless `--force`. `--json`
+reports it as a top-level `fail_closed` boolean. Recency gate:
 `recency_gate` / `recency_threshold_days` in `~/.corgea/config.toml`, overridden
 by `CORGEA_RECENCY_GATE` and `CORGEA_RECENCY_THRESHOLD_DAYS`. Overrides for
 testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`, `CORGEA_VULN_API_URL`.

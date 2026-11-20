@@ -113,8 +113,17 @@ fn print_escape_hint(report: &PrecheckReport) {
     eprintln!("  bypass the gate with: {corrected}");
 }
 
+/// Say why an install with unverifiable verdicts proceeds: public mode
+/// failing open, or `--force` overriding a fail-closed gate.
 pub(super) fn warn_public_lookup_failures(report: &PrecheckReport, opts: &PrecheckOptions) {
-    if super::verdict::public_verdict(opts).is_some() && report.unverifiable_count() > 0 {
+    if report.unverifiable_count() == 0 {
+        return;
+    }
+    if super::verdict::fail_closed(opts) {
+        if opts.force {
+            eprintln!("warning: CVE check unavailable; continuing under --force.");
+        }
+    } else if super::verdict::public_verdict(opts).is_some() {
         eprintln!("warning: CVE check unavailable; continuing because public mode is fail-open.");
     }
 }
@@ -231,7 +240,9 @@ fn collapsed_unverifiable_groups(report: &PrecheckReport) -> Vec<(&str, usize, &
     groups
 }
 
-pub(super) fn print_text(report: &PrecheckReport) {
+/// `fail_closed`: whether an unresolved target blocks (a fail-closed gate
+/// without `--force`), so the text never calls a blocking target ungated.
+pub(super) fn print_text(report: &PrecheckReport, fail_closed: bool) {
     // Build the echoed command from non-empty parts: a bare gated install
     // (e.g. `npm install` with zero specs) has no args to append.
     let mut command = format!("{} {}", report.manager.binary_name(), report.subcommand);
@@ -408,11 +419,14 @@ pub(super) fn print_text(report: &PrecheckReport) {
             TargetOutcome::Error { target, error } => {
                 // Be explicit that an unresolvable target was NOT vetted:
                 // without this line a resolution failure followed by a
-                // proceeding install reads like a pass.
-                println!(
-                    "  ✗ {}: {} (not verified — this target is ungated)",
-                    target.display, error
-                );
+                // proceeding install reads like a pass. A fail-closed gate
+                // blocks it, so it is not ungated there.
+                let note = if fail_closed {
+                    "not verified"
+                } else {
+                    "not verified — this target is ungated"
+                };
+                println!("  ✗ {}: {} ({note})", target.display, error);
             }
         }
     }
@@ -580,6 +594,9 @@ pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
             },
         },
         "verdict_mode": verdict_mode,
+        // Whether lookup/resolution failures block: authenticated mode or the
+        // `install_gate_fail_closed` setting. Independent of `verdict_mode`.
+        "fail_closed": super::verdict::fail_closed(opts),
         // `null` when the recency gate is off; consumers pair it with each
         // result's `age_seconds` to see which named targets tripped it.
         "recency_threshold_days": opts.recency.as_ref().map(|r| r.threshold_days),
