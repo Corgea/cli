@@ -27,6 +27,11 @@ pub struct Config {
     pub(crate) recency_gate: bool,
     #[serde(default = "default_recency_threshold_days")]
     pub(crate) recency_threshold_days: u32,
+    /// Install gate: fail closed — block unverifiable verdicts, lookup and
+    /// resolution errors, skipped targets and a degraded tree — even when no
+    /// token is sent. Off by default. Never causes a token to be sent.
+    #[serde(default)]
+    pub(crate) install_gate_fail_closed: bool,
 }
 
 fn default_recency_gate() -> bool {
@@ -63,6 +68,7 @@ impl Config {
             default_agent: None,
             recency_gate: default_recency_gate(),
             recency_threshold_days: default_recency_threshold_days(),
+            install_gate_fail_closed: false,
         }
     }
 
@@ -165,15 +171,14 @@ impl Config {
     /// Whether the install-gate recency check is enabled. `CORGEA_RECENCY_GATE`
     /// (`1`/`true` | `0`/`false`) overrides the config file.
     pub fn get_recency_gate(&self) -> bool {
-        if let Ok(v) = env::var("CORGEA_RECENCY_GATE") {
-            match v.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" => return true,
-                "0" | "false" => return false,
-                _ => {}
-            }
-        }
+        env_bool("CORGEA_RECENCY_GATE").unwrap_or(self.recency_gate)
+    }
 
-        self.recency_gate
+    /// Whether the install gate fails closed without a token.
+    /// `CORGEA_INSTALL_GATE_FAIL_CLOSED` (`1`/`true` | `0`/`false`) overrides
+    /// the config file.
+    pub fn get_install_gate_fail_closed(&self) -> bool {
+        env_bool("CORGEA_INSTALL_GATE_FAIL_CLOSED").unwrap_or(self.install_gate_fail_closed)
     }
 
     /// Recency window in days. `CORGEA_RECENCY_THRESHOLD_DAYS` overrides the
@@ -186,6 +191,16 @@ impl Config {
         }
 
         self.recency_threshold_days
+    }
+}
+
+/// A boolean env override: `1`/`true` or `0`/`false` (case-insensitive);
+/// `None` when unset or anything else, so the config file value stands.
+fn env_bool(name: &str) -> Option<bool> {
+    match env::var(name).ok()?.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
     }
 }
 
@@ -223,6 +238,19 @@ mod tests {
         let config: Config = toml::from_str(legacy).expect("deserialize legacy config");
         assert!(config.recency_gate, "missing recency_gate defaults to on");
         assert_eq!(config.recency_threshold_days, 14);
+        assert!(
+            !config.install_gate_fail_closed,
+            "missing install_gate_fail_closed defaults to off"
+        );
+    }
+
+    #[test]
+    fn install_gate_fail_closed_round_trips_through_toml() {
+        let mut config = Config::defaults();
+        config.install_gate_fail_closed = true;
+        let toml = toml::to_string(&config).expect("serialize");
+        let back: Config = toml::from_str(&toml).expect("deserialize");
+        assert!(back.install_gate_fail_closed);
     }
 
     #[test]

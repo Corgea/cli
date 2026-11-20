@@ -282,13 +282,13 @@ package's publish time is shown for provenance (`published <age> ago at
 <UTC timestamp>`), but it never blocks.
 Baseline public CVE checks need no token: known-vulnerable or malicious
 versions block, but vuln-api lookup outages warn and continue because public
-mode is fail-open. A Corgea token on the default vuln-api enables
+mode is fail-open by default. A Corgea token on the default vuln-api enables
 authenticated enforcement; in that mode, verdict lookup failures, resolution
 errors, and unverifiable git/URL/path specs (including `pip install .`, PEP
 508 `name @ url` direct references, and npm GitHub shorthand `user/repo`) all
 block (fail-closed) unless `--force`. In public mode those same specs are
-noted, never blocked, and everything else passes through with the package
-manager's own exit code. The install verb
+noted, not blocked (unless `install_gate_fail_closed` is on, see below), and
+everything else passes through with the package manager's own exit code. The install verb
 is found behind global flags (`npm --loglevel silent install x` is still
 gated). Bare `npm install` (zero specs, project `package.json` found like npm
 finds it — nearest ancestor) is gated too: the full lockfile-resolved tree is
@@ -370,7 +370,13 @@ Baseline CVE checks need no token. The default vuln-api
 uses `CORGEA_TOKEN` (or the `corgea login` token) when present. A custom
 `CORGEA_VULN_API_URL` is public by default, even when a token exists; set
 `CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1` to send the token to that
-custom URL and make lookup failures fail closed. Recency gate:
+custom URL and make lookup failures fail closed. To fail closed in public
+mode without sending the token to a custom URL, set `install_gate_fail_closed = true` in
+`~/.corgea/config.toml` (or `CORGEA_INSTALL_GATE_FAIL_CLOSED=1`; default off):
+unverifiable verdicts, lookup and resolution errors, skipped git/URL/path
+targets and a degraded dependency tree then block unless `--force`. It does
+not change where a token is sent. `--json` reports the configured policy as a
+top-level `fail_closed` boolean. Recency gate:
 `recency_gate` / `recency_threshold_days` in `~/.corgea/config.toml`, overridden
 by `CORGEA_RECENCY_GATE` and `CORGEA_RECENCY_THRESHOLD_DAYS`. Overrides for
 testing: `CORGEA_PYPI_REGISTRY`, `CORGEA_NPM_REGISTRY`, `CORGEA_VULN_API_URL`.

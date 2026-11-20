@@ -466,6 +466,7 @@ fn install_wrap_options(
             base_url: access.base_url,
             mode: access.mode,
             public_hint: Some(public_hint_for(access.has_token)),
+            fail_closed_without_token: config.get_install_gate_fail_closed(),
         }),
         npm_registry: utils::generic::get_env_var_if_exists("CORGEA_NPM_REGISTRY"),
         pypi_registry: utils::generic::get_env_var_if_exists("CORGEA_PYPI_REGISTRY"),
@@ -1124,7 +1125,8 @@ fn main() {
             ));
         }
         // Install wrappers: no auth gate. Public CVE checks run without a
-        // token and fail open on lookup outages.
+        // token and fail open on lookup outages unless
+        // `install_gate_fail_closed` is on.
         Some(Commands::Npm(args)) => {
             run_install_wrap_command(corgea::precheck::PackageManager::Npm, args, &corgea_config)
         }

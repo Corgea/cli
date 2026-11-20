@@ -188,7 +188,9 @@ hijacks before advisory feeds catch up. It is on by default; turn it off with
 
 Logging in (`corgea login`) upgrades the gate to authenticated enforcement —
 unverifiable packages, resolution errors, and lookup failures then fail closed
-(public mode warns and continues). Wrapper flags (`--force`, `--json`) go between
+(public mode warns and continues by default). To fail closed without a token, set
+`install_gate_fail_closed = true` in `~/.corgea/config.toml` (or
+`CORGEA_INSTALL_GATE_FAIL_CLOSED=1`); it does not change where a token is sent. Wrapper flags (`--force`, `--json`) go between
 the manager and its command: `corgea npm --force install <pkg>`.
 
 See [the CLI docs](https://docs.corgea.app/cli) for the full flag and exit-code reference.
