@@ -1148,8 +1148,7 @@ fn git_project_leaves_the_hook_repository_alone() {
     std::fs::write(hook_repo.path().join("kept.txt"), "kept\n").expect("write file");
     run_git(hook_repo.path(), &["add", "kept.txt"]);
     let git_dir = hook_repo.path().join(".git");
-    let config_before = std::fs::read(git_dir.join("config")).expect("read config");
-    let index_before = std::fs::read(git_dir.join("index")).expect("read index");
+    let before = snapshot(&git_dir);
 
     let output = Command::new(std::env::current_exe().expect("test binary"))
         .args([
@@ -1163,15 +1162,15 @@ fn git_project_leaves_the_hook_repository_alone() {
         .output()
         .expect("run fixture under a hook environment");
 
-    assert_eq!(
-        String::from_utf8_lossy(&std::fs::read(git_dir.join("config")).expect("read config")),
-        String::from_utf8_lossy(&config_before),
-        "fixture rewrote the hook repository's config"
-    );
-    assert_eq!(
-        std::fs::read(git_dir.join("index")).expect("read index"),
-        index_before,
-        "fixture rewrote the hook repository's index"
+    let after = snapshot(&git_dir);
+    let changed: Vec<_> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| before.get(*path) != after.get(*path))
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "fixture wrote to the hook repository: {changed:?}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -1184,10 +1183,31 @@ fn git_project_leaves_the_hook_repository_alone() {
 
 const HOOK_AUTHOR: &str = "Hook Author";
 
+/// Every file under `dir` with its bytes, keyed by path.
+fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read hook repository") {
+            let path = entry.expect("read hook repository entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let bytes = std::fs::read(&path).expect("read hook repository file");
+                files.insert(path, bytes);
+            }
+        }
+    }
+    files
+}
+
 #[test]
 #[ignore = "run by git_project_leaves_the_hook_repository_alone with a hook's git environment"]
 fn git_project_under_a_hook_environment() {
     let project = git_project();
-    let author = run_git(project.path(), &["log", "-1", "--format=%an"]);
-    assert_eq!(String::from_utf8_lossy(&author.stdout).trim(), HOOK_AUTHOR);
+    // The parent sets the author; a direct `--ignored` run only builds the fixture.
+    if std::env::var("GIT_AUTHOR_NAME").as_deref() == Ok(HOOK_AUTHOR) {
+        let author = run_git(project.path(), &["log", "-1", "--format=%an"]);
+        assert_eq!(String::from_utf8_lossy(&author.stdout).trim(), HOOK_AUTHOR);
+    }
 }

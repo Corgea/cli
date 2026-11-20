@@ -271,8 +271,13 @@ cmd_pre_commit() {
     # hooks, and every git a test spawns would inherit them and act on this
     # repo. Clear them once the staged files are known, so child git processes
     # find their repository from their own working directory.
-    # shellcheck disable=SC2046
-    unset $(git rev-parse --local-env-vars)
+    local git_local_vars
+    if ! git_local_vars="$(git rev-parse --local-env-vars)"; then
+        printf "  %s✗%s git rev-parse --local-env-vars failed\n" "$RED" "$RESET"
+        exit 1
+    fi
+    # shellcheck disable=SC2086
+    unset $git_local_vars
     # Check-only: never rewrite the working tree behind the commit.
     # Mirrors the CI gate so anything that passes here passes there.
     run "Clippy (strict)" 0 -- cargo clippy --all-targets -- -D warnings
