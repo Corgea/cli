@@ -1,6 +1,6 @@
 # Dependency scan fixtures (`tests/fixtures/`)
 
-Offline fixture projects for `corgea deps` unit and CLI tests per `docs/PRD_DEPS_TESTING.md` §4.2.
+Offline fixture projects for `corgea deps` unit and CLI tests.
 
 - Pins are **intentional** — do not bump versions without updating advisory-backed tests.
 - Used by `cargo test deps` and `tests/cli_deps.rs` (hermetic `HOME`, no network).

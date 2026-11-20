@@ -1,5 +1,5 @@
 //! Slice 0 → 1 handoff: classification tests target `classify_constraint` in
-//! `src/deps/ecosystems/mod.rs` (PRD_DEPS_TESTING.md §8.2, §9.4).
+//! `src/deps/ecosystems/mod.rs`.
 
 use crate::deps::ecosystems::classify_constraint;
 use crate::deps::model::{ConstraintKind, Ecosystem::Npm};
