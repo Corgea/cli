@@ -2141,7 +2141,12 @@ mod tests {
 
         for depth in [1, 2] {
             let clone = dir.path().join(format!("depth-{depth}"));
-            let status = std::process::Command::new("git")
+            let mut command = std::process::Command::new("git");
+            // A hook's inherited GIT_INDEX_FILE would take the clone's checkout.
+            for var in crate::utils::generic::GIT_LOCAL_ENV_VARS {
+                command.env_remove(var);
+            }
+            let status = command
                 .args(["clone", "--quiet", "--depth", &depth.to_string()])
                 .arg(format!("file://{}", origin.display()))
                 .arg(&clone)
