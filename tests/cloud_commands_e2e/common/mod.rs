@@ -738,7 +738,15 @@ pub(crate) fn git_project() -> GitProject {
 }
 
 pub(crate) fn run_git(path: &Path, args: &[&str]) -> Output {
-    let output = Command::new("git")
+    // Git exports GIT_DIR, GIT_INDEX_FILE and friends to hooks; inherited,
+    // they would point these commands at the hook's repository, not `path`.
+    let mut command = Command::new("git");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(name);
+        }
+    }
+    let output = command
         .args(args)
         .current_dir(path)
         .output()
@@ -1115,4 +1123,52 @@ fn blast_plan_for(
         ));
     }
     plan
+}
+
+/// Git exports `GIT_DIR` and `GIT_INDEX_FILE` to hooks, and `./harness
+/// pre-commit` runs this suite from one. The fixture must still build its own
+/// repository, not rewrite the one the hook points at.
+#[test]
+fn git_project_leaves_the_hook_repository_alone() {
+    let hook_repo = TempDir::new().expect("create hook repository");
+    run_git(hook_repo.path(), &["init", "--quiet"]);
+    std::fs::write(hook_repo.path().join("kept.txt"), "kept\n").expect("write file");
+    run_git(hook_repo.path(), &["add", "kept.txt"]);
+    let git_dir = hook_repo.path().join(".git");
+    let config_before = std::fs::read(git_dir.join("config")).expect("read config");
+    let index_before = std::fs::read(git_dir.join("index")).expect("read index");
+
+    let output = Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "common::git_project_under_a_hook_environment",
+            "--ignored",
+            "--quiet",
+        ])
+        .env("GIT_DIR", &git_dir)
+        .env("GIT_INDEX_FILE", git_dir.join("index"))
+        .output()
+        .expect("run fixture under a hook environment");
+
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(git_dir.join("config")).expect("read config")),
+        String::from_utf8_lossy(&config_before),
+        "fixture rewrote the hook repository's config"
+    );
+    assert_eq!(
+        std::fs::read(git_dir.join("index")).expect("read index"),
+        index_before,
+        "fixture rewrote the hook repository's index"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "fixture failed under a hook environment\n{stdout}"
+    );
+}
+
+#[test]
+#[ignore = "run by git_project_leaves_the_hook_repository_alone with a hook's git environment"]
+fn git_project_under_a_hook_environment() {
+    git_project();
 }

@@ -266,6 +266,10 @@ cmd_pre_commit() {
         return 0
     fi
     printf "\n%s[pre-commit]%s\n\n" "$BLUE" "$RESET"
+    # Git exports GIT_DIR, GIT_INDEX_FILE and friends to hooks. Drop them once
+    # the staged files are known, so no git a test spawns can reach this repo.
+    # shellcheck disable=SC2046
+    unset $(git rev-parse --local-env-vars)
     # Check-only: never rewrite the working tree behind the commit.
     # Mirrors the CI gate so anything that passes here passes there.
     run "Clippy (strict)" 0 -- cargo clippy --all-targets -- -D warnings
