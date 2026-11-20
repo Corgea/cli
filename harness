@@ -266,8 +266,11 @@ cmd_pre_commit() {
         return 0
     fi
     printf "\n%s[pre-commit]%s\n\n" "$BLUE" "$RESET"
-    # Git exports GIT_DIR, GIT_INDEX_FILE and friends to hooks. Drop them once
-    # the staged files are known, so no git a test spawns can reach this repo.
+    # Invariant: the checks below never touch this repository's git state.
+    # Git exports its repo-local variables (GIT_DIR, GIT_INDEX_FILE, ...) to
+    # hooks, and every git a test spawns would inherit them and act on this
+    # repo. Clear them once the staged files are known, so child git processes
+    # find their repository from their own working directory.
     # shellcheck disable=SC2046
     unset $(git rev-parse --local-env-vars)
     # Check-only: never rewrite the working tree behind the commit.
