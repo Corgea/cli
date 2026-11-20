@@ -594,7 +594,8 @@ pub(super) fn print_json(report: &PrecheckReport, opts: &PrecheckOptions) {
             },
         },
         "verdict_mode": verdict_mode,
-        // Whether lookup/resolution failures block: authenticated mode or the
+        // Configured policy, not this run's outcome (`--force` still proceeds):
+        // whether lookup/resolution failures block — authenticated mode or the
         // `install_gate_fail_closed` setting. Independent of `verdict_mode`.
         "fail_closed": super::verdict::fail_closed(opts),
         // `null` when the recency gate is off; consumers pair it with each

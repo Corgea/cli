@@ -792,6 +792,14 @@ fn fail_closed_setting_yields_to_force() {
         stderr.contains("continuing under --force"),
         "stderr must say why it proceeds: {stderr}"
     );
+    let hint = stderr
+        .lines()
+        .find(|l| l.contains("using public CVE checks"))
+        .unwrap_or_else(|| panic!("public-mode hint missing: {stderr}"));
+    assert!(
+        hint.contains("unless --force"),
+        "a forced run proceeds, so the hint must not say failures simply block: {hint}"
+    );
 }
 
 #[test]

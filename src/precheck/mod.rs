@@ -177,13 +177,13 @@ impl PublicHint {
                 "warning: using public CVE checks; login enables authenticated enforcement and private Corgea intelligence."
             }
             (PublicHint::NoToken, true) => {
-                "warning: using public CVE checks; lookup failures block because install_gate_fail_closed is on. Login enables private Corgea intelligence."
+                "warning: using public CVE checks; lookup failures block unless --force because install_gate_fail_closed is on. Login enables private Corgea intelligence."
             }
             (PublicHint::TokenWithheld, false) => {
                 "warning: using public CVE checks; your token is not sent to this vuln-api, so lookup failures warn instead of blocking. Set CORGEA_INSTALL_GATE_FAIL_CLOSED=1 to block on them without sending the token, or CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1 to send it and enable authenticated enforcement."
             }
             (PublicHint::TokenWithheld, true) => {
-                "warning: using public CVE checks; your token is not sent to this vuln-api. Lookup failures still block because install_gate_fail_closed is on."
+                "warning: using public CVE checks; your token is not sent to this vuln-api. Lookup failures still block unless --force because install_gate_fail_closed is on."
             }
         }
     }
