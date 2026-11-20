@@ -252,17 +252,7 @@ pub(super) fn block_reason(report: &PrecheckReport, opts: &PrecheckOptions) -> O
     // org guarantee can't be sidestepped with `pip install git+https://…`.
     // `--force` is the escape for all of these.
     let fail_closed = fail_closed(opts);
-    // A fail-closed gate also blocks when a manager that HAS a tree
-    // resolver (pip/npm/uv) degraded to `NamedOnly`: the whole transitive set
-    // went unverified, which can hide the vulnerable package the gate exists
-    // to catch. (yarn/pnpm have no resolver, so their NamedOnly is inherent
-    // and not a failure — left to the named-only warning.)
-    let tree_degraded_unchecked = report.manager.has_tree_resolver()
-        && matches!(report.tree, Some(TreeReport::NamedOnly { .. }));
-    if report.verdicts().any(|v| v.blocks(fail_closed))
-        || (fail_closed
-            && (report.error_count() > 0 || report.skipped_count() > 0 || tree_degraded_unchecked))
-    {
+    if report.verdicts().any(|v| v.blocks(fail_closed)) || (fail_closed && unverified(report)) {
         // Malware outranks the existing-tree/Findings split below.
         if report.malicious_count() > 0 {
             return Some(BlockReason::Malware);
@@ -283,6 +273,21 @@ pub(super) fn block_reason(report: &PrecheckReport, opts: &PrecheckOptions) -> O
         }
     }
     None
+}
+
+/// Whether any part of the would-install set went unverified — what a
+/// fail-closed gate blocks beyond known-bad verdicts: an unverifiable
+/// verdict, a resolution error, a skipped git/URL/path target, or a manager
+/// that HAS a tree resolver (pip/npm/uv) degraded to `NamedOnly`, leaving the
+/// transitive set unchecked. (yarn/pnpm have no resolver, so their NamedOnly
+/// is inherent and not a failure — left to the named-only warning.)
+pub(super) fn unverified(report: &PrecheckReport) -> bool {
+    let tree_degraded_unchecked = report.manager.has_tree_resolver()
+        && matches!(report.tree, Some(TreeReport::NamedOnly { .. }));
+    report.unverifiable_count() > 0
+        || report.error_count() > 0
+        || report.skipped_count() > 0
+        || tree_degraded_unchecked
 }
 
 /// Named install targets whose resolved version was published within

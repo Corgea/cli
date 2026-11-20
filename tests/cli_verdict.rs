@@ -864,3 +864,49 @@ fn withheld_token_hint_names_the_fail_closed_setting() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains(FAIL_CLOSED_ENV), "stderr: {stderr}");
 }
+
+#[test]
+fn fail_closed_setting_under_force_says_a_resolution_error_was_overridden() {
+    // A resolution error has no unverifiable verdict, yet a fail-closed gate
+    // would block it; under --force the output must say it was overridden.
+    let mut h = common::GateHarness::new()
+        .fake_tree_pm("pip", common::TREE_REPORT, 0)
+        .wildcard_pypi_registry()
+        .build();
+    h.cmd.env(FAIL_CLOSED_ENV, "1");
+    let out = h
+        .cmd
+        .args(["pip", "--force", "install", "nosuchpkg==2.0.0"])
+        .output()
+        .expect("run corgea");
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("continuing under --force"),
+        "a forced bypass of a fail-closed block must say so: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("ungated"),
+        "the gate applied and was overridden; it was not ungated: {stdout}"
+    );
+}
+
+#[test]
+fn fail_closed_hint_names_everything_the_setting_blocks() {
+    let mut h = named_503_full_tree();
+    h.cmd.env(FAIL_CLOSED_ENV, "1");
+    let out = h
+        .cmd
+        .args(["pip", "install", "oldpkg==1.0.0"])
+        .output()
+        .expect("run corgea");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let hint = stderr
+        .lines()
+        .find(|l| l.contains("using public CVE checks"))
+        .unwrap_or_else(|| panic!("public-mode hint missing: {stderr}"));
+    for what in ["resolution", "git/URL/path", "dependency tree"] {
+        assert!(hint.contains(what), "hint must name {what}: {hint}");
+    }
+}

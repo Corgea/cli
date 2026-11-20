@@ -168,23 +168,27 @@ pub enum PublicHint {
     TokenWithheld,
 }
 
+/// What a fail-closed gate blocks (`verdict::block_reason`), named in the
+/// hints so they never describe a narrower policy than the gate enforces.
+const UNVERIFIED: &str = "anything the gate cannot verify (lookup or resolution failures, git/URL/path installs, an incomplete dependency tree)";
+
 impl PublicHint {
-    /// `fail_closed`: whether lookup failures block anyway
+    /// `fail_closed`: whether unverified installs block anyway
     /// (`verdict::fail_closed`), so the hint never claims they only warn.
-    fn message(self, fail_closed: bool) -> &'static str {
+    fn message(self, fail_closed: bool) -> String {
         match (self, fail_closed) {
             (PublicHint::NoToken, false) => {
-                "warning: using public CVE checks; login enables authenticated enforcement and private Corgea intelligence."
+                "warning: using public CVE checks; login enables authenticated enforcement and private Corgea intelligence.".to_string()
             }
-            (PublicHint::NoToken, true) => {
-                "warning: using public CVE checks; lookup failures block unless --force because install_gate_fail_closed is on. Login enables private Corgea intelligence."
-            }
-            (PublicHint::TokenWithheld, false) => {
-                "warning: using public CVE checks; your token is not sent to this vuln-api, so lookup failures warn instead of blocking. Set CORGEA_INSTALL_GATE_FAIL_CLOSED=1 to block on them without sending the token, or CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1 to send it and enable authenticated enforcement."
-            }
-            (PublicHint::TokenWithheld, true) => {
-                "warning: using public CVE checks; your token is not sent to this vuln-api. Lookup failures still block unless --force because install_gate_fail_closed is on."
-            }
+            (PublicHint::NoToken, true) => format!(
+                "warning: using public CVE checks; {UNVERIFIED} blocks unless --force because install_gate_fail_closed is on. Login enables private Corgea intelligence."
+            ),
+            (PublicHint::TokenWithheld, false) => format!(
+                "warning: using public CVE checks; your token is not sent to this vuln-api, so {UNVERIFIED} is let through instead of blocking. Set CORGEA_INSTALL_GATE_FAIL_CLOSED=1 to block it without sending the token, or CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1 to send it and enable authenticated enforcement."
+            ),
+            (PublicHint::TokenWithheld, true) => format!(
+                "warning: using public CVE checks; your token is not sent to this vuln-api. {UNVERIFIED} still blocks unless --force because install_gate_fail_closed is on."
+            ),
         }
     }
 }
@@ -749,8 +753,7 @@ fn report_and_exec(
     if opts.json {
         render::print_json(report, opts);
     } else {
-        // Under --force nothing blocks, so an unresolved target is ungated.
-        render::print_text(report, verdict::fail_closed(opts) && !opts.force);
+        render::print_text(report, verdict::fail_closed(opts));
     }
     render::warn_public_lookup_failures(report, opts);
     if let Some(reason) = verdict::block_reason(report, opts) {

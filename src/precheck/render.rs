@@ -113,17 +113,15 @@ fn print_escape_hint(report: &PrecheckReport) {
     eprintln!("  bypass the gate with: {corrected}");
 }
 
-/// Say why an install with unverifiable verdicts proceeds: public mode
-/// failing open, or `--force` overriding a fail-closed gate.
+/// Say why an install with unverified parts proceeds: `--force` overriding
+/// a fail-closed gate (any `verdict::unverified` part), or public mode
+/// failing open on an unverifiable verdict.
 pub(super) fn warn_public_lookup_failures(report: &PrecheckReport, opts: &PrecheckOptions) {
-    if report.unverifiable_count() == 0 {
-        return;
-    }
     if super::verdict::fail_closed(opts) {
-        if opts.force {
-            eprintln!("warning: CVE check unavailable; continuing under --force.");
+        if opts.force && super::verdict::unverified(report) {
+            eprintln!("warning: not everything could be verified; continuing under --force.");
         }
-    } else if super::verdict::public_verdict(opts).is_some() {
+    } else if super::verdict::public_verdict(opts).is_some() && report.unverifiable_count() > 0 {
         eprintln!("warning: CVE check unavailable; continuing because public mode is fail-open.");
     }
 }
@@ -240,8 +238,9 @@ fn collapsed_unverifiable_groups(report: &PrecheckReport) -> Vec<(&str, usize, &
     groups
 }
 
-/// `fail_closed`: whether an unresolved target blocks (a fail-closed gate
-/// without `--force`), so the text never calls a blocking target ungated.
+/// `fail_closed`: whether the gate applies to an unresolved target
+/// (`verdict::fail_closed`), so the text never calls a gated target ungated.
+/// Under `--force` the override is reported by `warn_public_lookup_failures`.
 pub(super) fn print_text(report: &PrecheckReport, fail_closed: bool) {
     // Build the echoed command from non-empty parts: a bare gated install
     // (e.g. `npm install` with zero specs) has no args to append.
@@ -420,7 +419,8 @@ pub(super) fn print_text(report: &PrecheckReport, fail_closed: bool) {
                 // Be explicit that an unresolvable target was NOT vetted:
                 // without this line a resolution failure followed by a
                 // proceeding install reads like a pass. A fail-closed gate
-                // blocks it, so it is not ungated there.
+                // blocks it (or reports the --force override), so it is not
+                // ungated there.
                 let note = if fail_closed {
                     "not verified"
                 } else {
