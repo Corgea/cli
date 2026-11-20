@@ -631,8 +631,7 @@ fn unsupported_pip_add_message(rest: &[String]) -> String {
 /// (env/public) registry, so it cannot vouch that the artifact the manager
 /// pulls from the override matches the advisory universe. Resolving against
 /// the override (and multi-index cases like `--extra-index-url`) is a
-/// documented limitation — registry allow-listing is future work, separate
-/// PRD.
+/// documented limitation — registry allow-listing is future work.
 ///
 /// pip config-file (`pip.conf`) and `PIP_INDEX_URL`-style env detection is
 /// future work: only pip CLI index flags are inspected here.
