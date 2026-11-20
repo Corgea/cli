@@ -1620,8 +1620,9 @@ fn wait_for_blocking_rules(
             std::process::exit(1);
         }
 
-        let result = utils::api::check_blocking_rules(&config.get_url(), scan_id, None, block_on)
-            .map_err(|e| e.to_string());
+        let result =
+            utils::api::check_blocking_rules(&config.get_url(), scan_id, None, block_on, true)
+                .map_err(|e| e.to_string());
         match decide_blocking_rules_poll(result, started.elapsed(), timeout) {
             BlockingRulesPollDecision::Complete(rules) => {
                 stop_blocking_rules_spinner(&stop_signal, spinner);
