@@ -12,11 +12,13 @@
 //! Each resolved package's publish time is shown for provenance, but it
 //! never blocks the install.
 //!
-//! Verdict lookups run in one of two modes: public (no token — a vuln-api
-//! outage warns and the install continues, fail-open) or authenticated
-//! (token present — outages, resolution errors, and a degraded tree pass
-//! block unless `--force`, fail-closed). `verdict::block_reason` owns the
-//! mode-aware decision.
+//! Verdict lookups run in one of two modes: public (no token sent) or
+//! authenticated (token sent). Authenticated mode fails closed — outages,
+//! resolution errors, skipped targets and a degraded tree pass block unless
+//! `--force`; public mode fails open (warns and continues) unless the
+//! `install_gate_fail_closed` setting is on, which fails it closed the same
+//! way without sending a token. `verdict::fail_closed` is the one definition;
+//! `verdict::block_reason` owns the decision.
 
 mod detect;
 mod exec;
@@ -119,10 +121,12 @@ impl PackageManager {
     }
 }
 
-/// Auth and failure policy for the vuln-api verdict pass.
+/// Whether the vuln-api verdict pass sends the token. Authenticated mode
+/// also fails closed; public mode fails closed only with
+/// `VerdictConfig::fail_closed_without_token` (`verdict::fail_closed`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerdictMode {
-    /// No auth header; vuln-api lookup errors warn and fail open.
+    /// No auth header.
     Public,
     /// Auth header sent; vuln-api lookup errors fail closed.
     Authenticated { token: String },
@@ -147,9 +151,12 @@ pub struct VerdictConfig {
     /// Disclosure printed after a check is attempted in public mode, so a
     /// fail-open run never looks like an enforced one. `None` suppresses it.
     pub public_hint: Option<PublicHint>,
+    /// The `install_gate_fail_closed` setting: fail closed even when no
+    /// token is sent. Never affects whether a token is sent.
+    pub fail_closed_without_token: bool,
 }
 
-/// Why the gate is running public (fail-open) checks. Both cases warn, but a
+/// Why the gate is running public checks (no token sent). Both cases warn, but a
 /// user who never logged in needs different advice from one whose token is
 /// deliberately withheld from this endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,15 +168,27 @@ pub enum PublicHint {
     TokenWithheld,
 }
 
+/// What a fail-closed gate blocks (`verdict::block_reason`), named in the
+/// hints so they never describe a narrower policy than the gate enforces.
+const UNVERIFIED: &str = "anything the gate cannot verify (lookup or resolution failures, git/URL/path installs, an incomplete dependency tree)";
+
 impl PublicHint {
-    fn message(self) -> &'static str {
-        match self {
-            PublicHint::NoToken => {
-                "warning: using public CVE checks; login enables authenticated enforcement and private Corgea intelligence."
+    /// `fail_closed`: whether unverified installs block anyway
+    /// (`verdict::fail_closed`), so the hint never claims they only warn.
+    fn message(self, fail_closed: bool) -> String {
+        match (self, fail_closed) {
+            (PublicHint::NoToken, false) => {
+                "warning: using public CVE checks; login enables authenticated enforcement and private Corgea intelligence.".to_string()
             }
-            PublicHint::TokenWithheld => {
-                "warning: using public CVE checks; your token is not sent to this vuln-api, so lookup failures warn instead of blocking. Set CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1 to enable authenticated enforcement."
-            }
+            (PublicHint::NoToken, true) => format!(
+                "warning: using public CVE checks; {UNVERIFIED} blocks unless --force because install_gate_fail_closed is on. Login enables private Corgea intelligence."
+            ),
+            (PublicHint::TokenWithheld, false) => format!(
+                "warning: using public CVE checks; your token is not sent to this vuln-api, so {UNVERIFIED} is let through instead of blocking. Set CORGEA_INSTALL_GATE_FAIL_CLOSED=1 to block it without sending the token, or CORGEA_VULN_API_SEND_TOKEN_TO_CUSTOM_URL=1 to send it and enable authenticated enforcement."
+            ),
+            (PublicHint::TokenWithheld, true) => format!(
+                "warning: using public CVE checks; your token is not sent to this vuln-api. {UNVERIFIED} still blocks unless --force because install_gate_fail_closed is on."
+            ),
         }
     }
 }
@@ -187,7 +206,7 @@ pub enum VerdictStatus {
     /// the stronger claim names the verdict.
     Malicious(Vec<crate::vuln_api::VulnMatch>),
     /// The verdict could not be obtained (network/5xx/auth/integrity).
-    /// Blocks only in authenticated mode.
+    /// Blocks only when the gate fails closed (`verdict::fail_closed`).
     Unverifiable(String),
     /// Verdict never attempted (no `VerdictConfig`).
     NotChecked,
@@ -195,7 +214,7 @@ pub enum VerdictStatus {
 
 impl VerdictStatus {
     /// Whether this verdict blocks the install: vulnerable always;
-    /// unverifiable only when the mode fails closed (authenticated).
+    /// unverifiable only when the gate fails closed (`verdict::fail_closed`).
     /// The single definition of "blocking finding", shared by
     /// `verdict::block_reason` and the refusal-blame predicate.
     fn blocks(&self, fail_closed: bool) -> bool {
@@ -734,7 +753,7 @@ fn report_and_exec(
     if opts.json {
         render::print_json(report, opts);
     } else {
-        render::print_text(report);
+        render::print_text(report, verdict::fail_closed(opts));
     }
     render::warn_public_lookup_failures(report, opts);
     if let Some(reason) = verdict::block_reason(report, opts) {
@@ -872,7 +891,7 @@ fn run_parsed_install(
         );
     }
     if let Some(hint) = verdict::public_verdict(&opts).and_then(|cfg| cfg.public_hint) {
-        eprintln!("{}", hint.message());
+        eprintln!("{}", hint.message(verdict::fail_closed(&opts)));
     }
 
     let report = PrecheckReport {
@@ -904,7 +923,7 @@ fn run_locked_install(
     // Same disclosure as run_parsed_install: an `npm ci`/`uv sync` running
     // public checks says so rather than gating silently.
     if let Some(hint) = verdict::public_verdict(opts).and_then(|cfg| cfg.public_hint) {
-        eprintln!("{}", hint.message());
+        eprintln!("{}", hint.message(verdict::fail_closed(opts)));
     }
     let jobs = match lock {
         Ok(jobs) => jobs,
@@ -1173,8 +1192,8 @@ fn requirements_fallback_outcomes(
 
 /// Vuln-api verdict pass over resolved targets, run through the bounded
 /// worker pool. No-op without a `VerdictConfig` (resolve-and-display callers).
-/// Any client/call failure becomes `Unverifiable` — public mode warns and
-/// fails open; authenticated mode blocks (`VerdictStatus::blocks`).
+/// Any client/call failure becomes `Unverifiable` — it warns and fails open,
+/// or blocks when the gate fails closed (`VerdictStatus::blocks`).
 fn run_verdict_pass(
     manager: PackageManager,
     outcomes: &mut [TargetOutcome],
