@@ -36,6 +36,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use config::Config;
 use corgea::output_format::{self, OutputFormat};
 use project_naming::ProjectNamingMode;
+use scanners::blast::GateRequest;
 use scanners::fortify::parse as fortify_parse;
 use std::str::FromStr;
 
@@ -916,6 +917,12 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            let gate_request = match (*fail, block_on, fail_on) {
+                (true, _, _) => GateRequest::Fail,
+                (false, Some(slugs), _) => GateRequest::BlockOn(slugs),
+                (false, None, Some(level)) => GateRequest::FailOn(level.clone()),
+                (false, None, None) => GateRequest::NotRequested,
+            };
 
             if let Some(scan_type) = scan_type {
                 if scan_type.is_empty() {
@@ -1009,9 +1016,7 @@ fn main() {
                 Scanner::Semgrep => scan::run_semgrep(&corgea_config, project_name.clone()),
                 Scanner::Blast => scanners::blast::run(
                     &corgea_config,
-                    fail_on.clone(),
-                    fail,
-                    block_on,
+                    gate_request,
                     only_uncommitted,
                     disable_incremental,
                     ignore_dirty_worktree,

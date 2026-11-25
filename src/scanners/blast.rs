@@ -86,9 +86,7 @@ fn export_included_images(
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     config: &Config,
-    fail_on: Option<String>,
-    fail: &bool,
-    block_on: Option<String>,
+    gate_request: GateRequest,
     only_uncommitted: &bool,
     disable_incremental: &bool,
     ignore_dirty_worktree_for_run: &bool,
@@ -200,7 +198,7 @@ pub fn run(
     );
 
     let issues = collect_scan_issues(config, &project_name, &scan_id, &scan_url);
-    let classifications = summary::legacy_urgency_counts(&issues);
+    let counts_excluding_false_positives = summary::legacy_urgency_counts(&issues);
     // The report and the SBOM are produced before the blocking-rule gates: a
     // tripped gate exits 1, and a pipeline that fails on policy is exactly the
     // one that needs the report, to ingest the findings it failed on.
@@ -208,7 +206,7 @@ pub fn run(
         config,
         &project_name,
         &scan_id,
-        &classifications,
+        &counts_excluding_false_positives,
         out_format.as_deref(),
         out_file.as_deref(),
     );
@@ -221,10 +219,8 @@ pub fn run(
         config,
         &project_name,
         &scan_id,
-        *fail,
-        block_on.as_deref(),
-        fail_on.as_deref(),
-        &classifications,
+        &gate_request,
+        &counts_excluding_false_positives,
     );
 
     let summary = ScanSummary::build(
@@ -249,53 +245,57 @@ pub fn run(
     }
 }
 
+pub enum GateRequest {
+    NotRequested,
+    Fail,
+    BlockOn(String),
+    FailOn(String),
+}
+
 fn evaluate_gate(
     config: &Config,
     project_name: &str,
     scan_id: &str,
-    fail: bool,
-    block_on: Option<&str>,
-    fail_on: Option<&str>,
-    classifications: &HashMap<String, usize>,
+    request: &GateRequest,
+    counts_excluding_false_positives: &HashMap<String, usize>,
 ) -> Gate {
-    if fail {
-        log::warn!(
-            "\n--fail is deprecated: it evaluates every active blocking rule regardless of whether it applies to pull requests or CI. Use --block-on <slug> to name the CI blocking rules this pipeline should enforce."
-        );
-        let blocking_rules = wait_for_blocking_rules(config, scan_id, None);
-        let condition = "--fail (every active blocking rule)".to_string();
-        return if blocking_rules.block {
-            Gate::Failed {
-                condition,
-                tripped: blocking_rules.blocked_count(),
-            }
-        } else {
-            Gate::Passed { condition }
-        };
-    }
-
-    if let Some(block_on) = block_on {
-        let blocking_rules = wait_for_blocking_rules(config, scan_id, Some(block_on));
-        return if blocking_rules.block {
-            // The count comes from the server's pre-pagination total; the slug
-            // list is drawn from the returned page, which is all the gate needs
-            // to name the rules at fault.
-            Gate::Failed {
-                condition: format!(
-                    "--block-on {block_on} (rules violated: {})",
-                    triggered_slug_summary(&blocking_rules.blocking_issues)
-                ),
-                tripped: blocking_rules.blocked_count(),
-            }
-        } else {
-            Gate::Passed {
-                condition: format!("--block-on {block_on}"),
-            }
-        };
-    }
-
-    let Some(fail_on) = fail_on else {
-        return Gate::NotRequested;
+    let fail_on = match request {
+        GateRequest::NotRequested => return Gate::NotRequested,
+        GateRequest::Fail => {
+            log::warn!(
+                "\n--fail is deprecated: it evaluates every active blocking rule regardless of whether it applies to pull requests or CI. Use --block-on <slug> to name the CI blocking rules this pipeline should enforce."
+            );
+            let blocking_rules = wait_for_blocking_rules(config, scan_id, None);
+            let condition = "--fail (every active blocking rule)".to_string();
+            return if blocking_rules.block {
+                Gate::Failed {
+                    condition,
+                    tripped: blocking_rules.blocked_count(),
+                }
+            } else {
+                Gate::Passed { condition }
+            };
+        }
+        GateRequest::BlockOn(block_on) => {
+            let blocking_rules = wait_for_blocking_rules(config, scan_id, Some(block_on));
+            return if blocking_rules.block {
+                // The count comes from the server's pre-pagination total; the slug
+                // list is drawn from the returned page, which is all the gate needs
+                // to name the rules at fault.
+                Gate::Failed {
+                    condition: format!(
+                        "--block-on {block_on} (rules violated: {})",
+                        triggered_slug_summary(&blocking_rules.blocking_issues)
+                    ),
+                    tripped: blocking_rules.blocked_count(),
+                }
+            } else {
+                Gate::Passed {
+                    condition: format!("--block-on {block_on}"),
+                }
+            };
+        }
+        GateRequest::FailOn(fail_on) => fail_on,
     };
     let tokens = match parse_fail_on_tokens(fail_on) {
         Ok(tokens) => tokens,
@@ -308,7 +308,7 @@ fn evaluate_gate(
     let severity_already_tripped = tokens
         .iter()
         .filter(|t| t.as_str() != "malicious")
-        .any(|t| severity_gate_trips(t, classifications));
+        .any(|t| severity_gate_trips(t, counts_excluding_false_positives));
     let needs_sca_fetch = !severity_already_tripped && tokens.iter().any(|t| t == "malicious");
 
     let sca_issues = if needs_sca_fetch {
@@ -331,7 +331,7 @@ fn evaluate_gate(
     };
 
     let condition = format!("--fail-on {fail_on}");
-    match fail_on_tripped_count(&tokens, classifications, &sca_issues) {
+    match fail_on_tripped_count(&tokens, counts_excluding_false_positives, &sca_issues) {
         0 => Gate::Passed { condition },
         tripped => Gate::Failed { condition, tripped },
     }
@@ -1989,15 +1989,12 @@ mod tests {
             issue_json("f1", "false_positive", "CR"),
         ]))
         .unwrap();
-        let classifications = summary::legacy_urgency_counts(&issues);
         let gate = evaluate_gate(
             &config,
             "goof",
             "scan-1",
-            false,
-            None,
-            Some("HI"),
-            &classifications,
+            &GateRequest::FailOn("HI".into()),
+            &summary::legacy_urgency_counts(&issues),
         );
         assert_eq!(
             gate,
