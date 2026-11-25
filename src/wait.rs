@@ -66,6 +66,9 @@ pub fn run(config: &Config, args: WaitArgs) {
         project_id,
         format,
     } = args;
+    // `corgea wait` sets this in main; `upload --wait`, semgrep and snyk reach
+    // here without it, and the summary would then ignore a pipe and NO_COLOR.
+    corgea::output_format::set_process_format(format);
 
     // A scan id alone leaves nothing to resolve: the scan and issue endpoints
     // both fetch by scan id, so neither /projects nor the listing is dialed.

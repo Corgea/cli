@@ -512,7 +512,8 @@ pub fn render_human(summary: &ScanSummary, color: bool) -> String {
         String::new()
     };
     out.push_str(&format!(
-        "{total} findings in this scan: {}, {} in other states{unrecognized_note}.\n\n",
+        "{total} {} in this scan: {}, {} in other states{unrecognized_note}.\n\n",
+        if total == 1 { "finding" } else { "findings" },
         ledger.paint(&format!("{open} open"), BOLD),
         total - open - unrecognized
     ));
@@ -872,7 +873,7 @@ mod tests {
         let out = render_human(&summary_of(issues, Gate::NotRequested), false);
         let expected = "
 Scan complete: goof, branch main, scan scan-1
-1 findings in this scan: 1 open, 0 in other states.
+1 finding in this scan: 1 open, 0 in other states.
 
 Open issues                   Critical  High  Medium  Low  Total
 ----------------------------------------------------------------

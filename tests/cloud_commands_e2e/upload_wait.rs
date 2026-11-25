@@ -62,6 +62,10 @@ fn upload_wait_uses_returned_ids_and_stops_at_complete() {
         "{context}"
     );
     assert_issue_summary(&stdout, &context);
+    assert!(
+        !stdout.contains('\x1b'),
+        "piped stdout must carry no ANSI escapes\n{context}"
+    );
 }
 
 #[test]
