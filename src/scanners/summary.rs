@@ -154,13 +154,21 @@ impl SeverityCounts {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RecentScanReuse {
+    #[default]
+    NotRequested,
+    NotReused,
+    Reused,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanInfo {
     pub id: String,
     pub project: String,
     pub branch: Option<String>,
     pub git_sha: Option<String>,
-    pub reused_recent_scan: Option<bool>,
+    pub reused_recent_scan: RecentScanReuse,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -474,7 +482,7 @@ pub fn render_human(summary: &ScanSummary, color: bool) -> String {
     }
     title.push_str(&format!(", scan {}", scan.id));
     let mut out = format!("\n{}\n", ledger.paint(&title, BOLD));
-    if scan.reused_recent_scan == Some(true) {
+    if scan.reused_recent_scan == RecentScanReuse::Reused {
         out.push_str("Reused a recent scan of this commit.\n");
     }
     out.push_str(&format!(
@@ -557,9 +565,11 @@ pub fn render_agent(summary: &ScanSummary) -> String {
         tsv_cell(&scan.project),
         tsv_cell(scan.branch.as_deref().unwrap_or("")),
         tsv_cell(scan.git_sha.as_deref().unwrap_or("")),
-        scan.reused_recent_scan
-            .map(|reused| reused.to_string())
-            .unwrap_or_default(),
+        match scan.reused_recent_scan {
+            RecentScanReuse::NotRequested => "",
+            RecentScanReuse::NotReused => "false",
+            RecentScanReuse::Reused => "true",
+        },
         tsv_cell(&summary.results_url)
     ));
     let open = summary.counts(Status::Open);
@@ -627,8 +637,10 @@ pub fn render_json(summary: &ScanSummary) -> String {
         "branch": scan.branch,
         "git_sha": scan.git_sha,
     });
-    if let Some(reused) = scan.reused_recent_scan {
-        scan_json["reused_recent_scan"] = reused.into();
+    match scan.reused_recent_scan {
+        RecentScanReuse::NotRequested => {}
+        RecentScanReuse::NotReused => scan_json["reused_recent_scan"] = false.into(),
+        RecentScanReuse::Reused => scan_json["reused_recent_scan"] = true.into(),
     }
     let gate = &summary.gate;
     let mut by_status = Map::new();
@@ -746,7 +758,7 @@ mod tests {
             project: "goof".into(),
             branch: Some("main".into()),
             git_sha: Some("abc123".into()),
-            reused_recent_scan: None,
+            reused_recent_scan: RecentScanReuse::NotRequested,
         }
     }
 
@@ -898,7 +910,7 @@ issue\to1\thigh\tCWE-89\tSQL Injection\tsrc/b.js:9
     #[test]
     fn json_document_mirrors_the_summary() {
         let mut scan = scan_info();
-        scan.reused_recent_scan = Some(true);
+        scan.reused_recent_scan = RecentScanReuse::Reused;
         let summary = ScanSummary::build(
             scan,
             Gate::Passed {

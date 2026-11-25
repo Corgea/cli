@@ -167,7 +167,11 @@ pub fn run(
         )
     });
 
-    let reused_recent_scan = skip_recent.as_ref().map(|_| reused_scan.is_some());
+    let reused_recent_scan = match (&skip_recent, &reused_scan) {
+        (None, _) => summary::RecentScanReuse::NotRequested,
+        (Some(_), None) => summary::RecentScanReuse::NotReused,
+        (Some(_), Some(_)) => summary::RecentScanReuse::Reused,
+    };
     let ScanToReport { scan, project_id } = match reused_scan {
         Some(scan) => ScanToReport {
             project_id: scan.project_id.clone(),

@@ -169,7 +169,7 @@ pub fn run(config: &Config, args: WaitArgs) {
             project: project_name,
             branch: scan.branch,
             git_sha: scan.git_sha,
-            reused_recent_scan: None,
+            reused_recent_scan: summary::RecentScanReuse::NotRequested,
         },
         Gate::NotRequested,
         &issues,
