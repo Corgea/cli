@@ -102,7 +102,7 @@ Removing, disabling or editing a project ignore rule (scan settings → File Ign
 When the scan finishes, `scan` and `wait` print one results summary chosen by `--format`:
 
 - `human`: tables of open issues by severity and of every finding by status (open, fix in progress, fixed, accepted risk, false positive, duplicate), then the results link. Colors only on a terminal without `NO_COLOR`; no spinners or `\r` redraws on a pipe.
-- `agent`: tab-separated records, each kind under its own `record` header row: `gate` first (result `pass|fail|none`, exit code, condition, tripped count), then `scan`, open counts by `severity`, counts by `status` with what each status means, and up to five open `issue` rows (critical first) to fix first. `Hint: Run ...` lines for `corgea ls --issues --scan-id <id> --json` and `corgea inspect --issue <id>` go to stderr.
+- `agent`: tab-separated records, each kind under its own `record` header row: `gate` first (result `pass|fail|none`, exit code, condition, tripped count), then `scan`, open counts by `severity`, counts by `status` with what each status means, and up to five open `issue` rows (critical first) to fix first. `Hint: Run ...` lines for `corgea ls --issues --scan-id <id> --json` and `corgea inspect --issue <id>` go to stderr, as does every progress line, `CORGEA_SCAN_SKIPPED=` included, so stdout holds only the records.
 - `json`: one document with `schema_version: 1`, `scan`, `gate`, `total_findings`, `by_status` (each with `critical`, `high`, `medium`, `low`, `total`), `unrecognized`, `fix_first` and `results_url`; `scan.reused_recent_scan` appears with `--skip-if-commit-scanned-recently`. Every other line the run prints, `CORGEA_SCAN_SKIPPED=` included, goes to stderr.
 - `quiet`: no summary.
 

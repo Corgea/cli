@@ -310,13 +310,7 @@ fn evaluate_gate(
         }
     };
 
-    let severity_already_tripped = tokens
-        .iter()
-        .filter(|t| t.as_str() != "malicious")
-        .any(|t| severity_gate_trips(t, counts_excluding_false_positives));
-    let needs_sca_fetch = !severity_already_tripped && tokens.iter().any(|t| t == "malicious");
-
-    let sca_issues = if needs_sca_fetch {
+    let sca_issues = if tokens.iter().any(|t| t == "malicious") {
         match utils::api::get_all_sca_issues(
             &config.get_url(),
             project_name,
@@ -335,7 +329,7 @@ fn evaluate_gate(
         Vec::new()
     };
 
-    let condition = format!("--fail-on {fail_on}");
+    let condition = format!("--fail-on {fail_on} (findings in any status, not only open)");
     match fail_on_tripped_count(&tokens, counts_excluding_false_positives, &sca_issues) {
         0 => Gate::Passed { condition },
         tripped => Gate::Failed { condition, tripped },
@@ -1099,16 +1093,7 @@ fn severity_rank(severity: &str) -> Option<u8> {
     }
 }
 
-/// At-or-above semantics: --fail-on ME trips on ME, HI, and CR.
-pub fn severity_gate_trips(threshold: &str, counts: &HashMap<String, usize>) -> bool {
-    let Some(threshold_rank) = severity_rank(threshold) else {
-        return false;
-    };
-    counts.iter().any(|(severity, &count)| {
-        count > 0 && severity_rank(severity).is_some_and(|rank| rank >= threshold_rank)
-    })
-}
-
+/// At-or-above semantics: --fail-on ME counts ME, HI, and CR.
 pub fn fail_on_tripped_count(
     tokens: &[String],
     counts: &HashMap<String, usize>,
@@ -1904,26 +1889,27 @@ mod tests {
     }
 
     #[test]
-    fn severity_gate_me_trips_on_cr_only_scan() {
-        // Deliberate behavior fix: at-or-above (previously the ME arm omitted CR).
-        assert!(severity_gate_trips("ME", &counts(&[("CR", 1)])));
-    }
-
-    #[test]
     fn severity_gate_at_or_above_matrix() {
-        assert!(severity_gate_trips("LO", &counts(&[("LO", 1)])));
-        assert!(severity_gate_trips("LO", &counts(&[("CR", 1)])));
-        assert!(severity_gate_trips("ME", &counts(&[("ME", 2)])));
-        assert!(severity_gate_trips("HI", &counts(&[("CR", 1)])));
-        assert!(severity_gate_trips("CR", &counts(&[("CR", 1)])));
-        assert!(!severity_gate_trips("CR", &counts(&[("HI", 5)])));
-        assert!(!severity_gate_trips("HI", &counts(&[("ME", 5), ("LO", 5)])));
-        assert!(!severity_gate_trips("ME", &counts(&[("LO", 5)])));
-        assert!(!severity_gate_trips("LO", &counts(&[])));
-        // zero-count buckets never trip
-        assert!(!severity_gate_trips("LO", &counts(&[("CR", 0)])));
-        // unknown severity strings never trip
-        assert!(!severity_gate_trips("LO", &counts(&[("NA", 3)])));
+        let trips = |threshold: &str, pairs: &[(&str, usize)]| {
+            fail_on_tripped_count(
+                &parse_fail_on_tokens(threshold).unwrap(),
+                &counts(pairs),
+                &[],
+            ) > 0
+        };
+        // Deliberate behavior fix: at-or-above (previously the ME arm omitted CR).
+        assert!(trips("ME", &[("CR", 1)]));
+        assert!(trips("LO", &[("LO", 1)]));
+        assert!(trips("LO", &[("CR", 1)]));
+        assert!(trips("ME", &[("ME", 2)]));
+        assert!(trips("HI", &[("CR", 1)]));
+        assert!(trips("CR", &[("CR", 1)]));
+        assert!(!trips("CR", &[("HI", 5)]));
+        assert!(!trips("HI", &[("ME", 5), ("LO", 5)]));
+        assert!(!trips("ME", &[("LO", 5)]));
+        assert!(!trips("LO", &[]));
+        assert!(!trips("LO", &[("CR", 0)]));
+        assert!(!trips("LO", &[("NA", 3)]));
     }
 
     #[test]
@@ -2013,7 +1999,7 @@ mod tests {
         assert_eq!(
             gate,
             Gate::Failed {
-                condition: "--fail-on HI".into(),
+                condition: "--fail-on HI (findings in any status, not only open)".into(),
                 tripped: 1
             }
         );
@@ -2034,7 +2020,10 @@ mod tests {
             lines.next(),
             Some("record\tresult\texit_code\tcondition\ttripped")
         );
-        assert_eq!(lines.next(), Some("gate\tfail\t1\t--fail-on HI\t1"));
+        assert_eq!(
+            lines.next(),
+            Some("gate\tfail\t1\t--fail-on HI (findings in any status, not only open)\t1")
+        );
     }
 
     fn issue_json(id: &str, status: &str, urgency: &str) -> serde_json::Value {

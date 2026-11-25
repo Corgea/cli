@@ -1029,6 +1029,20 @@ pub(crate) fn assert_summary_issue_query(request: &CapturedRequest) -> Result<()
     assert_query(request, "show_false_positives", "true")
 }
 
+/// `plan` with the request labeled `label` answered by `response` instead.
+pub(crate) fn answer_with(
+    mut plan: Vec<ExpectedRequest>,
+    label: &str,
+    response: StubResponse,
+) -> Vec<ExpectedRequest> {
+    let request = plan
+        .iter_mut()
+        .find(|request| request.label == label)
+        .unwrap_or_else(|| panic!("no request labeled {label:?} in the plan"));
+    request.response = response;
+    plan
+}
+
 pub(crate) fn blast_plan(sha: &str) -> Vec<ExpectedRequest> {
     blast_upload_plan(sha, false, true)
 }

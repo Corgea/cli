@@ -107,10 +107,11 @@ pub fn write_status(args: fmt::Arguments) {
     } else {
         text.replace('\r', "")
     };
-    if process_output() == ProcessOutput::Format(OutputFormat::Json) {
-        eprint!("{text}");
-    } else {
-        print!("{text}");
+    match process_output() {
+        ProcessOutput::LegacyCommand | ProcessOutput::Format(OutputFormat::Human) => {
+            print!("{text}")
+        }
+        ProcessOutput::Format(_) => eprint!("{text}"),
     }
 }
 

@@ -229,7 +229,7 @@ fn ensure_image_present(engine: &str, image: &str) -> Result<(), String> {
     statusln!("  {} isn't available locally, pulling it...", image);
     let status = Command::new(engine)
         .args(["pull", image])
-        .stdout(Stdio::inherit())
+        .stdout(std::io::stderr())
         .stderr(Stdio::inherit())
         .status()
         .map_err(|e| format!("Failed to run `{} pull {}`: {}", engine, image, e))?;

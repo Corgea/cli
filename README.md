@@ -57,7 +57,8 @@ evaluated; override with `CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS`.
 When the scan finishes, `scan` and `wait` print a results summary: open issues
 by severity, every finding by status, and the results link. `--format` picks how:
 `human` (tables), `agent` (tab-separated records for coding agents), `json` (one
-document on stdout; progress goes to stderr) or `quiet` (no summary). Without it,
+document on stdout) or `quiet` (no summary). In every format but `human`,
+progress goes to stderr, so stdout holds only the summary. Without it,
 agent output is used when an agent environment is detected (`AI_AGENT`,
 `CLAUDECODE`, `CODEX_SANDBOX`, and related variables), human output otherwise.
 Exit codes are the same in every format.
