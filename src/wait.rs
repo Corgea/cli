@@ -160,7 +160,9 @@ pub fn run(config: &Config, args: WaitArgs) {
         }
     };
 
-    let issues = blast::collect_scan_issues(config, &project_name, &scan_id, &scan_url);
+    let issues = blast::collect_scan_issues(config, &project_name, &scan_id).unwrap_or_else(|e| {
+        blast::exit_for_failed_issue_fetch(config, &project_name, &scan_url, e)
+    });
     let summary = ScanSummary::build(
         summary::ScanInfo {
             id: scan_id,

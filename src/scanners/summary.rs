@@ -1,4 +1,4 @@
-use crate::utils::api::Issue;
+use crate::utils::api::{get_all_issues, FalsePositives, Issue};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeSet, HashMap};
 
@@ -259,12 +259,33 @@ pub fn legacy_urgency_counts(issues: &[Issue]) -> HashMap<String, usize> {
     counts
 }
 
+pub struct ScanIssues(Vec<Issue>);
+
+impl ScanIssues {
+    pub fn fetch(
+        url: &str,
+        project: &str,
+        scan_id: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        get_all_issues(url, project, Some(scan_id.into()), FalsePositives::Include).map(Self)
+    }
+
+    #[cfg(test)]
+    pub fn including_false_positives(issues: Vec<Issue>) -> Self {
+        Self(issues)
+    }
+
+    pub fn as_slice(&self) -> &[Issue] {
+        &self.0
+    }
+}
+
 impl ScanSummary {
-    pub fn build(scan: ScanInfo, gate: Gate, issues: &[Issue], results_url: String) -> Self {
+    pub fn build(scan: ScanInfo, gate: Gate, issues: &ScanIssues, results_url: String) -> Self {
         let mut by_status = [SeverityCounts::default(); 6];
         let mut unrecognized = Unrecognized::default();
         let mut open = Vec::new();
-        for issue in issues {
+        for issue in issues.as_slice() {
             match classify(issue) {
                 Ok((status, severity)) => {
                     by_status[status as usize].add(severity);
@@ -722,13 +743,18 @@ mod tests {
         }
     }
 
-    fn summary_of(issues: &[Issue], gate: Gate) -> ScanSummary {
-        ScanSummary::build(scan_info(), gate, issues, "https://corgea.test/scan".into())
+    fn summary_of(issues: Vec<Issue>, gate: Gate) -> ScanSummary {
+        ScanSummary::build(
+            scan_info(),
+            gate,
+            &ScanIssues::including_false_positives(issues),
+            "https://corgea.test/scan".into(),
+        )
     }
 
     #[test]
     fn open_counts_only_open_findings() {
-        let summary = summary_of(&mixed_issues(), Gate::NotRequested);
+        let summary = summary_of(mixed_issues(), Gate::NotRequested);
         let open = summary.counts(Status::Open);
         assert_eq!(open.get(Severity::Critical), 1);
         assert_eq!(open.get(Severity::High), 1);
@@ -754,7 +780,7 @@ mod tests {
             issue("x1", "snoozed", "HI", "a", 2),
             issue("x2", "open", "IN", "a", 3),
         ];
-        let summary = summary_of(&issues, Gate::NotRequested);
+        let summary = summary_of(issues, Gate::NotRequested);
         assert_eq!(summary.counts(Status::Open).total(), 1);
         assert_eq!(summary.unrecognized.count, 2);
         assert_eq!(summary.total_findings(), 3);
@@ -775,7 +801,7 @@ mod tests {
             issue("m", "open", "ME", "src/a.js", 1),
             issue("fixed", "fixed", "CR", "src/a.js", 1),
         ];
-        let summary = summary_of(&issues, Gate::NotRequested);
+        let summary = summary_of(issues, Gate::NotRequested);
         let ids: Vec<&str> = summary.fix_first.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["c", "h-a1", "h-a2", "h-b", "m"]);
     }
@@ -783,7 +809,7 @@ mod tests {
     #[test]
     fn human_prints_every_status_row_with_zeros() {
         let issues = vec![issue("o1", "open", "HI", "src/a.js", 1)];
-        let out = render_human(&summary_of(&issues, Gate::NotRequested), false);
+        let out = render_human(&summary_of(issues, Gate::NotRequested), false);
         let expected = "
 Scan complete: goof, branch main, scan scan-1
 1 findings in this scan: 1 open, 0 in other states.
@@ -813,7 +839,7 @@ Go to https://corgea.test/scan to see results.
 
     #[test]
     fn human_colors_cells_by_severity_and_bolds_totals() {
-        let summary = summary_of(&mixed_issues(), Gate::NotRequested);
+        let summary = summary_of(mixed_issues(), Gate::NotRequested);
         let colored = render_human(&summary, true);
         let code_row = concat!(
             "SAST, Logic & Auth, Secrets ",
@@ -837,7 +863,7 @@ Go to https://corgea.test/scan to see results.
             condition: "--fail-on HI".into(),
             tripped: 3,
         };
-        let out = render_agent(&summary_of(&mixed_issues(), gate));
+        let out = render_agent(&summary_of(mixed_issues(), gate));
         let expected = "record\tresult\texit_code\tcondition\ttripped
 gate\tfail\t1\t--fail-on HI\t3
 record\tid\tproject\tbranch\tgit_sha\treused_recent_scan\tresults_url
@@ -871,7 +897,7 @@ issue\to1\thigh\tCWE-89\tSQL Injection\tsrc/b.js:9
             Gate::Passed {
                 condition: "--block-on criticals".into(),
             },
-            &mixed_issues(),
+            &ScanIssues::including_false_positives(mixed_issues()),
             "https://corgea.test/scan".into(),
         );
         let json: Value = serde_json::from_str(&render_json(&summary)).unwrap();
@@ -889,7 +915,7 @@ issue\to1\thigh\tCWE-89\tSQL Injection\tsrc/b.js:9
     #[test]
     fn json_omits_reuse_when_the_flag_was_not_passed() {
         let json: Value =
-            serde_json::from_str(&render_json(&summary_of(&[], Gate::NotRequested))).unwrap();
+            serde_json::from_str(&render_json(&summary_of(vec![], Gate::NotRequested))).unwrap();
         assert!(json["scan"].get("reused_recent_scan").is_none());
         assert_eq!(json["gate"]["result"], "none");
         assert_eq!(json["gate"]["condition"], Value::Null);

@@ -3,10 +3,10 @@ use crate::images;
 use crate::incremental::{FullScanCause, FullScanReason};
 use crate::manifest::Manifest;
 use crate::scan::build_scan_url;
-use crate::scanners::summary::{self, Gate, ScanSummary};
+use crate::scanners::summary::{self, Gate, ScanIssues, ScanSummary};
 use crate::targets;
 use crate::utils;
-use crate::utils::api::{Issue, SCAIssue};
+use crate::utils::api::SCAIssue;
 use corgea::output_format::{colors_enabled, OutputFormat};
 use corgea::{status, statusln};
 use std::collections::{HashMap, HashSet};
@@ -197,8 +197,9 @@ pub fn run(
         &scan_id,
     );
 
-    let issues = collect_scan_issues(config, &project_name, &scan_id, &scan_url);
-    let counts_excluding_false_positives = summary::legacy_urgency_counts(&issues);
+    let issues = collect_scan_issues(config, &project_name, &scan_id)
+        .unwrap_or_else(|e| exit_for_failed_issue_fetch(config, &project_name, &scan_url, e));
+    let counts_excluding_false_positives = summary::legacy_urgency_counts(issues.as_slice());
     // The report and the SBOM are produced before the blocking-rule gates: a
     // tripped gate exits 1, and a pipeline that fails on policy is exactly the
     // one that needs the report, to ingest the findings it failed on.
@@ -971,7 +972,7 @@ fn write_scan_report(
             &config.get_url(),
             project_name,
             Some(scan_id.into()),
-            false,
+            utils::api::FalsePositives::Exclude,
         ) {
             Ok(issues) => issues,
             Err(e) => {
@@ -1661,8 +1662,7 @@ pub fn collect_scan_issues(
     config: &Config,
     project_name: &str,
     scan_id: &str,
-    scan_url: &str,
-) -> Vec<Issue> {
+) -> Result<ScanIssues, Box<dyn std::error::Error>> {
     let stop_signal = Arc::new(Mutex::new(false));
     let stop_signal_clone = Arc::clone(&stop_signal);
     let results_thread = thread::spawn(move || {
@@ -1671,35 +1671,38 @@ pub fn collect_scan_issues(
             stop_signal_clone,
         );
     });
-    let fetched =
-        utils::api::get_all_issues(&config.get_url(), project_name, Some(scan_id.into()), true);
+    let fetched = ScanIssues::fetch(&config.get_url(), project_name, scan_id);
     *stop_signal.lock().unwrap() = true;
     let _ = results_thread.join();
     utils::terminal::clear_previous_line();
-    match fetched {
-        Ok(issues) => issues,
-        Err(e) => {
-            log::error!(
-                "\n\n{}\n\n\
-                However, the scan results may still be accessible at the following link:\n\n\
-                {}\n\n\
-                \n\nPlease check your network connection, authentication token, and server URL:\n\n\
-                - Server URL: {}\n\
-                - Error details: Failed to fetch scan issues: {}\n",
-                utils::terminal::set_text_color(
-                    &format!(
-                        "Failed to report the scan status for project: '{}'.",
-                        project_name
-                    ),
-                    utils::terminal::TerminalColor::Red
-                ),
-                utils::terminal::set_text_color(scan_url, utils::terminal::TerminalColor::Blue),
-                config.get_url(),
-                e
-            );
-            std::process::exit(1);
-        }
-    }
+    fetched
+}
+
+pub fn exit_for_failed_issue_fetch(
+    config: &Config,
+    project_name: &str,
+    scan_url: &str,
+    error: Box<dyn std::error::Error>,
+) -> ! {
+    log::error!(
+        "\n\n{}\n\n\
+        However, the scan results may still be accessible at the following link:\n\n\
+        {}\n\n\
+        \n\nPlease check your network connection, authentication token, and server URL:\n\n\
+        - Server URL: {}\n\
+        - Error details: Failed to fetch scan issues: {}\n",
+        utils::terminal::set_text_color(
+            &format!(
+                "Failed to report the scan status for project: '{}'.",
+                project_name
+            ),
+            utils::terminal::TerminalColor::Red
+        ),
+        utils::terminal::set_text_color(scan_url, utils::terminal::TerminalColor::Blue),
+        config.get_url(),
+        error
+    );
+    std::process::exit(1);
 }
 
 pub fn print_summary(summary: &ScanSummary, format: OutputFormat) {
@@ -1744,7 +1747,7 @@ pub fn metadata_json_from_pairs(pairs: &[String]) -> Result<Option<String>, Stri
 mod tests {
     use super::*;
     use crate::utils::api::{
-        BlockOnError, BlockingIssue, BlockingRuleResponse, BlockingRuleStats, SCAIssue,
+        BlockOnError, BlockingIssue, BlockingRuleResponse, BlockingRuleStats, Issue, SCAIssue,
         SCALocation, SCAPackage, BLOCKING_RULES_STATUS_COMPLETE, BLOCKING_RULES_STATUS_PENDING,
     };
 
@@ -2017,7 +2020,7 @@ mod tests {
                 ..Default::default()
             },
             gate,
-            &issues,
+            &ScanIssues::including_false_positives(issues),
             "https://corgea.test/scan".into(),
         );
         assert_eq!(summary.gate.exit_code(), 1);

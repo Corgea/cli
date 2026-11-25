@@ -144,7 +144,7 @@ pub fn run(
             &config.get_url(),
             &scan_details.project,
             Some(scan_details.id.clone()),
-            false,
+            utils::api::FalsePositives::Exclude,
         )
         .map(|issues| scanners::summary::legacy_urgency_counts(&issues))
         {

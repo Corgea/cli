@@ -919,13 +919,19 @@ pub fn upload_zip(
     Err("Failed to upload file".into())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FalsePositives {
+    Include,
+    Exclude,
+}
+
 // shortcut: pages 30 issues per request, so a scan with 1M findings costs ~33k
 // requests; move the summary to a server-side count endpoint once doghouse has one.
 pub fn get_all_issues(
     url: &str,
     project: &str,
     scan_id: Option<String>,
-    show_false_positives: bool,
+    false_positives: FalsePositives,
 ) -> Result<Vec<Issue>, Box<dyn std::error::Error>> {
     let mut all_issues = Vec::new();
     let mut current_page: u32 = 1;
@@ -937,7 +943,7 @@ pub fn get_all_issues(
             Some(current_page as u16),
             Some(30),
             scan_id.clone(),
-            show_false_positives,
+            false_positives == FalsePositives::Include,
         ) {
             Ok(response) => response,
             Err(e) => return Err(format!("Failed to get scan issues: {}", e).into()),
