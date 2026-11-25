@@ -505,10 +505,16 @@ pub fn render_human(summary: &ScanSummary, color: bool) -> String {
     if scan.reused_recent_scan == RecentScanReuse::Reused {
         out.push_str("Reused a recent scan of this commit.\n");
     }
+    let unrecognized = summary.unrecognized.count;
+    let unrecognized_note = if unrecognized > 0 {
+        format!(", {unrecognized} unrecognized")
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
-        "{total} findings in this scan: {}, {} in other states.\n\n",
+        "{total} findings in this scan: {}, {} in other states{unrecognized_note}.\n\n",
         ledger.paint(&format!("{open} open"), BOLD),
-        total - open
+        total - open - unrecognized
     ));
 
     out.push_str(&ledger.table(
@@ -833,7 +839,12 @@ mod tests {
         assert_eq!(summary.counts(Status::Open).total(), 1);
         assert_eq!(summary.unrecognized.count, 2);
         assert_eq!(summary.total_findings(), 3);
-        assert!(render_human(&summary, false).contains("status=snoozed, urgency=IN"));
+        let human = render_human(&summary, false);
+        assert!(human.contains("status=snoozed, urgency=IN"));
+        assert!(
+            human.contains("3 findings in this scan: 1 open, 0 in other states, 2 unrecognized."),
+            "{human}"
+        );
         assert!(render_agent(&summary).contains("unrecognized\t2\tstatus=snoozed, urgency=IN\n"));
         let json: Value = serde_json::from_str(&render_json(&summary)).unwrap();
         assert_eq!(json["unrecognized"]["count"], 2);
