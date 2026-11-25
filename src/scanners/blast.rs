@@ -168,11 +168,11 @@ pub fn run(
     });
 
     let reused_recent_scan = skip_recent.as_ref().map(|_| reused_scan.is_some());
-    let (scan, project_id) = match reused_scan {
-        Some(scan) => {
-            let project_id = scan.project_id.clone();
-            (scan, project_id)
-        }
+    let ScanToReport { scan, project_id } = match reused_scan {
+        Some(scan) => ScanToReport {
+            project_id: scan.project_id.clone(),
+            scan,
+        },
         None => start_new_scan(
             config,
             &project_name,
@@ -438,6 +438,11 @@ fn partial_scan_files(
     (to_scan, skipped)
 }
 
+struct ScanToReport {
+    scan: utils::api::ScanResponse,
+    project_id: Option<String>,
+}
+
 /// Package the project, upload it, and wait for the scan to finish.
 #[allow(clippy::too_many_arguments)]
 fn start_new_scan(
@@ -453,7 +458,7 @@ fn start_new_scan(
     exclude: Option<String>,
     include_rules: crate::include_rules::IncludeRules,
     include_images: Vec<String>,
-) -> (utils::api::ScanResponse, Option<String>) {
+) -> ScanToReport {
     statusln!("\nScanning with BLAST 🚀🚀🚀");
 
     if let Some(scan_type) = &scan_type {
@@ -927,8 +932,10 @@ fn start_new_scan(
        utils::terminal::set_text_color("Your scan will continue securely in the Corgea cloud.\nYou can safely exit the process now if you prefer not to wait for it to complete.\n\n", utils::terminal::TerminalColor::Blue)
     );
 
-    let scan = wait_for_scan(config, &scan_id, WaitBudget::start());
-    (scan, upload_result.project_id)
+    ScanToReport {
+        scan: wait_for_scan(config, &scan_id, WaitBudget::start()),
+        project_id: upload_result.project_id,
+    }
 }
 
 /// Write the `--out-format` report for a completed scan to `--out-file`.
