@@ -3,6 +3,7 @@ use crate::scan::build_scan_url;
 use crate::scanners::blast;
 use crate::utils;
 use crate::utils::api::ProjectSelector;
+use corgea::{status, statusln};
 
 #[derive(Default)]
 pub struct WaitArgs {
@@ -127,19 +128,19 @@ pub fn run(config: &Config, args: WaitArgs) {
     // never matched and finished scans were polled again.
     match blast::classify_scan_status(&scan.status) {
         blast::ScanState::Running => {
-            print!(
+            status!(
                 "\n\nWaiting for scan with ID: {}.\n\nYou can view it populate at the link:\n{}\n\n",
                 scan_id,
                 utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
             );
-            print!(
+            status!(
                "{}",
                utils::terminal::set_text_color("Your scan will continue securely in the Corgea cloud.\nYou can safely exit the process now if you prefer not to wait for it to complete.\n\n", utils::terminal::TerminalColor::Blue)
             );
             blast::wait_for_scan(config, &scan_id, budget);
         }
         blast::ScanState::Completed => {
-            println!("Scan has been processed successfully!");
+            statusln!("Scan has been processed successfully!");
             if let Some(warnings) = blast::format_scan_warnings(&scan) {
                 log::warn!("\n{}\n", warnings);
             }
@@ -147,7 +148,7 @@ pub fn run(config: &Config, args: WaitArgs) {
         // Report the failure rather than claim success or poll forever.
         blast::ScanState::Failed => {
             log::error!("\n\n{}\n", blast::format_scan_failure(&scan));
-            println!(
+            statusln!(
                 "\nYou can view the scan details at the following link:\n{}",
                 utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Blue)
             );
@@ -157,7 +158,7 @@ pub fn run(config: &Config, args: WaitArgs) {
 
     match blast::report_scan_status(&config.get_url(), &project_name, &scan_id) {
         Ok(_) => {
-            println!(
+            statusln!(
                 "\n\nYou can view the scan results at the following link:\n{}",
                 utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
             );

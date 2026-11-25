@@ -6,6 +6,7 @@ use crate::scan::build_scan_url;
 use crate::targets;
 use crate::utils;
 use crate::utils::api::SCAIssue;
+use corgea::{status, statusln};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -64,18 +65,18 @@ fn export_included_images(
         return Ok(Vec::new());
     }
 
-    println!(
+    statusln!(
         "Including {} container image(s) in this scan. Corgea will scan them instead of the base images referenced in your code.\n",
         images.len()
     );
 
     let archives = images::save_images(images, &temp_dir.join("images"))?;
 
-    println!("\nContainer images bundled with this scan:");
+    statusln!("\nContainer images bundled with this scan:");
     for archive in &archives {
-        println!("  {}", archive.description());
+        statusln!("  {}", archive.description());
     }
-    println!();
+    statusln!();
 
     Ok(archives)
 }
@@ -149,7 +150,7 @@ pub fn run(
     // server reports it, as it is for a fresh upload.
     let reused_scan = skip_recent.as_ref().and_then(|skip| {
         if let Some(reason) = include_rules.reuse_refusal() {
-            println!("Scanning instead of reusing a previous scan: {reason}.");
+            statusln!("Scanning instead of reusing a previous scan: {reason}.");
             // The flag promises this marker on every run, and reuse was
             // declined before resolve_reusable_scan could print it.
             crate::skip_scan::report_scan_not_skipped();
@@ -203,7 +204,7 @@ pub fn run(
         Ok(issues_classes) => {
             *stop_signal.lock().unwrap() = true;
             let _ = results_thread.join();
-            println!(
+            statusln!(
                 "\n\nYou can view the scan results at the following link:\n{}",
                 utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
             );
@@ -256,7 +257,7 @@ pub fn run(
         );
         let blocking_rules = wait_for_blocking_rules(config, &scan_id, None);
         if blocking_rules.block {
-            println!("\nExiting with error code 1 due to some issues violating some blocking rules defined for this project.\nfor more details, please check the scan results at the link: {}\nAlternatively, you can run {} to view the issues list on your local machine.",
+            statusln!("\nExiting with error code 1 due to some issues violating some blocking rules defined for this project.\nfor more details, please check the scan results at the link: {}\nAlternatively, you can run {} to view the issues list on your local machine.",
             utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green),
             utils::terminal::set_text_color(
                 &format!("corgea ls -i -s={}", scan_id),
@@ -274,7 +275,7 @@ pub fn run(
             // list is drawn from the returned page, which is all the gate needs
             // to name the rules at fault.
             let triggered = triggered_slug_summary(&blocking_rules.blocking_issues);
-            println!(
+            statusln!(
                 "\nExiting with error code 1: {} issue(s) violated the blocking rule(s) {}.\nFor more details, check the scan results at: {}\nAlternatively, run {} to view the issues list on your local machine.",
                 blocking_rules.blocked_count(),
                 utils::terminal::set_text_color(&triggered, utils::terminal::TerminalColor::Red),
@@ -286,13 +287,13 @@ pub fn run(
             );
             std::process::exit(1);
         }
-        println!(
+        statusln!(
             "\nNo issues violated the blocking rule(s): {}.",
             utils::terminal::set_text_color(block_on, utils::terminal::TerminalColor::Green)
         );
     }
 
-    print!("\n\nThank you for using Corgea! 🐕\n\n");
+    status!("\n\nThank you for using Corgea! 🐕\n\n");
 
     if let Some(fail_on) = fail_on {
         let tokens = match parse_fail_on_tokens(&fail_on) {
@@ -329,7 +330,7 @@ pub fn run(
         };
 
         if fail_on_gate_trips(&tokens, &classifications, &sca_issues) {
-            println!(
+            statusln!(
                 "\nExiting with error code 1: scan results matched --fail-on {}.",
                 fail_on
             );
@@ -457,18 +458,18 @@ fn start_new_scan(
     include_rules: crate::include_rules::IncludeRules,
     include_images: Vec<String>,
 ) -> (String, Option<String>) {
-    println!("\nScanning with BLAST 🚀🚀🚀");
+    statusln!("\nScanning with BLAST 🚀🚀🚀");
 
     if let Some(scan_type) = &scan_type {
-        println!("Running Scan Type: {}", scan_type);
+        statusln!("Running Scan Type: {}", scan_type);
     }
     if let Some(policy) = &policy {
-        println!(
+        statusln!(
             "Including only specified policies for policy scan: {}",
             policy
         );
     }
-    println!("\n\n");
+    statusln!("\n\n");
     let temp_dir = match utils::generic::create_private_temp_dir("corgea-scan-") {
         Ok(dir) => dir,
         Err(e) => {
@@ -522,7 +523,7 @@ fn start_new_scan(
             Err(e) => {
                 *stop_signal.lock().unwrap() = true;
                 let _ = packaging_thread.join();
-                print!(
+                status!(
                     "\r{}",
                     utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
                 );
@@ -568,20 +569,20 @@ fn start_new_scan(
         // Named, not just counted: these paths override .gitignore and the
         // default excludes (which cover `**/*.env` among others), so whoever
         // reads the log needs to see what actually went into the archive.
-        println!(
+        statusln!(
             "\nForce-including {} file(s) Corgea would otherwise skip:",
             force_included.len()
         );
         for path in force_included.iter().take(FORCE_INCLUDE_PREVIEW) {
-            println!("  {}", path.display());
+            statusln!("  {}", path.display());
         }
         if force_included.len() > FORCE_INCLUDE_PREVIEW {
-            println!("  (+{} more)", force_included.len() - FORCE_INCLUDE_PREVIEW);
+            statusln!("  (+{} more)", force_included.len() - FORCE_INCLUDE_PREVIEW);
         }
     }
 
     if target_str.is_none() && exclude.is_some() {
-        println!("Excluding files matching: {}", exclude.as_deref().unwrap());
+        statusln!("Excluding files matching: {}", exclude.as_deref().unwrap());
     }
 
     if let Some(target_value) = target_str {
@@ -594,7 +595,7 @@ fn start_new_scan(
                     if image_archives.is_empty() && force_included.is_empty() {
                         *stop_signal.lock().unwrap() = true;
                         let _ = packaging_thread.join();
-                        print!(
+                        status!(
                             "\r{}",
                             utils::terminal::set_text_color(
                                 "",
@@ -637,41 +638,41 @@ fn start_new_scan(
                         )
                     );
                 } else if *only_uncommitted {
-                    println!("\rFiles to be submitted for partial scan:\n");
+                    statusln!("\rFiles to be submitted for partial scan:\n");
                     for (index, file) in result.files.iter().enumerate() {
                         if let Ok(relative) =
                             file.strip_prefix(std::env::current_dir().unwrap_or_default())
                         {
-                            println!("{}: {}", index + 1, relative.display());
+                            statusln!("{}: {}", index + 1, relative.display());
                         } else {
-                            println!("{}: {}", index + 1, file.display());
+                            statusln!("{}: {}", index + 1, file.display());
                         }
                     }
-                    println!();
+                    statusln!();
                 } else {
                     let file_count = result.files.len();
-                    println!("Scanning {} files (target mode)", file_count);
+                    statusln!("Scanning {} files (target mode)", file_count);
 
                     let display_count = std::cmp::min(20, file_count);
                     for file in result.files.iter().take(display_count) {
                         if let Ok(relative) =
                             file.strip_prefix(std::env::current_dir().unwrap_or_default())
                         {
-                            println!("  {}", relative.display());
+                            statusln!("  {}", relative.display());
                         } else {
-                            println!("  {}", file.display());
+                            statusln!("  {}", file.display());
                         }
                     }
                     if file_count > display_count {
-                        println!("  (+{} more)", file_count - display_count);
+                        statusln!("  (+{} more)", file_count - display_count);
                     }
-                    println!();
+                    statusln!();
                 }
             }
             Err(e) => {
                 *stop_signal.lock().unwrap() = true;
                 let _ = packaging_thread.join();
-                print!(
+                status!(
                     "\r{}",
                     utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
                 );
@@ -696,7 +697,7 @@ fn start_new_scan(
             if archive.added_files.is_empty() {
                 *stop_signal.lock().unwrap() = true;
                 let _ = packaging_thread.join();
-                print!(
+                status!(
                     "\r{}",
                     utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
                 );
@@ -715,7 +716,7 @@ fn start_new_scan(
         Err(e) => {
             *stop_signal.lock().unwrap() = true;
             let _ = packaging_thread.join();
-            print!(
+            status!(
                 "\r{}",
                 utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
             );
@@ -729,7 +730,7 @@ fn start_new_scan(
     };
     *stop_signal.lock().unwrap() = true;
     let _ = packaging_thread.join();
-    print!(
+    status!(
         "\r{}Project packaged successfully.\n",
         utils::terminal::set_text_color("", utils::terminal::TerminalColor::Green)
     );
@@ -768,11 +769,11 @@ fn start_new_scan(
                 )
             );
         } else {
-            println!("\nFiles to be submitted for partial scan:\n");
+            statusln!("\nFiles to be submitted for partial scan:\n");
             for (index, file) in files.iter().enumerate() {
-                println!("{}: {}", index + 1, file);
+                statusln!("{}: {}", index + 1, file);
             }
-            println!();
+            statusln!();
         }
         files
     });
@@ -789,12 +790,12 @@ fn start_new_scan(
         match notice_sha {
             Some(sha) => {
                 let short_sha = &sha[..sha.len().min(7)];
-                println!(
+                statusln!(
                     "Working tree has uncommitted changes - scanning your local files, not commit {short_sha}."
                 );
             }
             None => {
-                println!("Working tree has uncommitted changes - scanning your local files.")
+                statusln!("Working tree has uncommitted changes - scanning your local files.")
             }
         }
     }
@@ -861,7 +862,7 @@ fn start_new_scan(
         // findings forward for whatever the diff omits — so without this an
         // include rule would never get the file looked at on an incremental run.
         .and_then(|plan| plan.including(&repo_relative_strings(&force_included)))
-        .inspect_err(|reason| println!("Scanning every file: {}.", reason.detail))
+        .inspect_err(|reason| statusln!("Scanning every file: {}.", reason.detail))
     };
     // Stored with the scan for a later run to diff against, so it is worth
     // uploading even when this run scans everything. Under
@@ -872,7 +873,7 @@ fn start_new_scan(
         .manifest
         .as_ref()
         .and_then(Manifest::encode);
-    println!("\n\nSubmitting scan to Corgea:");
+    statusln!("\n\nSubmitting scan to Corgea:");
     let upload_result = match utils::api::upload_zip(
         &zip_path,
         &config.get_url(),
@@ -919,13 +920,13 @@ fn start_new_scan(
     );
 
     let _ = utils::generic::delete_directory(&temp_dir);
-    print!(
+    status!(
         "\n\nScan has started with ID: {}.\n\nYou can view it populate at the link:\n{}\n\n",
         scan_id,
         utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
     );
 
-    print!(
+    status!(
        "{}",
        utils::terminal::set_text_color("Your scan will continue securely in the Corgea cloud.\nYou can safely exit the process now if you prefer not to wait for it to complete.\n\n", utils::terminal::TerminalColor::Blue)
     );
@@ -995,7 +996,7 @@ fn write_scan_report(
         stop_spinner();
         fs::write(out_file, results_json).expect("Failed to write JSON file, check if the file path is valid and you have the necessary permissions to write to it.");
         utils::terminal::clear_previous_line();
-        println!("\n\nScan results written to: {}\n\n", out_file);
+        statusln!("\n\nScan results written to: {}\n\n", out_file);
         return;
     }
 
@@ -1021,7 +1022,7 @@ fn write_scan_report(
     stop_spinner();
     fs::write(out_file, report).unwrap_or_else(|_| panic!("\n\nFailed to write {label} file, check if the file path is valid and you have the necessary permissions to write to it."));
     utils::terminal::clear_previous_line();
-    println!("\n\nScan report written to: {}\n\n", out_file);
+    statusln!("\n\nScan report written to: {}\n\n", out_file);
 }
 
 /// Write a CycloneDX SBOM of the working directory to `sbom_file`.
@@ -1033,7 +1034,7 @@ fn write_sbom(sbom_file: &str) {
                 log::error!("\n\nFailed to write SBOM to '{}': {}\n\n", sbom_file, e);
                 std::process::exit(1);
             }
-            println!("CycloneDX SBOM written to: {}\n", sbom_file);
+            statusln!("CycloneDX SBOM written to: {}\n", sbom_file);
         }
         Err(e) => {
             log::error!("\n\nFailed to generate SBOM: {}\n\n", e);
@@ -1497,7 +1498,7 @@ pub fn wait_for_scan(config: &Config, scan_id: &str, budget: WaitBudget) {
 
     *stop_signal.lock().unwrap() = true;
     let _ = spinner.join();
-    print!(
+    status!(
         "\r{}",
         utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
     );
@@ -1510,13 +1511,14 @@ pub fn wait_for_scan(config: &Config, scan_id: &str, budget: WaitBudget) {
         }
     };
 
-    println!(
+    statusln!(
         "\r╭────────────────────────────────────────────╮\n\
              │ {: <42} │\n\
              │   🎉🎉 Scan Completed Successfully! 🎉🎉   │\n\
              │ {: <42} │\n\
              ╰────────────────────────────────────────────╯\n",
-        " ", " "
+        " ",
+        " "
     );
     if let Some(warnings) = format_scan_warnings(&scan) {
         log::warn!("{}\n", warnings);
@@ -1534,7 +1536,7 @@ const BLOCKING_RULES_POLL_INTERVAL: Duration = Duration::from_secs(2);
 fn stop_blocking_rules_spinner(stop_signal: &Arc<Mutex<bool>>, spinner: thread::JoinHandle<()>) {
     *stop_signal.lock().unwrap() = true;
     let _ = spinner.join();
-    print!(
+    status!(
         "{}",
         utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset)
     );
@@ -1678,21 +1680,21 @@ pub fn report_scan_status(
 
     let total_issues = classification_counts.values().sum::<usize>();
     utils::terminal::clear_previous_line();
-    println!("\rScan Results:-\n");
-    println!("{:<20} | Count", "Classification");
-    println!("{:-<20} | ", "");
+    statusln!("\rScan Results:-\n");
+    statusln!("{:<20} | Count", "Classification");
+    statusln!("{:-<20} | ", "");
 
     let order = vec!["CR", "HI", "ME", "LO"];
     for classification in order {
         if let Some(count) = classification_counts.get(classification) {
-            println!("{:<20} | {}", classification, count);
+            statusln!("{:<20} | {}", classification, count);
         } else {
-            println!("{:<20} | {}", classification, 0);
+            statusln!("{:<20} | {}", classification, 0);
         }
     }
 
-    println!("{:-<20} | ", "");
-    println!("{:<20} | {}", "Total", total_issues);
+    statusln!("{:-<20} | ", "");
+    statusln!("{:<20} | {}", "Total", total_issues);
     Ok(classification_counts)
 }
 

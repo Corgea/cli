@@ -895,7 +895,9 @@ pub fn upload_zip(
 
         if bytes_read < CHUNK_SIZE {
             utils::terminal::show_progress_bar(1.0);
-            println!();
+            if corgea::output_format::decorations_enabled() {
+                println!();
+            }
             let body: HashMap<String, Value> = response.json()?;
             if let Some(scan_id_value) = body.get("scan_id") {
                 let scan_id = scan_id_value.as_str().unwrap().to_string();

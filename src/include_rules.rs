@@ -13,6 +13,7 @@
 
 use crate::config::Config;
 use crate::utils::api;
+use corgea::statusln;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
@@ -223,7 +224,7 @@ pub fn resolve(
                 push_unique(&mut patterns, pattern);
             }
             if !patterns.is_empty() {
-                println!(
+                statusln!(
                     "\n\nApplying {} project include rule(s) from Corgea: {}.",
                     patterns.len(),
                     patterns.join(", ")
