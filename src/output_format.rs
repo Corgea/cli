@@ -66,24 +66,37 @@ fn agent_env_detected(env: impl Fn(&str) -> Option<String>) -> bool {
     })
 }
 
-static PROCESS_FORMAT: OnceLock<OutputFormat> = OnceLock::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessOutput {
+    LegacyCommand,
+    Format(OutputFormat),
+}
+
+static PROCESS_OUTPUT: OnceLock<ProcessOutput> = OnceLock::new();
+
+fn process_output() -> ProcessOutput {
+    PROCESS_OUTPUT
+        .get()
+        .copied()
+        .unwrap_or(ProcessOutput::LegacyCommand)
+}
 
 pub fn set_process_format(format: OutputFormat) {
-    let _ = PROCESS_FORMAT.set(format);
+    let _ = PROCESS_OUTPUT.set(ProcessOutput::Format(format));
 }
 
 pub fn decorations_enabled() -> bool {
-    match PROCESS_FORMAT.get() {
-        None => true,
-        Some(OutputFormat::Human) => std::io::stdout().is_terminal(),
-        Some(_) => false,
+    match process_output() {
+        ProcessOutput::LegacyCommand => true,
+        ProcessOutput::Format(OutputFormat::Human) => std::io::stdout().is_terminal(),
+        ProcessOutput::Format(_) => false,
     }
 }
 
 pub fn colors_enabled() -> bool {
-    match PROCESS_FORMAT.get() {
-        None => true,
-        Some(_) => decorations_enabled() && std::env::var_os("NO_COLOR").is_none(),
+    match process_output() {
+        ProcessOutput::LegacyCommand => true,
+        ProcessOutput::Format(_) => decorations_enabled() && std::env::var_os("NO_COLOR").is_none(),
     }
 }
 
@@ -94,7 +107,7 @@ pub fn write_status(args: fmt::Arguments) {
     } else {
         text.replace('\r', "")
     };
-    if PROCESS_FORMAT.get() == Some(&OutputFormat::Json) {
+    if process_output() == ProcessOutput::Format(OutputFormat::Json) {
         eprint!("{text}");
     } else {
         print!("{text}");
