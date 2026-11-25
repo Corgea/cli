@@ -186,6 +186,55 @@ fn scan_include_image_bundles_every_exported_archive() {
     }
 }
 
+/// Stub container CLI that has no local image, so the scan pulls it. The pull
+/// writes progress to stdout, as `docker pull` does.
+const PULLING_ENGINE: &str = r#"#!/bin/sh
+if [ "$1" = "image" ]; then
+  exit 1
+fi
+if [ "$1" = "pull" ]; then
+  echo "latest: Pulling from library/$2"
+  exit 0
+fi
+if [ "$1" = "save" ]; then
+  printf 'archive of %s' "$4" > "$3"
+  exit 0
+fi
+exit 1
+"#;
+
+/// `--format json` promises one JSON document on stdout. An image pull must not
+/// leak the container CLI's progress into it.
+#[cfg(unix)]
+#[test]
+fn scan_format_json_keeps_image_pull_output_off_stdout() {
+    let (base_url, _uploads) = spawn_recording_scan_stub("scan-pull-json");
+    let project = stub_project();
+    let bin = TempDir::new().expect("engine dir");
+    write_script(bin.path(), "stub-engine", PULLING_ENGINE);
+
+    let (mut cmd, _home) = corgea_isolated();
+    cmd.current_dir(project.path())
+        .env("CORGEA_URL", &base_url)
+        .env("CORGEA_TOKEN", "test-token")
+        .env("CORGEA_CONTAINER_ENGINE", bin.path().join("stub-engine"))
+        .args(["scan", "--format", "json", "--include-image", "myapp:1.0"]);
+
+    let output = cmd.output().expect("run corgea scan --format json");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    serde_json::from_str::<serde_json::Value>(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is not one JSON document ({e}):\n{stdout}"));
+    assert!(
+        stderr.contains("Pulling from library/myapp:1.0"),
+        "pull progress should stay visible on stderr, got:\n{stderr}"
+    );
+}
+
 /// An explicit image is a complete scan payload: a clean working tree makes
 /// `--only-uncommitted` resolve to zero files, and the scan must still upload the
 /// exported archive instead of failing on the empty target.
