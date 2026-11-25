@@ -919,9 +919,6 @@ pub fn upload_zip(
     Err("Failed to upload file".into())
 }
 
-/// Every issue of a project or scan, paging through the list. False positives
-/// are included only when `show_false_positives` is set, as the server hides
-/// them by default.
 // shortcut: pages 30 issues per request, so a scan with 1M findings costs ~33k
 // requests; move the summary to a server-side count endpoint once doghouse has one.
 pub fn get_all_issues(

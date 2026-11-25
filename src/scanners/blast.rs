@@ -249,11 +249,6 @@ pub fn run(
     }
 }
 
-/// Run the one gate this command line asked for and say how it came out.
-///
-/// `main` lets at most one of `--fail`, `--block-on` and `--fail-on` through.
-/// `classifications` are the counts `--fail-on` has always used: every finding
-/// but false positives, whatever its status.
 fn evaluate_gate(
     config: &Config,
     project_name: &str,
@@ -444,9 +439,6 @@ fn partial_scan_files(
 }
 
 /// Package the project, upload it, and wait for the scan to finish.
-///
-/// Returns the finished scan's record and, when the upload reported one, its
-/// project id.
 #[allow(clippy::too_many_arguments)]
 fn start_new_scan(
     config: &Config,
@@ -1105,8 +1097,6 @@ pub fn severity_gate_trips(threshold: &str, counts: &HashMap<String, usize>) -> 
     })
 }
 
-/// How many findings trip `--fail-on`: those at or above its lowest severity
-/// threshold, plus malicious dependencies when it lists `malicious`.
 pub fn fail_on_tripped_count(
     tokens: &[String],
     counts: &HashMap<String, usize>,
@@ -1473,9 +1463,6 @@ impl ScanPoll {
     }
 }
 
-/// Block until the scan reaches a terminal state, then report it and return
-/// its final record.
-///
 /// Exits non-zero on failure or poll timeout, so CI cannot mistake a broken
 /// scan for a clean one.
 pub fn wait_for_scan(
@@ -1663,8 +1650,6 @@ fn wait_for_blocking_rules(
     }
 }
 
-/// Every finding of the scan, false positives included, behind a spinner.
-/// Exits 1 naming the server and the link when the list cannot be read.
 pub fn collect_scan_issues(
     config: &Config,
     project_name: &str,
@@ -1710,8 +1695,6 @@ pub fn collect_scan_issues(
     }
 }
 
-/// Print the summary on stdout in `format`; agent hints go to stderr, as
-/// `deps` prints its own.
 pub fn print_summary(summary: &ScanSummary, format: OutputFormat) {
     match format {
         OutputFormat::Human => print!("{}", summary::render_human(summary, colors_enabled())),
@@ -1986,7 +1969,6 @@ mod tests {
             ),
             0
         );
-        // the lowest listed threshold sets the count
         assert_eq!(
             fail_on_tripped_count(
                 &tokens("CR,ME"),
@@ -2001,8 +1983,6 @@ mod tests {
     fn fail_on_hi_fails_the_gate_and_leads_the_agent_report() {
         let config: Config =
             toml::from_str("url = \"http://127.0.0.1:9\"\ndebug = 0\ntoken = \"t\"").unwrap();
-        // An accepted-risk HI still counts, as --fail-on always has; a false
-        // positive does not.
         let issues: Vec<Issue> = serde_json::from_value(serde_json::json!([
             issue_json("o1", "open", "ME"),
             issue_json("a1", "accepted_risk", "HI"),

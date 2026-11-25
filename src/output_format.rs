@@ -1,8 +1,3 @@
-//! `--format human|agent|json|quiet`, shared by every command that offers it.
-//!
-//! With no `--format`, an agent environment selects agent output and anything
-//! else human output; an explicit value always wins.
-
 use std::fmt;
 use std::io::IsTerminal;
 use std::sync::OnceLock;
@@ -15,8 +10,6 @@ pub enum OutputFormat {
     Quiet,
 }
 
-/// Variables an agent harness sets. Any of them set to something other than
-/// empty, `0` or `false` selects agent output.
 const AGENT_ENV_VARS: [&str; 8] = [
     "AI_AGENT",
     "CODEX_SANDBOX",
@@ -41,7 +34,6 @@ impl OutputFormat {
         }
     }
 
-    /// The explicit format, else agent output in an agent environment, else human.
     pub fn resolve(explicit: Option<Self>) -> Self {
         Self::resolve_with(explicit, |name| std::env::var(name).ok())
     }
@@ -74,15 +66,12 @@ fn agent_env_detected(env: impl Fn(&str) -> Option<String>) -> bool {
     })
 }
 
-/// The format a `scan` or `wait` run renders in, set once before it prints.
-/// Unset for every other command, which keeps its terminal output as it was.
 static PROCESS_FORMAT: OnceLock<OutputFormat> = OnceLock::new();
 
 pub fn set_process_format(format: OutputFormat) {
     let _ = PROCESS_FORMAT.set(format);
 }
 
-/// Spinners, progress bars and `\r` redraws: human output on a terminal only.
 pub fn decorations_enabled() -> bool {
     match PROCESS_FORMAT.get() {
         None => true,
@@ -91,7 +80,6 @@ pub fn decorations_enabled() -> bool {
     }
 }
 
-/// ANSI colors: as decorations, and never when `NO_COLOR` is set.
 pub fn colors_enabled() -> bool {
     match PROCESS_FORMAT.get() {
         None => true,
@@ -99,8 +87,6 @@ pub fn colors_enabled() -> bool {
     }
 }
 
-/// Write a progress or status line. JSON output owns stdout, so these go to
-/// stderr there; `\r` is dropped wherever decorations are off.
 pub fn write_status(args: fmt::Arguments) {
     let text = args.to_string();
     let text = if decorations_enabled() {
@@ -115,7 +101,6 @@ pub fn write_status(args: fmt::Arguments) {
     }
 }
 
-/// `print!` for progress and status text; see [`write_status`].
 #[macro_export]
 macro_rules! status {
     ($($arg:tt)*) => {
@@ -123,7 +108,6 @@ macro_rules! status {
     };
 }
 
-/// `println!` for progress and status text; see [`write_status`].
 #[macro_export]
 macro_rules! statusln {
     () => {

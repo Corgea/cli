@@ -3,8 +3,6 @@ use hyper::{Method, StatusCode};
 use serde_json::json;
 use tempfile::TempDir;
 
-/// JSON output owns stdout: the upload progress, the completion banner and
-/// every other status line go to stderr, and the document carries the gate.
 #[test]
 fn scan_format_json_prints_only_the_document_on_stdout() {
     let project = git_project();
@@ -36,7 +34,6 @@ fn scan_format_json_prints_only_the_document_on_stdout() {
     assert!(stderr.contains("Scan has started with ID"), "{context}");
 }
 
-/// Agent output leads with the gate result, without ANSI or carriage returns.
 #[test]
 fn scan_format_agent_leads_with_the_gate_record() {
     let project = git_project();

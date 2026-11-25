@@ -43,7 +43,6 @@ const PROJECT_NAMING_MODE_HELP: &str = "Derive the Corgea project name instead o
 
 const PROJECT_NAMING_MODE_QUERY_HELP: &str = "Query the project that a scan with the same --project-naming-mode names. sparse-postfixed: in a sparse checkout at the repository root, the default project name followed by the checked-out top-level folders (monorepo-jsoar-agent). Anywhere else it warns and the project is resolved as usual.";
 
-/// `--format` help shared by `scan` and `wait`.
 const SUMMARY_FORMAT_HELP: &str = "How to print the results summary when the scan finishes: human (tables for a terminal), agent (tab-separated records for coding agents), json (one JSON document on stdout; every other line goes to stderr), or quiet (no summary; the exit code still carries any gate). Defaults to agent when an agent environment is detected (AI_AGENT, CLAUDECODE, CODEX_SANDBOX, CURSOR_AGENT and related variables), otherwise human. Independent of --out-format/--out-file.";
 
 #[derive(Parser, Debug)]

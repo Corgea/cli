@@ -1,6 +1,3 @@
-//! The report `scan` and `wait` print when a scan finishes: one `ScanSummary`,
-//! rendered for humans, agents or JSON parsers.
-
 use crate::utils::api::Issue;
 use crate::utils::terminal::{set_text_color, TerminalColor};
 use serde_json::{json, Map, Value};
@@ -63,13 +60,11 @@ pub enum Status {
 
 struct StatusInfo {
     status: Status,
-    /// The server's value, and the JSON and agent key.
     key: &'static str,
     label: &'static str,
     meaning: &'static str,
 }
 
-/// Every status, in report order.
 const STATUSES: [StatusInfo; 6] = [
     StatusInfo {
         status: Status::Open,
@@ -150,7 +145,6 @@ pub struct ScanInfo {
     pub project: String,
     pub branch: Option<String>,
     pub git_sha: Option<String>,
-    /// `Some` only when `--skip-if-commit-scanned-recently` was passed.
     pub reused_recent_scan: Option<bool>,
 }
 
@@ -202,8 +196,6 @@ pub struct IssueRow {
     pub line: u32,
 }
 
-/// Findings whose status or severity this CLI does not know. They count toward
-/// the total and are named in every format, never dropped or guessed at.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Unrecognized {
     pub count: usize,
@@ -214,7 +206,6 @@ pub struct Unrecognized {
 pub struct ScanSummary {
     pub scan: ScanInfo,
     pub gate: Gate,
-    /// Indexed by `Status as usize`.
     by_status: [SeverityCounts; 6],
     pub unrecognized: Unrecognized,
     pub fix_first: Vec<IssueRow>,
@@ -223,13 +214,8 @@ pub struct ScanSummary {
 
 const FIX_FIRST_LIMIT: usize = 5;
 
-/// The label of the one open-issues row until the server splits findings by
-/// scanner.
 const CODE_ROW_LABEL: &str = "Code (SAST, Logic & Auth, Secrets)";
 
-/// The server hides a finding as a false positive when its status says so or
-/// when auto-triage held it as one; the list carries the hold as
-/// `auto_triage.false_positive_detection.status`.
 fn is_false_positive(issue: &Issue) -> bool {
     issue.status == "false_positive"
         || issue.auto_triage.false_positive_detection.status == "false_positive"
@@ -257,10 +243,6 @@ fn classify(issue: &Issue) -> Result<(Status, Severity), Vec<String>> {
     }
 }
 
-/// Counts by urgency code over the findings the server lists by default (every
-/// one but false positives), keyed as the server sends them. This is what
-/// `--fail-on` and the `--out-format json` report always counted, so their
-/// results do not move with the summary.
 pub fn legacy_urgency_counts(issues: &[Issue]) -> HashMap<String, usize> {
     let mut counts = HashMap::new();
     for issue in issues.iter().filter(|issue| !is_false_positive(issue)) {
@@ -270,7 +252,6 @@ pub fn legacy_urgency_counts(issues: &[Issue]) -> HashMap<String, usize> {
 }
 
 impl ScanSummary {
-    /// `issues` must include false positives (`show_false_positives=true`).
     pub fn build(scan: ScanInfo, gate: Gate, issues: &[Issue], results_url: String) -> Self {
         let mut by_status = [SeverityCounts::default(); 6];
         let mut unrecognized = Unrecognized::default();
@@ -367,7 +348,6 @@ fn table_row(label: &str, counts: &SeverityCounts, width: usize) -> String {
     row
 }
 
-/// Ledger layout: header, open issues, every status, then the link.
 pub fn render_human(summary: &ScanSummary, color: bool) -> String {
     let paint = |text: &str, tint: TerminalColor| {
         if color {
@@ -453,7 +433,6 @@ fn tsv_cell(value: &str) -> String {
     value.replace(['\t', '\r', '\n'], " ")
 }
 
-/// TSV records, one header row per record kind, as `deps --format agent`.
 pub fn render_agent(summary: &ScanSummary) -> String {
     let gate = &summary.gate;
     let scan = &summary.scan;
@@ -521,7 +500,6 @@ pub fn render_agent(summary: &ScanSummary) -> String {
     out
 }
 
-/// Next steps for an agent, printed to stderr after the records as `deps` does.
 pub fn agent_hints(summary: &ScanSummary) -> String {
     let issue_id = summary
         .fix_first
@@ -644,7 +622,6 @@ mod tests {
         issue
     }
 
-    /// One finding per status, plus a second open one and an auto-triage hold.
     fn mixed_issues() -> Vec<Issue> {
         vec![
             issue("o1", "open", "HI", "src/b.js", 9),

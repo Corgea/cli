@@ -1010,8 +1010,6 @@ pub(crate) fn append_wait_plan(
     ));
 }
 
-/// The human summary of `regular_issue_page`: four open findings, one
-/// critical, two high and one medium.
 pub(crate) fn assert_issue_summary(stdout: &str, context: &str) {
     for line in [
         "4 findings in this scan: 4 open, 0 in other states.",
@@ -1022,8 +1020,6 @@ pub(crate) fn assert_issue_summary(stdout: &str, context: &str) {
     }
 }
 
-/// The summary reads every finding, false positives included, so the open
-/// count and the false-positive row come from the same list.
 pub(crate) fn assert_summary_issue_query(request: &CapturedRequest) -> Result<(), String> {
     assert_query(request, "page", "1")?;
     assert_query(request, "page_size", "30")?;
