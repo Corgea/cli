@@ -517,13 +517,7 @@ fn get_repo_info_inner(dir: &str, sample_dirty: bool) -> Result<Option<RepoInfo>
         return Ok(None);
     }
 
-    let branch = repo.head().ok().and_then(|head| {
-        if head.is_branch() {
-            head.shorthand().ok().map(|s| s.to_string())
-        } else {
-            None
-        }
-    });
+    let branch = head_branch(&repo, crate::cicd::ci_branch);
 
     let sha = repo.head().ok().and_then(|head| {
         head.peel_to_commit()
@@ -539,6 +533,23 @@ fn get_repo_info_inner(dir: &str, sample_dirty: bool) -> Result<Option<RepoInfo>
         sha,
         dirty,
     }))
+}
+
+/// The branch HEAD is on, or the one `ci_branch` names when HEAD is detached.
+///
+/// CI systems check out a commit, not a branch, so there the pipeline's own
+/// variables are the only record of which branch the commit was built for. A
+/// checked-out branch always wins: the environment describes what triggered
+/// the pipeline, which a later `git checkout` in the same job may have left.
+fn head_branch(repo: &Repository, ci_branch: impl FnOnce() -> Option<String>) -> Option<String> {
+    let head = repo.head().ok()?;
+    if head.is_branch() {
+        head.shorthand().ok().map(|s| s.to_string())
+    } else if repo.head_detached().unwrap_or(false) {
+        ci_branch()
+    } else {
+        None
+    }
 }
 
 /// True when the worktree holds changes `git status` reports.
@@ -802,6 +813,28 @@ mod tests {
             "nested CWD must not attach parent HEAD SHA / remote project name"
         );
         assert!(!is_at_repo_root(nested_s));
+    }
+
+    #[test]
+    fn a_detached_head_takes_the_branch_the_ci_system_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_committed_repo(root);
+        git(root, &["checkout", "-B", "work"]);
+        let repo = Repository::open(root).unwrap();
+
+        assert_eq!(
+            head_branch(&repo, || Some("from-ci".into())).as_deref(),
+            Some("work"),
+            "a checked-out branch wins over the environment"
+        );
+
+        git(root, &["checkout", "--detach"]);
+        assert_eq!(
+            head_branch(&repo, || Some("from-ci".into())).as_deref(),
+            Some("from-ci")
+        );
+        assert_eq!(head_branch(&repo, || None), None);
     }
 
     fn init_committed_repo(root: &std::path::Path) {
