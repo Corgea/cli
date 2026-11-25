@@ -69,11 +69,13 @@ fn scan_format_agent_leads_with_the_gate_record() {
     let project = git_project();
     let api = ApiStub::start(blast_plan(&project.sha));
     let (mut command, _home) = cloud_command(&api, project.path());
-    command.env("AI_AGENT", "1").args([
+    command.args([
         "scan",
         "blast",
         "--fail-on",
         "malicious",
+        "--format",
+        "agent",
         "--project-name",
         "cloud-e2e",
     ]);
@@ -105,7 +107,8 @@ fn scan_fail_on_malicious_sends_sha_and_list_renders_it() {
     let project = git_project();
     let scan_api = ApiStub::start(blast_plan(&project.sha));
     let (mut scan_command, _scan_home) = cloud_command(&scan_api, project.path());
-    scan_command.args([
+    // An agent environment does not switch the summary away from tables.
+    scan_command.env("AI_AGENT", "1").args([
         "scan",
         "blast",
         "--fail-on",

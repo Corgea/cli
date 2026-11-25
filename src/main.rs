@@ -44,7 +44,7 @@ const PROJECT_NAMING_MODE_HELP: &str = "Derive the Corgea project name instead o
 
 const PROJECT_NAMING_MODE_QUERY_HELP: &str = "Query the project that a scan with the same --project-naming-mode names. sparse-postfixed: in a sparse checkout at the repository root, the default project name followed by the checked-out top-level folders (monorepo-jsoar-agent). Anywhere else it warns and the project is resolved as usual.";
 
-const SUMMARY_FORMAT_HELP: &str = "How to print the results summary when the scan finishes: human (tables for a terminal), agent (tab-separated records for coding agents), json (one JSON document on stdout; every other line goes to stderr), or quiet (no summary; the exit code still carries any gate). Defaults to agent when an agent environment is detected (AI_AGENT, CLAUDECODE, CODEX_SANDBOX, CURSOR_AGENT and related variables), otherwise human. Independent of --out-format/--out-file.";
+const SUMMARY_FORMAT_HELP: &str = "Print the results summary for a program instead of a person: agent (tab-separated records for coding agents), json (one JSON document), or quiet (no summary; the exit code still carries any gate). Progress then goes to stderr, so stdout holds only the summary. Without it, the summary is human-readable tables. Independent of --out-format/--out-file.";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -255,8 +255,8 @@ enum Commands {
 
         #[arg(
             long,
-            value_name = "human|agent|json|quiet",
-            value_parser = OutputFormat::parse,
+            value_name = "agent|json|quiet",
+            value_parser = OutputFormat::parse_summary,
             help = SUMMARY_FORMAT_HELP
         )]
         format: Option<OutputFormat>,
@@ -295,8 +295,8 @@ enum Commands {
         project_id: Option<String>,
         #[arg(
             long,
-            value_name = "human|agent|json|quiet",
-            value_parser = OutputFormat::parse,
+            value_name = "agent|json|quiet",
+            value_parser = OutputFormat::parse_summary,
             help = SUMMARY_FORMAT_HELP
         )]
         format: Option<OutputFormat>,
@@ -827,7 +827,7 @@ fn main() {
                 ::log::error!("--format is only supported with the blast scanner.");
                 std::process::exit(1);
             }
-            let format = OutputFormat::resolve(*format);
+            let format = format.unwrap_or(OutputFormat::Human);
             if *scanner == Scanner::Blast {
                 output_format::set_process_format(format);
             }
@@ -1045,7 +1045,7 @@ fn main() {
             project_id,
             format,
         }) => {
-            let format = OutputFormat::resolve(*format);
+            let format = format.unwrap_or(OutputFormat::Human);
             output_format::set_process_format(format);
             verify_token_and_exit_when_fail(&corgea_config);
             wait::run(

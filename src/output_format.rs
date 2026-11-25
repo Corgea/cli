@@ -34,6 +34,17 @@ impl OutputFormat {
         }
     }
 
+    /// `scan` and `wait` print human output unless `--format` names another,
+    /// so `human` is not a value they accept.
+    pub fn parse_summary(value: &str) -> Result<Self, String> {
+        match Self::parse(value) {
+            Ok(Self::Human) | Err(_) => Err(format!(
+                "unsupported --format: {value}; expected agent, json, or quiet (omit --format for human output)"
+            )),
+            format => format,
+        }
+    }
+
     pub fn resolve(explicit: Option<Self>) -> Self {
         Self::resolve_with(explicit, |name| std::env::var(name).ok())
     }
@@ -135,6 +146,21 @@ macro_rules! statusln {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_format_accepts_machine_formats_only() {
+        assert_eq!(
+            OutputFormat::parse_summary("agent"),
+            Ok(OutputFormat::Agent)
+        );
+        assert_eq!(OutputFormat::parse_summary("json"), Ok(OutputFormat::Json));
+        assert_eq!(
+            OutputFormat::parse_summary("quiet"),
+            Ok(OutputFormat::Quiet)
+        );
+        assert!(OutputFormat::parse_summary("human").is_err());
+        assert!(OutputFormat::parse_summary("tsv").is_err());
+    }
 
     fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
         move |name| {
