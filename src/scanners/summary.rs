@@ -68,6 +68,7 @@ pub enum Status {
 
 struct StatusInfo {
     status: Status,
+    wire: &'static str,
     key: &'static str,
     label: &'static str,
     meaning: &'static str,
@@ -76,36 +77,42 @@ struct StatusInfo {
 const STATUSES: [StatusInfo; 6] = [
     StatusInfo {
         status: Status::Open,
+        wire: "open",
         key: "open",
         label: "Open",
         meaning: "to fix; the scan page count",
     },
     StatusInfo {
         status: Status::FixInProgress,
+        wire: "fix_in_progress",
         key: "fix_in_progress",
         label: "Fix in Progress",
         meaning: "a fix is underway",
     },
     StatusInfo {
         status: Status::Fixed,
+        wire: "fixed",
         key: "fixed",
         label: "Fixed",
         meaning: "resolved",
     },
     StatusInfo {
         status: Status::AcceptedRisk,
+        wire: "accepted_risk",
         key: "accepted_risk",
         label: "Accepted Risk",
         meaning: "risk accepted by your team",
     },
     StatusInfo {
         status: Status::FalsePositive,
+        wire: "false_positive",
         key: "false_positive",
         label: "False Positive",
         meaning: "not a real security issue",
     },
     StatusInfo {
         status: Status::Duplicate,
+        wire: "duplicate",
         key: "duplicate",
         label: "Duplicate",
         meaning: "same as another finding",
@@ -116,7 +123,7 @@ impl Status {
     fn parse(status: &str) -> Option<Self> {
         STATUSES
             .iter()
-            .find(|info| info.key == status)
+            .find(|info| info.wire == status)
             .map(|info| info.status)
     }
 }
