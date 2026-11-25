@@ -1011,12 +1011,15 @@ pub(crate) fn append_wait_plan(
 }
 
 pub(crate) fn assert_issue_summary(stdout: &str, context: &str) {
+    let plain = regex::Regex::new("\x1b\\[[0-9;]*m")
+        .unwrap()
+        .replace_all(stdout, "");
     for line in [
         "4 findings in this scan: 4 open, 0 in other states.",
-        "Total open                                 1         2         1         0         4",
-        "Open                    1         2         1         0         4",
+        "Total open                           1     2       1    0      4",
+        "Open                                 1     2       1    0      4",
     ] {
-        assert!(stdout.contains(line), "missing {line:?}\n{context}");
+        assert!(plain.contains(line), "missing {line:?}\n{context}");
     }
 }
 

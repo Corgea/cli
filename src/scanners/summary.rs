@@ -1,5 +1,4 @@
 use crate::utils::api::Issue;
-use crate::utils::terminal::{set_text_color, TerminalColor};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeSet, HashMap};
 
@@ -35,6 +34,15 @@ impl Severity {
             Self::High => "high",
             Self::Medium => "medium",
             Self::Low => "low",
+        }
+    }
+
+    fn sgr(self) -> &'static str {
+        match self {
+            Self::Critical => "38;5;203",
+            Self::High => "38;5;208",
+            Self::Medium => "38;5;220",
+            Self::Low => "38;5;250",
         }
     }
 
@@ -75,7 +83,7 @@ const STATUSES: [StatusInfo; 6] = [
     StatusInfo {
         status: Status::FixInProgress,
         key: "fix_in_progress",
-        label: "Fix in progress",
+        label: "Fix in Progress",
         meaning: "a fix is underway",
     },
     StatusInfo {
@@ -87,13 +95,13 @@ const STATUSES: [StatusInfo; 6] = [
     StatusInfo {
         status: Status::AcceptedRisk,
         key: "accepted_risk",
-        label: "Accepted risk",
+        label: "Accepted Risk",
         meaning: "risk accepted by your team",
     },
     StatusInfo {
         status: Status::FalsePositive,
         key: "false_positive",
-        label: "False positive",
+        label: "False Positive",
         meaning: "not a real security issue",
     },
     StatusInfo {
@@ -214,7 +222,7 @@ pub struct ScanSummary {
 
 const FIX_FIRST_LIMIT: usize = 5;
 
-const CODE_ROW_LABEL: &str = "Code (SAST, Logic & Auth, Secrets)";
+const CODE_ROW_LABEL: &str = "SAST, Logic & Auth, Secrets";
 
 fn is_false_positive(issue: &Issue) -> bool {
     issue.status == "false_positive"
@@ -314,82 +322,149 @@ impl ScanSummary {
     }
 }
 
-fn severity_table(
-    title: &str,
-    rows: &[(&str, SeverityCounts)],
-    total: (&str, SeverityCounts),
-) -> String {
-    let width = rows
-        .iter()
-        .map(|(label, _)| label.len())
-        .chain([total.0.len()])
-        .max()
-        .unwrap_or(0);
-    let mut out = format!("{title}\n{:width$}", "");
-    for severity in Severity::ALL {
-        out.push_str(&format!("  {:>8}", severity.label()));
-    }
-    out.push_str(&format!("  {:>8}\n", "Total"));
-    let rule = width + 10 * 5;
-    for (label, counts) in rows {
-        out.push_str(&table_row(label, counts, width));
-    }
-    out.push_str(&format!("{}\n", "-".repeat(rule)));
-    out.push_str(&table_row(total.0, &total.1, width));
-    out
+const TOTAL_HEADER: &str = "Total";
+const LABEL_MIN_WIDTH: usize = 24;
+const CELL_GAP: usize = 2;
+
+const PLAIN: &str = "";
+const BOLD: &str = "1";
+const DIM: &str = "2";
+const GREEN: &str = "32";
+const RED: &str = "31";
+const LINK: &str = "38;5;75;4";
+
+struct Ledger {
+    color: bool,
+    label_width: usize,
 }
 
-fn table_row(label: &str, counts: &SeverityCounts, width: usize) -> String {
-    let mut row = format!("{label:<width$}");
-    for severity in Severity::ALL {
-        row.push_str(&format!("  {:>8}", counts.get(severity)));
-    }
-    row.push_str(&format!("  {:>8}\n", counts.total()));
-    row
-}
-
-pub fn render_human(summary: &ScanSummary, color: bool) -> String {
-    let paint = |text: &str, tint: TerminalColor| {
-        if color {
-            set_text_color(text, tint)
+impl Ledger {
+    fn paint(&self, text: &str, sgr: &str) -> String {
+        if self.color && !sgr.is_empty() {
+            format!("\x1b[{sgr}m{text}\x1b[0m")
         } else {
             text.to_string()
         }
-    };
-    let scan = &summary.scan;
-    let open = summary.counts(Status::Open);
-    let total = summary.total_findings();
-    let mut out = String::from("\n");
-    out.push_str(&format!("Scan complete: {}", scan.project));
-    if let Some(branch) = &scan.branch {
-        out.push_str(&format!(", branch {branch}"));
     }
-    out.push_str(&format!(", scan {}\n", scan.id));
-    if scan.reused_recent_scan == Some(true) {
-        out.push_str("Reused a recent scan of this commit.\n");
+
+    fn width(&self) -> usize {
+        self.label_width
+            + Severity::ALL
+                .iter()
+                .map(|severity| severity.label().len() + CELL_GAP)
+                .sum::<usize>()
+            + TOTAL_HEADER.len()
+            + CELL_GAP
     }
-    out.push_str(&format!(
-        "{total} findings in this scan: {} open, {} in other states.\n\n",
-        open.total(),
-        total - open.total()
-    ));
 
-    let open_rows = vec![(CODE_ROW_LABEL, open)];
-    out.push_str(&severity_table(
-        "Open issues",
-        &open_rows,
-        ("Total open", open),
-    ));
-    out.push('\n');
+    fn label(&self, text: &str, sgr: &str) -> String {
+        let pad = self.label_width.saturating_sub(text.len());
+        format!("{}{}", self.paint(text, sgr), " ".repeat(pad))
+    }
 
+    fn cell(&self, header: &str, text: &str, sgr: &str) -> String {
+        let pad = (header.len() + CELL_GAP).saturating_sub(text.len());
+        format!("{}{}", " ".repeat(pad), self.paint(text, sgr))
+    }
+
+    fn rule(&self) -> String {
+        format!("{}\n", self.paint(&"-".repeat(self.width()), DIM))
+    }
+
+    fn header(&self, title: &str) -> String {
+        let mut out = self.label(title, BOLD);
+        for severity in Severity::ALL {
+            out.push_str(&self.cell(severity.label(), severity.label(), severity.sgr()));
+        }
+        out.push_str(&self.cell(TOTAL_HEADER, TOTAL_HEADER, BOLD));
+        out.push('\n');
+        out
+    }
+
+    fn row(&self, label: &str, label_sgr: &str, counts: &SeverityCounts) -> String {
+        let mut out = self.label(label, label_sgr);
+        for severity in Severity::ALL {
+            let count = counts.get(severity);
+            let sgr = if count == 0 { DIM } else { severity.sgr() };
+            out.push_str(&self.cell(severity.label(), &count.to_string(), sgr));
+        }
+        out.push_str(&self.cell(TOTAL_HEADER, &counts.total().to_string(), BOLD));
+        out.push('\n');
+        out
+    }
+
+    fn table(
+        &self,
+        title: &str,
+        rows: &[(&str, SeverityCounts)],
+        total: (&str, SeverityCounts),
+    ) -> String {
+        let mut out = self.header(title);
+        out.push_str(&self.rule());
+        for (label, counts) in rows {
+            out.push_str(&self.row(label, PLAIN, counts));
+        }
+        out.push_str(&self.rule());
+        out.push_str(&self.row(total.0, BOLD, &total.1));
+        out
+    }
+}
+
+pub fn render_human(summary: &ScanSummary, color: bool) -> String {
+    const OPEN_TITLE: &str = "Open issues";
+    const OPEN_TOTAL: &str = "Total open";
+    const STATUS_TITLE: &str = "All findings by status";
+    const STATUS_TOTAL: &str = "Total";
+
+    let open_rows = vec![(CODE_ROW_LABEL, summary.counts(Status::Open))];
     let status_rows: Vec<(&str, SeverityCounts)> = STATUSES
         .iter()
         .map(|info| (info.label, summary.counts(info.status)))
         .collect();
-    out.push_str(&severity_table(
-        "All findings by status",
+    let longest_label = [OPEN_TITLE, OPEN_TOTAL, STATUS_TITLE, STATUS_TOTAL]
+        .into_iter()
+        .chain(
+            open_rows
+                .iter()
+                .chain(&status_rows)
+                .map(|(label, _)| *label),
+        )
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let ledger = Ledger {
+        color,
+        label_width: (longest_label + 1).max(LABEL_MIN_WIDTH),
+    };
+
+    let scan = &summary.scan;
+    let open = summary.counts(Status::Open).total();
+    let total = summary.total_findings();
+    let mut title = format!("Scan complete: {}", scan.project);
+    if let Some(branch) = &scan.branch {
+        title.push_str(&format!(", branch {branch}"));
+    }
+    title.push_str(&format!(", scan {}", scan.id));
+    let mut out = format!("\n{}\n", ledger.paint(&title, BOLD));
+    if scan.reused_recent_scan == Some(true) {
+        out.push_str("Reused a recent scan of this commit.\n");
+    }
+    out.push_str(&format!(
+        "{total} findings in this scan: {}, {} in other states.\n\n",
+        ledger.paint(&format!("{open} open"), BOLD),
+        total - open
+    ));
+
+    out.push_str(&ledger.table(
+        OPEN_TITLE,
+        &open_rows,
+        (OPEN_TOTAL, summary.counts(Status::Open)),
+    ));
+    out.push('\n');
+    out.push_str(&ledger.table(
+        STATUS_TITLE,
         &status_rows,
-        ("Total", summary.all_statuses()),
+        (STATUS_TOTAL, summary.all_statuses()),
     ));
 
     if summary.unrecognized.count > 0 {
@@ -404,18 +479,20 @@ pub fn render_human(summary: &ScanSummary, color: bool) -> String {
         Gate::NotRequested => {}
         Gate::Passed { condition } => out.push_str(&format!(
             "\n{} {condition}\n",
-            paint("Gate passed:", TerminalColor::Green)
+            ledger.paint("Gate passed:", GREEN)
         )),
         Gate::Failed { condition, tripped } => out.push_str(&format!(
             "\n{} {condition} matched {tripped} finding(s). Exiting with code {}.\n",
-            paint("Gate failed:", TerminalColor::Red),
+            ledger.paint("Gate failed:", RED),
             summary.gate.exit_code()
         )),
     }
 
     out.push_str(&format!(
-        "\nView the results: {}\n",
-        paint(&summary.results_url, TerminalColor::Green)
+        "\n{}{}{}\n",
+        ledger.paint("Go to ", DIM),
+        ledger.paint(&summary.results_url, LINK),
+        ledger.paint(" to see results.", DIM)
     ));
     out
 }
@@ -711,27 +788,47 @@ mod tests {
 Scan complete: goof, branch main, scan scan-1
 1 findings in this scan: 1 open, 0 in other states.
 
-Open issues
-                                    Critical      High    Medium       Low     Total
-Code (SAST, Logic & Auth, Secrets)         0         1         0         0         1
-------------------------------------------------------------------------------------
-Total open                                 0         1         0         0         1
+Open issues                   Critical  High  Medium  Low  Total
+----------------------------------------------------------------
+SAST, Logic & Auth, Secrets          0     1       0    0      1
+----------------------------------------------------------------
+Total open                           0     1       0    0      1
 
-All findings by status
-                 Critical      High    Medium       Low     Total
-Open                    0         1         0         0         1
-Fix in progress         0         0         0         0         0
-Fixed                   0         0         0         0         0
-Accepted risk           0         0         0         0         0
-False positive          0         0         0         0         0
-Duplicate               0         0         0         0         0
------------------------------------------------------------------
-Total                   0         1         0         0         1
+All findings by status        Critical  High  Medium  Low  Total
+----------------------------------------------------------------
+Open                                 0     1       0    0      1
+Fix in Progress                      0     0       0    0      0
+Fixed                                0     0       0    0      0
+Accepted Risk                        0     0       0    0      0
+False Positive                       0     0       0    0      0
+Duplicate                            0     0       0    0      0
+----------------------------------------------------------------
+Total                                0     1       0    0      1
 
-View the results: https://corgea.test/scan
+Go to https://corgea.test/scan to see results.
 ";
         assert_eq!(out, expected);
         assert!(out.is_ascii());
+    }
+
+    #[test]
+    fn human_colors_cells_by_severity_and_bolds_totals() {
+        let summary = summary_of(&mixed_issues(), Gate::NotRequested);
+        let colored = render_human(&summary, true);
+        let code_row = concat!(
+            "SAST, Logic & Auth, Secrets ",
+            "         \x1b[38;5;203m1\x1b[0m",
+            "     \x1b[38;5;208m1\x1b[0m",
+            "       \x1b[2m0\x1b[0m",
+            "    \x1b[2m0\x1b[0m",
+            "      \x1b[1m2\x1b[0m\n",
+        );
+        assert!(colored.contains(code_row), "{colored}");
+        assert!(colored.contains("\x1b[1mTotal open\x1b[0m"), "{colored}");
+        let plain = regex::Regex::new("\x1b\\[[0-9;]*m")
+            .unwrap()
+            .replace_all(&colored, "");
+        assert_eq!(plain, render_human(&summary, false));
     }
 
     #[test]
