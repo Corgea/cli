@@ -241,12 +241,12 @@ pub fn run(
         scan_url,
     );
     print_summary(&summary, format);
-    if format == OutputFormat::Human {
-        statusln!("\nThank you for using Corgea! 🐕\n");
-    }
     let exit_code = summary.gate.exit_code();
     if exit_code != 0 {
         std::process::exit(exit_code);
+    }
+    if format == OutputFormat::Human {
+        statusln!("\nThank you for using Corgea! 🐕\n");
     }
 }
 
