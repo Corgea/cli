@@ -1,11 +1,12 @@
 use crate::config::Config;
 use crate::scan::build_scan_url;
 use crate::scanners::blast;
+use crate::scanners::summary::{self, Gate, ScanSummary};
 use crate::utils;
 use crate::utils::api::ProjectSelector;
+use corgea::output_format::OutputFormat;
 use corgea::{status, statusln};
 
-#[derive(Default)]
 pub struct WaitArgs {
     pub scan_id: Option<String>,
     pub selector: ProjectSelector,
@@ -14,6 +15,7 @@ pub struct WaitArgs {
     /// server reports for the scan is used, and only a server predating that
     /// field leaves the link to fall back to the project name.
     pub project_id: Option<String>,
+    pub format: OutputFormat,
 }
 
 /// Most recent scan of the resolved project, or a hard exit naming what was
@@ -62,6 +64,7 @@ pub fn run(config: &Config, args: WaitArgs) {
         scan_id,
         selector,
         project_id,
+        format,
     } = args;
 
     // A scan id alone leaves nothing to resolve: the scan and issue endpoints
@@ -126,7 +129,7 @@ pub fn run(config: &Config, args: WaitArgs) {
 
     // The API reports lowercase statuses, so comparing against "Complete"
     // never matched and finished scans were polled again.
-    match blast::classify_scan_status(&scan.status) {
+    let scan = match blast::classify_scan_status(&scan.status) {
         blast::ScanState::Running => {
             status!(
                 "\n\nWaiting for scan with ID: {}.\n\nYou can view it populate at the link:\n{}\n\n",
@@ -137,13 +140,14 @@ pub fn run(config: &Config, args: WaitArgs) {
                "{}",
                utils::terminal::set_text_color("Your scan will continue securely in the Corgea cloud.\nYou can safely exit the process now if you prefer not to wait for it to complete.\n\n", utils::terminal::TerminalColor::Blue)
             );
-            blast::wait_for_scan(config, &scan_id, budget);
+            blast::wait_for_scan(config, &scan_id, budget)
         }
         blast::ScanState::Completed => {
             statusln!("Scan has been processed successfully!");
             if let Some(warnings) = blast::format_scan_warnings(&scan) {
                 log::warn!("\n{}\n", warnings);
             }
+            scan
         }
         // Report the failure rather than claim success or poll forever.
         blast::ScanState::Failed => {
@@ -154,35 +158,20 @@ pub fn run(config: &Config, args: WaitArgs) {
             );
             std::process::exit(1);
         }
-    }
+    };
 
-    match blast::report_scan_status(&config.get_url(), &project_name, &scan_id) {
-        Ok(_) => {
-            statusln!(
-                "\n\nYou can view the scan results at the following link:\n{}",
-                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
-            );
-        }
-        Err(e) => {
-            log::error!(
-                "\n\n{}\n\n\
-                However, the scan results may still be accessible at the following link:\n\n\
-                {}\n\n\
-                \n\nPlease check your network connection, authentication token, and server URL:\n\n\
-                - Server URL: {}\n\
-                - Error details: {}\n",
-                utils::terminal::set_text_color(
-                    &format!(
-                        "Failed to report the scan status for project: '{}'.",
-                        project_name
-                    ),
-                    utils::terminal::TerminalColor::Red
-                ),
-                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Blue),
-                config.get_url(),
-                e
-            );
-            std::process::exit(1);
-        }
-    }
+    let issues = blast::collect_scan_issues(config, &project_name, &scan_id, &scan_url);
+    let summary = ScanSummary::build(
+        summary::ScanInfo {
+            id: scan_id,
+            project: project_name,
+            branch: scan.branch,
+            git_sha: scan.git_sha,
+            reused_recent_scan: None,
+        },
+        Gate::NotRequested,
+        &issues,
+        scan_url,
+    );
+    blast::print_summary(&summary, format);
 }

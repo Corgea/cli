@@ -212,6 +212,7 @@ pub fn run_semgrep(config: &Config, project_name: Option<String>) {
                     ..Default::default()
                 },
                 project_id: result.project_id,
+                format: corgea::output_format::OutputFormat::Human,
             },
         );
     }
@@ -237,6 +238,7 @@ pub fn run_snyk(config: &Config, project_name: Option<String>) {
                     ..Default::default()
                 },
                 project_id: result.project_id,
+                format: corgea::output_format::OutputFormat::Human,
             },
         );
     }

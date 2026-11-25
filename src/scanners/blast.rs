@@ -3,9 +3,11 @@ use crate::images;
 use crate::incremental::{FullScanCause, FullScanReason};
 use crate::manifest::Manifest;
 use crate::scan::build_scan_url;
+use crate::scanners::summary::{self, Gate, ScanSummary};
 use crate::targets;
 use crate::utils;
-use crate::utils::api::SCAIssue;
+use crate::utils::api::{Issue, SCAIssue};
+use corgea::output_format::{colors_enabled, OutputFormat};
 use corgea::{status, statusln};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -103,6 +105,7 @@ pub fn run(
     include_images: Vec<String>,
     skip_recent: Option<crate::skip_scan::SkipRecentScan>,
     ignore_dirty_worktree: &bool,
+    format: OutputFormat,
 ) {
     // Validate that only_uncommitted and target are not used together
     if *only_uncommitted && target.is_some() {
@@ -166,8 +169,12 @@ pub fn run(
         )
     });
 
-    let (scan_id, project_id) = match reused_scan {
-        Some(scan) => (scan.id, scan.project_id),
+    let reused_recent_scan = skip_recent.as_ref().map(|_| reused_scan.is_some());
+    let (scan, project_id) = match reused_scan {
+        Some(scan) => {
+            let project_id = scan.project_id.clone();
+            (scan, project_id)
+        }
         None => start_new_scan(
             config,
             &project_name,
@@ -183,6 +190,7 @@ pub fn run(
             include_images,
         ),
     };
+    let scan_id = scan.id.clone();
 
     let scan_url = build_scan_url(
         &config.get_url(),
@@ -191,50 +199,8 @@ pub fn run(
         &scan_id,
     );
 
-    let stop_signal = Arc::new(Mutex::new(false));
-    let stop_signal_clone = Arc::clone(&stop_signal);
-    let results_thread = thread::spawn(move || {
-        utils::terminal::show_loading_message(
-            "Collecting scan results... ([T]s)",
-            stop_signal_clone,
-        );
-    });
-
-    let classifications = match report_scan_status(&config.get_url(), &project_name, &scan_id) {
-        Ok(issues_classes) => {
-            *stop_signal.lock().unwrap() = true;
-            let _ = results_thread.join();
-            statusln!(
-                "\n\nYou can view the scan results at the following link:\n{}",
-                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green)
-            );
-            issues_classes
-        }
-        Err(e) => {
-            *stop_signal.lock().unwrap() = true;
-            let _ = results_thread.join();
-            log::error!(
-                "\r{}\n\n{}\n\n\
-                However, the scan results may still be accessible at the following link:\n\n\
-                {}\n\n\
-                \n\nPlease check your network connection, authentication token, and server URL:\n\n\
-                - Server URL: {}\n\
-                - Error details: {}\n",
-                utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset),
-                utils::terminal::set_text_color(
-                    &format!(
-                        "Failed to report the scan status for project: '{}'.",
-                        project_name
-                    ),
-                    utils::terminal::TerminalColor::Red
-                ),
-                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Blue),
-                config.get_url(),
-                e
-            );
-            std::process::exit(1);
-        }
-    };
+    let issues = collect_scan_issues(config, &project_name, &scan_id, &scan_url);
+    let classifications = summary::legacy_urgency_counts(&issues);
     // The report and the SBOM are produced before the blocking-rule gates: a
     // tripped gate exits 1, and a pipeline that fails on policy is exactly the
     // one that needs the report, to ingest the findings it failed on.
@@ -251,91 +217,128 @@ pub fn run(
         write_sbom(&sbom_file);
     }
 
-    if *fail {
+    let gate = evaluate_gate(
+        config,
+        &project_name,
+        &scan_id,
+        *fail,
+        block_on.as_deref(),
+        fail_on.as_deref(),
+        &classifications,
+    );
+
+    let summary = ScanSummary::build(
+        summary::ScanInfo {
+            id: scan_id,
+            project: project_name,
+            branch: scan.branch,
+            git_sha: scan.git_sha,
+            reused_recent_scan,
+        },
+        gate,
+        &issues,
+        scan_url,
+    );
+    print_summary(&summary, format);
+    if format == OutputFormat::Human {
+        statusln!("\nThank you for using Corgea! 🐕\n");
+    }
+    let exit_code = summary.gate.exit_code();
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+}
+
+/// Run the one gate this command line asked for and say how it came out.
+///
+/// `main` lets at most one of `--fail`, `--block-on` and `--fail-on` through.
+/// `classifications` are the counts `--fail-on` has always used: every finding
+/// but false positives, whatever its status.
+fn evaluate_gate(
+    config: &Config,
+    project_name: &str,
+    scan_id: &str,
+    fail: bool,
+    block_on: Option<&str>,
+    fail_on: Option<&str>,
+    classifications: &HashMap<String, usize>,
+) -> Gate {
+    if fail {
         log::warn!(
             "\n--fail is deprecated: it evaluates every active blocking rule regardless of whether it applies to pull requests or CI. Use --block-on <slug> to name the CI blocking rules this pipeline should enforce."
         );
-        let blocking_rules = wait_for_blocking_rules(config, &scan_id, None);
-        if blocking_rules.block {
-            statusln!("\nExiting with error code 1 due to some issues violating some blocking rules defined for this project.\nfor more details, please check the scan results at the link: {}\nAlternatively, you can run {} to view the issues list on your local machine.",
-            utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green),
-            utils::terminal::set_text_color(
-                &format!("corgea ls -i -s={}", scan_id),
-                utils::terminal::TerminalColor::Green
-            )
-        );
-            std::process::exit(1);
-        }
+        let blocking_rules = wait_for_blocking_rules(config, scan_id, None);
+        let condition = "--fail (every active blocking rule)".to_string();
+        return if blocking_rules.block {
+            Gate::Failed {
+                condition,
+                tripped: blocking_rules.blocked_count(),
+            }
+        } else {
+            Gate::Passed { condition }
+        };
     }
 
-    if let Some(block_on) = &block_on {
-        let blocking_rules = wait_for_blocking_rules(config, &scan_id, Some(block_on));
-        if blocking_rules.block {
+    if let Some(block_on) = block_on {
+        let blocking_rules = wait_for_blocking_rules(config, scan_id, Some(block_on));
+        return if blocking_rules.block {
             // The count comes from the server's pre-pagination total; the slug
             // list is drawn from the returned page, which is all the gate needs
             // to name the rules at fault.
-            let triggered = triggered_slug_summary(&blocking_rules.blocking_issues);
-            statusln!(
-                "\nExiting with error code 1: {} issue(s) violated the blocking rule(s) {}.\nFor more details, check the scan results at: {}\nAlternatively, run {} to view the issues list on your local machine.",
-                blocking_rules.blocked_count(),
-                utils::terminal::set_text_color(&triggered, utils::terminal::TerminalColor::Red),
-                utils::terminal::set_text_color(&scan_url, utils::terminal::TerminalColor::Green),
-                utils::terminal::set_text_color(
-                    &format!("corgea ls -i -s={}", scan_id),
-                    utils::terminal::TerminalColor::Green
-                )
-            );
-            std::process::exit(1);
-        }
-        statusln!(
-            "\nNo issues violated the blocking rule(s): {}.",
-            utils::terminal::set_text_color(block_on, utils::terminal::TerminalColor::Green)
-        );
-    }
-
-    status!("\n\nThank you for using Corgea! 🐕\n\n");
-
-    if let Some(fail_on) = fail_on {
-        let tokens = match parse_fail_on_tokens(&fail_on) {
-            Ok(tokens) => tokens,
-            Err(msg) => {
-                log::error!("{}", msg);
-                std::process::exit(1);
-            }
-        };
-
-        let severity_already_tripped = tokens
-            .iter()
-            .filter(|t| t.as_str() != "malicious")
-            .any(|t| severity_gate_trips(t, &classifications));
-        let needs_sca_fetch = !severity_already_tripped && tokens.iter().any(|t| t == "malicious");
-
-        let sca_issues = if needs_sca_fetch {
-            match utils::api::get_all_sca_issues(
-                &config.get_url(),
-                &project_name,
-                Some(scan_id.clone()),
-            ) {
-                Ok(issues) => issues,
-                Err(e) => {
-                    log::error!(
-                        "\n\nFailed to fetch SCA issues for --fail-on malicious: {}\n\n",
-                        e
-                    );
-                    std::process::exit(1);
-                }
+            Gate::Failed {
+                condition: format!(
+                    "--block-on {block_on} (rules violated: {})",
+                    triggered_slug_summary(&blocking_rules.blocking_issues)
+                ),
+                tripped: blocking_rules.blocked_count(),
             }
         } else {
-            Vec::new()
+            Gate::Passed {
+                condition: format!("--block-on {block_on}"),
+            }
         };
+    }
 
-        if fail_on_gate_trips(&tokens, &classifications, &sca_issues) {
-            statusln!(
-                "\nExiting with error code 1: scan results matched --fail-on {}.",
-                fail_on
-            );
+    let Some(fail_on) = fail_on else {
+        return Gate::NotRequested;
+    };
+    let tokens = match parse_fail_on_tokens(fail_on) {
+        Ok(tokens) => tokens,
+        Err(msg) => {
+            log::error!("{}", msg);
             std::process::exit(1);
         }
+    };
+
+    let severity_already_tripped = tokens
+        .iter()
+        .filter(|t| t.as_str() != "malicious")
+        .any(|t| severity_gate_trips(t, classifications));
+    let needs_sca_fetch = !severity_already_tripped && tokens.iter().any(|t| t == "malicious");
+
+    let sca_issues = if needs_sca_fetch {
+        match utils::api::get_all_sca_issues(
+            &config.get_url(),
+            project_name,
+            Some(scan_id.to_string()),
+        ) {
+            Ok(issues) => issues,
+            Err(e) => {
+                log::error!(
+                    "\n\nFailed to fetch SCA issues for --fail-on malicious: {}\n\n",
+                    e
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let condition = format!("--fail-on {fail_on}");
+    match fail_on_tripped_count(&tokens, classifications, &sca_issues) {
+        0 => Gate::Passed { condition },
+        tripped => Gate::Failed { condition, tripped },
     }
 }
 
@@ -442,7 +445,8 @@ fn partial_scan_files(
 
 /// Package the project, upload it, and wait for the scan to finish.
 ///
-/// Returns the new scan's id and, when the server reported one, its project id.
+/// Returns the finished scan's record and, when the upload reported one, its
+/// project id.
 #[allow(clippy::too_many_arguments)]
 fn start_new_scan(
     config: &Config,
@@ -457,7 +461,7 @@ fn start_new_scan(
     exclude: Option<String>,
     include_rules: crate::include_rules::IncludeRules,
     include_images: Vec<String>,
-) -> (String, Option<String>) {
+) -> (utils::api::ScanResponse, Option<String>) {
     statusln!("\nScanning with BLAST 🚀🚀🚀");
 
     if let Some(scan_type) = &scan_type {
@@ -931,8 +935,8 @@ fn start_new_scan(
        utils::terminal::set_text_color("Your scan will continue securely in the Corgea cloud.\nYou can safely exit the process now if you prefer not to wait for it to complete.\n\n", utils::terminal::TerminalColor::Blue)
     );
 
-    wait_for_scan(config, &scan_id, WaitBudget::start());
-    (scan_id, upload_result.project_id)
+    let scan = wait_for_scan(config, &scan_id, WaitBudget::start());
+    (scan, upload_result.project_id)
 }
 
 /// Write the `--out-format` report for a completed scan to `--out-file`.
@@ -964,16 +968,19 @@ fn write_scan_report(
     };
 
     if out_format == "json" {
-        let issues =
-            match utils::api::get_all_issues(&config.get_url(), project_name, Some(scan_id.into()))
-            {
-                Ok(issues) => issues,
-                Err(e) => {
-                    stop_spinner();
-                    log::error!("\n\nFailed to fetch issues: {}\n\n", e);
-                    std::process::exit(1);
-                }
-            };
+        let issues = match utils::api::get_all_issues(
+            &config.get_url(),
+            project_name,
+            Some(scan_id.into()),
+            false,
+        ) {
+            Ok(issues) => issues,
+            Err(e) => {
+                stop_spinner();
+                log::error!("\n\nFailed to fetch issues: {}\n\n", e);
+                std::process::exit(1);
+            }
+        };
         let sca_issues = match utils::api::get_all_sca_issues(
             &config.get_url(),
             project_name,
@@ -1098,24 +1105,30 @@ pub fn severity_gate_trips(threshold: &str, counts: &HashMap<String, usize>) -> 
     })
 }
 
-/// Any scan-scoped SCA issue classified malicious trips the gate.
-/// Merely-vulnerable issues (classification None or other) do not.
-pub fn malicious_gate_trips(sca_issues: &[SCAIssue]) -> bool {
-    sca_issues
-        .iter()
-        .any(|issue| issue.classification.as_deref() == Some("malicious"))
-}
-
-/// Comma-list OR semantics: ANY listed condition tripping fails the scan.
-pub fn fail_on_gate_trips(
+/// How many findings trip `--fail-on`: those at or above its lowest severity
+/// threshold, plus malicious dependencies when it lists `malicious`.
+pub fn fail_on_tripped_count(
     tokens: &[String],
     counts: &HashMap<String, usize>,
     sca_issues: &[SCAIssue],
-) -> bool {
-    tokens.iter().any(|token| match token.as_str() {
-        "malicious" => malicious_gate_trips(sca_issues),
-        threshold => severity_gate_trips(threshold, counts),
-    })
+) -> usize {
+    let lowest_threshold = tokens.iter().filter_map(|t| severity_rank(t)).min();
+    let severity_count: usize = lowest_threshold.map_or(0, |threshold| {
+        counts
+            .iter()
+            .filter(|(severity, _)| severity_rank(severity).is_some_and(|rank| rank >= threshold))
+            .map(|(_, count)| count)
+            .sum()
+    });
+    let malicious_count = if tokens.iter().any(|t| t == "malicious") {
+        sca_issues
+            .iter()
+            .filter(|issue| issue.classification.as_deref() == Some("malicious"))
+            .count()
+    } else {
+        0
+    };
+    severity_count + malicious_count
 }
 
 /// Trim and de-duplicate the comma-separated `--block-on` slugs.
@@ -1460,11 +1473,16 @@ impl ScanPoll {
     }
 }
 
-/// Block until the scan reaches a terminal state, then report it.
+/// Block until the scan reaches a terminal state, then report it and return
+/// its final record.
 ///
 /// Exits non-zero on failure or poll timeout, so CI cannot mistake a broken
 /// scan for a clean one.
-pub fn wait_for_scan(config: &Config, scan_id: &str, budget: WaitBudget) {
+pub fn wait_for_scan(
+    config: &Config,
+    scan_id: &str,
+    budget: WaitBudget,
+) -> utils::api::ScanResponse {
     let stop_signal = Arc::new(Mutex::new(false));
     let stop_signal_clone = Arc::clone(&stop_signal);
     let spinner = thread::spawn(move || {
@@ -1523,6 +1541,7 @@ pub fn wait_for_scan(config: &Config, scan_id: &str, budget: WaitBudget) {
     if let Some(warnings) = format_scan_warnings(&scan) {
         log::warn!("{}\n", warnings);
     }
+    scan
 }
 
 /// Must outlast the longest doghouse wait window, currently
@@ -1644,58 +1663,65 @@ fn wait_for_blocking_rules(
     }
 }
 
-pub fn fetch_and_group_scan_issues(
-    url: &str,
-    project: &str,
+/// Every finding of the scan, false positives included, behind a spinner.
+/// Exits 1 naming the server and the link when the list cannot be read.
+pub fn collect_scan_issues(
+    config: &Config,
+    project_name: &str,
     scan_id: &str,
-) -> Result<HashMap<String, usize>, Box<dyn std::error::Error>> {
-    let issues = match utils::api::get_all_issues(url, project, Some(scan_id.to_string())) {
+    scan_url: &str,
+) -> Vec<Issue> {
+    let stop_signal = Arc::new(Mutex::new(false));
+    let stop_signal_clone = Arc::clone(&stop_signal);
+    let results_thread = thread::spawn(move || {
+        utils::terminal::show_loading_message(
+            "Collecting scan results... ([T]s)",
+            stop_signal_clone,
+        );
+    });
+    let fetched =
+        utils::api::get_all_issues(&config.get_url(), project_name, Some(scan_id.into()), true);
+    *stop_signal.lock().unwrap() = true;
+    let _ = results_thread.join();
+    utils::terminal::clear_previous_line();
+    match fetched {
         Ok(issues) => issues,
-        Err(err) => {
-            return Err(format!("Failed to fetch scan issues: {}", err).into());
-        }
-    };
-    let mut classification_counts: HashMap<String, usize> = HashMap::new();
-    if !issues.is_empty() {
-        for issue in &issues {
-            *classification_counts
-                .entry(issue.urgency.clone())
-                .or_insert(0) += 1;
+        Err(e) => {
+            log::error!(
+                "\n\n{}\n\n\
+                However, the scan results may still be accessible at the following link:\n\n\
+                {}\n\n\
+                \n\nPlease check your network connection, authentication token, and server URL:\n\n\
+                - Server URL: {}\n\
+                - Error details: Failed to fetch scan issues: {}\n",
+                utils::terminal::set_text_color(
+                    &format!(
+                        "Failed to report the scan status for project: '{}'.",
+                        project_name
+                    ),
+                    utils::terminal::TerminalColor::Red
+                ),
+                utils::terminal::set_text_color(scan_url, utils::terminal::TerminalColor::Blue),
+                config.get_url(),
+                e
+            );
+            std::process::exit(1);
         }
     }
-    Ok(classification_counts)
 }
 
-pub fn report_scan_status(
-    url: &str,
-    project: &str,
-    scan_id: &str,
-) -> Result<HashMap<String, usize>, Box<dyn std::error::Error>> {
-    let classification_counts = match fetch_and_group_scan_issues(url, project, scan_id) {
-        Ok(counts) => counts,
-        Err(e) => {
-            return Err(e);
+/// Print the summary on stdout in `format`; agent hints go to stderr, as
+/// `deps` prints its own.
+pub fn print_summary(summary: &ScanSummary, format: OutputFormat) {
+    match format {
+        OutputFormat::Human => print!("{}", summary::render_human(summary, colors_enabled())),
+        OutputFormat::Agent => {
+            print!("{}", summary::render_agent(summary));
+            eprint!("{}", summary::agent_hints(summary));
         }
-    };
-
-    let total_issues = classification_counts.values().sum::<usize>();
-    utils::terminal::clear_previous_line();
-    statusln!("\rScan Results:-\n");
-    statusln!("{:<20} | Count", "Classification");
-    statusln!("{:-<20} | ", "");
-
-    let order = vec!["CR", "HI", "ME", "LO"];
-    for classification in order {
-        if let Some(count) = classification_counts.get(classification) {
-            statusln!("{:<20} | {}", classification, count);
-        } else {
-            statusln!("{:<20} | {}", classification, 0);
-        }
+        OutputFormat::Json => print!("{}", summary::render_json(summary)),
+        OutputFormat::Quiet => {}
     }
-
-    statusln!("{:-<20} | ", "");
-    statusln!("{:<20} | {}", "Total", total_issues);
-    Ok(classification_counts)
 }
 
 /// Parse `--metadata KEY=VALUE` flags into a JSON object string.
@@ -1904,16 +1930,15 @@ mod tests {
     }
 
     #[test]
-    fn malicious_gate_trips_only_on_malicious_classification() {
-        assert!(malicious_gate_trips(&[sca_issue(Some("malicious"))]));
-        assert!(malicious_gate_trips(&[
-            sca_issue(None),
-            sca_issue(Some("malicious"))
-        ]));
+    fn malicious_counts_only_malicious_classification() {
+        let malicious = parse_fail_on_tokens("malicious").unwrap();
+        let tripped = |sca: &[SCAIssue]| fail_on_tripped_count(&malicious, &counts(&[]), sca);
+        assert_eq!(tripped(&[sca_issue(Some("malicious"))]), 1);
+        assert_eq!(tripped(&[sca_issue(None), sca_issue(Some("malicious"))]), 1);
         // merely-vulnerable (classification None) does NOT trip
-        assert!(!malicious_gate_trips(&[sca_issue(None)]));
-        assert!(!malicious_gate_trips(&[sca_issue(Some("other"))]));
-        assert!(!malicious_gate_trips(&[]));
+        assert_eq!(tripped(&[sca_issue(None)]), 0);
+        assert_eq!(tripped(&[sca_issue(Some("other"))]), 0);
+        assert_eq!(tripped(&[]), 0);
     }
 
     #[test]
@@ -1921,35 +1946,123 @@ mod tests {
         let tokens = |s: &str| parse_fail_on_tokens(s).unwrap();
 
         // HI,malicious: severity side alone trips (CR is at-or-above HI)
-        assert!(fail_on_gate_trips(
-            &tokens("HI,malicious"),
-            &counts(&[("CR", 1)]),
-            &[]
-        ));
+        assert_eq!(
+            fail_on_tripped_count(&tokens("HI,malicious"), &counts(&[("CR", 1)]), &[]),
+            1
+        );
         // HI,malicious: malicious side alone trips
-        assert!(fail_on_gate_trips(
-            &tokens("HI,malicious"),
-            &counts(&[("LO", 1)]),
-            &[sca_issue(Some("malicious"))]
-        ));
+        assert_eq!(
+            fail_on_tripped_count(
+                &tokens("HI,malicious"),
+                &counts(&[("LO", 1)]),
+                &[sca_issue(Some("malicious"))]
+            ),
+            1
+        );
         // HI,malicious: neither side trips
-        assert!(!fail_on_gate_trips(
-            &tokens("HI,malicious"),
-            &counts(&[("LO", 1)]),
-            &[sca_issue(None)]
-        ));
+        assert_eq!(
+            fail_on_tripped_count(
+                &tokens("HI,malicious"),
+                &counts(&[("LO", 1)]),
+                &[sca_issue(None)]
+            ),
+            0
+        );
         // malicious alone: severity findings never trip it, merely-vulnerable passes
-        assert!(!fail_on_gate_trips(
-            &tokens("malicious"),
-            &counts(&[("CR", 9)]),
-            &[sca_issue(None)]
-        ));
+        assert_eq!(
+            fail_on_tripped_count(
+                &tokens("malicious"),
+                &counts(&[("CR", 9)]),
+                &[sca_issue(None)]
+            ),
+            0
+        );
         // severity alone: SCA issues never trip it
-        assert!(!fail_on_gate_trips(
-            &tokens("CR"),
-            &counts(&[("LO", 1)]),
-            &[sca_issue(Some("malicious"))]
-        ));
+        assert_eq!(
+            fail_on_tripped_count(
+                &tokens("CR"),
+                &counts(&[("LO", 1)]),
+                &[sca_issue(Some("malicious"))]
+            ),
+            0
+        );
+        // the lowest listed threshold sets the count
+        assert_eq!(
+            fail_on_tripped_count(
+                &tokens("CR,ME"),
+                &counts(&[("CR", 1), ("HI", 2), ("ME", 3), ("LO", 4)]),
+                &[]
+            ),
+            6
+        );
+    }
+
+    #[test]
+    fn fail_on_hi_fails_the_gate_and_leads_the_agent_report() {
+        let config: Config =
+            toml::from_str("url = \"http://127.0.0.1:9\"\ndebug = 0\ntoken = \"t\"").unwrap();
+        // An accepted-risk HI still counts, as --fail-on always has; a false
+        // positive does not.
+        let issues: Vec<Issue> = serde_json::from_value(serde_json::json!([
+            issue_json("o1", "open", "ME"),
+            issue_json("a1", "accepted_risk", "HI"),
+            issue_json("f1", "false_positive", "CR"),
+        ]))
+        .unwrap();
+        let classifications = summary::legacy_urgency_counts(&issues);
+        let gate = evaluate_gate(
+            &config,
+            "goof",
+            "scan-1",
+            false,
+            None,
+            Some("HI"),
+            &classifications,
+        );
+        assert_eq!(
+            gate,
+            Gate::Failed {
+                condition: "--fail-on HI".into(),
+                tripped: 1
+            }
+        );
+        let summary = ScanSummary::build(
+            summary::ScanInfo {
+                id: "scan-1".into(),
+                project: "goof".into(),
+                ..Default::default()
+            },
+            gate,
+            &issues,
+            "https://corgea.test/scan".into(),
+        );
+        assert_eq!(summary.gate.exit_code(), 1);
+        let agent = summary::render_agent(&summary);
+        let mut lines = agent.lines();
+        assert_eq!(
+            lines.next(),
+            Some("record\tresult\texit_code\tcondition\ttripped")
+        );
+        assert_eq!(lines.next(), Some("gate\tfail\t1\t--fail-on HI\t1"));
+    }
+
+    fn issue_json(id: &str, status: &str, urgency: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "scan_id": null,
+            "status": status,
+            "urgency": urgency,
+            "created_at": "",
+            "classification": {"id": "CWE-89", "name": "SQL Injection", "description": null},
+            "location": {
+                "file": {"name": "a.js", "language": "js", "path": "src/a.js"},
+                "line_number": 1,
+                "project": {"name": "goof", "branch": null, "git_sha": null}
+            },
+            "details": null,
+            "auto_triage": {"false_positive_detection": {"status": "valid", "reasoning": null}},
+            "auto_fix_suggestion": null
+        })
     }
 
     #[test]

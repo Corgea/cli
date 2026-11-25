@@ -1004,20 +1004,30 @@ pub(crate) fn append_wait_plan(
         "read completed scan issues",
         move |request| {
             assert_authenticated_request(request, Method::GET, &issue_path)?;
-            assert_query(request, "page", "1")?;
-            assert_query(request, "page_size", "30")
+            assert_summary_issue_query(request)
         },
         json_response(regular_issue_page(scan_id, project)),
     ));
 }
 
+/// The human summary of `regular_issue_page`: four open findings, one
+/// critical, two high and one medium.
 pub(crate) fn assert_issue_summary(stdout: &str, context: &str) {
-    for (urgency, count) in [("CR", 1), ("HI", 2), ("ME", 1), ("LO", 0)] {
-        let row = format!("{urgency:<20} | {count}");
-        assert!(stdout.contains(&row), "missing {row:?}\n{context}");
+    for line in [
+        "4 findings in this scan: 4 open, 0 in other states.",
+        "Total open                                 1         2         1         0         4",
+        "Open                    1         2         1         0         4",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?}\n{context}");
     }
-    let total = format!("{:<20} | 4", "Total");
-    assert!(stdout.contains(&total), "missing {total:?}\n{context}");
+}
+
+/// The summary reads every finding, false positives included, so the open
+/// count and the false-positive row come from the same list.
+pub(crate) fn assert_summary_issue_query(request: &CapturedRequest) -> Result<(), String> {
+    assert_query(request, "page", "1")?;
+    assert_query(request, "page_size", "30")?;
+    assert_query(request, "show_false_positives", "true")
 }
 
 pub(crate) fn blast_plan(sha: &str) -> Vec<ExpectedRequest> {
@@ -1116,8 +1126,7 @@ fn blast_plan_for(
             "read regular BLAST issues",
             move |request| {
                 assert_authenticated_request(request, Method::GET, &issue_path)?;
-                assert_query(request, "page", "1")?;
-                assert_query(request, "page_size", "30")
+                assert_summary_issue_query(request)
             },
             json_response(empty_issue_page()),
         ),

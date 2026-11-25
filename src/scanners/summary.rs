@@ -1,0 +1,823 @@
+//! The report `scan` and `wait` print when a scan finishes: one `ScanSummary`,
+//! rendered for humans, agents or JSON parsers.
+
+use crate::utils::api::Issue;
+use crate::utils::terminal::{set_text_color, TerminalColor};
+use serde_json::{json, Map, Value};
+use std::collections::{BTreeSet, HashMap};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    Critical,
+    High,
+    Medium,
+    Low,
+}
+
+impl Severity {
+    pub const ALL: [Severity; 4] = [
+        Severity::Critical,
+        Severity::High,
+        Severity::Medium,
+        Severity::Low,
+    ];
+
+    fn parse(urgency: &str) -> Option<Self> {
+        match urgency {
+            "CR" => Some(Self::Critical),
+            "HI" => Some(Self::High),
+            "ME" => Some(Self::Medium),
+            "LO" => Some(Self::Low),
+            _ => None,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Critical => "Critical",
+            Self::High => "High",
+            Self::Medium => "Medium",
+            Self::Low => "Low",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Open,
+    FixInProgress,
+    Fixed,
+    AcceptedRisk,
+    FalsePositive,
+    Duplicate,
+}
+
+struct StatusInfo {
+    status: Status,
+    /// The server's value, and the JSON and agent key.
+    key: &'static str,
+    label: &'static str,
+    meaning: &'static str,
+}
+
+/// Every status, in report order.
+const STATUSES: [StatusInfo; 6] = [
+    StatusInfo {
+        status: Status::Open,
+        key: "open",
+        label: "Open",
+        meaning: "to fix; the scan page count",
+    },
+    StatusInfo {
+        status: Status::FixInProgress,
+        key: "fix_in_progress",
+        label: "Fix in progress",
+        meaning: "a fix is underway",
+    },
+    StatusInfo {
+        status: Status::Fixed,
+        key: "fixed",
+        label: "Fixed",
+        meaning: "resolved",
+    },
+    StatusInfo {
+        status: Status::AcceptedRisk,
+        key: "accepted_risk",
+        label: "Accepted risk",
+        meaning: "risk accepted by your team",
+    },
+    StatusInfo {
+        status: Status::FalsePositive,
+        key: "false_positive",
+        label: "False positive",
+        meaning: "not a real security issue",
+    },
+    StatusInfo {
+        status: Status::Duplicate,
+        key: "duplicate",
+        label: "Duplicate",
+        meaning: "same as another finding",
+    },
+];
+
+impl Status {
+    fn parse(status: &str) -> Option<Self> {
+        STATUSES
+            .iter()
+            .find(|info| info.key == status)
+            .map(|info| info.status)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SeverityCounts([usize; 4]);
+
+impl SeverityCounts {
+    pub fn get(&self, severity: Severity) -> usize {
+        self.0[severity as usize]
+    }
+
+    fn add(&mut self, severity: Severity) {
+        self.0[severity as usize] += 1;
+    }
+
+    pub fn total(&self) -> usize {
+        self.0.iter().sum()
+    }
+
+    fn json(&self) -> Value {
+        let mut map = Map::new();
+        for severity in Severity::ALL {
+            map.insert(severity.key().into(), self.get(severity).into());
+        }
+        map.insert("total".into(), self.total().into());
+        Value::Object(map)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanInfo {
+    pub id: String,
+    pub project: String,
+    pub branch: Option<String>,
+    pub git_sha: Option<String>,
+    /// `Some` only when `--skip-if-commit-scanned-recently` was passed.
+    pub reused_recent_scan: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gate {
+    NotRequested,
+    Passed { condition: String },
+    Failed { condition: String, tripped: usize },
+}
+
+impl Gate {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Gate::Failed { .. } => 1,
+            Gate::NotRequested | Gate::Passed { .. } => 0,
+        }
+    }
+
+    fn result(&self) -> &'static str {
+        match self {
+            Gate::NotRequested => "none",
+            Gate::Passed { .. } => "pass",
+            Gate::Failed { .. } => "fail",
+        }
+    }
+
+    fn condition(&self) -> &str {
+        match self {
+            Gate::NotRequested => "",
+            Gate::Passed { condition } | Gate::Failed { condition, .. } => condition,
+        }
+    }
+
+    fn tripped(&self) -> usize {
+        match self {
+            Gate::Failed { tripped, .. } => *tripped,
+            Gate::NotRequested | Gate::Passed { .. } => 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueRow {
+    pub id: String,
+    pub severity: Severity,
+    pub cwe: String,
+    pub title: String,
+    pub path: String,
+    pub line: u32,
+}
+
+/// Findings whose status or severity this CLI does not know. They count toward
+/// the total and are named in every format, never dropped or guessed at.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unrecognized {
+    pub count: usize,
+    pub values: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanSummary {
+    pub scan: ScanInfo,
+    pub gate: Gate,
+    /// Indexed by `Status as usize`.
+    by_status: [SeverityCounts; 6],
+    pub unrecognized: Unrecognized,
+    pub fix_first: Vec<IssueRow>,
+    pub results_url: String,
+}
+
+const FIX_FIRST_LIMIT: usize = 5;
+
+/// The label of the one open-issues row until the server splits findings by
+/// scanner.
+const CODE_ROW_LABEL: &str = "Code (SAST, Logic & Auth, Secrets)";
+
+/// The server hides a finding as a false positive when its status says so or
+/// when auto-triage held it as one; the list carries the hold as
+/// `auto_triage.false_positive_detection.status`.
+fn is_false_positive(issue: &Issue) -> bool {
+    issue.status == "false_positive"
+        || issue.auto_triage.false_positive_detection.status == "false_positive"
+}
+
+fn classify(issue: &Issue) -> Result<(Status, Severity), Vec<String>> {
+    let status = if is_false_positive(issue) {
+        Some(Status::FalsePositive)
+    } else {
+        Status::parse(&issue.status)
+    };
+    let severity = Severity::parse(&issue.urgency);
+    match (status, severity) {
+        (Some(status), Some(severity)) => Ok((status, severity)),
+        _ => {
+            let mut unknown = Vec::new();
+            if status.is_none() {
+                unknown.push(format!("status={}", issue.status));
+            }
+            if severity.is_none() {
+                unknown.push(format!("urgency={}", issue.urgency));
+            }
+            Err(unknown)
+        }
+    }
+}
+
+/// Counts by urgency code over the findings the server lists by default (every
+/// one but false positives), keyed as the server sends them. This is what
+/// `--fail-on` and the `--out-format json` report always counted, so their
+/// results do not move with the summary.
+pub fn legacy_urgency_counts(issues: &[Issue]) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for issue in issues.iter().filter(|issue| !is_false_positive(issue)) {
+        *counts.entry(issue.urgency.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+impl ScanSummary {
+    /// `issues` must include false positives (`show_false_positives=true`).
+    pub fn build(scan: ScanInfo, gate: Gate, issues: &[Issue], results_url: String) -> Self {
+        let mut by_status = [SeverityCounts::default(); 6];
+        let mut unrecognized = Unrecognized::default();
+        let mut open = Vec::new();
+        for issue in issues {
+            match classify(issue) {
+                Ok((status, severity)) => {
+                    by_status[status as usize].add(severity);
+                    if status == Status::Open {
+                        open.push(IssueRow {
+                            id: issue.id.clone(),
+                            severity,
+                            cwe: issue.classification.id.clone(),
+                            title: issue.classification.name.clone(),
+                            path: issue.location.file.path.clone(),
+                            line: issue.location.line_number,
+                        });
+                    }
+                }
+                Err(values) => {
+                    unrecognized.count += 1;
+                    unrecognized.values.extend(values);
+                }
+            }
+        }
+        open.sort_by(|a, b| {
+            (a.severity, &a.path, a.line, &a.id).cmp(&(b.severity, &b.path, b.line, &b.id))
+        });
+        open.truncate(FIX_FIRST_LIMIT);
+        ScanSummary {
+            scan,
+            gate,
+            by_status,
+            unrecognized,
+            fix_first: open,
+            results_url,
+        }
+    }
+
+    pub fn counts(&self, status: Status) -> SeverityCounts {
+        self.by_status[status as usize]
+    }
+
+    pub fn total_findings(&self) -> usize {
+        self.by_status
+            .iter()
+            .map(SeverityCounts::total)
+            .sum::<usize>()
+            + self.unrecognized.count
+    }
+
+    fn all_statuses(&self) -> SeverityCounts {
+        let mut all = SeverityCounts::default();
+        for counts in &self.by_status {
+            for (slot, count) in all.0.iter_mut().zip(counts.0) {
+                *slot += count;
+            }
+        }
+        all
+    }
+}
+
+fn severity_table(
+    title: &str,
+    rows: &[(&str, SeverityCounts)],
+    total: (&str, SeverityCounts),
+) -> String {
+    let width = rows
+        .iter()
+        .map(|(label, _)| label.len())
+        .chain([total.0.len()])
+        .max()
+        .unwrap_or(0);
+    let mut out = format!("{title}\n{:width$}", "");
+    for severity in Severity::ALL {
+        out.push_str(&format!("  {:>8}", severity.label()));
+    }
+    out.push_str(&format!("  {:>8}\n", "Total"));
+    let rule = width + 10 * 5;
+    for (label, counts) in rows {
+        out.push_str(&table_row(label, counts, width));
+    }
+    out.push_str(&format!("{}\n", "-".repeat(rule)));
+    out.push_str(&table_row(total.0, &total.1, width));
+    out
+}
+
+fn table_row(label: &str, counts: &SeverityCounts, width: usize) -> String {
+    let mut row = format!("{label:<width$}");
+    for severity in Severity::ALL {
+        row.push_str(&format!("  {:>8}", counts.get(severity)));
+    }
+    row.push_str(&format!("  {:>8}\n", counts.total()));
+    row
+}
+
+/// Ledger layout: header, open issues, every status, then the link.
+pub fn render_human(summary: &ScanSummary, color: bool) -> String {
+    let paint = |text: &str, tint: TerminalColor| {
+        if color {
+            set_text_color(text, tint)
+        } else {
+            text.to_string()
+        }
+    };
+    let scan = &summary.scan;
+    let open = summary.counts(Status::Open);
+    let total = summary.total_findings();
+    let mut out = String::from("\n");
+    out.push_str(&format!("Scan complete: {}", scan.project));
+    if let Some(branch) = &scan.branch {
+        out.push_str(&format!(", branch {branch}"));
+    }
+    out.push_str(&format!(", scan {}\n", scan.id));
+    if scan.reused_recent_scan == Some(true) {
+        out.push_str("Reused a recent scan of this commit.\n");
+    }
+    out.push_str(&format!(
+        "{total} findings in this scan: {} open, {} in other states.\n\n",
+        open.total(),
+        total - open.total()
+    ));
+
+    let open_rows = vec![(CODE_ROW_LABEL, open)];
+    out.push_str(&severity_table(
+        "Open issues",
+        &open_rows,
+        ("Total open", open),
+    ));
+    out.push('\n');
+
+    let status_rows: Vec<(&str, SeverityCounts)> = STATUSES
+        .iter()
+        .map(|info| (info.label, summary.counts(info.status)))
+        .collect();
+    out.push_str(&severity_table(
+        "All findings by status",
+        &status_rows,
+        ("Total", summary.all_statuses()),
+    ));
+
+    if summary.unrecognized.count > 0 {
+        out.push_str(&format!(
+            "\n{} more finding(s) have a value this CLI does not recognize ({}). They count in the total above only; update the CLI to see them in a row.\n",
+            summary.unrecognized.count,
+            unrecognized_list(&summary.unrecognized)
+        ));
+    }
+
+    match &summary.gate {
+        Gate::NotRequested => {}
+        Gate::Passed { condition } => out.push_str(&format!(
+            "\n{} {condition}\n",
+            paint("Gate passed:", TerminalColor::Green)
+        )),
+        Gate::Failed { condition, tripped } => out.push_str(&format!(
+            "\n{} {condition} matched {tripped} finding(s). Exiting with code {}.\n",
+            paint("Gate failed:", TerminalColor::Red),
+            summary.gate.exit_code()
+        )),
+    }
+
+    out.push_str(&format!(
+        "\nView the results: {}\n",
+        paint(&summary.results_url, TerminalColor::Green)
+    ));
+    out
+}
+
+fn unrecognized_list(unrecognized: &Unrecognized) -> String {
+    unrecognized
+        .values
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn tsv_cell(value: &str) -> String {
+    value.replace(['\t', '\r', '\n'], " ")
+}
+
+/// TSV records, one header row per record kind, as `deps --format agent`.
+pub fn render_agent(summary: &ScanSummary) -> String {
+    let gate = &summary.gate;
+    let scan = &summary.scan;
+    let mut out = String::new();
+    out.push_str("record\tresult\texit_code\tcondition\ttripped\n");
+    out.push_str(&format!(
+        "gate\t{}\t{}\t{}\t{}\n",
+        gate.result(),
+        gate.exit_code(),
+        tsv_cell(gate.condition()),
+        gate.tripped()
+    ));
+    out.push_str("record\tid\tproject\tbranch\tgit_sha\treused_recent_scan\tresults_url\n");
+    out.push_str(&format!(
+        "scan\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        tsv_cell(&scan.id),
+        tsv_cell(&scan.project),
+        tsv_cell(scan.branch.as_deref().unwrap_or("")),
+        tsv_cell(scan.git_sha.as_deref().unwrap_or("")),
+        scan.reused_recent_scan
+            .map(|reused| reused.to_string())
+            .unwrap_or_default(),
+        tsv_cell(&summary.results_url)
+    ));
+    let open = summary.counts(Status::Open);
+    out.push_str("record\tseverity\topen\n");
+    for severity in Severity::ALL {
+        out.push_str(&format!(
+            "severity\t{}\t{}\n",
+            severity.key(),
+            open.get(severity)
+        ));
+    }
+    out.push_str("record\tstatus\tcritical\thigh\tmedium\tlow\ttotal\tmeaning\n");
+    for info in &STATUSES {
+        let counts = summary.counts(info.status);
+        out.push_str(&format!("status\t{}", info.key));
+        for severity in Severity::ALL {
+            out.push_str(&format!("\t{}", counts.get(severity)));
+        }
+        out.push_str(&format!("\t{}\t{}\n", counts.total(), info.meaning));
+    }
+    if summary.unrecognized.count > 0 {
+        out.push_str("record\tcount\tvalues\n");
+        out.push_str(&format!(
+            "unrecognized\t{}\t{}\n",
+            summary.unrecognized.count,
+            tsv_cell(&unrecognized_list(&summary.unrecognized))
+        ));
+    }
+    if !summary.fix_first.is_empty() {
+        out.push_str("record\tid\tseverity\tcwe\ttitle\tlocation\n");
+        for row in &summary.fix_first {
+            out.push_str(&format!(
+                "issue\t{}\t{}\t{}\t{}\t{}:{}\n",
+                tsv_cell(&row.id),
+                row.severity.key(),
+                tsv_cell(&row.cwe),
+                tsv_cell(&row.title),
+                tsv_cell(&row.path),
+                row.line
+            ));
+        }
+    }
+    out
+}
+
+/// Next steps for an agent, printed to stderr after the records as `deps` does.
+pub fn agent_hints(summary: &ScanSummary) -> String {
+    let issue_id = summary
+        .fix_first
+        .first()
+        .map(|row| row.id.as_str())
+        .unwrap_or("<ISSUE_ID>");
+    format!(
+        "Hint: Run `corgea ls --issues --scan-id {scan} --json` to list every finding in this scan.\n\
+         Hint: Run `corgea inspect --issue {issue_id}` to read one finding.\n\
+         Hint: Run `corgea inspect --issue --diff {issue_id}` to see its suggested fix.\n",
+        scan = summary.scan.id
+    )
+}
+
+pub fn render_json(summary: &ScanSummary) -> String {
+    let scan = &summary.scan;
+    let mut scan_json = json!({
+        "id": scan.id,
+        "project": scan.project,
+        "branch": scan.branch,
+        "git_sha": scan.git_sha,
+    });
+    if let Some(reused) = scan.reused_recent_scan {
+        scan_json["reused_recent_scan"] = reused.into();
+    }
+    let gate = &summary.gate;
+    let mut by_status = Map::new();
+    for info in &STATUSES {
+        by_status.insert(info.key.into(), summary.counts(info.status).json());
+    }
+    let fix_first: Vec<Value> = summary
+        .fix_first
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "severity": row.severity.key(),
+                "cwe": row.cwe,
+                "title": row.title,
+                "path": row.path,
+                "line": row.line,
+            })
+        })
+        .collect();
+    let document = json!({
+        "schema_version": 1,
+        "scan": scan_json,
+        "gate": {
+            "result": gate.result(),
+            "exit_code": gate.exit_code(),
+            "condition": match gate {
+                Gate::NotRequested => Value::Null,
+                _ => gate.condition().into(),
+            },
+            "tripped": gate.tripped(),
+        },
+        "total_findings": summary.total_findings(),
+        "by_status": by_status,
+        "unrecognized": {
+            "count": summary.unrecognized.count,
+            "values": summary.unrecognized.values,
+        },
+        "fix_first": fix_first,
+        "results_url": summary.results_url,
+    });
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(&document).expect("serialize summary")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::api::{
+        AutoTriage, Classification, CorgeaFile, FalsePositiveDetection, Location, Project,
+    };
+
+    fn issue(id: &str, status: &str, urgency: &str, path: &str, line: u32) -> Issue {
+        Issue {
+            id: id.into(),
+            scan_id: None,
+            status: status.into(),
+            urgency: urgency.into(),
+            created_at: String::new(),
+            classification: Classification {
+                id: "CWE-89".into(),
+                name: "SQL Injection".into(),
+                description: None,
+            },
+            location: Location {
+                file: CorgeaFile {
+                    name: String::new(),
+                    language: String::new(),
+                    path: path.into(),
+                },
+                line_number: line,
+                project: Project {
+                    name: String::new(),
+                    branch: None,
+                    git_sha: None,
+                },
+            },
+            details: None,
+            auto_triage: AutoTriage {
+                false_positive_detection: FalsePositiveDetection {
+                    status: "valid".into(),
+                    reasoning: None,
+                },
+            },
+            auto_fix_suggestion: None,
+            scanner_metadata: None,
+            metadata: None,
+        }
+    }
+
+    fn held_false_positive(id: &str, urgency: &str) -> Issue {
+        let mut issue = issue(id, "open", urgency, "src/held.js", 1);
+        issue.auto_triage.false_positive_detection.status = "false_positive".into();
+        issue
+    }
+
+    /// One finding per status, plus a second open one and an auto-triage hold.
+    fn mixed_issues() -> Vec<Issue> {
+        vec![
+            issue("o1", "open", "HI", "src/b.js", 9),
+            issue("o2", "open", "CR", "src/z.js", 1),
+            issue("p1", "fix_in_progress", "HI", "src/a.js", 1),
+            issue("f1", "fixed", "CR", "src/a.js", 2),
+            issue("a1", "accepted_risk", "ME", "src/a.js", 3),
+            issue("d1", "duplicate", "LO", "src/a.js", 4),
+            issue("fp1", "false_positive", "HI", "src/a.js", 5),
+            held_false_positive("fp2", "ME"),
+        ]
+    }
+
+    fn scan_info() -> ScanInfo {
+        ScanInfo {
+            id: "scan-1".into(),
+            project: "goof".into(),
+            branch: Some("main".into()),
+            git_sha: Some("abc123".into()),
+            reused_recent_scan: None,
+        }
+    }
+
+    fn summary_of(issues: &[Issue], gate: Gate) -> ScanSummary {
+        ScanSummary::build(scan_info(), gate, issues, "https://corgea.test/scan".into())
+    }
+
+    #[test]
+    fn open_counts_only_open_findings() {
+        let summary = summary_of(&mixed_issues(), Gate::NotRequested);
+        let open = summary.counts(Status::Open);
+        assert_eq!(open.get(Severity::Critical), 1);
+        assert_eq!(open.get(Severity::High), 1);
+        assert_eq!(open.total(), 2);
+        assert_eq!(summary.counts(Status::FalsePositive).total(), 2);
+        assert_eq!(summary.counts(Status::AcceptedRisk).total(), 1);
+        assert_eq!(summary.total_findings(), 8);
+    }
+
+    #[test]
+    fn legacy_counts_keep_every_status_but_false_positives() {
+        let counts = legacy_urgency_counts(&mixed_issues());
+        assert_eq!(counts.get("CR"), Some(&2));
+        assert_eq!(counts.get("HI"), Some(&2));
+        assert_eq!(counts.get("ME"), Some(&1));
+        assert_eq!(counts.get("LO"), Some(&1));
+    }
+
+    #[test]
+    fn unknown_status_or_urgency_is_counted_and_named() {
+        let issues = vec![
+            issue("o1", "open", "HI", "a", 1),
+            issue("x1", "snoozed", "HI", "a", 2),
+            issue("x2", "open", "IN", "a", 3),
+        ];
+        let summary = summary_of(&issues, Gate::NotRequested);
+        assert_eq!(summary.counts(Status::Open).total(), 1);
+        assert_eq!(summary.unrecognized.count, 2);
+        assert_eq!(summary.total_findings(), 3);
+        assert!(render_human(&summary, false).contains("status=snoozed, urgency=IN"));
+        assert!(render_agent(&summary).contains("unrecognized\t2\tstatus=snoozed, urgency=IN\n"));
+        let json: Value = serde_json::from_str(&render_json(&summary)).unwrap();
+        assert_eq!(json["unrecognized"]["count"], 2);
+    }
+
+    #[test]
+    fn fix_first_is_critical_first_then_path_then_line_and_capped() {
+        let issues = vec![
+            issue("h-b", "open", "HI", "src/b.js", 1),
+            issue("h-a2", "open", "HI", "src/a.js", 20),
+            issue("h-a1", "open", "HI", "src/a.js", 3),
+            issue("l", "open", "LO", "src/a.js", 1),
+            issue("c", "open", "CR", "src/z.js", 1),
+            issue("m", "open", "ME", "src/a.js", 1),
+            issue("fixed", "fixed", "CR", "src/a.js", 1),
+        ];
+        let summary = summary_of(&issues, Gate::NotRequested);
+        let ids: Vec<&str> = summary.fix_first.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["c", "h-a1", "h-a2", "h-b", "m"]);
+    }
+
+    #[test]
+    fn human_prints_every_status_row_with_zeros() {
+        let issues = vec![issue("o1", "open", "HI", "src/a.js", 1)];
+        let out = render_human(&summary_of(&issues, Gate::NotRequested), false);
+        let expected = "
+Scan complete: goof, branch main, scan scan-1
+1 findings in this scan: 1 open, 0 in other states.
+
+Open issues
+                                    Critical      High    Medium       Low     Total
+Code (SAST, Logic & Auth, Secrets)         0         1         0         0         1
+------------------------------------------------------------------------------------
+Total open                                 0         1         0         0         1
+
+All findings by status
+                 Critical      High    Medium       Low     Total
+Open                    0         1         0         0         1
+Fix in progress         0         0         0         0         0
+Fixed                   0         0         0         0         0
+Accepted risk           0         0         0         0         0
+False positive          0         0         0         0         0
+Duplicate               0         0         0         0         0
+-----------------------------------------------------------------
+Total                   0         1         0         0         1
+
+View the results: https://corgea.test/scan
+";
+        assert_eq!(out, expected);
+        assert!(out.is_ascii());
+    }
+
+    #[test]
+    fn agent_output_starts_with_the_result_record() {
+        let gate = Gate::Failed {
+            condition: "--fail-on HI".into(),
+            tripped: 3,
+        };
+        let out = render_agent(&summary_of(&mixed_issues(), gate));
+        let expected = "record\tresult\texit_code\tcondition\ttripped
+gate\tfail\t1\t--fail-on HI\t3
+record\tid\tproject\tbranch\tgit_sha\treused_recent_scan\tresults_url
+scan\tscan-1\tgoof\tmain\tabc123\t\thttps://corgea.test/scan
+record\tseverity\topen
+severity\tcritical\t1
+severity\thigh\t1
+severity\tmedium\t0
+severity\tlow\t0
+record\tstatus\tcritical\thigh\tmedium\tlow\ttotal\tmeaning
+status\topen\t1\t1\t0\t0\t2\tto fix; the scan page count
+status\tfix_in_progress\t0\t1\t0\t0\t1\ta fix is underway
+status\tfixed\t1\t0\t0\t0\t1\tresolved
+status\taccepted_risk\t0\t0\t1\t0\t1\trisk accepted by your team
+status\tfalse_positive\t0\t1\t1\t0\t2\tnot a real security issue
+status\tduplicate\t0\t0\t0\t1\t1\tsame as another finding
+record\tid\tseverity\tcwe\ttitle\tlocation
+issue\to2\tcritical\tCWE-89\tSQL Injection\tsrc/z.js:1
+issue\to1\thigh\tCWE-89\tSQL Injection\tsrc/b.js:9
+";
+        assert_eq!(out, expected);
+        assert!(!out.contains('\x1b') && !out.contains('\r'));
+    }
+
+    #[test]
+    fn json_document_mirrors_the_summary() {
+        let mut scan = scan_info();
+        scan.reused_recent_scan = Some(true);
+        let summary = ScanSummary::build(
+            scan,
+            Gate::Passed {
+                condition: "--block-on criticals".into(),
+            },
+            &mixed_issues(),
+            "https://corgea.test/scan".into(),
+        );
+        let json: Value = serde_json::from_str(&render_json(&summary)).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["scan"]["reused_recent_scan"], true);
+        assert_eq!(json["gate"]["result"], "pass");
+        assert_eq!(json["gate"]["exit_code"], 0);
+        assert_eq!(json["by_status"]["open"]["total"], 2);
+        assert_eq!(json["by_status"]["duplicate"]["low"], 1);
+        assert_eq!(json["by_status"]["false_positive"]["medium"], 1);
+        assert_eq!(json["fix_first"][0]["severity"], "critical");
+        assert_eq!(json["total_findings"], 8);
+    }
+
+    #[test]
+    fn json_omits_reuse_when_the_flag_was_not_passed() {
+        let json: Value =
+            serde_json::from_str(&render_json(&summary_of(&[], Gate::NotRequested))).unwrap();
+        assert!(json["scan"].get("reused_recent_scan").is_none());
+        assert_eq!(json["gate"]["result"], "none");
+        assert_eq!(json["gate"]["condition"], Value::Null);
+    }
+}

@@ -140,11 +140,14 @@ pub fn run(
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
         print_section("Created At", &created_at);
-        if let Ok(counts) = scanners::blast::fetch_and_group_scan_issues(
+        if let Ok(counts) = utils::api::get_all_issues(
             &config.get_url(),
             &scan_details.project,
-            &scan_details.id,
-        ) {
+            Some(scan_details.id.clone()),
+            false,
+        )
+        .map(|issues| scanners::summary::legacy_urgency_counts(&issues))
+        {
             let total_issues = counts.values().sum::<usize>();
             let order = vec!["CR", "HI", "ME", "LO"];
             for urgency in order {

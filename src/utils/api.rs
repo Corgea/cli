@@ -919,10 +919,16 @@ pub fn upload_zip(
     Err("Failed to upload file".into())
 }
 
+/// Every issue of a project or scan, paging through the list. False positives
+/// are included only when `show_false_positives` is set, as the server hides
+/// them by default.
+// shortcut: pages 30 issues per request, so a scan with 1M findings costs ~33k
+// requests; move the summary to a server-side count endpoint once doghouse has one.
 pub fn get_all_issues(
     url: &str,
     project: &str,
     scan_id: Option<String>,
+    show_false_positives: bool,
 ) -> Result<Vec<Issue>, Box<dyn std::error::Error>> {
     let mut all_issues = Vec::new();
     let mut current_page: u32 = 1;
@@ -934,6 +940,7 @@ pub fn get_all_issues(
             Some(current_page as u16),
             Some(30),
             scan_id.clone(),
+            show_false_positives,
         ) {
             Ok(response) => response,
             Err(e) => return Err(format!("Failed to get scan issues: {}", e).into()),
@@ -964,6 +971,7 @@ pub fn get_scan_issues(
     page: Option<u16>,
     page_size: Option<u16>,
     scan_id: Option<String>,
+    show_false_positives: bool,
 ) -> Result<ProjectIssuesResponse, Box<dyn std::error::Error>> {
     // Project names can contain `&`/`?`/`#`, so use `query`, not `format!`.
     let (url, mut query_params) = match scan_id {
@@ -980,6 +988,9 @@ pub fn get_scan_issues(
         query_params.push(("page", p.to_string()));
     }
     query_params.push(("page_size", page_size.unwrap_or(30).to_string()));
+    if show_false_positives {
+        query_params.push(("show_false_positives", "true".to_string()));
+    }
     let client = http_client();
 
     debug(&format!("Sending request to URL: {}", url));

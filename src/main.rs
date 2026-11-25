@@ -22,6 +22,7 @@ mod scanners {
     pub mod fortify;
     pub mod parsers;
     pub mod report_paths;
+    pub mod summary;
 }
 mod utils {
     pub mod api;
@@ -33,6 +34,7 @@ mod version_check;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use config::Config;
+use corgea::output_format::{self, OutputFormat};
 use project_naming::ProjectNamingMode;
 use scanners::fortify::parse as fortify_parse;
 use std::str::FromStr;
@@ -40,6 +42,9 @@ use std::str::FromStr;
 const PROJECT_NAMING_MODE_HELP: &str = "Derive the Corgea project name instead of passing --project-name. sparse-postfixed: in a sparse checkout at the repository root, the checked-out top-level folders are appended to the default project name (monorepo-jsoar-agent for a checkout of jsoar-agent from monorepo), so each service of a monorepo gets its own project. Anywhere else it warns and the default name is used.";
 
 const PROJECT_NAMING_MODE_QUERY_HELP: &str = "Query the project that a scan with the same --project-naming-mode names. sparse-postfixed: in a sparse checkout at the repository root, the default project name followed by the checked-out top-level folders (monorepo-jsoar-agent). Anywhere else it warns and the project is resolved as usual.";
+
+/// `--format` help shared by `scan` and `wait`.
+const SUMMARY_FORMAT_HELP: &str = "How to print the results summary when the scan finishes: human (tables for a terminal), agent (tab-separated records for coding agents), json (one JSON document on stdout; every other line goes to stderr), or quiet (no summary; the exit code still carries any gate). Defaults to agent when an agent environment is detected (AI_AGENT, CLAUDECODE, CODEX_SANDBOX, CURSOR_AGENT and related variables), otherwise human. Independent of --out-format/--out-file.";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -103,6 +108,9 @@ enum Commands {
         wait: bool,
     },
     /// Scan the current directory. Supports blast, semgrep and snyk.
+    #[command(
+        after_help = "Examples:\n  corgea scan --format agent\n  corgea scan --format json --fail-on HI | jq .gate\n  corgea scan --format quiet --block-on criticals\n  corgea scan --out-format sarif --out-file corgea.sarif"
+    )]
     Scan {
         /// What scanner to use. Valid options are blast, semgrep and snyk.
         #[arg(default_value = "blast")]
@@ -244,8 +252,19 @@ enum Commands {
             help = "Do not let uncommitted changes stop this run from taking a shortcut. For an incremental scan, the diff is measured against the working tree instead of the last commit, so edited and untracked files are analyzed rather than skipped. With --skip-if-commit-scanned-recently, a recent scan of this commit may be reused even though this worktree is dirty or the prior scan recorded worktree_dirty. A new scan still reports the real dirty status."
         )]
         ignore_dirty_worktree: bool,
+
+        #[arg(
+            long,
+            value_name = "human|agent|json|quiet",
+            value_parser = OutputFormat::parse,
+            help = SUMMARY_FORMAT_HELP
+        )]
+        format: Option<OutputFormat>,
     },
     /// Wait for the latest in progress scan
+    #[command(
+        after_help = "Examples:\n  corgea wait --format agent\n  corgea wait <SCAN_ID> --format json | jq .by_status.open"
+    )]
     Wait {
         scan_id: Option<String>,
         #[arg(
@@ -274,6 +293,13 @@ enum Commands {
             help = "Use this Corgea project id for the result link instead of the one the server reports for the scan, skipping project resolution. Requires a scan id, which is what the id then belongs to."
         )]
         project_id: Option<String>,
+        #[arg(
+            long,
+            value_name = "human|agent|json|quiet",
+            value_parser = OutputFormat::parse,
+            help = SUMMARY_FORMAT_HELP
+        )]
+        format: Option<OutputFormat>,
     },
     /// List something, by default it lists the scans
     #[command(alias = "ls")]
@@ -765,6 +791,7 @@ fn main() {
                                 ..Default::default()
                             },
                             project_id: result.project_id.clone(),
+                            format: OutputFormat::Human,
                         },
                     );
                 } else {
@@ -794,7 +821,16 @@ fn main() {
             skip_if_commit_scanned_recently,
             scanned_within,
             ignore_dirty_worktree,
+            format,
         }) => {
+            if format.is_some() && *scanner != Scanner::Blast {
+                ::log::error!("--format is only supported with the blast scanner.");
+                std::process::exit(1);
+            }
+            let format = OutputFormat::resolve(*format);
+            if *scanner == Scanner::Blast {
+                output_format::set_process_format(format);
+            }
             verify_token_and_exit_when_fail(&corgea_config);
             if let Some(level) = fail_on {
                 if *scanner != Scanner::Blast {
@@ -993,6 +1029,7 @@ fn main() {
                     include_images,
                     skip_recent,
                     ignore_dirty_worktree,
+                    format,
                 ),
             }
         }
@@ -1002,7 +1039,10 @@ fn main() {
             project_naming_mode,
             repo,
             project_id,
+            format,
         }) => {
+            let format = OutputFormat::resolve(*format);
+            output_format::set_process_format(format);
             verify_token_and_exit_when_fail(&corgea_config);
             wait::run(
                 &corgea_config,
@@ -1013,6 +1053,7 @@ fn main() {
                         repo: repo.clone(),
                     },
                     project_id: project_id.clone(),
+                    format,
                 },
             );
         }

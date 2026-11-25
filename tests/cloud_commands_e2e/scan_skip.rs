@@ -67,7 +67,10 @@ fn reused_scan_issues() -> ExpectedRequest {
     let path = format!("/api/v1/scan/{PRIOR_SCAN}/issues");
     expected_request(
         "read the reused scan's issues",
-        move |request| assert_authenticated_request(request, Method::GET, &path),
+        move |request| {
+            assert_authenticated_request(request, Method::GET, &path)?;
+            assert_summary_issue_query(request)
+        },
         json_response(regular_issue_page(PRIOR_SCAN, PROJECT)),
     )
 }
@@ -151,7 +154,7 @@ fn skipped_scan_still_fails_the_build_on_the_prior_scans_blocking_rules() {
         "{context}"
     );
     assert!(
-        stdout.contains("violated the blocking rule(s)"),
+        stdout.contains("Gate failed: --block-on criticals (rules violated: criticals)"),
         "{context}"
     );
     // The upload never happened; the stub would have failed on an extra
@@ -193,7 +196,7 @@ fn skipped_scan_reports_the_prior_findings() {
     assert_eq!(output.status.code(), Some(0), "{context}");
     assert_issue_summary(&stdout, &context);
     assert!(
-        stdout.contains("No issues violated the blocking rule(s)"),
+        stdout.contains("Gate passed: --block-on criticals"),
         "{context}"
     );
 }
