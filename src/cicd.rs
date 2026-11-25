@@ -37,6 +37,9 @@ pub fn ci_branch() -> Option<String> {
 }
 
 fn ci_branch_from(env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    // CI systems export variables that do not apply to a build as empty
+    // strings (GITHUB_HEAD_REF on a push), so a blank value is an unset one.
+    let env = |name: &str| env(name).filter(|value| !value.trim().is_empty());
     let set = |name: &str| env(name).is_some();
     let raw = if set("GITHUB_ACTIONS") {
         // GITHUB_HEAD_REF is only set on pull request events, where GITHUB_REF
@@ -52,10 +55,13 @@ fn ci_branch_from(env: impl Fn(&str) -> Option<String>) -> Option<String> {
     } else if set("BITBUCKET_BUILD_NUMBER") {
         env("BITBUCKET_BRANCH")
     } else if set("JENKINS_URL") {
-        // On a change request build BRANCH_NAME is the job's name (`PR-123`),
-        // not a branch.
+        // BRANCH_NAME is the job's name, which is a branch only on a branch
+        // build: a change request build calls it `PR-123` and a tag build
+        // gives it the tag.
         if set("CHANGE_ID") {
             env("CHANGE_BRANCH")
+        } else if set("TAG_NAME") {
+            None
         } else {
             env("BRANCH_NAME")
         }
@@ -186,12 +192,43 @@ mod tests {
             &[("GITLAB_CI", "true"), ("CI_COMMIT_TAG", "v1")],
             &[
                 ("JENKINS_URL", "https://ci/"),
+                ("BRANCH_NAME", "v1"),
+                ("TAG_NAME", "v1"),
+            ],
+            &[
+                ("JENKINS_URL", "https://ci/"),
                 ("CHANGE_ID", "12"),
                 ("BRANCH_NAME", "PR-12"),
             ],
         ];
         for vars in cases {
             assert_eq!(branch(vars), None, "{vars:?}");
+        }
+    }
+
+    #[test]
+    fn a_blank_variable_counts_as_unset() {
+        let cases: &[(&[(&str, &str)], &str)] = &[
+            (
+                &[
+                    ("GITHUB_ACTIONS", "true"),
+                    ("GITHUB_HEAD_REF", ""),
+                    ("GITHUB_REF", "refs/heads/main"),
+                ],
+                "main",
+            ),
+            (
+                &[
+                    ("JENKINS_URL", "https://ci/"),
+                    ("CHANGE_ID", " "),
+                    ("TAG_NAME", ""),
+                    ("BRANCH_NAME", "main"),
+                ],
+                "main",
+            ),
+        ];
+        for (vars, expected) in cases {
+            assert_eq!(branch(vars).as_deref(), Some(*expected), "{vars:?}");
         }
     }
 
