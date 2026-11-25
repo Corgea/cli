@@ -37,6 +37,15 @@ impl Severity {
         }
     }
 
+    fn index(self) -> usize {
+        match self {
+            Self::Critical => 0,
+            Self::High => 1,
+            Self::Medium => 2,
+            Self::Low => 3,
+        }
+    }
+
     fn sgr(self) -> &'static str {
         match self {
             Self::Critical => "38;5;203",
@@ -120,6 +129,17 @@ const STATUSES: [StatusInfo; 6] = [
 ];
 
 impl Status {
+    fn index(self) -> usize {
+        match self {
+            Self::Open => 0,
+            Self::FixInProgress => 1,
+            Self::Fixed => 2,
+            Self::AcceptedRisk => 3,
+            Self::FalsePositive => 4,
+            Self::Duplicate => 5,
+        }
+    }
+
     fn parse(status: &str) -> Option<Self> {
         STATUSES
             .iter()
@@ -129,15 +149,15 @@ impl Status {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SeverityCounts([usize; 4]);
+pub struct SeverityCounts([usize; Severity::ALL.len()]);
 
 impl SeverityCounts {
     pub fn get(&self, severity: Severity) -> usize {
-        self.0[severity as usize]
+        self.0[severity.index()]
     }
 
     fn add(&mut self, severity: Severity) {
-        self.0[severity as usize] += 1;
+        self.0[severity.index()] += 1;
     }
 
     pub fn total(&self) -> usize {
@@ -229,7 +249,7 @@ pub struct Unrecognized {
 pub struct ScanSummary {
     pub scan: ScanInfo,
     pub gate: Gate,
-    by_status: [SeverityCounts; 6],
+    by_status: [SeverityCounts; STATUSES.len()],
     pub unrecognized: Unrecognized,
     pub fix_first: Vec<IssueRow>,
     pub results_url: String,
@@ -297,13 +317,13 @@ impl ScanIssues {
 
 impl ScanSummary {
     pub fn build(scan: ScanInfo, gate: Gate, issues: &ScanIssues, results_url: String) -> Self {
-        let mut by_status = [SeverityCounts::default(); 6];
+        let mut by_status = [SeverityCounts::default(); STATUSES.len()];
         let mut unrecognized = Unrecognized::default();
         let mut open = Vec::new();
         for issue in issues.as_slice() {
             match classify(issue) {
                 Ok((status, severity)) => {
-                    by_status[status as usize].add(severity);
+                    by_status[status.index()].add(severity);
                     if status == Status::Open {
                         open.push(IssueRow {
                             id: issue.id.clone(),
@@ -336,7 +356,7 @@ impl ScanSummary {
     }
 
     pub fn counts(&self, status: Status) -> SeverityCounts {
-        self.by_status[status as usize]
+        self.by_status[status.index()]
     }
 
     pub fn total_findings(&self) -> usize {
@@ -769,6 +789,16 @@ mod tests {
             &ScanIssues::including_false_positives(issues),
             "https://corgea.test/scan".into(),
         )
+    }
+
+    #[test]
+    fn count_slots_follow_the_listed_order() {
+        for (slot, severity) in Severity::ALL.iter().enumerate() {
+            assert_eq!(severity.index(), slot, "{severity:?}");
+        }
+        for (slot, info) in STATUSES.iter().enumerate() {
+            assert_eq!(info.status.index(), slot, "{:?}", info.status);
+        }
     }
 
     #[test]
