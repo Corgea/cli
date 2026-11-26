@@ -1667,7 +1667,8 @@ pub struct ScanSettingsResponse {
     pub project: UploadProject,
 }
 
-/// `null` is a project the upload will create, an id one it lands in.
+/// `null` is a project the upload will create, an id one it lands in. A
+/// project without an id is a broken answer, so the whole lookup fails.
 fn upload_project<'de, D>(deserializer: D) -> Result<UploadProject, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1677,11 +1678,11 @@ where
         #[serde(default, deserialize_with = "id_as_string")]
         id: Option<String>,
     }
-    Ok(match Option::<Project>::deserialize(deserializer)? {
-        None => UploadProject::New,
-        Some(Project { id: Some(id) }) => UploadProject::Existing(id),
-        Some(Project { id: None }) => UploadProject::Unknown,
-    })
+    match Option::<Project>::deserialize(deserializer)? {
+        None => Ok(UploadProject::New),
+        Some(Project { id: Some(id) }) => Ok(UploadProject::Existing(id)),
+        Some(Project { id: None }) => Err(serde::de::Error::missing_field("project.id")),
+    }
 }
 
 /// GET /api/v1/scan/configs — the project's ignore and include rules, and the
@@ -2897,6 +2898,10 @@ mod tests {
         );
         assert_eq!(project(r#"{"project": null}"#), UploadProject::New);
         assert_eq!(project("{}"), UploadProject::Unknown);
+        // A project that cannot be named is a broken answer, not a missing one.
+        assert!(
+            serde_json::from_str::<ScanSettingsResponse>(r#"{"project": {"name": "p"}}"#).is_err()
+        );
     }
 
     #[test]
