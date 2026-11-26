@@ -51,7 +51,7 @@
 use crate::config::Config;
 use crate::manifest::{Manifest, MANIFEST_VERSION};
 use crate::scanners::blast::{classify_scan_status, ScanState};
-use crate::utils::api::{self, ProjectScope, ScanResponse, UploadProject};
+use crate::utils::api::{self, ProjectScope, ScanResponse, Unscoped, UploadProject};
 use corgea::statusln;
 use git2::Repository;
 use serde::Serialize;
@@ -298,14 +298,24 @@ fn plan_diff(
     upload_project: &UploadProject,
     sources: &DiffSources<'_>,
 ) -> Result<(IncrementalPlan, String), FullScanReason> {
-    let Some(project) = upload_project.scope(project_name) else {
-        return Err(FullScanReason::new(
-            FullScanCause::NoBaselineScan,
-            format!(
-                "Corgea has no project '{project_name}' for this repository yet, so \
-                 there is no earlier scan to diff against"
-            ),
-        ));
+    let project = match upload_project.scope(project_name) {
+        Ok(project) => project,
+        Err(Unscoped::NewProject) => {
+            return Err(FullScanReason::new(
+                FullScanCause::NoBaselineScan,
+                format!(
+                    "Corgea has no project '{project_name}' for this repository yet, so \
+                     there is no earlier scan to diff against"
+                ),
+            ))
+        }
+        Err(Unscoped::LookupFailed) => {
+            return Err(FullScanReason::new(
+                FullScanCause::BaselineLookupFailed,
+                "the Corgea project this upload lands in could not be looked up, so no \
+                 earlier scan can be shown to be its own. Run with --verbose for the error",
+            ))
+        }
     };
     // Optional, because a checksum diff needs no repository. Only the git diff
     // below does, and it reports its absence by its real name.

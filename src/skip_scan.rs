@@ -35,7 +35,7 @@
 use crate::config::Config;
 use crate::scanners::blast::{classify_scan_status, format_scan_warnings, ScanState};
 use crate::utils;
-use crate::utils::api::{ProjectScope, ScanResponse, UploadProject};
+use crate::utils::api::{ProjectScope, ScanResponse, Unscoped, UploadProject};
 use chrono::{DateTime, Utc};
 use corgea::statusln;
 use std::collections::BTreeSet;
@@ -161,14 +161,27 @@ pub fn resolve_reusable_scan(
         }
     }
 
-    let Some(project) = upload_project.scope(project_name) else {
-        statusln!(
-            "Corgea has no project '{}' for this repository yet, so there is no earlier scan of commit {} to reuse - running a new scan.",
-            project_name,
-            short
-        );
-        print_skipped_marker(None);
-        return None;
+    let project = match upload_project.scope(project_name) {
+        Ok(project) => project,
+        Err(Unscoped::NewProject) => {
+            statusln!(
+                "Corgea has no project '{}' for this repository yet, so there is no earlier scan of commit {} to reuse - running a new scan.",
+                project_name,
+                short
+            );
+            print_skipped_marker(None);
+            return None;
+        }
+        // `IncludeRules::reuse_refusal` turns a failed lookup away first, so
+        // this only keeps the answer right for any other caller.
+        Err(Unscoped::LookupFailed) => {
+            log::warn!(
+                "Could not look up the Corgea project this upload lands in, so no scan of commit {} can be shown to be its own. Running a new scan.",
+                short
+            );
+            print_skipped_marker(None);
+            return None;
+        }
     };
 
     statusln!(

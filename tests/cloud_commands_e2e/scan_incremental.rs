@@ -917,6 +917,66 @@ fn a_scan_that_starts_a_new_project_does_not_look_for_a_baseline() {
     );
 }
 
+/// When the lookup of the upload's project fails, no listed scan can be shown
+/// to be that project's, so none is looked up. The full scan names the failed
+/// lookup, not a missing baseline.
+#[test]
+fn a_failed_project_lookup_is_not_reported_as_a_missing_baseline() {
+    let project = git_project();
+    let head_sha = second_commit(&project);
+
+    let plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with no diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_multipart_text_field(request, "sha", &head_sha)?;
+                assert_no_multipart_field(request, "incremental_base_scan_id")?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_skipped_reason",
+                    "baseline_lookup_failed",
+                )
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": UPLOAD_PROJECT_ID})),
+        ),
+    ];
+    let mut plan = answer_with(
+        plan,
+        "read project include rules",
+        json_response_with_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"status": "error"}),
+        ),
+    );
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(
+            "Scanning every file: the Corgea project this upload lands in could not be \
+             looked up, so no earlier scan can be shown to be its own."
+        ),
+        "{context}"
+    );
+}
+
 /// Once no recent commit turns out to have been scanned, the branch being
 /// scanned is asked about next, and its own last scan wins over trunk's.
 ///

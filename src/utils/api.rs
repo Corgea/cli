@@ -1598,23 +1598,35 @@ pub enum UploadProject {
     Existing(String),
     /// No project holds this repository yet (or this name, without one).
     New,
-    /// The server did not say: a backend predating the endpoint, or a lookup
-    /// that failed.
+    /// The server did not say, as a backend predating the endpoint does. Its
+    /// scans carry no project id either, so they match on name.
     #[default]
     Unknown,
+    /// The lookup failed. A backend that has the endpoint lists scans with
+    /// their project ids, and none can be shown to be this upload's.
+    LookupFailed,
+}
+
+/// Why an upload has no scans of its own project to read.
+#[derive(Debug)]
+pub enum Unscoped {
+    /// The upload creates its project, which has no scans yet.
+    NewProject,
+    /// Which project the upload lands in could not be looked up.
+    LookupFailed,
 }
 
 impl UploadProject {
-    /// The scope of an upload named `name`, or `None` when the upload creates
-    /// its project, which has no scans yet. Other projects may share the name,
+    /// The scope of an upload named `name`. Other projects may share the name,
     /// but their scans are not this project's.
-    pub fn scope<'a>(&'a self, name: &'a str) -> Option<ProjectScope<'a>> {
+    pub fn scope<'a>(&'a self, name: &'a str) -> Result<ProjectScope<'a>, Unscoped> {
         let id = match self {
             UploadProject::Existing(id) => Some(id.as_str()),
             UploadProject::Unknown => None,
-            UploadProject::New => return None,
+            UploadProject::New => return Err(Unscoped::NewProject),
+            UploadProject::LookupFailed => return Err(Unscoped::LookupFailed),
         };
-        Some(ProjectScope { name, id })
+        Ok(ProjectScope { name, id })
     }
 }
 
