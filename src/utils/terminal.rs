@@ -1,4 +1,5 @@
 use crate::utils;
+use corgea::output_format::{colors_enabled, decorations_enabled};
 use regex::Regex;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
@@ -6,6 +7,9 @@ use std::{thread, time};
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
 pub fn show_progress_bar(progress: f32) {
+    if !decorations_enabled() {
+        return;
+    }
     let total_bar_length = 50;
     if progress == -1.0 {
         print!("\r{}", " ".repeat(50));
@@ -27,11 +31,18 @@ pub fn show_progress_bar(progress: f32) {
 }
 
 pub fn show_loading_message(message: &str, stop_signal: Arc<Mutex<bool>>) {
+    if !decorations_enabled() {
+        return;
+    }
     let spinner = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
     let spinner_colors = [Color::Cyan, Color::Magenta, Color::Yellow, Color::Green];
     let start_time = time::Instant::now();
     let mut i = 0;
-    let mut stdout = StandardStream::stdout(ColorChoice::Always);
+    let mut stdout = StandardStream::stdout(if colors_enabled() {
+        ColorChoice::Always
+    } else {
+        ColorChoice::Never
+    });
     print!("{} ", message);
     io::stdout().flush().unwrap();
     loop {
@@ -65,6 +76,9 @@ pub fn show_loading_message(message: &str, stop_signal: Arc<Mutex<bool>>) {
 }
 
 pub fn set_text_color(txt: &str, color: TerminalColor) -> String {
+    if !colors_enabled() {
+        return txt.to_string();
+    }
     let color_code = match color {
         TerminalColor::Red => "\x1b[31m",
         TerminalColor::Green => "\x1b[32m",
@@ -150,6 +164,9 @@ pub fn clear_line(length: usize) {
 }
 
 pub fn clear_previous_line() {
+    if !decorations_enabled() {
+        return;
+    }
     print!(
         "\r{}{}",
         utils::terminal::set_text_color("", utils::terminal::TerminalColor::Reset),

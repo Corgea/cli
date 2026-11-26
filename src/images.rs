@@ -1,3 +1,4 @@
+use corgea::statusln;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -109,7 +110,7 @@ fn save_images_with_engine(
         let archive_name = unique_archive_name(image, &saved);
         let path = out_dir.join(&archive_name);
 
-        println!("Exporting container image {}...", image);
+        statusln!("Exporting container image {}...", image);
         ensure_image_present(engine, image)?;
         save_image(engine, image, &path)?;
 
@@ -225,10 +226,10 @@ fn ensure_image_present(engine: &str, image: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    println!("  {} isn't available locally, pulling it...", image);
+    statusln!("  {} isn't available locally, pulling it...", image);
     let status = Command::new(engine)
         .args(["pull", image])
-        .stdout(Stdio::inherit())
+        .stdout(std::io::stderr())
         .stderr(Stdio::inherit())
         .status()
         .map_err(|e| format!("Failed to run `{} pull {}`: {}", engine, image, e))?;

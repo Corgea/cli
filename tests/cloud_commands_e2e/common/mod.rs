@@ -1004,20 +1004,43 @@ pub(crate) fn append_wait_plan(
         "read completed scan issues",
         move |request| {
             assert_authenticated_request(request, Method::GET, &issue_path)?;
-            assert_query(request, "page", "1")?;
-            assert_query(request, "page_size", "30")
+            assert_summary_issue_query(request)
         },
         json_response(regular_issue_page(scan_id, project)),
     ));
 }
 
 pub(crate) fn assert_issue_summary(stdout: &str, context: &str) {
-    for (urgency, count) in [("CR", 1), ("HI", 2), ("ME", 1), ("LO", 0)] {
-        let row = format!("{urgency:<20} | {count}");
-        assert!(stdout.contains(&row), "missing {row:?}\n{context}");
+    let plain = regex::Regex::new("\x1b\\[[0-9;]*m")
+        .unwrap()
+        .replace_all(stdout, "");
+    for line in [
+        "4 findings in this scan: 4 open, 0 in other states.",
+        "Total open                           1     2       1    0      4",
+        "Open                                 1     2       1    0      4",
+    ] {
+        assert!(plain.contains(line), "missing {line:?}\n{context}");
     }
-    let total = format!("{:<20} | 4", "Total");
-    assert!(stdout.contains(&total), "missing {total:?}\n{context}");
+}
+
+pub(crate) fn assert_summary_issue_query(request: &CapturedRequest) -> Result<(), String> {
+    assert_query(request, "page", "1")?;
+    assert_query(request, "page_size", "30")?;
+    assert_query(request, "show_false_positives", "true")
+}
+
+/// `plan` with the request labeled `label` answered by `response` instead.
+pub(crate) fn answer_with(
+    mut plan: Vec<ExpectedRequest>,
+    label: &str,
+    response: StubResponse,
+) -> Vec<ExpectedRequest> {
+    let request = plan
+        .iter_mut()
+        .find(|request| request.label == label)
+        .unwrap_or_else(|| panic!("no request labeled {label:?} in the plan"));
+    request.response = response;
+    plan
 }
 
 pub(crate) fn blast_plan(sha: &str) -> Vec<ExpectedRequest> {
@@ -1116,8 +1139,7 @@ fn blast_plan_for(
             "read regular BLAST issues",
             move |request| {
                 assert_authenticated_request(request, Method::GET, &issue_path)?;
-                assert_query(request, "page", "1")?;
-                assert_query(request, "page_size", "30")
+                assert_summary_issue_query(request)
             },
             json_response(empty_issue_page()),
         ),

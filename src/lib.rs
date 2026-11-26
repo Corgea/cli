@@ -6,6 +6,7 @@ pub mod verify_deps;
 // (e.g. vuln_api) can use `crate::log::debug`. src/log.rs is a thin `::log` facade that
 // compiles cleanly in both crates.
 mod log;
+pub mod output_format;
 pub mod vuln_api;
 // Test-only HTTP stub for the vuln-api. Gated out of release builds; the
 // `test-stub` feature is enabled for every test build by the self

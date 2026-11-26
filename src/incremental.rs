@@ -52,6 +52,7 @@ use crate::config::Config;
 use crate::manifest::{Manifest, MANIFEST_VERSION};
 use crate::scanners::blast::{classify_scan_status, ScanState};
 use crate::utils::api::{self, ScanResponse};
+use corgea::statusln;
 use git2::Repository;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -242,8 +243,8 @@ impl IncrementalPlan {
         };
         match added {
             0 => {}
-            1 => println!("Incremental scan: also analyzing 1 force-included file."),
-            count => println!("Incremental scan: also analyzing {count} force-included files."),
+            1 => statusln!("Incremental scan: also analyzing 1 force-included file."),
+            count => statusln!("Incremental scan: also analyzing {count} force-included files."),
         }
         Ok(plan)
     }
@@ -285,7 +286,7 @@ pub fn resolve_incremental_plan(
     sources: DiffSources<'_>,
 ) -> Result<IncrementalPlan, FullScanReason> {
     let (plan, summary) = plan_diff(config, project_name, &sources)?;
-    println!("{summary}");
+    statusln!("{summary}");
     Ok(plan)
 }
 

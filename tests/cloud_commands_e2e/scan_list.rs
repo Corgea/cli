@@ -4,11 +4,111 @@ use serde_json::json;
 use tempfile::TempDir;
 
 #[test]
+fn scan_format_json_prints_only_the_document_on_stdout() {
+    let project = git_project();
+    let api = ApiStub::start(blast_plan(&project.sha));
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--fail-on",
+        "malicious",
+        "--format",
+        "json",
+        "--project-name",
+        "cloud-e2e",
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    assert_eq!(output.status.code(), Some(1), "{context}");
+    let document = parse_output_json(&output, &transcript);
+    assert_eq!(document["schema_version"], 1, "{context}");
+    assert_eq!(document["gate"]["result"], "fail", "{context}");
+    assert_eq!(document["gate"]["exit_code"], 1, "{context}");
+    assert_eq!(document["gate"]["tripped"], 1, "{context}");
+    assert_eq!(document["scan"]["id"], "blast-scan-123", "{context}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Scanning with BLAST"), "{context}");
+    assert!(stderr.contains("Scan has started with ID"), "{context}");
+}
+
+#[test]
+fn scan_fail_on_severity_and_malicious_counts_both_when_severity_already_trips() {
+    let project = git_project();
+    let plan = answer_with(
+        blast_plan(&project.sha),
+        "read regular BLAST issues",
+        json_response(regular_issue_page("blast-scan-123", "cloud-e2e")),
+    );
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--fail-on",
+        "HI,malicious",
+        "--format",
+        "json",
+        "--project-name",
+        "cloud-e2e",
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    assert_eq!(output.status.code(), Some(1), "{context}");
+    let document = parse_output_json(&output, &transcript);
+    // CR + two HI at or above HI, plus the one malicious dependency.
+    assert_eq!(document["gate"]["tripped"], 4, "{context}");
+}
+
+#[test]
+fn scan_format_agent_leads_with_the_gate_record() {
+    let project = git_project();
+    let api = ApiStub::start(blast_plan(&project.sha));
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--fail-on",
+        "malicious",
+        "--format",
+        "agent",
+        "--project-name",
+        "cloud-e2e",
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    assert_eq!(output.status.code(), Some(1), "{context}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with(
+            "record\tresult\texit_code\tcondition\ttripped\ngate\tfail\t1\t--fail-on malicious (findings in any status, not only open)\t1\n"
+        ),
+        "{context}"
+    );
+    assert!(
+        !stdout.contains('\x1b') && !stdout.contains('\r'),
+        "{context}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Hint: Run `corgea ls --issues --scan-id blast-scan-123 --json`"),
+        "{context}"
+    );
+}
+
+#[test]
 fn scan_fail_on_malicious_sends_sha_and_list_renders_it() {
     let project = git_project();
     let scan_api = ApiStub::start(blast_plan(&project.sha));
     let (mut scan_command, _scan_home) = cloud_command(&scan_api, project.path());
-    scan_command.args([
+    // An agent environment does not switch the summary away from tables.
+    scan_command.env("AI_AGENT", "1").args([
         "scan",
         "blast",
         "--fail-on",
@@ -23,7 +123,7 @@ fn scan_fail_on_malicious_sends_sha_and_list_renders_it() {
     assert_eq!(scan_output.status.code(), Some(1), "{scan_context}");
     let scan_stdout = String::from_utf8_lossy(&scan_output.stdout);
     assert!(
-        scan_stdout.contains("matched --fail-on malicious"),
+        scan_stdout.contains("Gate failed: --fail-on malicious (findings in any status, not only open) matched 1 finding(s)"),
         "{scan_context}"
     );
     assert!(

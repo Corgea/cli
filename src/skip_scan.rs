@@ -37,6 +37,7 @@ use crate::scanners::blast::{classify_scan_status, format_scan_warnings, ScanSta
 use crate::utils;
 use crate::utils::api::ScanResponse;
 use chrono::{DateTime, Utc};
+use corgea::statusln;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -145,12 +146,12 @@ pub fn resolve_reusable_scan(
 
     if worktree_dirty {
         if ignore_dirty_worktree {
-            println!(
+            statusln!(
                 "Ignoring dirty worktree (--ignore-dirty-worktree); treating this as a scan of commit {}.",
                 short
             );
         } else {
-            println!(
+            statusln!(
                 "Working tree does not match commit {} exactly (git status reports uncommitted changes), so no scan of that commit describes what would be scanned here - running a new scan.",
                 short
             );
@@ -159,9 +160,11 @@ pub fn resolve_reusable_scan(
         }
     }
 
-    println!(
+    statusln!(
         "Checking Corgea for a scan of commit {} in project '{}' from the last {}...",
-        short, project_name, skip.label
+        short,
+        project_name,
+        skip.label
     );
 
     let found = match find_reusable_scan(
@@ -185,16 +188,17 @@ pub fn resolve_reusable_scan(
     };
 
     let Some((scan, age)) = found else {
-        println!(
+        statusln!(
             "No reusable scan of commit {} in the last {}; running a new scan.",
-            short, skip.label
+            short,
+            skip.label
         );
         print_skipped_marker(None);
         return None;
     };
 
     if let Some(reason) = ignore_rules_refusal(&scan, ignore_paths) {
-        println!(
+        statusln!(
             "Not reusing scan {}: {reason}. Running a new scan.",
             scan.id
         );
@@ -212,11 +216,13 @@ pub fn resolve_reusable_scan(
         return None;
     }
 
-    println!(
+    statusln!(
         "Skipping scan: commit {} was already scanned {} ago by scan {}.",
-        short, age, scan.id
+        short,
+        age,
+        scan.id
     );
-    println!("Reporting on that scan instead - blocking rules and report output are unchanged.");
+    statusln!("Reporting on that scan instead - blocking rules and report output are unchanged.");
     // A reusable scan is one of the whole commit, and an `--exclude` upload is
     // recorded dirty, so a reused scan was never narrowed the way this run asks.
     // The gate below can therefore fail on a file this command line excludes,
@@ -346,10 +352,10 @@ pub fn report_scan_not_skipped() {
 fn print_skipped_marker(reused_scan_id: Option<&str>) {
     match reused_scan_id {
         Some(scan_id) => {
-            println!("{}=true", SKIPPED_MARKER);
-            println!("CORGEA_SCAN_ID={}", scan_id);
+            statusln!("{}=true", SKIPPED_MARKER);
+            statusln!("CORGEA_SCAN_ID={}", scan_id);
         }
-        None => println!("{}=false", SKIPPED_MARKER),
+        None => statusln!("{}=false", SKIPPED_MARKER),
     }
 }
 

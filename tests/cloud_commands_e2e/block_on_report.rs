@@ -105,7 +105,7 @@ fn block_on_writes_the_report_and_sbom_before_failing_the_gate() {
     assert_eq!(output.status.code(), Some(1), "{context}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("3 issue(s) violated the blocking rule(s)"),
+        stdout.contains("(rules violated: criticals) matched 3 finding(s)"),
         "{context}"
     );
     let report = std::fs::read_to_string(&out_file)
@@ -195,9 +195,8 @@ fn block_on_still_writes_the_report_when_the_gate_passes() {
     let context = output_context(&output, &transcript);
     assert_eq!(output.status.code(), Some(0), "{context}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // The slug itself is color-coded, so the literal stops at the colon.
     assert!(
-        stdout.contains("No issues violated the blocking rule(s):"),
+        stdout.contains("Gate passed: --block-on criticals"),
         "{context}"
     );
     let report = std::fs::read_to_string(&out_file)

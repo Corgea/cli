@@ -68,6 +68,9 @@ corgea scan --sbom sbom.cdx.json               # SBOM to a custom file
 corgea scan --include-image myapp:1.2.3        # Also scan a fully built container image
 corgea scan --include-image myapp:1.2.3 --include-image ghcr.io/acme/api:latest  # Repeatable
 corgea scan --project-name my-service          # Override project name
+corgea scan --format agent                     # Results summary as TSV records for coding agents
+corgea scan --format json --fail-on HI         # One JSON document on stdout; progress on stderr
+corgea scan --format quiet --block-on criticals  # No summary; the exit code carries the gate
 corgea scan --project-naming-mode sparse-postfixed  # One project per sparse-checkout service (monorepo-jsoar-agent)
 corgea scan --skip-if-commit-scanned-recently  # Reuse a recent scan of this commit instead of scanning again
 corgea scan --skip-if-commit-scanned-recently --scanned-within 4h  # Window for "recently" (default 24h)
@@ -95,6 +98,15 @@ Include rules also take scan reuse off the table. A reusable scan ran before the
 Removing, disabling or editing a project ignore rule (scan settings → File Ignore Rules) makes the next incremental run also analyze the files the old rule matched and the current rules do not, and it says how many. Earlier scans hold no findings for those files, so carrying findings forward alone would leave them unscanned. If those files would push the run past the incremental limit, or the project's rules cannot be read, it scans every file and says why. Adding an ignore rule does not cost anything extra: the findings it hides are dropped when they are carried forward. Scans started from an integration rather than the CLI scan every file after a rule is lifted.
 
 `--project-naming-mode sparse-postfixed` names the project for a monorepo service cloned with a sparse checkout: the default project name (the repository name) followed by the checked-out top-level folders, joined with dots — `monorepo-jsoar-agent`, or `monorepo-common.jsoar-agent` for two folders. A nested folder counts as its top-level folder (`services/payments` gives `monorepo-services`), root files listed in the sparse checkout (`package.json`) are left out, characters outside `A-Za-z0-9._-` become `_`, and the name is cut at 100 characters. It only applies at the repository root of a sparse checkout; anywhere else it warns and the default name is used. It cannot be combined with `--project-name`. `upload`, `list` and `wait` take the same flag, so pass it there too to reach the same project.
+
+When the scan finishes, `scan` and `wait` print one results summary. Pass `--format agent` when you are a coding agent reading the output:
+
+- no `--format`: tables of open issues by severity and of every finding by status (open, fix in progress, fixed, accepted risk, false positive, duplicate), then the results link. Colors only on a terminal without `NO_COLOR`; no spinners or `\r` redraws on a pipe.
+- `agent`: tab-separated records, each kind under its own `record` header row: `gate` first (result `pass|fail|none`, exit code, condition, tripped count), then `scan`, open counts by `severity`, counts by `status` with what each status means, and up to five open `issue` rows (critical first) to fix first. `Hint: Run ...` lines for `corgea ls --issues --scan-id <id> --json` and `corgea inspect --issue <id>` go to stderr, as does every progress line, `CORGEA_SCAN_SKIPPED=` included, so stdout holds only the records.
+- `json`: one document with `schema_version: 1`, `scan`, `gate`, `total_findings`, `by_status` (each with `critical`, `high`, `medium`, `low`, `total`), `unrecognized`, `fix_first` and `results_url`; `scan.reused_recent_scan` appears with `--skip-if-commit-scanned-recently`. Every other line the run prints, `CORGEA_SCAN_SKIPPED=` included, goes to stderr.
+- `quiet`: no summary.
+
+There is no `--format human`: omit the flag for tables. Agent environments are not detected for `scan` and `wait` (unlike `deps`), so an agent must pass `--format agent` or `--format json`. Open counts only findings with status `open` that are not held as false positives; `--fail-on` still counts every finding except false positives, as before, so its exit code is unchanged. Exit codes are the same in every format, and `--format` is independent of `--out-format`/`--out-file` and `--sbom`.
 
 `--only-uncommitted` and `--target` are mutually exclusive. `--fail-on`, `--fail`, and `--block-on` are mutually exclusive.
 
@@ -128,6 +140,8 @@ By default `upload` prints the scan page URL so you can track the results. Pass 
 corgea wait                                    # Wait for latest scan
 corgea wait SCAN_ID                            # Wait for a specific scan
 corgea wait --project-naming-mode sparse-postfixed  # Latest scan of the sparse-checkout service's project
+corgea wait SCAN_ID --format json              # Results summary as JSON (see Scan for --format)
+corgea wait --format agent                     # TSV records; the gate record reads "none"
 ```
 
 Waiting (`corgea scan`, `corgea wait`, `corgea upload --wait`) exits 1 if the

@@ -11,6 +11,7 @@ use crate::deps::model::{DependencyNode, Severity};
 use crate::deps::policy::Policy;
 use crate::deps::report::{graph_nodes_json, table_output, to_json, to_sarif};
 use crate::deps::{scan, DepsError};
+use crate::output_format::OutputFormat;
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum DepsSubcommand {
@@ -118,8 +119,14 @@ impl RenderArgs {
         self.format.is_some()
     }
 
-    fn resolve(&self) -> Result<RenderFormat, DepsError> {
-        RenderFormat::resolve(self.format.as_deref())
+    fn resolve(&self) -> Result<OutputFormat, DepsError> {
+        let explicit = self
+            .format
+            .as_deref()
+            .map(OutputFormat::parse)
+            .transpose()
+            .map_err(DepsError)?;
+        Ok(OutputFormat::resolve(explicit))
     }
 }
 
@@ -295,60 +302,6 @@ impl ReportFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RenderFormat {
-    Human,
-    Agent,
-    Json,
-    Quiet,
-}
-
-impl RenderFormat {
-    fn resolve(value: Option<&str>) -> Result<Self, DepsError> {
-        match value {
-            Some("human") => Ok(Self::Human),
-            Some("agent") => Ok(Self::Agent),
-            Some("json") => Ok(Self::Json),
-            Some("quiet") => Ok(Self::Quiet),
-            Some(other) => Err(DepsError(format!(
-                "unsupported --format: {other}; expected human, agent, json, or quiet"
-            ))),
-            None if agent_env_detected() => Ok(Self::Agent),
-            None => Ok(Self::Human),
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Human => "human",
-            Self::Agent => "agent",
-            Self::Json => "json",
-            Self::Quiet => "quiet",
-        }
-    }
-}
-
-fn agent_env_detected() -> bool {
-    [
-        "AI_AGENT",
-        "CODEX_SANDBOX",
-        "CLAUDECODE",
-        "CLAUDE_CODE",
-        "CURSOR_AGENT",
-        "CURSOR_TRACE_ID",
-        "GEMINI_CLI",
-        "PI_AGENT",
-    ]
-    .iter()
-    .any(|name| match std::env::var(name) {
-        Ok(value) => {
-            let normalized = value.trim().to_ascii_lowercase();
-            !normalized.is_empty() && normalized != "0" && normalized != "false"
-        }
-        Err(_) => false,
-    })
-}
-
 fn emit_output(output: &str, out_file: Option<&str>) -> Result<(), DepsError> {
     if let Some(file) = out_file {
         std::fs::write(file, output).map_err(|e| DepsError(format!("write out-file: {e}")))?;
@@ -362,8 +315,8 @@ fn json_line(value: Value) -> String {
     format!("{value}\n")
 }
 
-fn emit_scan_hints(path: &str, inv: &crate::deps::Inventory, format: RenderFormat) {
-    if format == RenderFormat::Quiet {
+fn emit_scan_hints(path: &str, inv: &crate::deps::Inventory, format: OutputFormat) {
+    if format == OutputFormat::Quiet {
         return;
     }
 
@@ -390,8 +343,8 @@ fn emit_scan_hints(path: &str, inv: &crate::deps::Inventory, format: RenderForma
     );
 }
 
-fn emit_policy_init_hint(path: &str, format: RenderFormat) {
-    if format == RenderFormat::Quiet {
+fn emit_policy_init_hint(path: &str, format: OutputFormat) {
+    if format == OutputFormat::Quiet {
         return;
     }
 
@@ -401,12 +354,12 @@ fn emit_policy_init_hint(path: &str, format: RenderFormat) {
     );
 }
 
-fn render_scan(inv: &crate::deps::Inventory, format: RenderFormat) -> String {
+fn render_scan(inv: &crate::deps::Inventory, format: OutputFormat) -> String {
     match format {
-        RenderFormat::Human => table_output(inv),
-        RenderFormat::Agent => agent_scan_output(inv),
-        RenderFormat::Json => json_line(to_json(inv)),
-        RenderFormat::Quiet => String::new(),
+        OutputFormat::Human => table_output(inv),
+        OutputFormat::Agent => agent_scan_output(inv),
+        OutputFormat::Json => json_line(to_json(inv)),
+        OutputFormat::Quiet => String::new(),
     }
 }
 
@@ -439,12 +392,12 @@ fn agent_scan_output(inv: &crate::deps::Inventory) -> String {
     out
 }
 
-fn render_graph(inv: &crate::deps::Inventory, format: RenderFormat) -> String {
+fn render_graph(inv: &crate::deps::Inventory, format: OutputFormat) -> String {
     match format {
-        RenderFormat::Human => human_graph_output(inv),
-        RenderFormat::Agent => agent_graph_output(inv),
-        RenderFormat::Json => json_line(json!({ "nodes": graph_nodes_json(&inv.graph) })),
-        RenderFormat::Quiet => String::new(),
+        OutputFormat::Human => human_graph_output(inv),
+        OutputFormat::Agent => agent_graph_output(inv),
+        OutputFormat::Json => json_line(json!({ "nodes": graph_nodes_json(&inv.graph) })),
+        OutputFormat::Quiet => String::new(),
     }
 }
 
@@ -482,13 +435,13 @@ fn agent_graph_output(inv: &crate::deps::Inventory) -> String {
 fn render_explanation(
     package: &str,
     explanation: &crate::deps::explain::Explanation,
-    format: RenderFormat,
+    format: OutputFormat,
 ) -> String {
     match format {
-        RenderFormat::Human => human_explanation_output(package, explanation),
-        RenderFormat::Agent => agent_explanation_output(package, explanation),
-        RenderFormat::Json => json_line(explanation_json(package, explanation)),
-        RenderFormat::Quiet => String::new(),
+        OutputFormat::Human => human_explanation_output(package, explanation),
+        OutputFormat::Agent => agent_explanation_output(package, explanation),
+        OutputFormat::Json => json_line(explanation_json(package, explanation)),
+        OutputFormat::Quiet => String::new(),
     }
 }
 
@@ -539,12 +492,12 @@ fn explanation_json(package: &str, explanation: &crate::deps::explain::Explanati
     })
 }
 
-fn render_diff(base: &str, diff: &crate::deps::diff::GraphDiff, format: RenderFormat) -> String {
+fn render_diff(base: &str, diff: &crate::deps::diff::GraphDiff, format: OutputFormat) -> String {
     match format {
-        RenderFormat::Human => human_diff_output(base, diff),
-        RenderFormat::Agent => agent_diff_output(diff),
-        RenderFormat::Json => json_line(diff_json(base, diff)),
-        RenderFormat::Quiet => String::new(),
+        OutputFormat::Human => human_diff_output(base, diff),
+        OutputFormat::Agent => agent_diff_output(diff),
+        OutputFormat::Json => json_line(diff_json(base, diff)),
+        OutputFormat::Quiet => String::new(),
     }
 }
 
@@ -698,14 +651,14 @@ fn diff_nodes_json(nodes: &[DependencyNode]) -> Vec<Value> {
         .collect()
 }
 
-fn render_policy_init(path: &Path, created: bool, format: RenderFormat) -> String {
+fn render_policy_init(path: &Path, created: bool, format: OutputFormat) -> String {
     let path = path.display().to_string();
     match format {
-        RenderFormat::Human if created => format!("Wrote {path}\n"),
-        RenderFormat::Human => format!("Exists {path}\n"),
-        RenderFormat::Agent => format!("path\n{}\n", tsv_cell(&path)),
-        RenderFormat::Json => json_line(json!({ "path": path, "created": created })),
-        RenderFormat::Quiet => String::new(),
+        OutputFormat::Human if created => format!("Wrote {path}\n"),
+        OutputFormat::Human => format!("Exists {path}\n"),
+        OutputFormat::Agent => format!("path\n{}\n", tsv_cell(&path)),
+        OutputFormat::Json => json_line(json!({ "path": path, "created": created })),
+        OutputFormat::Quiet => String::new(),
     }
 }
 

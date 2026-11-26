@@ -163,6 +163,7 @@ pub fn run(config: &Config, args: ListArgs) {
                 Some(page.unwrap_or(1)),
                 page_size,
                 scan_id.clone(),
+                false,
             )
         };
         let issues_response = match fetch_result {
