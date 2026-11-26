@@ -846,6 +846,7 @@ fn start_new_scan(
         crate::incremental::resolve_incremental_plan(
             config,
             project_name,
+            &include_rules.upload_project,
             crate::incremental::DiffSources {
                 branch: repo_info.as_ref().and_then(|info| info.branch.as_deref()),
                 head_sha: repo_info.as_ref().and_then(|info| info.sha.as_deref()),

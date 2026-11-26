@@ -790,6 +790,132 @@ fn a_project_with_no_baseline_scan_uploads_without_a_diff() {
     );
 }
 
+/// Doghouse keys a project by its repository URL, so a clone with another
+/// remote lands in a project of its own under the same name, and a lookup by
+/// name returns both projects' scans. The other project's scan of a nearer
+/// commit must not win: the server copies findings only from a scan of the
+/// project the upload lands in, so the diff would be measured from a base it
+/// refuses, and this project's own baseline would go unused.
+#[test]
+fn a_scan_of_another_project_with_the_same_name_is_never_the_baseline() {
+    let project = git_project();
+    let history = commit_steps(&project, 2);
+    let (other_sha, own_sha) = (history[1].clone(), history[2].clone());
+
+    let mut other_projects = baseline_scan(&other_sha);
+    other_projects["id"] = json!("other-project-scan");
+    other_projects["project_id"] = json!(UPLOAD_PROJECT_ID + 1);
+    let mut own = baseline_scan(&own_sha);
+    own["project_id"] = json!(UPLOAD_PROJECT_ID);
+    let expected_base = own_sha.clone();
+    let mut plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        ancestor_lookup(Some(history.clone()), vec![other_projects, own]),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with the diff from this project's scan",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_multipart_text_field(request, "incremental_base_sha", &expected_base)?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_changed_files",
+                    r#"["step0.py","step1.py"]"#,
+                )
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": UPLOAD_PROJECT_ID})),
+        ),
+    ];
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(&format!(
+            "Incremental scan: 2 files changed since commit {}.",
+            &own_sha[..7]
+        )),
+        "{context}"
+    );
+}
+
+/// When no project holds this repository yet, the upload starts one, however
+/// many other projects share its name. None of their scans can be a baseline,
+/// so there is nothing to look up, and the full scan says why.
+#[test]
+fn a_scan_that_starts_a_new_project_does_not_look_for_a_baseline() {
+    let project = git_project();
+    let head_sha = second_commit(&project);
+
+    let patch_sha = head_sha.clone();
+    let plan = vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        start_upload(),
+        expected_request(
+            "upload BLAST archive with no diff",
+            move |request| {
+                assert_authenticated_request(
+                    request,
+                    Method::PATCH,
+                    "/api/v1/start-scan/transfer-123/",
+                )?;
+                assert_multipart_text_field(request, "sha", &patch_sha)?;
+                assert_no_multipart_field(request, "incremental_base_sha")?;
+                assert_no_multipart_field(request, "incremental_base_scan_id")?;
+                assert_no_multipart_field(request, "incremental_changed_files")?;
+                assert_multipart_text_field(
+                    request,
+                    "incremental_skipped_reason",
+                    "no_baseline_scan",
+                )
+            },
+            json_response(json!({"scan_id": "blast-scan-123", "project_id": UPLOAD_PROJECT_ID})),
+        ),
+    ];
+    let mut plan = answer_with(
+        plan,
+        "read project include rules",
+        json_response(json!({
+            "status": "ok",
+            "project": null,
+            "settings": {"include_paths": [], "ignore_paths": []}
+        })),
+    );
+    plan.extend(scan_tail());
+
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", PROJECT]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(&format!(
+            "Scanning every file: Corgea has no project '{PROJECT}' for this repository yet, \
+             so there is no earlier scan to diff against."
+        )),
+        "{context}"
+    );
+}
+
 /// Once no recent commit turns out to have been scanned, the branch being
 /// scanned is asked about next, and its own last scan wins over trunk's.
 ///

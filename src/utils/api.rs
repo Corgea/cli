@@ -1590,13 +1590,48 @@ where
         .collect())
 }
 
-#[derive(Deserialize, Debug, Default)]
-struct ScanSettingsResponse {
-    #[serde(default)]
-    settings: ScanSettings,
+/// The project an upload lands in, which `/scan/configs` resolves from the
+/// same name and repository URL the upload sends, the way the upload will.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum UploadProject {
+    /// An existing project, by id.
+    Existing(String),
+    /// No project holds this repository yet (or this name, without one).
+    New,
+    /// The server did not say: a backend predating the endpoint, or a lookup
+    /// that failed.
+    #[default]
+    Unknown,
 }
 
-/// GET /api/v1/scan/configs — the project's ignore and include rules.
+#[derive(Deserialize, Debug, Default)]
+pub struct ScanSettingsResponse {
+    #[serde(default)]
+    pub settings: ScanSettings,
+    /// Missing says nothing either way, so it stays `Unknown`.
+    #[serde(default, deserialize_with = "upload_project")]
+    pub project: UploadProject,
+}
+
+/// `null` is a project the upload will create, an id one it lands in.
+fn upload_project<'de, D>(deserializer: D) -> Result<UploadProject, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct Project {
+        #[serde(default, deserialize_with = "id_as_string")]
+        id: Option<String>,
+    }
+    Ok(match Option::<Project>::deserialize(deserializer)? {
+        None => UploadProject::New,
+        Some(Project { id: Some(id) }) => UploadProject::Existing(id),
+        Some(Project { id: None }) => UploadProject::Unknown,
+    })
+}
+
+/// GET /api/v1/scan/configs — the project's ignore and include rules, and the
+/// project an upload with this name and repository URL lands in.
 ///
 /// `Ok(None)` only for a 404, which is a backend predating the endpoint: it has
 /// no rules to apply, so the caller proceeds with just its own flags. Anything
@@ -1606,7 +1641,7 @@ pub fn query_scan_settings(
     url: &str,
     project_name: &str,
     repo_url: Option<&str>,
-) -> Result<Option<ScanSettings>, Box<dyn Error>> {
+) -> Result<Option<ScanSettingsResponse>, Box<dyn Error>> {
     let request_url = format!("{}{}/scan/configs", url, API_BASE);
     let client = http_client();
     let mut query = vec![("project_name", project_name.to_string())];
@@ -1640,7 +1675,7 @@ pub fn query_scan_settings(
     }
     let text = response.text()?;
     match serde_json::from_str::<ScanSettingsResponse>(&text) {
-        Ok(parsed) => Ok(Some(parsed.settings)),
+        Ok(parsed) => Ok(Some(parsed)),
         Err(e) => {
             debug(&format!("/scan/configs response body: {}", text));
             Err(format!("Failed to parse the /scan/configs response: {}", e).into())
@@ -2793,6 +2828,21 @@ mod tests {
         let missing: ScanSettingsResponse =
             serde_json::from_str(r#"{"settings": {}}"#).expect("parses");
         assert_eq!(missing.settings, ScanSettings::default());
+    }
+
+    #[test]
+    fn scan_settings_tell_a_project_to_be_created_from_one_never_mentioned() {
+        let project = |body: &str| {
+            serde_json::from_str::<ScanSettingsResponse>(body)
+                .expect("parses")
+                .project
+        };
+        assert_eq!(
+            project(r#"{"project": {"id": 7040, "name": "p"}}"#),
+            UploadProject::Existing("7040".to_string())
+        );
+        assert_eq!(project(r#"{"project": null}"#), UploadProject::New);
+        assert_eq!(project("{}"), UploadProject::Unknown);
     }
 
     #[test]

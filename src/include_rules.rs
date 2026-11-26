@@ -36,6 +36,9 @@ pub struct IncludeRules {
     /// scan checks its baseline against them. `None` when they could not be
     /// read.
     pub project_ignore_paths: Option<Vec<String>>,
+    /// The project the upload lands in, read in the same request. Only its
+    /// scans can be the baseline of an incremental scan.
+    pub upload_project: api::UploadProject,
 }
 
 impl IncludeRules {
@@ -216,9 +219,11 @@ pub fn resolve(
     let mut patterns = Vec::new();
     let mut lookup_failed = false;
     let mut project_ignore_paths = None;
+    let mut upload_project = api::UploadProject::Unknown;
 
     match api::query_scan_settings(&config.get_url(), project_name, repo_url) {
-        Ok(Some(settings)) => {
+        Ok(Some(api::ScanSettingsResponse { settings, project })) => {
+            upload_project = project;
             project_ignore_paths = Some(settings.ignore_paths);
             for pattern in normalize_patterns(&settings.include_paths) {
                 push_unique(&mut patterns, pattern);
@@ -250,6 +255,7 @@ pub fn resolve(
         cli_patterns,
         lookup_failed,
         project_ignore_paths,
+        upload_project,
     }
 }
 
