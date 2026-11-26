@@ -201,7 +201,13 @@ pub fn run(config: &Config, args: ListArgs) {
         if let Some(id) = scan_id.as_ref().filter(|_| !code_quality) {
             let mut page: u32 = 1;
             loop {
-                match utils::api::check_blocking_rules(&config.get_url(), id, Some(page), None) {
+                match utils::api::check_blocking_rules(
+                    &config.get_url(),
+                    id,
+                    Some(page),
+                    None,
+                    false,
+                ) {
                     Ok(rules) => {
                         if rules.block {
                             render_blocking_rules = true;

@@ -57,6 +57,8 @@ fn blocked_check_request(block_on: Option<&'static str>) -> ExpectedRequest {
                 Method::GET,
                 &format!("/api/v1/scan/{SCAN_ID}/check_blocking_rules"),
             )?;
+            // The gate tells the backend to record which rules it enforced.
+            assert_query(request, "enforce", "1")?;
             match block_on {
                 Some(slugs) => assert_query(request, "block_on", slugs),
                 // --fail evaluates every active rule, so it must not narrow the

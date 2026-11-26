@@ -2050,11 +2050,15 @@ pub fn get_webapp_version(corgea_url: &str) -> Result<Option<String>, Box<dyn Er
 /// `block_on` is a comma-separated list of CI rule slugs. When omitted the
 /// backend falls back to evaluating every active rule, which is the legacy
 /// `--fail` behavior.
+///
+/// `enforce` marks a scan gate, so the backend records which rules the scan
+/// was checked against. `corgea list` reads the same endpoint without it.
 pub fn check_blocking_rules(
     url: &str,
     sast_scan_id: &str,
     page: Option<u32>,
     block_on: Option<&str>,
+    enforce: bool,
 ) -> Result<BlockingRuleResponse, Box<dyn Error>> {
     let url = format!(
         "{}{}/scan/{}/check_blocking_rules",
@@ -2064,6 +2068,9 @@ pub fn check_blocking_rules(
     let mut query_params = vec![("page", page.to_string())];
     if let Some(block_on) = block_on {
         query_params.push(("block_on", block_on.to_string()));
+    }
+    if enforce {
+        query_params.push(("enforce", "1".to_string()));
     }
 
     let client = http_client();

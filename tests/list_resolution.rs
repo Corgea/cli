@@ -402,4 +402,17 @@ fn list_issues_with_scan_id_skips_project_resolution() {
         !hits.iter().any(|h| h.starts_with("/api/v1/projects")),
         "no /projects resolution for --issues --scan-id; hits: {hits:?}"
     );
+    // list only reads blocking rules; it must not be recorded as a CI gate.
+    let checks: Vec<_> = hits
+        .iter()
+        .filter(|h| h.contains("/check_blocking_rules"))
+        .collect();
+    assert!(
+        !checks.is_empty(),
+        "list should read blocking rules; hits: {hits:?}"
+    );
+    assert!(
+        !checks.iter().any(|h| h.contains("enforce=")),
+        "list must not send enforce; hits: {hits:?}"
+    );
 }
