@@ -1633,15 +1633,15 @@ pub struct ProjectScope<'a> {
 }
 
 impl ProjectScope<'_> {
-    /// Whether `scan` belongs to the upload's project. Once the server has
-    /// named that project, a scan listed without a project id cannot be shown
-    /// to be its own and is passed over; only a backend that names no project
-    /// keeps the name-only match every earlier release used.
+    /// Whether `scan` belongs to the upload's project. The two ids must match.
+    /// A scan whose ownership cannot be shown either way is passed over, so
+    /// the name-only match every earlier release used survives only where
+    /// neither side carries an id: a backend that predates both.
     pub fn holds(&self, scan: &ScanResponse) -> bool {
         match (self.id, scan.project_id.as_deref()) {
             (Some(ours), Some(theirs)) => ours == theirs,
-            (Some(_), None) => false,
-            (None, _) => true,
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
         }
     }
 }
@@ -2885,6 +2885,27 @@ mod tests {
         );
         assert_eq!(project(r#"{"project": null}"#), UploadProject::New);
         assert_eq!(project("{}"), UploadProject::Unknown);
+    }
+
+    #[test]
+    fn a_scan_counts_as_the_uploads_own_only_when_the_ids_prove_it() {
+        let scan = |project_id: Option<&str>| {
+            let mut row = json!({"id": "s", "project": "app", "repo": null, "branch": null, "status": "complete", "engine": "corgea-blast", "created_at": "2026-11-26T09:00:00Z"});
+            if let Some(id) = project_id {
+                row["project_id"] = json!(id);
+            }
+            serde_json::from_value::<ScanResponse>(row).expect("parses")
+        };
+        let known = UploadProject::Existing("7".to_string());
+        let known = known.scope("app").expect("scoped");
+        assert!(known.holds(&scan(Some("7"))));
+        assert!(!known.holds(&scan(Some("999"))));
+        assert!(!known.holds(&scan(None)));
+
+        let unknown = UploadProject::Unknown;
+        let unknown = unknown.scope("app").expect("scoped");
+        assert!(!unknown.holds(&scan(Some("999"))));
+        assert!(unknown.holds(&scan(None)));
     }
 
     #[test]
