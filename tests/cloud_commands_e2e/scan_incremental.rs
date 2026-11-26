@@ -32,6 +32,7 @@ fn baseline_scan(sha: &str) -> Value {
     json!({
         "id": BASELINE_SCAN,
         "project": PROJECT,
+        "project_id": UPLOAD_PROJECT_ID,
         "repo": null,
         "branch": FIXTURE_BRANCH,
         "status": "complete",

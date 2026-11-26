@@ -22,6 +22,7 @@ fn prior_scan(sha: &str, created_at: &str) -> Value {
     json!({
         "id": PRIOR_SCAN,
         "project": PROJECT,
+        "project_id": UPLOAD_PROJECT_ID,
         "repo": null,
         "branch": "e2e-main",
         "status": "complete",
@@ -810,6 +811,50 @@ fn a_scan_of_another_project_with_the_same_name_is_never_reused() {
         verify_request(),
         scan_settings_request(PROJECT),
         commit_lookup(&project.sha, vec![other_projects, own]),
+        clean_detail(&project.sha),
+        reused_scan_issues(),
+        reused_scan_blocking_rules(false),
+    ]);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--skip-if-commit-scanned-recently",
+        "--block-on",
+        "criticals",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(&format!("CORGEA_SCAN_ID={PRIOR_SCAN}")),
+        "{context}"
+    );
+}
+
+/// A scan listed without a project id cannot be shown to belong to the
+/// upload's project, so once the server has named that project it is never
+/// reused, however new it is.
+#[test]
+fn a_scan_listed_without_a_project_id_is_not_reused_once_the_project_is_known() {
+    let project = git_project();
+    let mut unscoped = prior_scan(&project.sha, &ago(1));
+    unscoped["id"] = json!("unscoped-scan");
+    if let Some(row) = unscoped.as_object_mut() {
+        row.remove("project_id");
+    }
+    let mut own = prior_scan(&project.sha, &ago(3));
+    own["project_id"] = json!(UPLOAD_PROJECT_ID);
+    let api = ApiStub::start(vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        commit_lookup(&project.sha, vec![unscoped, own]),
         clean_detail(&project.sha),
         reused_scan_issues(),
         reused_scan_blocking_rules(false),

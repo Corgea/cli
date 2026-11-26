@@ -1633,13 +1633,15 @@ pub struct ProjectScope<'a> {
 }
 
 impl ProjectScope<'_> {
-    /// Whether `scan` may belong to the upload's project. A scan listed without
-    /// a project id, by a backend predating them, is taken on its name alone,
-    /// as every earlier release took it.
+    /// Whether `scan` belongs to the upload's project. Once the server has
+    /// named that project, a scan listed without a project id cannot be shown
+    /// to be its own and is passed over; only a backend that names no project
+    /// keeps the name-only match every earlier release used.
     pub fn holds(&self, scan: &ScanResponse) -> bool {
         match (self.id, scan.project_id.as_deref()) {
             (Some(ours), Some(theirs)) => ours == theirs,
-            _ => true,
+            (Some(_), None) => false,
+            (None, _) => true,
         }
     }
 }
