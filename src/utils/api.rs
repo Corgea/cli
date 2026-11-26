@@ -1590,13 +1590,103 @@ where
         .collect())
 }
 
-#[derive(Deserialize, Debug, Default)]
-struct ScanSettingsResponse {
-    #[serde(default)]
-    settings: ScanSettings,
+/// The project an upload lands in, which `/scan/configs` resolves from the
+/// same name and repository URL the upload sends, the way the upload will.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum UploadProject {
+    /// An existing project, by id.
+    Existing(String),
+    /// No project holds this repository yet (or this name, without one).
+    New,
+    /// The server did not say, as a backend predating the endpoint does. Its
+    /// scans carry no project id either, so they match on name.
+    #[default]
+    Unknown,
+    /// The lookup failed. A backend that has the endpoint lists scans with
+    /// their project ids, and none can be shown to be this upload's.
+    LookupFailed,
 }
 
-/// GET /api/v1/scan/configs — the project's ignore and include rules.
+/// Why an upload has no scans of its own project to read.
+#[derive(Debug)]
+pub enum Unscoped {
+    /// The upload creates its project, which has no scans yet.
+    NewProject,
+    /// Which project the upload lands in could not be looked up.
+    LookupFailed,
+}
+
+impl UploadProject {
+    /// The scope of an upload named `name`. Other projects may share the name,
+    /// but their scans are not this project's.
+    pub fn scope<'a>(&'a self, name: &'a str) -> Result<ProjectScope<'a>, Unscoped> {
+        let id = match self {
+            UploadProject::Existing(id) => Some(id.as_str()),
+            UploadProject::Unknown => None,
+            UploadProject::New => return Err(Unscoped::NewProject),
+            UploadProject::LookupFailed => return Err(Unscoped::LookupFailed),
+        };
+        Ok(ProjectScope { name, id })
+    }
+}
+
+/// Whose scans an upload may use: the project it lands in.
+///
+/// The scan list is asked by name, and a name is not unique. Doghouse keys a
+/// project by its repository URL, so clones with different remotes land in
+/// different projects of the same name. The server copies findings only from a
+/// scan of the upload's own project, and only that project's scan can stand in
+/// for the upload.
+#[derive(Clone, Copy)]
+pub struct ProjectScope<'a> {
+    pub name: &'a str,
+    /// `None` when the server could not say which project that is.
+    id: Option<&'a str>,
+}
+
+impl ProjectScope<'_> {
+    /// Whether `scan` belongs to the upload's project. The two ids must match.
+    /// A scan whose ownership cannot be shown either way is passed over, so
+    /// the name-only match every earlier release used survives only where
+    /// neither side carries an id: a backend that predates both.
+    pub fn holds(&self, scan: &ScanResponse) -> bool {
+        match (self.id, scan.project_id.as_deref()) {
+            (Some(ours), Some(theirs)) => ours == theirs,
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct ScanSettingsResponse {
+    #[serde(default)]
+    pub settings: ScanSettings,
+    /// Missing says nothing either way, so it stays `Unknown`.
+    #[serde(default, deserialize_with = "upload_project")]
+    pub project: UploadProject,
+}
+
+/// `null` is a project the upload will create, an id one it lands in. A
+/// project without an id is a broken answer, so the whole lookup fails.
+fn upload_project<'de, D>(deserializer: D) -> Result<UploadProject, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct Project {
+        #[serde(default, deserialize_with = "id_as_string")]
+        id: Option<String>,
+    }
+    match Option::<Project>::deserialize(deserializer)? {
+        None => Ok(UploadProject::New),
+        Some(Project { id: Some(id) }) => Ok(UploadProject::Existing(id)),
+        Some(Project { id: None }) => Err(serde::de::Error::missing_field("project.id")),
+    }
+}
+
+/// GET /api/v1/scan/configs — the project's ignore and include rules, and the
+/// project an upload with this name and repository URL lands in.
 ///
 /// `Ok(None)` only for a 404, which is a backend predating the endpoint: it has
 /// no rules to apply, so the caller proceeds with just its own flags. Anything
@@ -1606,7 +1696,7 @@ pub fn query_scan_settings(
     url: &str,
     project_name: &str,
     repo_url: Option<&str>,
-) -> Result<Option<ScanSettings>, Box<dyn Error>> {
+) -> Result<Option<ScanSettingsResponse>, Box<dyn Error>> {
     let request_url = format!("{}{}/scan/configs", url, API_BASE);
     let client = http_client();
     let mut query = vec![("project_name", project_name.to_string())];
@@ -1640,7 +1730,7 @@ pub fn query_scan_settings(
     }
     let text = response.text()?;
     match serde_json::from_str::<ScanSettingsResponse>(&text) {
-        Ok(parsed) => Ok(Some(parsed.settings)),
+        Ok(parsed) => Ok(Some(parsed)),
         Err(e) => {
             debug(&format!("/scan/configs response body: {}", text));
             Err(format!("Failed to parse the /scan/configs response: {}", e).into())
@@ -2793,6 +2883,46 @@ mod tests {
         let missing: ScanSettingsResponse =
             serde_json::from_str(r#"{"settings": {}}"#).expect("parses");
         assert_eq!(missing.settings, ScanSettings::default());
+    }
+
+    #[test]
+    fn scan_settings_tell_a_project_to_be_created_from_one_never_mentioned() {
+        let project = |body: &str| {
+            serde_json::from_str::<ScanSettingsResponse>(body)
+                .expect("parses")
+                .project
+        };
+        assert_eq!(
+            project(r#"{"project": {"id": 7040, "name": "p"}}"#),
+            UploadProject::Existing("7040".to_string())
+        );
+        assert_eq!(project(r#"{"project": null}"#), UploadProject::New);
+        assert_eq!(project("{}"), UploadProject::Unknown);
+        // A project that cannot be named is a broken answer, not a missing one.
+        assert!(
+            serde_json::from_str::<ScanSettingsResponse>(r#"{"project": {"name": "p"}}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn a_scan_counts_as_the_uploads_own_only_when_the_ids_prove_it() {
+        let scan = |project_id: Option<&str>| {
+            let mut row = json!({"id": "s", "project": "app", "repo": null, "branch": null, "status": "complete", "engine": "corgea-blast", "created_at": "2026-11-26T09:00:00Z"});
+            if let Some(id) = project_id {
+                row["project_id"] = json!(id);
+            }
+            serde_json::from_value::<ScanResponse>(row).expect("parses")
+        };
+        let known = UploadProject::Existing("7".to_string());
+        let known = known.scope("app").expect("scoped");
+        assert!(known.holds(&scan(Some("7"))));
+        assert!(!known.holds(&scan(Some("999"))));
+        assert!(!known.holds(&scan(None)));
+
+        let unknown = UploadProject::Unknown;
+        let unknown = unknown.scope("app").expect("scoped");
+        assert!(!unknown.holds(&scan(Some("999"))));
+        assert!(unknown.holds(&scan(None)));
     }
 
     #[test]

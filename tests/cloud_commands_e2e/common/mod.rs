@@ -788,9 +788,14 @@ pub(crate) fn verify_request() -> ExpectedRequest {
     )
 }
 
+/// The project the fixture's BLAST uploads land in, as both `/scan/configs` and
+/// the upload response name it.
+pub(crate) const UPLOAD_PROJECT_ID: i64 = 91;
+
 /// Every BLAST run reads the project's include rules before deciding whether a
 /// previous scan can be reused and before packaging, so files Corgea would
-/// classify away can still be forced into the archive.
+/// classify away can still be forced into the archive. The same answer names
+/// the project the upload will land in.
 pub(crate) fn scan_settings_request(project: &str) -> ExpectedRequest {
     scan_settings_request_with(project, &[])
 }
@@ -800,7 +805,7 @@ pub(crate) fn scan_settings_request_with(project: &str, include_paths: &[&str]) 
     let project = project.to_string();
     let body = json!({
         "status": "ok",
-        "project": null,
+        "project": {"id": UPLOAD_PROJECT_ID, "name": project},
         "settings": {"include_paths": include_paths, "ignore_paths": []}
     });
     expected_request(

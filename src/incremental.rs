@@ -51,7 +51,7 @@
 use crate::config::Config;
 use crate::manifest::{Manifest, MANIFEST_VERSION};
 use crate::scanners::blast::{classify_scan_status, ScanState};
-use crate::utils::api::{self, ScanResponse};
+use crate::utils::api::{self, ProjectScope, ScanResponse, Unscoped, UploadProject};
 use corgea::statusln;
 use git2::Repository;
 use serde::Serialize;
@@ -283,9 +283,10 @@ pub struct DiffSources<'a> {
 pub fn resolve_incremental_plan(
     config: &Config,
     project_name: &str,
+    upload_project: &UploadProject,
     sources: DiffSources<'_>,
 ) -> Result<IncrementalPlan, FullScanReason> {
-    let (plan, summary) = plan_diff(config, project_name, &sources)?;
+    let (plan, summary) = plan_diff(config, project_name, upload_project, &sources)?;
     statusln!("{summary}");
     Ok(plan)
 }
@@ -294,8 +295,28 @@ pub fn resolve_incremental_plan(
 fn plan_diff(
     config: &Config,
     project_name: &str,
+    upload_project: &UploadProject,
     sources: &DiffSources<'_>,
 ) -> Result<(IncrementalPlan, String), FullScanReason> {
+    let project = match upload_project.scope(project_name) {
+        Ok(project) => project,
+        Err(Unscoped::NewProject) => {
+            return Err(FullScanReason::new(
+                FullScanCause::NoBaselineScan,
+                format!(
+                    "Corgea has no project '{project_name}' for this repository yet, so \
+                     there is no earlier scan to diff against"
+                ),
+            ))
+        }
+        Err(Unscoped::LookupFailed) => {
+            return Err(FullScanReason::new(
+                FullScanCause::BaselineLookupFailed,
+                "the Corgea project this upload lands in could not be looked up, so no \
+                 earlier scan can be shown to be its own. Run with --verbose for the error",
+            ))
+        }
+    };
     // Optional, because a checksum diff needs no repository. Only the git diff
     // below does, and it reports its absence by its real name.
     let repo = Repository::discover(".").ok();
@@ -328,7 +349,7 @@ fn plan_diff(
     if let Some(ancestry) = &ancestry {
         lookup = match find_ancestor_baseline(
             config,
-            project_name,
+            project,
             ancestry,
             checksums_usable,
             own_root.as_deref(),
@@ -352,14 +373,14 @@ fn plan_diff(
                 // scan of this branch behind a page of dirty ones still beats
                 // trunk's.
                 let (own, trunks) = candidates.split_at(usize::from(branch.is_some()));
-                match find_baseline(config, project_name, Some(own), checksums_usable) {
+                match find_baseline(config, project, Some(own), checksums_usable) {
                     BaselineLookup::NotFound => {
-                        find_baseline(config, project_name, Some(trunks), checksums_usable)
+                        find_baseline(config, project, Some(trunks), checksums_usable)
                     }
                     found => found,
                 }
             }
-            None => find_baseline(config, project_name, None, checksums_usable),
+            None => find_baseline(config, project, None, checksums_usable),
         };
     }
     let baseline = match lookup {
@@ -867,7 +888,7 @@ fn join_or(branches: &[String]) -> String {
 /// it one query for the project's newest usable scan on any branch.
 fn find_baseline(
     config: &Config,
-    project_name: &str,
+    project: ProjectScope<'_>,
     branches: Option<&[String]>,
     checksums_usable: bool,
 ) -> BaselineLookup {
@@ -879,7 +900,7 @@ fn find_baseline(
     // Pass one will take a baseline of either kind, so it cannot ask the server
     // to drop what is not known-clean: that is how a git-less scan reports
     // itself, and those are the ones carrying checksums.
-    let found = search_baseline(config, project_name, &searches, checksums_usable, false);
+    let found = search_baseline(config, project, &searches, checksums_usable, false);
     if !checksums_usable || branches.is_none() || !matches!(found, BaselineLookup::NotFound) {
         return found;
     }
@@ -890,13 +911,13 @@ fn find_baseline(
     // them is a baseline this would otherwise report as not existing. A
     // checksum baseline is already ruled out, so nothing is left for the
     // filter to wrongly exclude.
-    search_baseline(config, project_name, &searches, checksums_usable, true)
+    search_baseline(config, project, &searches, checksums_usable, true)
 }
 
 /// One walk of the project's scans, newest first, over `searches` in order.
 fn search_baseline(
     config: &Config,
-    project_name: &str,
+    project: ProjectScope<'_>,
     searches: &[Option<&str>],
     checksums_usable: bool,
     require_clean: bool,
@@ -915,7 +936,7 @@ fn search_baseline(
             budget -= 1;
             let response = match api::query_baseline_scans(
                 &url,
-                project_name,
+                project.name,
                 BLAST_ENGINE,
                 branch,
                 require_clean,
@@ -934,10 +955,13 @@ fn search_baseline(
                 }
             };
 
-            let scans = response.scans.unwrap_or_default();
+            let mut scans = response.scans.unwrap_or_default();
             if scans.is_empty() {
                 break;
             }
+            // After the end-of-list check: a page of another project's scans
+            // is not the last page.
+            scans.retain(|scan| project.holds(scan));
             // Newest first, so the first match on this branch is the best
             // available and no later page can improve on it. Matched
             // client-side too: a backend that ignored the branch filter would
@@ -1099,7 +1123,7 @@ impl Ancestry {
 /// is at least as far back, so none of its scans could be closer.
 fn find_ancestor_baseline(
     config: &Config,
-    project_name: &str,
+    project: ProjectScope<'_>,
     ancestry: &Ancestry,
     checksums_usable: bool,
     own_root: Option<&str>,
@@ -1109,7 +1133,7 @@ fn find_ancestor_baseline(
     for batch in ancestry.shas.chunks(ANCESTOR_LOOKUP_BATCH) {
         match search_ancestor_batch(
             &url,
-            project_name,
+            project,
             ancestry,
             batch,
             checksums_usable,
@@ -1137,7 +1161,7 @@ fn find_ancestor_baseline(
 /// the rest on that account.
 fn search_ancestor_batch(
     url: &str,
-    project_name: &str,
+    project: ProjectScope<'_>,
     ancestry: &Ancestry,
     batch: &[String],
     checksums_usable: bool,
@@ -1165,7 +1189,7 @@ fn search_ancestor_batch(
     for page in 1..=SCAN_LOOKUP_MAX_PAGES {
         let response = match api::query_baseline_scans_at_commits(
             url,
-            project_name,
+            project.name,
             BLAST_ENGINE,
             batch,
             // Only a checksum baseline may have been dirty, so without one
@@ -1181,10 +1205,11 @@ fn search_ancestor_batch(
                 return best.map_or(BaselineLookup::LookupFailed, BaselineLookup::Found);
             }
         };
-        let scans = response.scans.unwrap_or_default();
+        let mut scans = response.scans.unwrap_or_default();
         if scans.is_empty() {
             break;
         }
+        scans.retain(|scan| project.holds(scan));
         if let Some(scan) =
             nearest_ancestor_baseline(&scans, ancestry, checksums_usable, own_root, git_diffable)
         {

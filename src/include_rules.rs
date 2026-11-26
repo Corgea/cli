@@ -29,13 +29,15 @@ pub struct IncludeRules {
     pub patterns: Vec<String>,
     /// Just the `--include` values, the ones the server does not know yet.
     pub cli_patterns: Vec<String>,
-    /// Whether the project's rules could not be read. Distinct from "no rules":
-    /// this run does not know what the project asked for.
-    pub lookup_failed: bool,
     /// The project's ignore rules, read in the same request. An incremental
     /// scan checks its baseline against them. `None` when they could not be
     /// read.
     pub project_ignore_paths: Option<Vec<String>>,
+    /// The project the upload lands in, read in the same request. Only its
+    /// scans can be the baseline of an incremental scan. `LookupFailed` when
+    /// the request failed, which is distinct from "no rules": this run does not
+    /// know what the project asked for.
+    pub upload_project: api::UploadProject,
 }
 
 impl IncludeRules {
@@ -54,7 +56,7 @@ impl IncludeRules {
     /// project has rules is not the same as knowing it has none, and a real
     /// scan is only slower.
     pub fn reuse_refusal(&self) -> Option<String> {
-        if self.lookup_failed {
+        if self.upload_project == api::UploadProject::LookupFailed {
             return Some(
                 "this project's include rules could not be read, so a reused scan \
                  cannot be shown to cover them"
@@ -214,11 +216,12 @@ pub fn resolve(
 ) -> IncludeRules {
     let cli_patterns = normalize_patterns(cli_include);
     let mut patterns = Vec::new();
-    let mut lookup_failed = false;
     let mut project_ignore_paths = None;
+    let mut upload_project = api::UploadProject::Unknown;
 
     match api::query_scan_settings(&config.get_url(), project_name, repo_url) {
-        Ok(Some(settings)) => {
+        Ok(Some(api::ScanSettingsResponse { settings, project })) => {
+            upload_project = project;
             project_ignore_paths = Some(settings.ignore_paths);
             for pattern in normalize_patterns(&settings.include_paths) {
                 push_unique(&mut patterns, pattern);
@@ -235,7 +238,7 @@ pub fn resolve(
         // so this is a clean "none", not a failure.
         Ok(None) => {}
         Err(e) => {
-            lookup_failed = true;
+            upload_project = api::UploadProject::LookupFailed;
             log::warn!(
                 "Could not read the project's include rules, so only --include applies to this run: {e}"
             );
@@ -248,8 +251,8 @@ pub fn resolve(
     IncludeRules {
         patterns,
         cli_patterns,
-        lookup_failed,
         project_ignore_paths,
+        upload_project,
     }
 }
 
@@ -371,7 +374,7 @@ mod tests {
         assert!(IncludeRules::default().reuse_refusal().is_none());
         assert!(rules(&["vendor/our-fork/**"]).reuse_refusal().is_some());
         assert!(IncludeRules {
-            lookup_failed: true,
+            upload_project: api::UploadProject::LookupFailed,
             ..Default::default()
         }
         .reuse_refusal()
