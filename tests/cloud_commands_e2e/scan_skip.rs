@@ -792,3 +792,93 @@ fn a_scan_of_another_commit_is_never_reused() {
     assert!(stdout.contains("CORGEA_SCAN_SKIPPED=false"), "{context}");
     assert!(stdout.contains("Scanning with BLAST"), "{context}");
 }
+
+/// Doghouse keys a project by its repository URL, so a clone with another
+/// remote lands in a project of its own under the same name, and the commit
+/// lookup, which asks by name, lists both projects' scans. The other project's
+/// newer scan must not stand in for this one: its results and gate are that
+/// project's findings, not those of the project this upload lands in.
+#[test]
+fn a_scan_of_another_project_with_the_same_name_is_never_reused() {
+    let project = git_project();
+    let mut other_projects = prior_scan(&project.sha, &ago(1));
+    other_projects["id"] = json!("other-project-scan");
+    other_projects["project_id"] = json!(UPLOAD_PROJECT_ID + 1);
+    let mut own = prior_scan(&project.sha, &ago(3));
+    own["project_id"] = json!(UPLOAD_PROJECT_ID);
+    let api = ApiStub::start(vec![
+        verify_request(),
+        scan_settings_request(PROJECT),
+        commit_lookup(&project.sha, vec![other_projects, own]),
+        clean_detail(&project.sha),
+        reused_scan_issues(),
+        reused_scan_blocking_rules(false),
+    ]);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--skip-if-commit-scanned-recently",
+        "--block-on",
+        "criticals",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(&format!("CORGEA_SCAN_ID={PRIOR_SCAN}")),
+        "{context}"
+    );
+}
+
+/// When no project holds this repository yet, the upload starts one, however
+/// many other projects share its name, so none of their scans can stand in for
+/// it. There is nothing to look up, and the run says why it scans.
+#[test]
+fn a_scan_that_starts_a_new_project_does_not_look_for_one_to_reuse() {
+    let project = git_project();
+    let mut plan = blast_upload_plan(&project.sha, false, false);
+    // Nor for a baseline: a new project has no scan to diff against either.
+    plan.drain(2..2 + baseline_lookups_finding_nothing(PROJECT).len());
+    let plan = answer_with(
+        plan,
+        "read project include rules",
+        json_response(json!({
+            "status": "ok",
+            "project": null,
+            "settings": {"include_paths": [], "ignore_paths": []}
+        })),
+    );
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--skip-if-commit-scanned-recently",
+        "--project-name",
+        PROJECT,
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    assert!(
+        stdout.contains(&format!(
+            "Corgea has no project '{PROJECT}' for this repository yet, so there is no \
+             earlier scan of commit {} to reuse - running a new scan.",
+            &project.sha[..7]
+        )),
+        "{context}"
+    );
+    assert!(stdout.contains("CORGEA_SCAN_SKIPPED=false"), "{context}");
+    assert!(stdout.contains("Scanning with BLAST"), "{context}");
+}

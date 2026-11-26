@@ -51,7 +51,7 @@
 use crate::config::Config;
 use crate::manifest::{Manifest, MANIFEST_VERSION};
 use crate::scanners::blast::{classify_scan_status, ScanState};
-use crate::utils::api::{self, ScanResponse, UploadProject};
+use crate::utils::api::{self, ProjectScope, ScanResponse, UploadProject};
 use corgea::statusln;
 use git2::Repository;
 use serde::Serialize;
@@ -298,23 +298,14 @@ fn plan_diff(
     upload_project: &UploadProject,
     sources: &DiffSources<'_>,
 ) -> Result<(IncrementalPlan, String), FullScanReason> {
-    let project = BaselineScope {
-        name: project_name,
-        id: match upload_project {
-            UploadProject::Existing(id) => Some(id.as_str()),
-            UploadProject::Unknown => None,
-            // Other projects may share the name, but none of their scans is
-            // one the server would copy findings from into a new project.
-            UploadProject::New => {
-                return Err(FullScanReason::new(
-                    FullScanCause::NoBaselineScan,
-                    format!(
-                        "Corgea has no project '{project_name}' for this repository yet, so \
-                         there is no earlier scan to diff against"
-                    ),
-                ))
-            }
-        },
+    let Some(project) = upload_project.scope(project_name) else {
+        return Err(FullScanReason::new(
+            FullScanCause::NoBaselineScan,
+            format!(
+                "Corgea has no project '{project_name}' for this repository yet, so \
+                 there is no earlier scan to diff against"
+            ),
+        ));
     };
     // Optional, because a checksum diff needs no repository. Only the git diff
     // below does, and it reports its absence by its real name.
@@ -876,31 +867,6 @@ fn join_or(branches: &[String]) -> String {
     }
 }
 
-/// Whose scans a baseline may come from: the project this upload lands in.
-///
-/// The scan list is asked by name, and a name is not unique. Doghouse keys a
-/// project by its repository URL, so clones with different remotes land in
-/// different projects of the same name, and the server copies findings only
-/// from a scan of the upload's own project.
-#[derive(Clone, Copy)]
-struct BaselineScope<'a> {
-    name: &'a str,
-    /// `None` when the server could not say which project that is.
-    id: Option<&'a str>,
-}
-
-impl BaselineScope<'_> {
-    /// Whether `scan` may belong to the upload's project. A scan listed without
-    /// a project id, by a backend predating them, is taken on its name alone,
-    /// as every earlier release took it.
-    fn holds(&self, scan: &ScanResponse) -> bool {
-        match (self.id, scan.project_id.as_deref()) {
-            (Some(ours), Some(theirs)) => ours == theirs,
-            _ => true,
-        }
-    }
-}
-
 /// The newest scan that can be diffed against, on the first candidate branch
 /// that has one.
 ///
@@ -912,7 +878,7 @@ impl BaselineScope<'_> {
 /// it one query for the project's newest usable scan on any branch.
 fn find_baseline(
     config: &Config,
-    project: BaselineScope<'_>,
+    project: ProjectScope<'_>,
     branches: Option<&[String]>,
     checksums_usable: bool,
 ) -> BaselineLookup {
@@ -941,7 +907,7 @@ fn find_baseline(
 /// One walk of the project's scans, newest first, over `searches` in order.
 fn search_baseline(
     config: &Config,
-    project: BaselineScope<'_>,
+    project: ProjectScope<'_>,
     searches: &[Option<&str>],
     checksums_usable: bool,
     require_clean: bool,
@@ -1147,7 +1113,7 @@ impl Ancestry {
 /// is at least as far back, so none of its scans could be closer.
 fn find_ancestor_baseline(
     config: &Config,
-    project: BaselineScope<'_>,
+    project: ProjectScope<'_>,
     ancestry: &Ancestry,
     checksums_usable: bool,
     own_root: Option<&str>,
@@ -1185,7 +1151,7 @@ fn find_ancestor_baseline(
 /// the rest on that account.
 fn search_ancestor_batch(
     url: &str,
-    project: BaselineScope<'_>,
+    project: ProjectScope<'_>,
     ancestry: &Ancestry,
     batch: &[String],
     checksums_usable: bool,

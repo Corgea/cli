@@ -1604,6 +1604,46 @@ pub enum UploadProject {
     Unknown,
 }
 
+impl UploadProject {
+    /// The scope of an upload named `name`, or `None` when the upload creates
+    /// its project, which has no scans yet. Other projects may share the name,
+    /// but their scans are not this project's.
+    pub fn scope<'a>(&'a self, name: &'a str) -> Option<ProjectScope<'a>> {
+        let id = match self {
+            UploadProject::Existing(id) => Some(id.as_str()),
+            UploadProject::Unknown => None,
+            UploadProject::New => return None,
+        };
+        Some(ProjectScope { name, id })
+    }
+}
+
+/// Whose scans an upload may use: the project it lands in.
+///
+/// The scan list is asked by name, and a name is not unique. Doghouse keys a
+/// project by its repository URL, so clones with different remotes land in
+/// different projects of the same name. The server copies findings only from a
+/// scan of the upload's own project, and only that project's scan can stand in
+/// for the upload.
+#[derive(Clone, Copy)]
+pub struct ProjectScope<'a> {
+    pub name: &'a str,
+    /// `None` when the server could not say which project that is.
+    id: Option<&'a str>,
+}
+
+impl ProjectScope<'_> {
+    /// Whether `scan` may belong to the upload's project. A scan listed without
+    /// a project id, by a backend predating them, is taken on its name alone,
+    /// as every earlier release took it.
+    pub fn holds(&self, scan: &ScanResponse) -> bool {
+        match (self.id, scan.project_id.as_deref()) {
+            (Some(ours), Some(theirs)) => ours == theirs,
+            _ => true,
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, Default)]
 pub struct ScanSettingsResponse {
     #[serde(default)]

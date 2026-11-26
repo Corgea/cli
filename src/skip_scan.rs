@@ -20,12 +20,12 @@
 //! One scan may only stand in for another when it answers the same question,
 //! which is a stricter test than "same commit". Doghouse already settled what
 //! that means for its own server-side dedupe (`ScanManager._find_reusable_scan`):
-//! same commit, not a pull-request scan, an explicitly clean worktree, and
-//! matching scan configuration and policies. The checks here are the client-side
-//! half of that rule, and where the API cannot yet prove the match — the scan's
-//! configured scan types and target policies are not exposed on any read
-//! endpoint — the flag refuses the run rather than guessing (see `main.rs`,
-//! where `--scan-type`/`--policy` conflict with it).
+//! same project and commit, not a pull-request scan, an explicitly clean
+//! worktree, and matching scan configuration and policies. The checks here are
+//! the client-side half of that rule, and where the API cannot yet prove the
+//! match — the scan's configured scan types and target policies are not exposed
+//! on any read endpoint — the flag refuses the run rather than guessing (see
+//! `main.rs`, where `--scan-type`/`--policy` conflict with it).
 //!
 //! `--exclude` is the one narrowing flag that only warns. It is typically a
 //! fixed line in a pipeline template rather than a per-run choice, and reusing a
@@ -35,7 +35,7 @@
 use crate::config::Config;
 use crate::scanners::blast::{classify_scan_status, format_scan_warnings, ScanState};
 use crate::utils;
-use crate::utils::api::ScanResponse;
+use crate::utils::api::{ProjectScope, ScanResponse, UploadProject};
 use chrono::{DateTime, Utc};
 use corgea::statusln;
 use std::collections::BTreeSet;
@@ -123,6 +123,7 @@ pub fn parse_window(raw: &str) -> Result<Duration, String> {
 pub fn resolve_reusable_scan(
     config: &Config,
     project_name: &str,
+    upload_project: &UploadProject,
     skip: &SkipRecentScan,
     exclude: Option<&str>,
     ignore_dirty_worktree: bool,
@@ -160,6 +161,16 @@ pub fn resolve_reusable_scan(
         }
     }
 
+    let Some(project) = upload_project.scope(project_name) else {
+        statusln!(
+            "Corgea has no project '{}' for this repository yet, so there is no earlier scan of commit {} to reuse - running a new scan.",
+            project_name,
+            short
+        );
+        print_skipped_marker(None);
+        return None;
+    };
+
     statusln!(
         "Checking Corgea for a scan of commit {} in project '{}' from the last {}...",
         short,
@@ -169,7 +180,7 @@ pub fn resolve_reusable_scan(
 
     let found = match find_reusable_scan(
         config,
-        project_name,
+        project,
         &sha,
         skip.window,
         Utc::now(),
@@ -272,7 +283,7 @@ fn ignore_rules_refusal(scan: &ScanResponse, current: Option<&[String]>) -> Opti
 /// scan. `Err` is a lookup failure, `Ok(None)` a clean miss.
 fn find_reusable_scan(
     config: &Config,
-    project_name: &str,
+    project: ProjectScope<'_>,
     sha: &str,
     window: Duration,
     now: DateTime<Utc>,
@@ -282,7 +293,7 @@ fn find_reusable_scan(
     loop {
         let response = utils::api::query_scans_for_commit(
             &config.get_url(),
-            project_name,
+            project.name,
             sha,
             page,
             SCAN_LOOKUP_PAGE_SIZE,
@@ -292,8 +303,15 @@ fn find_reusable_scan(
         if scans.is_empty() {
             return Ok(None);
         }
-        if let Some(reusable) =
-            select_reusable_scan(&scans, sha, now, window, ignore_dirty_worktree)
+        // Only the pick is narrowed to this project. The checks after it read
+        // the whole page: a page of another project's scans is not the end of
+        // this one's.
+        let ours: Vec<ScanResponse> = scans
+            .iter()
+            .filter(|scan| project.holds(scan))
+            .cloned()
+            .collect();
+        if let Some(reusable) = select_reusable_scan(&ours, sha, now, window, ignore_dirty_worktree)
         {
             return Ok(Some((reusable.scan.clone(), reusable.age)));
         }

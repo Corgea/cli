@@ -160,6 +160,7 @@ pub fn run(
         crate::skip_scan::resolve_reusable_scan(
             config,
             &project_name,
+            &include_rules.upload_project,
             skip,
             exclude.as_deref(),
             *ignore_dirty_worktree,
