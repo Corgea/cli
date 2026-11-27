@@ -212,6 +212,7 @@ pub fn run(
         &project_name,
         &scan_id,
         &counts_excluding_false_positives,
+        issues.dependencies(),
         out_format.as_deref(),
         out_file.as_deref(),
     );
@@ -222,10 +223,10 @@ pub fn run(
 
     let gate = evaluate_gate(
         config,
-        &project_name,
         &scan_id,
         &gate_request,
         &counts_excluding_false_positives,
+        issues.dependencies(),
     );
 
     let summary = ScanSummary::build(
@@ -259,10 +260,10 @@ pub enum GateRequest {
 
 fn evaluate_gate(
     config: &Config,
-    project_name: &str,
     scan_id: &str,
     request: &GateRequest,
     counts_excluding_false_positives: &HashMap<String, usize>,
+    dependencies: Result<&[SCAIssue], &str>,
 ) -> Gate {
     let fail_on = match request {
         GateRequest::NotRequested => return Gate::NotRequested,
@@ -311,11 +312,7 @@ fn evaluate_gate(
     };
 
     let sca_issues = if tokens.iter().any(|t| t == "malicious") {
-        match utils::api::get_all_sca_issues(
-            &config.get_url(),
-            project_name,
-            Some(scan_id.to_string()),
-        ) {
+        match dependencies {
             Ok(issues) => issues,
             Err(e) => {
                 log::error!(
@@ -326,11 +323,11 @@ fn evaluate_gate(
             }
         }
     } else {
-        Vec::new()
+        &[]
     };
 
     let condition = format!("--fail-on {fail_on} (findings in any status, not only open)");
-    match fail_on_tripped_count(&tokens, counts_excluding_false_positives, &sca_issues) {
+    match fail_on_tripped_count(&tokens, counts_excluding_false_positives, sca_issues) {
         0 => Gate::Passed { condition },
         tripped => Gate::Failed { condition, tripped },
     }
@@ -945,6 +942,7 @@ fn write_scan_report(
     project_name: &str,
     scan_id: &str,
     classifications: &HashMap<String, usize>,
+    dependencies: Result<&[SCAIssue], &str>,
     out_format: Option<&str>,
     out_file: Option<&str>,
 ) {
@@ -979,11 +977,7 @@ fn write_scan_report(
                 std::process::exit(1);
             }
         };
-        let sca_issues = match utils::api::get_all_sca_issues(
-            &config.get_url(),
-            project_name,
-            Some(scan_id.into()),
-        ) {
+        let sca_issues = match dependencies {
             Ok(issues) => issues,
             Err(e) => {
                 stop_spinner();
@@ -1992,10 +1986,10 @@ mod tests {
         .unwrap();
         let gate = evaluate_gate(
             &config,
-            "goof",
             "scan-1",
             &GateRequest::FailOn("HI".into()),
             &summary::legacy_urgency_counts(&issues),
+            Ok(&[]),
         );
         assert_eq!(
             gate,

@@ -1,4 +1,4 @@
-use crate::utils::api::{get_all_issues, FalsePositives, Issue};
+use crate::utils::api::{get_all_issues, get_all_sca_issues, FalsePositives, Issue, SCAIssue};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeSet, HashMap};
 
@@ -26,6 +26,13 @@ impl Severity {
             "LO" => Some(Self::Low),
             _ => None,
         }
+    }
+
+    fn parse_dependency(severity: Option<&str>) -> Option<Self> {
+        let severity = severity?;
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.key().eq_ignore_ascii_case(severity))
     }
 
     fn key(self) -> &'static str {
@@ -174,6 +181,80 @@ impl SeverityCounts {
     }
 }
 
+impl std::ops::AddAssign for SeverityCounts {
+    fn add_assign(&mut self, other: Self) {
+        for (slot, count) in self.0.iter_mut().zip(other.0) {
+            *slot += count;
+        }
+    }
+}
+
+/// Counts by severity, plus the findings whose severity is missing or unknown,
+/// which count in the total only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tally {
+    pub rated: SeverityCounts,
+    pub unrated: usize,
+}
+
+impl Tally {
+    pub fn total(&self) -> usize {
+        self.rated.total() + self.unrated
+    }
+
+    fn add(&mut self, severity: Option<Severity>) {
+        match severity {
+            Some(severity) => self.rated.add(severity),
+            None => self.unrated += 1,
+        }
+    }
+
+    fn json(&self) -> Value {
+        let mut json = self.rated.json();
+        json["unrated"] = self.unrated.into();
+        json["total"] = self.total().into();
+        json
+    }
+}
+
+impl From<SeverityCounts> for Tally {
+    fn from(rated: SeverityCounts) -> Self {
+        Tally { rated, unrated: 0 }
+    }
+}
+
+/// The scan's dependency findings in any status: the dependency endpoint
+/// does not report a finding's status.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DependencyCounts {
+    pub malicious: Tally,
+    pub vulnerable: Tally,
+}
+
+impl DependencyCounts {
+    fn count(issues: &[SCAIssue]) -> Self {
+        let mut counts = DependencyCounts::default();
+        for issue in issues {
+            let tally = if issue.classification.as_deref() == Some("malicious") {
+                &mut counts.malicious
+            } else {
+                &mut counts.vulnerable
+            };
+            tally.add(Severity::parse_dependency(issue.severity.as_deref()));
+        }
+        counts
+    }
+
+    fn all(&self) -> Tally {
+        let mut rated = self.malicious.rated;
+        rated += self.vulnerable.rated;
+        Tally {
+            rated,
+            unrated: self.malicious.unrated + self.vulnerable.unrated,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RecentScanReuse {
     #[default]
@@ -251,6 +332,7 @@ pub struct ScanSummary {
     pub gate: Gate,
     by_status: [SeverityCounts; STATUSES.len()],
     pub unrecognized: Unrecognized,
+    pub dependencies: Result<DependencyCounts, String>,
     pub fix_first: Vec<IssueRow>,
     pub results_url: String,
 }
@@ -294,24 +376,47 @@ pub fn legacy_urgency_counts(issues: &[Issue]) -> HashMap<String, usize> {
     counts
 }
 
-pub struct ScanIssues(Vec<Issue>);
+pub struct ScanIssues {
+    code: Vec<Issue>,
+    dependencies: Result<Vec<SCAIssue>, String>,
+}
 
 impl ScanIssues {
+    /// A failed dependency read is kept, not raised: the summary reports it
+    /// and the code issues still print.
     pub fn fetch(
         url: &str,
         project: &str,
         scan_id: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        get_all_issues(url, project, Some(scan_id.into()), FalsePositives::Include).map(Self)
+        let code = get_all_issues(url, project, Some(scan_id.into()), FalsePositives::Include)?;
+        let dependencies =
+            get_all_sca_issues(url, project, Some(scan_id.into())).map_err(|e| e.to_string());
+        Ok(Self { code, dependencies })
     }
 
     #[cfg(test)]
     pub fn including_false_positives(issues: Vec<Issue>) -> Self {
-        Self(issues)
+        Self {
+            code: issues,
+            dependencies: Ok(Vec::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_dependencies(self, dependencies: Result<Vec<SCAIssue>, String>) -> Self {
+        Self {
+            dependencies,
+            ..self
+        }
     }
 
     pub fn as_slice(&self) -> &[Issue] {
-        &self.0
+        &self.code
+    }
+
+    pub fn dependencies(&self) -> Result<&[SCAIssue], &str> {
+        self.dependencies.as_deref().map_err(String::as_str)
     }
 }
 
@@ -350,6 +455,10 @@ impl ScanSummary {
             gate,
             by_status,
             unrecognized,
+            dependencies: issues
+                .dependencies()
+                .map(DependencyCounts::count)
+                .map_err(str::to_string),
             fix_first: open,
             results_url,
         }
@@ -360,6 +469,10 @@ impl ScanSummary {
     }
 
     pub fn total_findings(&self) -> usize {
+        self.code_findings() + self.dependencies.as_ref().map_or(0, |d| d.all().total())
+    }
+
+    fn code_findings(&self) -> usize {
         self.by_status
             .iter()
             .map(SeverityCounts::total)
@@ -370,9 +483,7 @@ impl ScanSummary {
     fn all_statuses(&self) -> SeverityCounts {
         let mut all = SeverityCounts::default();
         for counts in &self.by_status {
-            for (slot, count) in all.0.iter_mut().zip(counts.0) {
-                *slot += count;
-            }
+            all += *counts;
         }
         all
     }
@@ -387,6 +498,7 @@ const BOLD: &str = "1";
 const DIM: &str = "2";
 const GREEN: &str = "32";
 const RED: &str = "31";
+const MALWARE: &str = "1;31";
 const LINK: &str = "38;5;75;4";
 
 struct Ledger {
@@ -437,10 +549,10 @@ impl Ledger {
         out
     }
 
-    fn row(&self, label: &str, label_sgr: &str, counts: &SeverityCounts) -> String {
+    fn row(&self, label: &str, label_sgr: &str, counts: &Tally) -> String {
         let mut out = self.label(label, label_sgr);
         for severity in Severity::ALL {
-            let count = counts.get(severity);
+            let count = counts.rated.get(severity);
             let sgr = if count == 0 { DIM } else { severity.sgr() };
             out.push_str(&self.cell(severity.label(), &count.to_string(), sgr));
         }
@@ -449,12 +561,7 @@ impl Ledger {
         out
     }
 
-    fn table(
-        &self,
-        title: &str,
-        rows: &[(&str, SeverityCounts)],
-        total: (&str, SeverityCounts),
-    ) -> String {
+    fn table(&self, title: &str, rows: &[(&str, Tally)], total: (&str, Tally)) -> String {
         let mut out = self.header(title);
         out.push_str(&self.rule());
         for (label, counts) in rows {
@@ -469,25 +576,42 @@ impl Ledger {
 pub fn render_human(summary: &ScanSummary, color: bool) -> String {
     const OPEN_TITLE: &str = "Open issues";
     const OPEN_TOTAL: &str = "Total open";
-    const STATUS_TITLE: &str = "All findings by status";
+    const DEPENDENCY_TITLE: &str = "Dependencies, any status";
+    const DEPENDENCY_TOTAL: &str = "Total dependencies";
+    const STATUS_TITLE: &str = "Code findings by status";
     const STATUS_TOTAL: &str = "Total";
 
-    let open_rows = vec![(CODE_ROW_LABEL, summary.counts(Status::Open))];
-    let status_rows: Vec<(&str, SeverityCounts)> = STATUSES
+    let open_rows = vec![(CODE_ROW_LABEL, summary.counts(Status::Open).into())];
+    let dependency_rows: Vec<(&str, Tally)> = match &summary.dependencies {
+        Ok(counts) => vec![
+            ("Malicious packages", counts.malicious),
+            ("Vulnerable packages", counts.vulnerable),
+        ],
+        Err(_) => Vec::new(),
+    };
+    let status_rows: Vec<(&str, Tally)> = STATUSES
         .iter()
-        .map(|info| (info.label, summary.counts(info.status)))
+        .map(|info| (info.label, summary.counts(info.status).into()))
         .collect();
-    let longest_label = [OPEN_TITLE, OPEN_TOTAL, STATUS_TITLE, STATUS_TOTAL]
-        .into_iter()
-        .chain(
-            open_rows
-                .iter()
-                .chain(&status_rows)
-                .map(|(label, _)| *label),
-        )
-        .map(str::len)
-        .max()
-        .unwrap_or(0);
+    let longest_label = [
+        OPEN_TITLE,
+        OPEN_TOTAL,
+        DEPENDENCY_TITLE,
+        DEPENDENCY_TOTAL,
+        STATUS_TITLE,
+        STATUS_TOTAL,
+    ]
+    .into_iter()
+    .chain(
+        open_rows
+            .iter()
+            .chain(&dependency_rows)
+            .chain(&status_rows)
+            .map(|(label, _)| *label),
+    )
+    .map(str::len)
+    .max()
+    .unwrap_or(0);
     let ledger = Ledger {
         color,
         label_width: (longest_label + 1).max(LABEL_MIN_WIDTH),
@@ -496,6 +620,7 @@ pub fn render_human(summary: &ScanSummary, color: bool) -> String {
     let scan = &summary.scan;
     let open = summary.counts(Status::Open).total();
     let total = summary.total_findings();
+    let code = summary.code_findings();
     let mut title = format!("Scan complete: {}", scan.project);
     if let Some(branch) = &scan.branch {
         title.push_str(&format!(", branch {branch}"));
@@ -511,23 +636,63 @@ pub fn render_human(summary: &ScanSummary, color: bool) -> String {
     } else {
         String::new()
     };
+    let dependency_note = match &summary.dependencies {
+        Ok(counts) => format!(", {} in dependencies", counts.all().total()),
+        Err(_) => ", dependencies not fetched".to_string(),
+    };
     out.push_str(&format!(
-        "{total} {} in this scan: {}, {} in other states{unrecognized_note}.\n\n",
+        "{total} {} in this scan: {}, {} in other states{unrecognized_note}{dependency_note}.\n",
         if total == 1 { "finding" } else { "findings" },
         ledger.paint(&format!("{open} open"), BOLD),
-        total - open - unrecognized
+        code - open - unrecognized
     ));
+    if let Ok(counts) = &summary.dependencies {
+        let malicious = counts.malicious.total();
+        if malicious > 0 {
+            out.push_str(&format!(
+                "{} {malicious} malicious {} in this scan's dependencies.\n",
+                ledger.paint("Malware:", MALWARE),
+                if malicious == 1 {
+                    "package"
+                } else {
+                    "packages"
+                }
+            ));
+        }
+    }
+    out.push('\n');
 
     out.push_str(&ledger.table(
         OPEN_TITLE,
         &open_rows,
-        (OPEN_TOTAL, summary.counts(Status::Open)),
+        (OPEN_TOTAL, summary.counts(Status::Open).into()),
     ));
+    out.push('\n');
+    match &summary.dependencies {
+        Ok(counts) => {
+            let all = counts.all();
+            out.push_str(&ledger.table(
+                DEPENDENCY_TITLE,
+                &dependency_rows,
+                (DEPENDENCY_TOTAL, all),
+            ));
+            if all.unrated > 0 {
+                out.push_str(&format!(
+                    "{} dependency finding(s) have no severity this CLI recognizes. They count in Total only.\n",
+                    all.unrated
+                ));
+            }
+        }
+        Err(error) => out.push_str(&format!(
+            "{} {error}\n",
+            ledger.paint("Dependency findings could not be fetched:", RED)
+        )),
+    }
     out.push('\n');
     out.push_str(&ledger.table(
         STATUS_TITLE,
         &status_rows,
-        (STATUS_TOTAL, summary.all_statuses()),
+        (STATUS_TOTAL, summary.all_statuses().into()),
     ));
 
     if summary.unrecognized.count > 0 {
@@ -617,6 +782,25 @@ pub fn render_agent(summary: &ScanSummary) -> String {
         }
         out.push_str(&format!("\t{}\t{}\n", counts.total(), info.meaning));
     }
+    match &summary.dependencies {
+        Ok(counts) => {
+            out.push_str("record\tkind\tcritical\thigh\tmedium\tlow\tunrated\ttotal\n");
+            for (kind, tally) in [
+                ("malicious", counts.malicious),
+                ("vulnerable", counts.vulnerable),
+            ] {
+                out.push_str(&format!("dependency\t{kind}"));
+                for severity in Severity::ALL {
+                    out.push_str(&format!("\t{}", tally.rated.get(severity)));
+                }
+                out.push_str(&format!("\t{}\t{}\n", tally.unrated, tally.total()));
+            }
+        }
+        Err(error) => {
+            out.push_str("record\terror\n");
+            out.push_str(&format!("dependency_error\t{}\n", tsv_cell(error)));
+        }
+    }
     if summary.unrecognized.count > 0 {
         out.push_str("record\tcount\tvalues\n");
         out.push_str(&format!(
@@ -702,6 +886,20 @@ pub fn render_json(summary: &ScanSummary) -> String {
         },
         "total_findings": summary.total_findings(),
         "by_status": by_status,
+        "dependencies": match &summary.dependencies {
+            Ok(counts) => json!({
+                "malicious": counts.malicious.json(),
+                "vulnerable": counts.vulnerable.json(),
+                "total": counts.all().total(),
+                "error": null,
+            }),
+            Err(error) => json!({
+                "malicious": null,
+                "vulnerable": null,
+                "total": null,
+                "error": error,
+            }),
+        },
         "unrecognized": {
             "count": summary.unrecognized.count,
             "values": summary.unrecognized.values,
@@ -720,6 +918,7 @@ mod tests {
     use super::*;
     use crate::utils::api::{
         AutoTriage, Classification, CorgeaFile, FalsePositiveDetection, Location, Project,
+        SCALocation, SCAPackage,
     };
 
     fn issue(id: &str, status: &str, urgency: &str, path: &str, line: u32) -> Issue {
@@ -758,6 +957,48 @@ mod tests {
             scanner_metadata: None,
             metadata: None,
         }
+    }
+
+    fn dependency(name: &str, severity: Option<&str>, classification: Option<&str>) -> SCAIssue {
+        SCAIssue {
+            id: format!("sca-{name}"),
+            created_at: String::new(),
+            description: None,
+            details: None,
+            severity: severity.map(str::to_string),
+            classification: classification.map(str::to_string),
+            cve: None,
+            package: SCAPackage {
+                name: name.into(),
+                version: "1.0.0".into(),
+                ecosystem: "npm".into(),
+                fix_version: None,
+            },
+            location: SCALocation {
+                path: "package-lock.json".into(),
+            },
+        }
+    }
+
+    /// The production case: no code issues, lockfiles pinning malware.
+    fn malware_dependencies() -> Vec<SCAIssue> {
+        vec![
+            dependency("flatmap-stream", Some("CRITICAL"), Some("malicious")),
+            dependency("rustdecimal", None, Some("malicious")),
+            dependency("lodash", Some("high"), None),
+        ]
+    }
+
+    fn summary_with_dependencies(
+        dependencies: Result<Vec<SCAIssue>, String>,
+        issues: Vec<Issue>,
+    ) -> ScanSummary {
+        ScanSummary::build(
+            scan_info(),
+            Gate::NotRequested,
+            &ScanIssues::including_false_positives(issues).with_dependencies(dependencies),
+            "https://corgea.test/scan".into(),
+        )
     }
 
     fn held_false_positive(id: &str, urgency: &str) -> Issue {
@@ -843,7 +1084,9 @@ mod tests {
         let human = render_human(&summary, false);
         assert!(human.contains("status=snoozed, urgency=IN"));
         assert!(
-            human.contains("3 findings in this scan: 1 open, 0 in other states, 2 unrecognized."),
+            human.contains(
+                "3 findings in this scan: 1 open, 0 in other states, 2 unrecognized, 0 in dependencies."
+            ),
             "{human}"
         );
         assert!(render_agent(&summary).contains("unrecognized\t2\tstatus=snoozed, urgency=IN\n"));
@@ -873,7 +1116,7 @@ mod tests {
         let out = render_human(&summary_of(issues, Gate::NotRequested), false);
         let expected = "
 Scan complete: goof, branch main, scan scan-1
-1 finding in this scan: 1 open, 0 in other states.
+1 finding in this scan: 1 open, 0 in other states, 0 in dependencies.
 
 Open issues                   Critical  High  Medium  Low  Total
 ----------------------------------------------------------------
@@ -881,7 +1124,14 @@ SAST, Logic & Auth, Secrets          0     1       0    0      1
 ----------------------------------------------------------------
 Total open                           0     1       0    0      1
 
-All findings by status        Critical  High  Medium  Low  Total
+Dependencies, any status      Critical  High  Medium  Low  Total
+----------------------------------------------------------------
+Malicious packages                   0     0       0    0      0
+Vulnerable packages                  0     0       0    0      0
+----------------------------------------------------------------
+Total dependencies                   0     0       0    0      0
+
+Code findings by status       Critical  High  Medium  Low  Total
 ----------------------------------------------------------------
 Open                                 0     1       0    0      1
 Fix in Progress                      0     0       0    0      0
@@ -941,6 +1191,9 @@ status\tfixed\t1\t0\t0\t0\t1\tresolved
 status\taccepted_risk\t0\t0\t1\t0\t1\trisk accepted by your team
 status\tfalse_positive\t0\t1\t1\t0\t2\tnot a real security issue
 status\tduplicate\t0\t0\t0\t1\t1\tsame as another finding
+record\tkind\tcritical\thigh\tmedium\tlow\tunrated\ttotal
+dependency\tmalicious\t0\t0\t0\t0\t0\t0
+dependency\tvulnerable\t0\t0\t0\t0\t0\t0
 record\tid\tseverity\tcwe\ttitle\tlocation
 issue\to2\tcritical\tCWE-89\tSQL Injection\tsrc/z.js:1
 issue\to1\thigh\tCWE-89\tSQL Injection\tsrc/b.js:9
@@ -971,6 +1224,107 @@ issue\to1\thigh\tCWE-89\tSQL Injection\tsrc/b.js:9
         assert_eq!(json["by_status"]["false_positive"]["medium"], 1);
         assert_eq!(json["fix_first"][0]["severity"], "critical");
         assert_eq!(json["total_findings"], 8);
+    }
+
+    #[test]
+    fn human_calls_out_malicious_dependencies() {
+        let out = render_human(
+            &summary_with_dependencies(Ok(malware_dependencies()), vec![]),
+            false,
+        );
+        let expected = "
+Scan complete: goof, branch main, scan scan-1
+3 findings in this scan: 0 open, 0 in other states, 3 in dependencies.
+Malware: 2 malicious packages in this scan's dependencies.
+
+Open issues                   Critical  High  Medium  Low  Total
+----------------------------------------------------------------
+SAST, Logic & Auth, Secrets          0     0       0    0      0
+----------------------------------------------------------------
+Total open                           0     0       0    0      0
+
+Dependencies, any status      Critical  High  Medium  Low  Total
+----------------------------------------------------------------
+Malicious packages                   1     0       0    0      2
+Vulnerable packages                  0     1       0    0      1
+----------------------------------------------------------------
+Total dependencies                   1     1       0    0      3
+1 dependency finding(s) have no severity this CLI recognizes. They count in Total only.
+
+Code findings by status       Critical  High  Medium  Low  Total
+----------------------------------------------------------------
+Open                                 0     0       0    0      0
+Fix in Progress                      0     0       0    0      0
+Fixed                                0     0       0    0      0
+Accepted Risk                        0     0       0    0      0
+False Positive                       0     0       0    0      0
+Duplicate                            0     0       0    0      0
+----------------------------------------------------------------
+Total                                0     0       0    0      0
+
+Go to https://corgea.test/scan to see results.
+";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn agent_and_json_count_malicious_dependencies() {
+        let summary = summary_with_dependencies(Ok(malware_dependencies()), vec![]);
+        let agent = render_agent(&summary);
+        assert!(
+            agent.contains(
+                "record\tkind\tcritical\thigh\tmedium\tlow\tunrated\ttotal\n\
+                 dependency\tmalicious\t1\t0\t0\t0\t1\t2\n\
+                 dependency\tvulnerable\t0\t1\t0\t0\t0\t1\n"
+            ),
+            "{agent}"
+        );
+        let json: Value = serde_json::from_str(&render_json(&summary)).unwrap();
+        assert_eq!(json["total_findings"], 3);
+        assert_eq!(json["dependencies"]["total"], 3);
+        assert_eq!(json["dependencies"]["malicious"]["total"], 2);
+        assert_eq!(json["dependencies"]["malicious"]["critical"], 1);
+        assert_eq!(json["dependencies"]["malicious"]["unrated"], 1);
+        assert_eq!(json["dependencies"]["vulnerable"]["high"], 1);
+        assert_eq!(json["dependencies"]["error"], Value::Null);
+    }
+
+    #[test]
+    fn a_failed_dependency_read_is_reported_never_counted_as_zero() {
+        let error = "Failed to get SCA issues: Request failed with status: 403 Forbidden";
+        let summary = summary_with_dependencies(
+            Err(error.into()),
+            vec![issue("o1", "open", "HI", "src/a.js", 1)],
+        );
+        assert_eq!(summary.total_findings(), 1);
+
+        let human = render_human(&summary, false);
+        assert!(
+            human.contains(
+                "1 finding in this scan: 1 open, 0 in other states, dependencies not fetched.\n"
+            ),
+            "{human}"
+        );
+        assert!(
+            human.contains(&format!(
+                "Dependency findings could not be fetched: {error}\n"
+            )),
+            "{human}"
+        );
+        assert!(!human.contains("Malicious packages"), "{human}");
+
+        let agent = render_agent(&summary);
+        assert!(
+            agent.contains(&format!("record\terror\ndependency_error\t{error}\n")),
+            "{agent}"
+        );
+        assert!(!agent.contains("dependency\t"), "{agent}");
+
+        let json: Value = serde_json::from_str(&render_json(&summary)).unwrap();
+        assert_eq!(json["dependencies"]["error"], error);
+        assert_eq!(json["dependencies"]["total"], Value::Null);
+        assert_eq!(json["dependencies"]["malicious"], Value::Null);
+        assert_eq!(json["total_findings"], 1);
     }
 
     #[test]

@@ -1008,6 +1008,22 @@ pub(crate) fn append_wait_plan(
         },
         json_response(regular_issue_page(scan_id, project)),
     ));
+    expected.push(sca_issues_request(scan_id, empty_issue_page()));
+}
+
+/// The summary's read of the scan's dependency findings, which follows the
+/// code-issue read on every `scan` and `wait`.
+pub(crate) fn sca_issues_request(scan_id: &str, page: Value) -> ExpectedRequest {
+    let path = format!("/api/v1/scan/{scan_id}/issues/sca");
+    expected_request(
+        "read SCA issues",
+        move |request| {
+            assert_authenticated_request(request, Method::GET, &path)?;
+            assert_query(request, "page", "1")?;
+            assert_query(request, "page_size", "30")
+        },
+        json_response(page),
+    )
 }
 
 pub(crate) fn assert_issue_summary(stdout: &str, context: &str) {
@@ -1015,7 +1031,7 @@ pub(crate) fn assert_issue_summary(stdout: &str, context: &str) {
         .unwrap()
         .replace_all(stdout, "");
     for line in [
-        "4 findings in this scan: 4 open, 0 in other states.",
+        "4 findings in this scan: 4 open, 0 in other states, 0 in dependencies.",
         "Total open                           1     2       1    0      4",
         "Open                                 1     2       1    0      4",
     ] {
@@ -1047,9 +1063,14 @@ pub(crate) fn blast_plan(sha: &str) -> Vec<ExpectedRequest> {
     blast_upload_plan(sha, false, true)
 }
 
-/// BLAST upload contract. `include_sca` covers `--fail-on malicious` (SCA fetch).
-pub(crate) fn blast_upload_plan(sha: &str, dirty: bool, include_sca: bool) -> Vec<ExpectedRequest> {
-    blast_plan_for(sha, dirty, include_sca, true)
+/// BLAST upload contract. `malicious_dependency` makes the scan's dependency
+/// findings hold one malicious package; otherwise it has none.
+pub(crate) fn blast_upload_plan(
+    sha: &str,
+    dirty: bool,
+    malicious_dependency: bool,
+) -> Vec<ExpectedRequest> {
+    blast_plan_for(sha, dirty, malicious_dependency, true)
 }
 
 /// The same contract for `--target`, which names the files to upload and so
@@ -1070,7 +1091,7 @@ pub(crate) fn blast_excluded_upload_plan(sha: &str) -> Vec<ExpectedRequest> {
 fn blast_plan_for(
     sha: &str,
     dirty: bool,
-    include_sca: bool,
+    malicious_dependency: bool,
     look_for_baseline: bool,
 ) -> Vec<ExpectedRequest> {
     let patch_sha = sha.to_string();
@@ -1143,19 +1164,15 @@ fn blast_plan_for(
             },
             json_response(empty_issue_page()),
         ),
-    ]);
-    if include_sca {
-        let sca_path = "/api/v1/scan/blast-scan-123/issues/sca".to_string();
-        plan.push(expected_request(
-            "read malicious SCA issues",
-            move |request| {
-                assert_authenticated_request(request, Method::GET, &sca_path)?;
-                assert_query(request, "page", "1")?;
-                assert_query(request, "page_size", "30")
+        sca_issues_request(
+            "blast-scan-123",
+            if malicious_dependency {
+                malicious_sca_issue_page()
+            } else {
+                empty_issue_page()
             },
-            json_response(malicious_sca_issue_page()),
-        ));
-    }
+        ),
+    ]);
     plan
 }
 

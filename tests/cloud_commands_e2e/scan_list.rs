@@ -34,6 +34,126 @@ fn scan_format_json_prints_only_the_document_on_stdout() {
     assert!(stderr.contains("Scan has started with ID"), "{context}");
 }
 
+/// A lockfile that pins a malicious package shows in the summary of a plain
+/// scan, with no gate: the code issues alone read "0 findings".
+#[test]
+fn scan_summary_reports_malicious_dependencies_without_a_gate() {
+    let project = git_project();
+    let api = ApiStub::start(blast_plan(&project.sha));
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args(["scan", "blast", "--project-name", "cloud-e2e"]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in [
+        "1 finding in this scan: 0 open, 0 in other states, 1 in dependencies.",
+        "Malware: 1 malicious package in this scan's dependencies.",
+        "Malicious packages                   1     0       0    0      1",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?}\n{context}");
+    }
+}
+
+/// A dependency read that fails is reported as failed, never as zero.
+#[test]
+fn scan_summary_says_when_dependency_findings_could_not_be_read() {
+    let project = git_project();
+    let plan = answer_with(
+        blast_plan(&project.sha),
+        "read SCA issues",
+        json_response_with_status(StatusCode::FORBIDDEN, json!({"status": "error"})),
+    );
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--format",
+        "json",
+        "--project-name",
+        "cloud-e2e",
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    assert_eq!(output.status.code(), Some(0), "{context}");
+    let document = parse_output_json(&output, &transcript);
+    let dependencies = &document["dependencies"];
+    assert!(dependencies["total"].is_null(), "{context}");
+    assert!(dependencies["malicious"].is_null(), "{context}");
+    assert!(
+        dependencies["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("403 Forbidden")),
+        "{context}"
+    );
+}
+
+/// The summary, the `--fail-on malicious` gate and the JSON report share one
+/// read of the dependency findings: the plan holds a single SCA request.
+#[test]
+fn scan_reads_dependency_findings_once_for_summary_gate_and_report() {
+    let project = git_project();
+    let out_dir = TempDir::new().expect("create output directory");
+    let out_file = out_dir.path().join("results.json");
+    let mut plan = blast_plan(&project.sha);
+    plan.push(expected_request(
+        "read issues for the JSON report",
+        |request| {
+            assert_authenticated_request(
+                request,
+                Method::GET,
+                "/api/v1/scan/blast-scan-123/issues",
+            )?;
+            match query_value(request, "show_false_positives") {
+                Ok(value) => Err(format!("unexpected show_false_positives={value}")),
+                Err(_) => Ok(()),
+            }
+        },
+        json_response(empty_issue_page()),
+    ));
+    let api = ApiStub::start(plan);
+    let (mut command, _home) = cloud_command(&api, project.path());
+    command.args([
+        "scan",
+        "blast",
+        "--fail-on",
+        "malicious",
+        "--out-format",
+        "json",
+        "--out-file",
+        out_file.to_str().expect("UTF-8 report path"),
+        "--project-name",
+        "cloud-e2e",
+    ]);
+
+    let output = run_with_timeout(command, &api);
+    let transcript = api.assert_finished();
+    let context = output_context(&output, &transcript);
+    assert_eq!(output.status.code(), Some(1), "{context}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Malware: 1 malicious package in this scan's dependencies."),
+        "{context}"
+    );
+    assert!(
+        stdout.contains("--fail-on malicious (findings in any status, not only open) matched 1"),
+        "{context}"
+    );
+    let report: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&out_file).expect("JSON report should exist"),
+    )
+    .expect("JSON report");
+    assert_eq!(
+        report["sca_issues"][0]["classification"], "malicious",
+        "{context}"
+    );
+}
+
 #[test]
 fn scan_fail_on_severity_and_malicious_counts_both_when_severity_already_trips() {
     let project = git_project();

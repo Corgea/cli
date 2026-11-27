@@ -199,6 +199,7 @@ fn scan_tail() -> Vec<ExpectedRequest> {
             },
             json_response(empty_issue_page()),
         ),
+        sca_issues_request("blast-scan-123", empty_issue_page()),
     ]
 }
 
