@@ -55,7 +55,10 @@ gives up after 10 hours; override with `CORGEA_SCAN_TIMEOUT_SECONDS`.
 evaluated; override with `CORGEA_BLOCKING_RULES_TIMEOUT_SECONDS`.
 
 When the scan finishes, `scan` and `wait` print a results summary: open issues
-by severity, every finding by status, and the results link. By default it
+by severity, the scan's dependency findings, every code finding by status, and
+the results link. A `Malware:` line counts the malicious packages among the
+dependencies. If the dependency findings cannot be read, the summary says so
+and does not count them as zero. By default it
 prints tables for a person. `--format` picks a format for a program instead:
 `agent` (tab-separated records for coding agents), `json` (one document on
 stdout) or `quiet` (no summary). With `--format`, progress goes to stderr, so

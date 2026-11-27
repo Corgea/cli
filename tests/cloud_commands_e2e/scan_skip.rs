@@ -123,6 +123,7 @@ fn skipped_scan_still_fails_the_build_on_the_prior_scans_blocking_rules() {
         commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
         clean_detail(&project.sha),
         reused_scan_issues(),
+        sca_issues_request(PRIOR_SCAN, empty_issue_page()),
         reused_scan_sarif_report(),
         reused_scan_blocking_rules(true),
     ]);
@@ -175,6 +176,7 @@ fn skipped_scan_reports_the_prior_findings() {
         commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
         clean_detail(&project.sha),
         reused_scan_issues(),
+        sca_issues_request(PRIOR_SCAN, empty_issue_page()),
         reused_scan_blocking_rules(false),
     ]);
     let (mut command, _home) = cloud_command(&api, project.path());
@@ -315,6 +317,7 @@ fn a_file_hidden_from_git_status_reuses_the_commits_scan() {
         commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
         clean_detail(&project.sha),
         reused_scan_issues(),
+        sca_issues_request(PRIOR_SCAN, empty_issue_page()),
         reused_scan_blocking_rules(false),
     ]);
     let (mut command, _home) = cloud_command(&api, project.path());
@@ -359,6 +362,7 @@ fn ignore_dirty_worktree_reuses_a_scan_a_dirty_tree_would_otherwise_run() {
         commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
         clean_detail(&project.sha),
         reused_scan_issues(),
+        sca_issues_request(PRIOR_SCAN, empty_issue_page()),
         reused_scan_blocking_rules(false),
     ]);
     let (mut command, _home) = cloud_command(&api, project.path());
@@ -412,6 +416,7 @@ fn ignore_dirty_worktree_reuses_a_prior_dirty_scan() {
             json_response(detail),
         ),
         reused_scan_issues(),
+        sca_issues_request(PRIOR_SCAN, empty_issue_page()),
         reused_scan_blocking_rules(false),
     ]);
     let (mut command, _home) = cloud_command(&api, project.path());
@@ -628,6 +633,7 @@ fn excluding_files_warns_but_still_reuses_the_commits_scan() {
         commit_lookup(&project.sha, vec![prior_scan(&project.sha, &ago(3))]),
         clean_detail(&project.sha),
         reused_scan_issues(),
+        sca_issues_request(PRIOR_SCAN, empty_issue_page()),
     ]);
     let (mut command, _home) = cloud_command(&api, project.path());
     command.args([
